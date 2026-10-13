@@ -1,0 +1,22 @@
+# The Navette agent on the remote machine: a systemd user service, no root. It only dials out
+# to the paired home machine and never listens.
+#
+# Install (once `navette pair <home:port>` has succeeded):
+#   cargo install --locked --path . --root ~/.local
+#   install -Dm644 dist/navette-agent.service ~/.config/systemd/user/navette-agent.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now navette-agent
+# Logs: journalctl --user -u navette-agent
+
+[Unit]
+Description=Navette agent: keeps the link to the paired home machine
+
+[Service]
+ExecStart=%h/.local/bin/navette agent
+# The agent redials on its own; this only covers a crash or a missing pairing.
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
