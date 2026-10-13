@@ -965,6 +965,20 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 Ok(text) => state.capture.keymap(text),
                 Err(e) => tracing::warn!("cannot read home's keymap: {e}"),
             },
+            Event::Enter { surface, keys, .. } if state.ours(&surface) => {
+                let (codes, _) = keys.as_chunks::<4>();
+                let codes: Vec<u32> = codes.iter().map(|code| u32::from_ne_bytes(*code)).collect();
+                state.capture.keyboard_entered(&codes);
+            }
+            Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => state
+                .capture
+                .modifiers(mods_depressed, mods_latched, mods_locked, group),
             Event::Leave { surface, .. } if state.ours(&surface) => state.capture.keyboard_left(),
             Event::Key {
                 key,

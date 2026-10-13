@@ -102,11 +102,13 @@ pub struct Ports {
     pub injectors: Arc<dyn Injectors>,
 }
 
-/// What home said of its input, kept for the next injector: its keymap and its surface's size.
+/// What home said of its input, kept for the next injector: its keymap, its surface's size
+/// and its locks.
 #[derive(Default)]
 struct Home {
     keymap: Option<String>,
     area: Option<input::Event>,
+    locked: Option<input::Event>,
 }
 
 /// An active mode: the copy asked for, and its stream when it runs.
@@ -206,6 +208,7 @@ pub async fn serve_peer(
                     match &event {
                         input::Event::Keymap(text) => home.keymap = Some(text.clone()),
                         input::Event::Area { .. } => home.area = Some(event.clone()),
+                        input::Event::Locked(_) => home.locked = Some(event.clone()),
                         _ => {}
                     }
                     if let Some(Active { stream: Stream::Running(running), .. }) = &active
@@ -312,9 +315,14 @@ async fn bring_up(
     outbox: &Outbox,
 ) -> io::Result<Running> {
     let (copy, caps, ports, outbox) = (copy.clone(), caps.clone(), ports.clone(), outbox.clone());
-    let (keymap, area) = (home.keymap.clone(), home.area.clone());
+    let keymap = home.keymap.clone();
+    let replay: Vec<_> = [&home.area, &home.locked]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
     tokio::task::spawn_blocking(move || {
-        start_blocking(&copy, caps, &ports, keymap.as_deref(), area, outbox)
+        start_blocking(&copy, caps, &ports, keymap.as_deref(), &replay, outbox)
     })
     .await
     .unwrap_or_else(|e| {
@@ -329,7 +337,7 @@ fn start_blocking(
     caps: ClientCaps,
     ports: &Ports,
     keymap: Option<&str>,
-    area: Option<input::Event>,
+    replay: &[input::Event],
     outbox: Outbox,
 ) -> io::Result<Running> {
     let hypr = &*ports.hypr;
@@ -350,8 +358,8 @@ fn start_blocking(
         .injectors
         .start(output::NAME, keymap)
         .inspect(|input| {
-            if let Some(area) = &area {
-                input.send(area);
+            for event in replay {
+                input.send(event);
             }
         })
         .map_err(|e| {
@@ -734,18 +742,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_injector_starts_again_with_the_stream_and_keeps_home_s_keymap() {
+    async fn the_injector_starts_again_with_the_stream_and_keeps_home_s_keymap_and_locks() {
         let agent = agent();
+        let caps = input::Event::Locked(vec!["Lock".into()]);
         agent.input.push(input::Event::Keymap("home keymap".into()));
         agent.inbox.try_send(start()).unwrap();
         until(|| agent.injected(0).is_some()).await;
+        agent.input.push(caps.clone());
+        until(|| agent.injected(0).unwrap().2.contains(&caps)).await;
         agent.streams.end_last();
         until(|| agent.injected(1).is_some()).await;
         assert_eq!(agent.dropped(0), Some(true));
         assert_eq!(agent.injected(1).unwrap().1.as_deref(), Some("home keymap"));
+        until(|| agent.injected(1).unwrap().2 == [caps.clone()]).await;
         // The new one gets what follows; the old one, gone, nothing.
         agent.input.push(key(false));
-        until(|| agent.injected(1).unwrap().2 == [key(false)]).await;
+        until(|| agent.injected(1).unwrap().2 == [caps.clone(), key(false)]).await;
         assert!(!agent.injected(0).unwrap().2.contains(&key(false)));
     }
 

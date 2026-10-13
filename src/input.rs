@@ -84,9 +84,12 @@ pub enum Event {
         #[n(1)]
         height: u32,
     },
-    /// Every key and button held goes up.
+    /// Every key and button held goes up; the locks stay.
     #[n(6)]
     ReleaseAll,
+    /// The locks on at home, by xkb name (`Lock` for Caps Lock, `Mod2` for Num Lock).
+    #[n(7)]
+    Locked(#[n(0)] Vec<String>),
 }
 
 #[derive(Default)]
@@ -292,6 +295,20 @@ impl Keys {
         self.state = xkb::State::new(&self.keymap);
     }
 
+    /// Home's modifiers as the compositor reports them; `group` is the layout in effect.
+    fn set_mods(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
+        self.state
+            .update_mask(depressed, latched, locked, 0, 0, group);
+    }
+
+    fn locks(&self) -> Vec<String> {
+        [xkb::MOD_NAME_CAPS, xkb::MOD_NAME_NUM]
+            .into_iter()
+            .filter(|name| self.state.mod_name_is_active(name, xkb::STATE_MODS_LOCKED))
+            .map(str::to_string)
+            .collect()
+    }
+
     /// The press of `code` with the modifiers held now is the hotkey. The key is read on its
     /// first level, so `shift+q` is the Q key with Shift, whatever Shift makes of it.
     fn is(&self, hotkey: &Hotkey, code: u32) -> bool {
@@ -334,6 +351,8 @@ pub struct Capture {
     held_buttons: BTreeSet<u32>,
     /// The hotkey gave the keyboard back; until the pointer leaves, keys stay home.
     released: bool,
+    /// The locks last sent since the keyboard came; `None` sends them at the next modifiers.
+    locks_sent: Option<Vec<String>>,
 }
 
 impl Capture {
@@ -346,6 +365,7 @@ impl Capture {
             held_keys: BTreeSet::new(),
             held_buttons: BTreeSet::new(),
             released: false,
+            locks_sent: None,
         }
     }
 
@@ -354,6 +374,9 @@ impl Capture {
             return;
         }
         self.keys = Keys::new(&text);
+        if self.keys.is_none() && self.hotkey.is_some() {
+            eprintln!("navette: home's keymap does not compile here; the release hotkey is off");
+        }
         self.keymap.clone_from(&text);
         if text.len() <= MAX_KEYMAP {
             self.queue.push(Event::Keymap(text));
@@ -376,6 +399,30 @@ impl Capture {
         self.release();
         self.released = false;
         Focus::Give
+    }
+
+    /// The keyboard came, with the keys already held at home: they count for the hotkey, but
+    /// their releases stay home, the remote never having had their presses.
+    pub fn keyboard_entered(&mut self, keys: &[u32]) {
+        if let Some(state) = &mut self.keys {
+            for &code in keys {
+                state.update(code, true);
+            }
+        }
+        // The remote may have lost them since (its injector started again): sent again.
+        self.locks_sent = None;
+    }
+
+    /// Home's modifiers, which the compositor sends when the keyboard comes and when they
+    /// change: the hotkey reads them, and the remote takes home's locks.
+    pub fn modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
+        let Some(keys) = &mut self.keys else { return };
+        keys.set_mods(depressed, latched, locked, group);
+        let locks = keys.locks();
+        if self.locks_sent.as_ref() != Some(&locks) {
+            self.locks_sent = Some(locks.clone());
+            self.queue.push(Event::Locked(locks));
+        }
     }
 
     /// The keyboard went elsewhere while the pointer stayed: the keys held go up there.
@@ -520,6 +567,7 @@ impl Inject for hypr_input::Input {
             Event::Keymap(text) => InputCmd::SetKeymap(text),
             Event::Area { width, height } => InputCmd::SetExtent { width, height },
             Event::ReleaseAll => InputCmd::ReleaseAll,
+            Event::Locked(names) => InputCmd::SetLocked(names),
         };
         let _ = hypr_input::Input::send(self, cmd);
     }
@@ -626,6 +674,43 @@ mod tests {
         assert_eq!(capture.enter(1.0, 1.0), Focus::Take);
         capture.key(KEY_T, true);
         assert_eq!(sent(&queue), [Event::ReleaseAll, key(KEY_T, true)]);
+    }
+
+    // The us keymap's modifier masks.
+    const SHIFT: u32 = 1 << 0;
+    const CAPS: u32 = 1 << 1;
+    const NUM: u32 = 1 << 4;
+
+    fn locked(names: &[&str]) -> Event {
+        Event::Locked(names.iter().map(|name| name.to_string()).collect())
+    }
+
+    #[test]
+    fn caps_lock_on_at_home_is_on_on_the_remote_when_the_keyboard_comes() {
+        let (mut capture, queue) = armed(DEFAULT_HOTKEY);
+        capture.keyboard_entered(&[]);
+        capture.modifiers(0, 0, CAPS | NUM, 0);
+        assert_eq!(sent(&queue), [locked(&["Lock", "Mod2"])]);
+        // The same locks again are not news; Caps Lock off is.
+        capture.modifiers(0, 0, CAPS | NUM, 0);
+        assert_eq!(sent(&queue), []);
+        capture.modifiers(0, 0, NUM, 0);
+        assert_eq!(sent(&queue), [locked(&["Mod2"])]);
+        // The keyboard comes again: the remote may have lost them, they are sent again.
+        capture.keyboard_left();
+        let _ = sent(&queue);
+        capture.keyboard_entered(&[]);
+        capture.modifiers(0, 0, NUM, 0);
+        assert_eq!(sent(&queue), [locked(&["Mod2"])]);
+    }
+
+    #[test]
+    fn shift_held_before_the_pointer_came_then_escape_gives_the_keyboard_back() {
+        let (mut capture, queue) = armed(DEFAULT_HOTKEY);
+        capture.keyboard_entered(&[KEY_LEFTSHIFT]);
+        capture.modifiers(SHIFT, 0, 0, 0);
+        assert_eq!(capture.key(KEY_ESC, true), Some(Focus::Give));
+        assert_eq!(sent(&queue), [locked(&[]), Event::ReleaseAll]);
     }
 
     #[test]
@@ -783,6 +868,7 @@ mod tests {
                 height: 1440,
             },
             Event::ReleaseAll,
+            locked(&["Lock"]),
         ];
         for event in events {
             let msg = crate::wire::LinkMsg::Input(event.clone());
