@@ -399,6 +399,8 @@ pub struct Capture {
     released: bool,
     /// The locks last sent since the keyboard came; `None` sends them at the next modifiers.
     locks_sent: Option<Vec<String>>,
+    /// Hears each time the hotkey gives the keyboard back.
+    on_release: Option<crate::display::Released>,
 }
 
 impl Capture {
@@ -412,7 +414,14 @@ impl Capture {
             held_buttons: BTreeSet::new(),
             released: false,
             locks_sent: None,
+            on_release: None,
         }
+    }
+
+    /// `released` hears each time the hotkey gives the keyboard back.
+    pub fn on_release(mut self, released: crate::display::Released) -> Self {
+        self.on_release = Some(released);
+        self
     }
 
     pub fn keymap(&mut self, text: String) {
@@ -509,6 +518,9 @@ impl Capture {
                     tracing::info!("the release hotkey: the keyboard goes home");
                     self.release();
                     self.released = true;
+                    if let Some(on_release) = &self.on_release {
+                        let _ = on_release.send(());
+                    }
                     return Some(Focus::Give);
                 }
                 Some(Chord::OtherMods(held)) => tracing::debug!(
