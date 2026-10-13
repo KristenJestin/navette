@@ -195,6 +195,13 @@ impl Outbox {
         rx
     }
 
+    /// What waits to be written, oldest first.
+    #[cfg(test)]
+    pub fn queued(&self) -> Vec<Msg> {
+        let queue = self.0.queue.lock().unwrap();
+        queue.packets.iter().map(|(msg, _)| msg.clone()).collect()
+    }
+
     fn close(&self) {
         let mut queue = self.0.queue.lock().unwrap();
         queue.closed = true;
