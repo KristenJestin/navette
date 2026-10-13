@@ -46,14 +46,6 @@ const LONGEST_WAIT: Duration = Duration::from_secs(30);
 const ATTEMPTS: u32 = 6;
 /// A stream that ran this long was not failing: the count starts again.
 const STEADY: Duration = Duration::from_secs(30);
-/// How often the lid is looked at while a mode runs with `closed_lid = on`: the inhibitor lock
-/// keeps the laptop up meanwhile, so a second is soon enough.
-const LID_POLL: Duration = if cfg!(test) {
-    Duration::from_millis(20)
-} else {
-    Duration::from_secs(1)
-};
-
 /// Starts the picture path for an output (the port behind which tests put a fake). The stream
 /// runs until the returned guard is dropped; `ended` says why if it stops on its own.
 pub trait Streams: Send + Sync {
@@ -96,16 +88,14 @@ pub async fn serve(
     let (hypr, record) = (ports.hypr.clone(), ports.lid_record.clone());
     let left = tokio::task::spawn_blocking(move || {
         // The laptop's screen first: the copies may be the only outputs on.
-        (lid::open(&*hypr, &record), output::remove_all(&*hypr))
+        (
+            restore(&*hypr, record.as_deref()),
+            output::remove_all(&*hypr),
+        )
     })
     .await;
     if let Ok((opened, removed)) = left {
-        match opened {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                eprintln!("navette: could not bring the laptop's screen back: {e}");
-            }
-            _ => {}
-        }
+        said_restored(opened);
         match removed {
             Err(e) if e.kind() != io::ErrorKind::NotFound => {
                 eprintln!("navette: could not remove a leftover remote output: {e}");
@@ -119,14 +109,41 @@ pub async fn serve(
 }
 
 /// What the agent drives: Hyprland, the picture path, the input injection and logind, with
-/// the file that brings the laptop's screen back.
+/// the file that brings the laptop's screen back (none without a runtime directory) and how
+/// often the lid is read.
 #[derive(Clone)]
 pub struct Ports {
     pub hypr: Arc<dyn Hypr>,
     pub streams: Arc<dyn Streams>,
     pub injectors: Arc<dyn Injectors>,
     pub logind: Arc<dyn Logind>,
-    pub lid_record: std::path::PathBuf,
+    pub lid_record: Option<std::path::PathBuf>,
+    pub lid_poll: Duration,
+}
+
+/// Puts the laptop's screen back if a record says the agent disabled it.
+fn restore(hypr: &dyn Hypr, record: Option<&std::path::Path>) -> io::Result<()> {
+    record.map_or(Ok(()), |record| lid::open(hypr, record))
+}
+
+fn said_restored(restored: io::Result<()>) {
+    match restored {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            eprintln!("navette: could not bring the laptop's screen back: {e}");
+        }
+        _ => {}
+    }
+}
+
+/// [`restore`], off the executor: at a start, and on Hyprland's events with no lid watched, so
+/// a restore that failed is tried again.
+async fn restore_now(ports: &Ports) {
+    let (hypr, record) = (ports.hypr.clone(), ports.lid_record.clone());
+    if let Ok(restored) =
+        tokio::task::spawn_blocking(move || restore(&*hypr, record.as_deref())).await
+    {
+        said_restored(restored);
+    }
 }
 
 /// What home said of its input, kept for the next injector: its keymap, each surface's size
@@ -150,74 +167,10 @@ struct Active {
     starting: bool,
     /// The output being started, and its start.
     up: Option<(usize, tokio::task::JoinHandle<io::Result<Running>>)>,
-    /// With `closed_lid = on` and logind's lock held.
-    lid: Option<Lid>,
-}
-
-/// The lid during a mode that lets it close.
-struct Lid {
-    _lock: Box<dyn Send + Sync>,
-    /// As last seen: closed, the laptop's screen is kept disabled.
-    closed: bool,
-    next: tokio::time::Instant,
-    /// A failure to look at it was said, and not since it worked again.
-    told: bool,
-}
-
-impl Lid {
-    /// Takes logind's lock; without it, the lid is left alone and the agent says why.
-    async fn take(logind: &Arc<dyn Logind>) -> Option<Lid> {
-        let logind = logind.clone();
-        match tokio::task::spawn_blocking(move || logind.inhibit_lid()).await {
-            Ok(Ok(lock)) => Some(Lid {
-                _lock: lock,
-                closed: false,
-                next: tokio::time::Instant::now(),
-                told: false,
-            }),
-            Ok(Err(e)) => {
-                eprintln!(
-                    "navette: closed_lid: the laptop cannot be kept up with its lid closed, \
-                     so the lid does as it always does: {e}"
-                );
-                None
-            }
-            Err(_) => None,
-        }
-    }
-
-    /// Looks at the lid and keeps the laptop's screen as it says: disabled while closed (again
-    /// after a reload or a restart turned it on), back once open.
-    async fn look(&mut self, ports: &Ports) {
-        self.next = tokio::time::Instant::now() + LID_POLL;
-        let (logind, hypr, record, was) = (
-            ports.logind.clone(),
-            ports.hypr.clone(),
-            ports.lid_record.clone(),
-            self.closed,
-        );
-        let looked = tokio::task::spawn_blocking(move || -> io::Result<bool> {
-            let closed = logind.lid_closed()?;
-            if closed {
-                lid::close(&*hypr, &record)?;
-            } else if was {
-                lid::open(&*hypr, &record)?;
-            }
-            Ok(closed)
-        })
-        .await;
-        match looked {
-            Ok(Ok(closed)) => {
-                self.closed = closed;
-                self.told = false;
-            }
-            Ok(Err(e)) if !self.told => {
-                self.told = true;
-                eprintln!("navette: closed_lid: {e}");
-            }
-            _ => {}
-        }
-    }
+    /// With `closed_lid = on`: the lid's watch.
+    lid: Option<lid::Watch>,
+    /// `closed_lid = on` was asked, said back in `Started`.
+    closed_lid: bool,
 }
 
 struct Output {
@@ -337,19 +290,20 @@ pub async fn serve_peer(
     let mut input_open = true;
     loop {
         let retry_at = active.as_ref().and_then(Active::retry_at);
-        let lid_at = active.as_ref().and_then(|a| Some(a.lid.as_ref()?.next));
         let had_mode = active.is_some();
         tokio::select! {
             msg = peer.inbox.recv() => match msg {
                 None => break,
                 Some(Incoming::Display(Display::Start { output, caps, others, closed_lid })) => {
                     stop(&mut active, ports).await;
+                    restore_now(ports).await;
                     let mut copies = vec![output];
                     copies.extend(others.unwrap_or_default());
                     match start(copies, caps) {
                         Ok(mut mode) => {
                             if closed_lid == Some(true) {
-                                mode.lid = Lid::take(&ports.logind).await;
+                                mode.closed_lid = true;
+                                mode.lid = watch_lid(ports, &peer.outbox);
                             }
                             mode.bring_up(0, ports, &home, &peer.outbox);
                             active = Some(mode);
@@ -395,9 +349,11 @@ pub async fn serve_peer(
                 None => input_open = false,
             },
             Some(event) = events.recv() => {
-                // A reload, or a script on the lid, may have turned the laptop's screen on.
-                if let Some(lid) = active.as_mut().and_then(|a| a.lid.as_mut()) {
-                    lid.next = tokio::time::Instant::now();
+                // A reload, or a script on the lid, may have turned the laptop's screen on;
+                // with no lid watched, a restore that failed may now go through.
+                match active.as_ref().and_then(|a| a.lid.as_ref()) {
+                    Some(watch) => watch.look(),
+                    None => restore_now(ports).await,
                 }
                 if let (hypr::Event::ConfigReloaded, Some(mode)) = (event, &active) {
                     let (hypr, copies, scales) =
@@ -443,6 +399,7 @@ pub async fn serve_peer(
                                 let started = Display::Started {
                                     output: names[0].clone(),
                                     others: (names.len() > 1).then(|| names[1..].to_vec()),
+                                    closed_lid: mode.closed_lid.then_some(true),
                                 };
                                 peer.outbox.send(Msg::Display(started), Vec::new());
                             }
@@ -463,11 +420,6 @@ pub async fn serve_peer(
                     }
                 }
             },
-            () = sleep_until(lid_at), if lid_at.is_some() => {
-                if let Some(lid) = active.as_mut().and_then(|a| a.lid.as_mut()) {
-                    lid.look(ports).await;
-                }
-            }
             () = sleep_until(retry_at), if retry_at.is_some() => {
                 let Some(mode) = &mut active else { continue };
                 let now = tokio::time::Instant::now();
@@ -486,6 +438,28 @@ pub async fn serve_peer(
         }
     }
     stop(&mut active, ports).await;
+}
+
+/// Starts the lid's watch; what keeps it from working is said here and at home.
+fn watch_lid(ports: &Ports, outbox: &Outbox) -> Option<lid::Watch> {
+    let outbox = outbox.clone();
+    let told = move |why: String| {
+        eprintln!("navette: closed_lid: {why}; the lid does what it always does");
+        outbox.send(Msg::NoLid(why), Vec::new());
+    };
+    match lid::Watch::start(
+        ports.logind.clone(),
+        ports.hypr.clone(),
+        ports.lid_record.clone(),
+        ports.lid_poll,
+        told,
+    ) {
+        Ok(watch) => Some(watch),
+        Err(e) => {
+            eprintln!("navette: closed_lid: the lid cannot be watched: {e}");
+            None
+        }
+    }
 }
 
 async fn sleep_until(at: Option<tokio::time::Instant>) {
@@ -518,6 +492,7 @@ fn start(copies: Vec<OutputCopy>, caps: ClientCaps) -> Result<Active, String> {
         starting: true,
         up: None,
         lid: None,
+        closed_lid: false,
     })
 }
 
@@ -649,21 +624,20 @@ async fn stop(active: &mut Option<Active>, ports: &Ports) {
         None => None,
     };
     let (hypr, record) = (ports.hypr.clone(), ports.lid_record.clone());
-    let lid = mode.lid.take();
+    let watch = mode.lid.take();
     let undone = tokio::task::spawn_blocking(move || {
         drop(starting);
+        let lock = watch.and_then(lid::Watch::stop);
         // Before the copies go: with the screen still disabled, no output would be on.
-        let opened = lid.as_ref().map(|_| lid::open(&*hypr, &record));
+        let opened = restore(&*hypr, record.as_deref());
         drop(mode);
         let removed = output::remove_all(&*hypr);
-        drop(lid);
+        drop(lock);
         (opened, removed)
     })
     .await;
     if let Ok((opened, removed)) = undone {
-        if let Some(Err(e)) = opened {
-            eprintln!("navette: could not bring the laptop's screen back: {e}");
-        }
+        said_restored(opened);
         if let Err(e) = removed {
             eprintln!("navette: could not remove the remote outputs: {e}");
         }
@@ -933,7 +907,15 @@ mod tests {
         task: tokio::task::JoinHandle<()>,
     }
 
+    /// The lid's poll in tests: soon, so a change is seen without an event.
+    const LID_POLL: Duration = Duration::from_millis(20);
+
     fn agent() -> Agent {
+        agent_polling(LID_POLL)
+    }
+
+    /// An agent reading the lid every `poll`.
+    fn agent_polling(poll: Duration) -> Agent {
         let hypr = Arc::new(FakeHypr::with(vec![FakeMonitor::new(
             "eDP-1", 1920, 1200, 0,
         )]));
@@ -962,7 +944,8 @@ mod tests {
                 refuse: refuse_input.clone(),
             }),
             logind: logind.clone(),
-            lid_record: record.clone(),
+            lid_record: Some(record.clone()),
+            lid_poll: poll,
         };
         let task = tokio::spawn(async move {
             serve_peer(peer, &ports, &mut events_rx).await;
@@ -1085,7 +1068,8 @@ mod tests {
                 .queued()
                 .contains(&Msg::Display(Display::Started {
                     output: FIRST.into(),
-                    others: None
+                    others: None,
+                    closed_lid: None,
                 }))
         );
         // The stream starts again after a stop of its own: still a picture, no second word.
@@ -1158,7 +1142,8 @@ mod tests {
             agent.outbox.queued()[1],
             Msg::Display(Display::Started {
                 output: FIRST.into(),
-                others: None
+                others: None,
+                closed_lid: None,
             })
         );
     }
@@ -1350,10 +1335,8 @@ mod tests {
                 refuse: Arc::default(),
             }),
             logind: Arc::new(FakeLogind::default()),
-            lid_record: record.map_or_else(
-                || std::path::PathBuf::from("/nonexistent/navette/lid"),
-                std::path::Path::to_path_buf,
-            ),
+            lid_record: record.map(std::path::Path::to_path_buf),
+            lid_poll: LID_POLL,
         }
     }
 
@@ -1463,6 +1446,7 @@ mod tests {
             Msg::Display(Display::Started {
                 output: FIRST.into(),
                 others: Some(vec![SECOND.into()]),
+                closed_lid: None,
             })
         );
     }
@@ -1686,7 +1670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dropped_link_or_a_stopped_agent_brings_the_laptop_screen_back() {
+    async fn a_dropped_link_brings_the_laptop_screen_back() {
         let agent = agent();
         running_with_the_lid(&agent).await;
         agent.logind.close(true);
@@ -1735,12 +1719,14 @@ mod tests {
         *agent.logind.refuse.lock().unwrap() = Some("Access denied".into());
         agent.logind.close(true);
         running_with_the_lid(&agent).await;
-        // The mode runs all the same, and the lid is never looked at.
-        until(|| agent.outbox.queued().len() == 2).await;
+        // The mode runs all the same, home is told, and the lid is read only before the lock.
+        until(|| !no_lid(&agent.outbox).is_empty()).await;
+        assert!(no_lid(&agent.outbox)[0].contains("Access denied"));
         tokio::time::sleep(LID_POLL * 5).await;
-        assert_eq!(agent.logind.looked(), 0);
+        assert_eq!(agent.logind.looked(), 1);
         assert!(!laptop_disabled(&agent));
         assert!(failed(&agent.outbox).is_none());
+        assert_eq!(agent.hypr.monitor(FIRST).map(|m| m.disabled), Some(false));
     }
 
     #[tokio::test]
@@ -1756,16 +1742,111 @@ mod tests {
 
     #[tokio::test]
     async fn a_reload_with_the_lid_closed_disables_the_laptop_screen_again() {
-        let agent = agent();
-        running_with_the_lid(&agent).await;
+        // No poll comes in the test's time: what follows the reload is the event's doing.
+        let agent = agent_polling(Duration::from_secs(3600));
         agent.logind.close(true);
+        running_with_the_lid(&agent).await;
+        // Hyprland says the copy came; the screen goes once it is there to take its windows.
+        agent
+            .events
+            .send(hypr::Event::MonitorAdded(FIRST.into()))
+            .unwrap();
         until(|| laptop_disabled(&agent)).await;
         agent.hypr.reload();
         assert!(!laptop_disabled(&agent));
         agent.events.send(hypr::Event::ConfigReloaded).unwrap();
         until(|| laptop_disabled(&agent)).await;
         agent.logind.close(false);
+        agent
+            .events
+            .send(hypr::Event::MonitorAdded("DP-9".into()))
+            .unwrap();
         until(|| !laptop_disabled(&agent)).await;
+    }
+
+    fn no_lid(outbox: &Outbox) -> Vec<String> {
+        outbox
+            .queued()
+            .into_iter()
+            .filter_map(|msg| match msg {
+                Msg::NoLid(reason) => Some(reason),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_agent_says_it_knows_closed_lid_when_its_outputs_are_up() {
+        let agent = agent();
+        running_with_the_lid(&agent).await;
+        until(|| agent.outbox.queued().len() == 2).await;
+        assert_eq!(
+            agent.outbox.queued()[1],
+            Msg::Display(Display::Started {
+                output: FIRST.into(),
+                others: None,
+                closed_lid: Some(true),
+            })
+        );
+    }
+
+    /// The mode stops while Hyprland cannot be reached; it is back, the screen still disabled.
+    async fn a_restore_that_failed_at_stop(agent: &Agent) {
+        running_with_the_lid(agent).await;
+        agent.logind.close(true);
+        until(|| laptop_disabled(agent)).await;
+        agent.hypr.set_down(true, Vec::new());
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        until(|| agent.logind.held() == 0).await;
+        assert!(agent.record.exists());
+        let disabled = FakeMonitor {
+            disabled: true,
+            ..FakeMonitor::new("eDP-1", 1920, 1200, 0)
+        };
+        agent.hypr.set_down(false, vec![disabled]);
+    }
+
+    #[tokio::test]
+    async fn a_restore_that_failed_at_stop_goes_through_at_hyprland_s_next_event() {
+        let agent = agent();
+        a_restore_that_failed_at_stop(&agent).await;
+        agent
+            .events
+            .send(hypr::Event::MonitorAdded("DP-9".into()))
+            .unwrap();
+        until(|| !laptop_disabled(&agent)).await;
+        assert!(!agent.record.exists());
+    }
+
+    #[tokio::test]
+    async fn a_restore_that_failed_at_stop_goes_through_at_the_next_start() {
+        let agent = agent();
+        a_restore_that_failed_at_stop(&agent).await;
+        agent.logind.close(false);
+        agent.inbox.try_send(start()).unwrap();
+        until(|| !laptop_disabled(&agent)).await;
+        assert!(!agent.record.exists());
+    }
+
+    #[tokio::test]
+    async fn a_slow_logind_holds_neither_the_start_nor_home_s_input() {
+        let agent = agent();
+        // Each answer takes longer than the whole start may.
+        let slow = Duration::from_millis(1500);
+        *agent.logind.slow.lock().unwrap() = slow;
+        let asked = tokio::time::Instant::now();
+        agent.inbox.try_send(start_with_the_lid()).unwrap();
+        until(|| agent.outbox.queued().len() == 2).await;
+        assert!(asked.elapsed() < slow, "started in {:?}", asked.elapsed());
+        assert_eq!(agent.logind.held(), 0);
+        let sent = tokio::time::Instant::now();
+        agent.input.push(key(true));
+        until(|| agent.injected(0).unwrap().2 == [key(true)]).await;
+        assert!(sent.elapsed() < slow, "injected in {:?}", sent.elapsed());
+        until(|| agent.logind.held() == 1).await;
     }
 
     #[tokio::test]

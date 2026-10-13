@@ -87,6 +87,12 @@ pub enum LinkMsg {
         #[n(0)]
         reason: String,
     },
+    /// Remote to home: the mode runs, but the remote leaves its lid alone (`closed_lid`).
+    #[n(32)]
+    NoLid {
+        #[n(0)]
+        reason: String,
+    },
     // The remote machine's sound (`crate::audio`), a block of numbers of its own.
     #[n(48)]
     AudioStart {
@@ -137,6 +143,7 @@ impl From<(u8, Msg)> for LinkMsg {
             Msg::Video(msg) => Self::Video(msg, output_id(output)),
             Msg::Feedback(msg) => Self::Feedback(msg, output_id(output)),
             Msg::NoInput(reason) => Self::NoInput { reason },
+            Msg::NoLid(reason) => Self::NoLid { reason },
         }
     }
 }
@@ -213,6 +220,7 @@ impl LinkMsg {
             | Self::Feedback(..)
             | Self::Input(..)
             | Self::NoInput { .. }
+            | Self::NoLid { .. }
             | Self::AudioStart { .. }
             | Self::AudioStop
             | Self::AudioFrame { .. }

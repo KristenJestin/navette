@@ -242,7 +242,8 @@ async fn main() -> io::Result<()> {
         streams: Arc::new(Synthetic),
         injectors: Arc::new(navette::input::LiveInjectors),
         logind: Arc::new(navette::lid::LiveLogind),
-        lid_record: navette::lid::record_path()?,
+        lid_record: navette::lid::record_path(),
+        lid_poll: navette::lid::POLL,
     };
     tokio::spawn(remote::serve(peers_rx, ports, hypr_events_rx));
     // The display only: no clipboard bridge here.
