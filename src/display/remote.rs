@@ -246,10 +246,10 @@ mod tests {
 
     impl FakeStreams {
         fn drop_last(&self) {
-        drop(self.ends.lock().unwrap().pop().unwrap());
-    }
+            drop(self.ends.lock().unwrap().pop().unwrap());
+        }
 
-    fn end_last(&self) {
+        fn end_last(&self) {
             let end = self.ends.lock().unwrap().pop().unwrap();
             let _ = end.send(io::Error::other("capture stopped"));
         }

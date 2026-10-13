@@ -226,7 +226,10 @@ fn version_comes_from_the_build_not_from_cargo_toml() {
 fn mode_start_without_serve_says_to_start_it() {
     let tmp = tempfile::tempdir().unwrap();
     let output = Navette::start(tmp.path(), &["mode", "start"]).finish();
-    assert!(output.contains("`navette serve` is not running"), "{output}");
+    assert!(
+        output.contains("`navette serve` is not running"),
+        "{output}"
+    );
 }
 
 #[test]
