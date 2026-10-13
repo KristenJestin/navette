@@ -1,0 +1,680 @@
+//! The mode, at home: the paired machine takes one home monitor, named in the config. `navette
+//! mode start` checks everything first (the config, the monitor, the link) and changes nothing
+//! when a check fails; then home covers the monitor with its surface, asks the remote for its
+//! output, and shows its stream. `navette mode stop`, or the link dropping, gives the monitor
+//! back. Home monitors are never moved or reconfigured.
+//!
+//! `navette serve` owns the link and the surface, so the two commands reach it over a Unix
+//! socket in `$XDG_RUNTIME_DIR/navette`, private to the user.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use gliff_vk::Gpu;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
+
+use crate::display::decode::{self, Decoding, Picture, Video};
+use crate::display::wire::{Display, Incoming, Msg, OutputCopy, Peer};
+use crate::hypr::{self, Hypr};
+
+const CONFIG_FILE: &str = "mode.conf";
+/// How long the remote has to make its output.
+const START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The mode's config: which home monitor the remote machine takes, by output name.
+pub fn monitor(config_dir: &Path) -> io::Result<String> {
+    let path = config_dir.join(CONFIG_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no mode configured: write `monitor = <output name>` in {}",
+                    path.display()
+                ),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(key, _)| key.trim() == "monitor")
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} names no monitor: `monitor = <output name>`",
+                    path.display()
+                ),
+            )
+        })
+}
+
+/// Covers a home monitor (the port behind which tests put a fake).
+pub trait Screens: Send + Sync {
+    /// Covers `monitor`; the guard takes the cover away when dropped.
+    fn open(&self, monitor: &str) -> io::Result<Box<dyn Screen>>;
+}
+
+pub trait Screen: Send {
+    fn pictures(&self) -> Box<dyn FnMut(Picture) + Send>;
+}
+
+/// The real cover: a layer surface on the monitor.
+pub struct LiveScreens;
+
+impl Screens for LiveScreens {
+    fn open(&self, monitor: &str) -> io::Result<Box<dyn Screen>> {
+        Ok(Box::new(crate::display::surface::Surface::open(monitor)?))
+    }
+}
+
+impl Screen for crate::display::surface::Surface {
+    fn pictures(&self) -> Box<dyn FnMut(Picture) + Send> {
+        crate::display::surface::Surface::pictures(self)
+    }
+}
+
+/// An order from `navette mode start|stop`, with where to answer.
+pub enum Order {
+    Start(oneshot::Sender<io::Result<String>>),
+    Stop(oneshot::Sender<io::Result<String>>),
+}
+
+/// What home needs to run a mode.
+pub struct Home {
+    pub config_dir: PathBuf,
+    pub hypr: Arc<dyn Hypr>,
+    pub screens: Arc<dyn Screens>,
+    /// The GPU that decodes, or none for the CPU.
+    pub gpu: Option<Arc<Gpu>>,
+}
+
+struct Active {
+    monitor: String,
+    // Field order is drop order: the decoder stops before the surface goes.
+    decoding: Decoding,
+    _screen: Box<dyn Screen>,
+    /// The `navette mode start` waiting for the remote's answer.
+    starting: Option<(oneshot::Sender<io::Result<String>>, tokio::time::Instant)>,
+}
+
+/// Serves the orders and the links, until both channels close.
+pub async fn serve(
+    home: Home,
+    mut peers: UnboundedReceiver<Peer>,
+    mut orders: UnboundedReceiver<Order>,
+) {
+    let mut peer: Option<Peer> = None;
+    let mut active: Option<Active> = None;
+    loop {
+        let deadline = active
+            .as_ref()
+            .and_then(|a| a.starting.as_ref().map(|(_, at)| *at));
+        tokio::select! {
+            // A link that came up is known before the orders that follow it.
+            biased;
+            new = peers.recv() => match new {
+                Some(new) => {
+                    if active.is_some() {
+                        stop(&mut active, "the link was replaced");
+                    }
+                    peer = Some(new);
+                }
+                None => break,
+            },
+            msg = next(&mut peer) => match msg {
+                None => {
+                    peer = None;
+                    if active.is_some() {
+                        stop(&mut active, "the link to the remote machine dropped");
+                    }
+                }
+                Some(Incoming::Display(Display::Started { output })) => {
+                    if let Some(a) = &mut active
+                        && let Some((reply, _)) = a.starting.take()
+                    {
+                        let _ = reply.send(Ok(format!(
+                            "{} shows the remote machine's {output}",
+                            a.monitor
+                        )));
+                    }
+                }
+                Some(Incoming::Display(Display::Failed { reason })) => {
+                    if let Some(mut a) = active.take() {
+                        if let Some((reply, _)) = a.starting.take() {
+                            let _ = reply.send(Err(io::Error::other(format!(
+                                "the remote machine could not make its output: {reason}"
+                            ))));
+                        }
+                        release(a);
+                    }
+                }
+                Some(Incoming::Video { msg, main, aux }) => {
+                    if let Some(a) = &active {
+                        a.decoding.video(Video { msg, main, aux });
+                    }
+                }
+                Some(_) => {}
+            },
+            order = orders.recv() => match order {
+                Some(Order::Start(reply)) => {
+                    match start(&home, peer.as_ref(), &mut active).await {
+                        Ok(()) => {
+                            if let Some(a) = &mut active {
+                                let at = tokio::time::Instant::now() + START_TIMEOUT;
+                                a.starting = Some((reply, at));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                }
+                Some(Order::Stop(reply)) => {
+                    let answer = match active.as_ref().map(|a| a.monitor.clone()) {
+                        Some(monitor) => {
+                            if let Some(peer) = &peer {
+                                peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
+                            }
+                            stop(&mut active, "stopped");
+                            Ok(format!("{monitor} is back home"))
+                        }
+                        None => Ok("no mode was running".to_string()),
+                    };
+                    let _ = reply.send(answer);
+                }
+                None => break,
+            },
+            _ = sleep_until(deadline) => {
+                if let Some(peer) = &peer {
+                    peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
+                }
+                if let Some(mut a) = active.take() {
+                    if let Some((reply, _)) = a.starting.take() {
+                        let _ = reply.send(Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "the remote machine did not answer in time",
+                        )));
+                    }
+                    release(a);
+                }
+            }
+        }
+    }
+    stop(&mut active, "navette is stopping");
+}
+
+async fn next(peer: &mut Option<Peer>) -> Option<Incoming> {
+    match peer {
+        Some(peer) => peer.inbox.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Every check first, then the surface, then the order to the remote.
+async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) -> io::Result<()> {
+    if let Some(a) = active {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("a mode is already running on {}", a.monitor),
+        ));
+    }
+    let monitor = self::monitor(&home.config_dir)?;
+    let (hypr, name) = (home.hypr.clone(), monitor.clone());
+    let monitors = blocking(move || hypr::monitors(&*hypr)).await?;
+    let Some(found) = monitors.iter().find(|m| m.name == name && !m.disabled) else {
+        let names: Vec<_> = monitors.iter().map(|m| m.name.as_str()).collect();
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no monitor {monitor} at home (there are: {}); nothing was changed",
+                names.join(", ")
+            ),
+        ));
+    };
+    let Some(peer) = peer.filter(|p| !p.outbox.is_closed()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "the remote machine is not connected (is `navette agent` running there?); \
+             nothing was changed",
+        ));
+    };
+    let copy = OutputCopy {
+        width: found.width,
+        height: found.height,
+        refresh_mhz: (found.refresh_rate * 1000.0).round() as u32,
+        scale_milli: (found.scale * 1000.0).round() as u32,
+        transform: found.transform.clamp(0, 7) as u8,
+    };
+    let (screens, name) = (home.screens.clone(), monitor.clone());
+    let screen = blocking(move || screens.open(&name)).await?;
+    let decoding = Decoding::start(home.gpu.clone(), peer.outbox.clone(), screen.pictures())?;
+    let caps = decode::caps(&home.gpu, (3840, 2160));
+    peer.outbox.send(
+        Msg::Display(Display::Start { output: copy, caps }),
+        Vec::new(),
+    );
+    *active = Some(Active {
+        monitor,
+        decoding,
+        _screen: screen,
+        starting: None,
+    });
+    Ok(())
+}
+
+/// Takes the cover away.
+fn stop(active: &mut Option<Active>, why: &str) {
+    if let Some(mut a) = active.take() {
+        if let Some((reply, _)) = a.starting.take() {
+            let _ = reply.send(Err(io::Error::other(format!("the mode ended: {why}"))));
+        }
+        eprintln!("navette: {} given back ({why})", a.monitor);
+        release(a);
+    }
+}
+
+/// Drops a mode off the executor: the surface thread is joined.
+fn release(active: Active) {
+    tokio::task::spawn_blocking(move || drop(active));
+}
+
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| io::Error::other(e.to_string()))?
+}
+
+/// `$XDG_RUNTIME_DIR/navette/control.sock`.
+pub fn control_path() -> io::Result<PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is not set"))?;
+    Ok(PathBuf::from(runtime).join("navette").join("control.sock"))
+}
+
+/// Listens for `navette mode start|stop`, in a directory only this user can enter.
+pub fn listen(path: &Path) -> io::Result<UnixListener> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = path.parent().expect("the socket sits in a directory");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "another `navette serve` is running",
+        ));
+    }
+    // A socket left by a `navette serve` that did not end cleanly.
+    let _ = std::fs::remove_file(path);
+    UnixListener::bind(path)
+}
+
+/// Turns each control connection into an order.
+pub async fn accept_orders(listener: UnixListener, orders: UnboundedSender<Order>) {
+    while let Ok((stream, _)) = listener.accept().await {
+        let orders = orders.clone();
+        tokio::spawn(async move {
+            let (read, mut write) = stream.into_split();
+            let mut line = String::new();
+            if BufReader::new(read).read_line(&mut line).await.is_err() {
+                return;
+            }
+            let (reply, answer) = oneshot::channel();
+            let order = match line.trim() {
+                "start" => Order::Start(reply),
+                "stop" => Order::Stop(reply),
+                _ => return,
+            };
+            if orders.send(order).is_err() {
+                return;
+            }
+            let text = match answer.await {
+                Ok(Ok(text)) => format!("ok {text}\n"),
+                Ok(Err(e)) => format!("error {e}\n"),
+                Err(_) => "error navette is stopping\n".to_string(),
+            };
+            let _ = write.write_all(text.as_bytes()).await;
+        });
+    }
+}
+
+/// `navette mode start|stop`: sends the order to `navette serve` and returns its answer.
+pub async fn order(path: &Path, order: &str) -> io::Result<String> {
+    let stream = UnixStream::connect(path).await.map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            "`navette serve` is not running here: start it first",
+        )
+    })?;
+    let (read, mut write) = stream.into_split();
+    write.write_all(format!("{order}\n").as_bytes()).await?;
+    let mut line = String::new();
+    BufReader::new(read).read_line(&mut line).await?;
+    match line.trim_end().split_once(' ') {
+        Some(("ok", text)) => Ok(text.to_string()),
+        Some(("error", text)) => Err(io::Error::other(text.to_string())),
+        _ => Err(io::Error::other("`navette serve` gave no answer")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::display::wire::Outbox;
+    use crate::hypr::fake::{FakeHypr, FakeMonitor};
+
+    #[derive(Default)]
+    struct FakeScreens {
+        /// Monitors covered right now.
+        covered: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct FakeScreen {
+        monitor: String,
+        covered: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Screens for FakeScreens {
+        fn open(&self, monitor: &str) -> io::Result<Box<dyn Screen>> {
+            self.covered.lock().unwrap().push(monitor.to_string());
+            Ok(Box::new(FakeScreen {
+                monitor: monitor.to_string(),
+                covered: self.covered.clone(),
+            }))
+        }
+    }
+
+    impl Screen for FakeScreen {
+        fn pictures(&self) -> Box<dyn FnMut(Picture) + Send> {
+            Box::new(|_| {})
+        }
+    }
+
+    impl Drop for FakeScreen {
+        fn drop(&mut self) {
+            self.covered.lock().unwrap().retain(|m| *m != self.monitor);
+        }
+    }
+
+    struct Desk {
+        _config: tempfile::TempDir,
+        hypr: Arc<FakeHypr>,
+        covered: Arc<Mutex<Vec<String>>>,
+        peers: UnboundedSender<Peer>,
+        orders: UnboundedSender<Order>,
+    }
+
+    fn desk(monitor: &str) -> Desk {
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join(CONFIG_FILE),
+            format!("monitor = {monitor}\n"),
+        )
+        .unwrap();
+        let hypr = Arc::new(FakeHypr::with(vec![
+            FakeMonitor::new("DP-1", 1920, 1080, 0),
+            FakeMonitor::new("DP-2", 2560, 1440, 1920),
+        ]));
+        let screens = FakeScreens::default();
+        let covered = screens.covered.clone();
+        let (peers, peers_rx) = mpsc::unbounded_channel();
+        let (orders, orders_rx) = mpsc::unbounded_channel();
+        let home = Home {
+            config_dir: config.path().to_path_buf(),
+            hypr: hypr.clone(),
+            screens: Arc::new(screens),
+            gpu: None,
+        };
+        tokio::spawn(serve(home, peers_rx, orders_rx));
+        Desk {
+            _config: config,
+            hypr,
+            covered,
+            peers,
+            orders,
+        }
+    }
+
+    /// A remote machine on the other end of an in-memory peer.
+    struct Remote {
+        outbox: Outbox,
+        to_home: UnboundedSender<Incoming>,
+    }
+
+    fn connect(desk: &Desk) -> Remote {
+        let outbox = Outbox::default();
+        let (to_home, inbox) = mpsc::unbounded_channel();
+        desk.peers
+            .send(Peer {
+                outbox: outbox.clone(),
+                inbox,
+            })
+            .unwrap();
+        Remote { outbox, to_home }
+    }
+
+    async fn ask(desk: &Desk, start: bool) -> oneshot::Receiver<io::Result<String>> {
+        let (reply, answer) = oneshot::channel();
+        let order = if start {
+            Order::Start(reply)
+        } else {
+            Order::Stop(reply)
+        };
+        desk.orders.send(order).unwrap();
+        answer
+    }
+
+    async fn answer(answer: oneshot::Receiver<io::Result<String>>) -> io::Result<String> {
+        tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("an answer in time")
+            .unwrap()
+    }
+
+    async fn until(done: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("home never got there");
+    }
+
+    fn starts(remote: &Remote) -> Vec<OutputCopy> {
+        remote
+            .outbox
+            .queued()
+            .into_iter()
+            .filter_map(|m| match m {
+                Msg::Display(Display::Start { output, .. }) => Some(output),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn starting_covers_the_monitor_and_asks_the_remote_for_a_copy() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        assert_eq!(*desk.covered.lock().unwrap(), ["DP-2"]);
+        assert_eq!(
+            starts(&remote),
+            [OutputCopy {
+                width: 2560,
+                height: 1440,
+                refresh_mhz: 60_000,
+                scale_milli: 1000,
+                transform: 0,
+            }]
+        );
+        remote
+            .to_home
+            .send(Incoming::Display(Display::Started {
+                output: "NAVETTE-1".into(),
+            }))
+            .unwrap();
+        let text = answer(pending).await.unwrap();
+        assert!(text.contains("DP-2"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_monitor_that_does_not_exist_fails_clearly_and_changes_nothing() {
+        let desk = desk("HDMI-A-9");
+        let remote = connect(&desk);
+        let error = answer(ask(&desk, true).await).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let text = error.to_string();
+        assert!(
+            text.contains("HDMI-A-9") && text.contains("DP-1, DP-2"),
+            "{text}"
+        );
+        assert!(desk.covered.lock().unwrap().is_empty());
+        assert!(remote.outbox.queued().is_empty());
+        assert!(desk.hypr.changes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_connected_remote_fails_clearly_and_changes_nothing() {
+        let desk = desk("DP-1");
+        let error = answer(ask(&desk, true).await).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert!(error.to_string().contains("not connected"));
+        assert!(desk.covered.lock().unwrap().is_empty());
+        assert!(desk.hypr.changes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_mode_configured_says_where_to_write_it() {
+        let desk = desk("DP-1");
+        std::fs::remove_file(desk._config.path().join(CONFIG_FILE)).unwrap();
+        let _remote = connect(&desk);
+        let error = answer(ask(&desk, true).await).await.unwrap_err();
+        assert!(error.to_string().contains("monitor = <output name>"));
+        assert!(desk.covered.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stopping_removes_the_surface_and_tells_the_remote() {
+        let desk = desk("DP-1");
+        let remote = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        remote
+            .to_home
+            .send(Incoming::Display(Display::Started {
+                output: "NAVETTE-1".into(),
+            }))
+            .unwrap();
+        answer(pending).await.unwrap();
+
+        answer(ask(&desk, false).await).await.unwrap();
+        until(|| desk.covered.lock().unwrap().is_empty()).await;
+        assert_eq!(
+            remote.outbox.queued().last(),
+            Some(&Msg::Display(Display::Stop))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_that_cannot_make_its_output_leaves_home_unchanged() {
+        let desk = desk("DP-1");
+        let remote = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        remote
+            .to_home
+            .send(Incoming::Display(Display::Failed {
+                reason: "no encoder".into(),
+            }))
+            .unwrap();
+        let error = answer(pending).await.unwrap_err();
+        assert!(error.to_string().contains("no encoder"));
+        until(|| desk.covered.lock().unwrap().is_empty()).await;
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_gives_the_monitor_back() {
+        let desk = desk("DP-1");
+        let remote = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        remote
+            .to_home
+            .send(Incoming::Display(Display::Started {
+                output: "NAVETTE-1".into(),
+            }))
+            .unwrap();
+        answer(pending).await.unwrap();
+        drop(remote);
+        until(|| desk.covered.lock().unwrap().is_empty()).await;
+    }
+
+    #[tokio::test]
+    async fn the_cli_reaches_serve_over_the_control_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("navette").join("control.sock");
+        let listener = listen(&path).unwrap();
+        let (orders, mut orders_rx) = mpsc::unbounded_channel();
+        tokio::spawn(accept_orders(listener, orders));
+        tokio::spawn(async move {
+            while let Some(order) = orders_rx.recv().await {
+                match order {
+                    Order::Start(reply) => {
+                        let _ = reply.send(Err(io::Error::other("no monitor X")));
+                    }
+                    Order::Stop(reply) => {
+                        let _ = reply.send(Ok("DP-1 is back home".into()));
+                    }
+                }
+            }
+        });
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert_eq!(order(&path, "stop").await.unwrap(), "DP-1 is back home");
+        let error = order(&path, "start").await.unwrap_err();
+        assert_eq!(error.to_string(), "no monitor X");
+        assert!(listen(&path).is_err(), "a second serve is refused");
+    }
+
+    #[tokio::test]
+    async fn the_cli_says_when_serve_is_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = order(&dir.path().join("control.sock"), "start")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("navette serve"));
+    }
+}
