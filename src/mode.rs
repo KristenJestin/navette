@@ -5,9 +5,9 @@
 //! its surface. `navette mode stop`, or the link dropping, gives the monitors back; so does any
 //! one surface going away. Home monitors are never moved or reconfigured: the changes to the
 //! home desk are a window rule per monitor that opens home windows on another home monitor
-//! rather than hidden under a surface (#2) and, with a mic, the hotkey that switches it, made through the desk recorder
-//! so they are undone on stop, on a dropped link and after a crash, and made again after a
-//! config reload. The home mic goes to the remote machine for as long as the mode runs.
+//! rather than hidden under a surface (#2) and, with a mic, the hotkey that switches it, made
+//! through the desk recorder so they are undone on stop, on a dropped link and after a crash,
+//! and made again after a config reload. The home mic goes to the remote machine for as long as the mode runs.
 //!
 //! `navette serve` owns the link and the surface, so the two commands reach it over a Unix
 //! socket in `$XDG_RUNTIME_DIR/navette`, private to the user.
@@ -81,7 +81,8 @@ pub fn monitors(config_dir: &Path) -> io::Result<Vec<String>> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "{} names no monitor: `monitor = <output name>`, or several: `monitor = DP-1, DP-2`",
+                "{} names no monitor: `monitor = <output name>`, or several: \
+                 `monitor = DP-1, DP-2`",
                 path.display()
             ),
         ));
@@ -351,7 +352,8 @@ pub async fn serve(
                     }
                 }
                 Heard::Msg(Incoming::Video { output, msg, main, aux }) => {
-                    if let Some(shown) = active.as_ref().and_then(|a| a.shown.get(usize::from(output))) {
+                    let shown = active.as_ref().and_then(|a| a.shown.get(usize::from(output)));
+                    if let Some(shown) = shown {
                         shown.decoding.video(Video { msg, main, aux });
                     }
                 }
@@ -362,7 +364,8 @@ pub async fn serve(
                     match start(&home, peer.as_ref(), &mut active).await {
                         Ok(()) => {
                             if let Some(a) = &mut active {
-                                let at = tokio::time::Instant::now() + start_timeout(a.monitors.len());
+                                let wait = start_timeout(a.monitors.len());
+                                let at = tokio::time::Instant::now() + wait;
                                 a.starting = Some((reply, at));
                             }
                         }
