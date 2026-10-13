@@ -56,6 +56,29 @@ missing frame from the next packet's FEC, or by concealment. The orders (start, 
 never dropped: they wait in order with the frames, however many frames are dropped around them,
 so a stop always reaches an audio thread that is slow for a while.
 
+## The counters
+
+Every 10 seconds while it plays, and once more when the link drops, home prints how the
+remote's sound fares; each kind of event is heard as a crackle, and is counted since the sound
+started:
+
+```
+navette: audio: buffer 31 ms; underruns 0, trims 0, concealed 0, lost 0, late 0, dropped 0
+```
+
+- *buffer*: what the jitter buffer holds now.
+- *underruns*: the playback found the buffer empty: a gap of silence, then a wait for the
+  buffer to fill again.
+- *trims*: the buffer was past its maximum and its oldest sound was dropped: a jump.
+- *concealed*: frames that never came, filled from the next packet's FEC or by concealment.
+- *lost*: frames that never came, in a gap too long to fill: the sound jumps over them.
+- *late*: frames that came after a later one, too late to play.
+- *dropped*: frames dropped at home because the audio thread had 64 waiting.
+
+On the remote machine, the agent prints, at most every 10 seconds, the frames it dropped
+because the link had no room for them (`N frames dropped, the link had no room`); home sees
+them as concealed or lost.
+
 ## Checking it on the two machines
 
 1. Install the build on both machines, then on the laptop

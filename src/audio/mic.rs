@@ -206,6 +206,8 @@ fn open_capture<G: Graph>(graph: &G, mic: &str, sending: &Sending) -> io::Result
         sending.session,
         sending.seq.clone(),
         sending.failures.clone(),
+        // Not reported: the remote's mic fills the gap, and only the remote's sound is counted.
+        Arc::default(),
         |session, seq, packet| Message::MicFrame {
             session,
             seq,
