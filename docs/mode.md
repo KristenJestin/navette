@@ -77,10 +77,16 @@ other monitor they stay home.
   own keyboard. With `input:follow_mouse = 1` (Hyprland's default) on the remote machine, keys
   go to the window under the pointer on `NAVETTE-1`; with another setting, to the window that
   had the focus there.
-- **The pointer** lands at the same place on `NAVETTE-1` whatever scale either machine uses. Its
-  image over the monitor is the remote machine's cursor (a text cursor over text, say), drawn by
-  home's compositor at home's pointer, so it never lags; until the remote has one to show, it is
-  the default arrow. When the remote machine hides its cursor, it is hidden at home too.
+- **The pointer** lands at the same place on `NAVETTE-1` whatever scale either machine uses.
+  Over the monitor it is home's own default arrow, drawn by home's compositor at home's
+  pointer, so it never lags, and there is only one: while the mode runs, the remote machine
+  hides its cursor (`cursor:invisible`, set at runtime and put back when the mode stops, when
+  the link drops, when the agent stops or starts again after a crash, and set again after a
+  config reload or a Hyprland restart there). The reason: a headless output has no cursor plane
+  (aquamarine's headless backend), so Hyprland draws its cursor into the output's frames, and
+  the capture copies it whatever it asks; the picture would show a second pointer, trailing
+  behind home's. The cost is the remote cursor's shape: no text cursor over text. One switch,
+  `REMOTE_CURSOR` in `src/display/mod.rs`, brings it back (and the second pointer with it).
 - **On the link**, input has a queue of its own that never blocks: a key goes ahead of a
   picture waiting to be sent, and if the link stalls long enough to fill it, everything held
   is released rather than a release being lost.

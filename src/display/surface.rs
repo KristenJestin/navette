@@ -20,7 +20,8 @@
 //! The pointer and keyboard events go to [`crate::input::Capture`]. The remote cursor's image is
 //! the surface's pointer image, so home's compositor draws it at home's pointer with no delay,
 //! as gliff's client does (gliff, MIT, see `LICENSES/gliff-MIT.txt`); before the first one, or
-//! for one with nothing to show, the pointer is the default arrow.
+//! for one with nothing to show, the pointer is the default arrow. While
+//! [`super::REMOTE_CURSOR`] is off, it is always the default arrow.
 
 use std::collections::HashMap;
 use std::io;
@@ -69,6 +70,7 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 use super::Ended;
+use super::REMOTE_CURSOR;
 use super::decode::Picture;
 use super::wire::{Cursor, MAX_CURSOR, Pointer};
 use crate::input::{self, Capture, Grab, Hotkey, Seat};
@@ -162,6 +164,16 @@ impl<T> Newest<T> {
 
     fn take(&self) -> Option<T> {
         self.0.lock().unwrap().take()
+    }
+}
+
+/// What the pointer over the surface shows of the remote's: all of it, or, with
+/// [`REMOTE_CURSOR`] off, nothing (home's default arrow, never hidden).
+fn shown(pointer: Pointer) -> Pointer {
+    if REMOTE_CURSOR {
+        pointer
+    } else {
+        Pointer::default()
     }
 }
 
@@ -262,7 +274,7 @@ impl Surface {
 
     /// The remote pointer as it changed.
     pub fn cursor(&self, pointer: Pointer) {
-        if self.pointer.put(pointer)
+        if self.pointer.put(shown(pointer))
             && let Some(pictures) = &self.pictures
         {
             let _ = pictures.send(Show::Pointer);
@@ -1125,6 +1137,17 @@ mod tests {
         assert_eq!(newest.take(), Some(2));
         assert_eq!(newest.take(), None);
         assert!(newest.put(3));
+    }
+
+    #[test]
+    fn home_shows_its_own_arrow_whatever_the_remote_says() {
+        let mut argb = vec![0; 16];
+        argb[3] = 255;
+        let hidden_text_cursor = Pointer {
+            shape: Some(cursor(2, 2, argb)),
+            visible: false,
+        };
+        assert_eq!(shown(hidden_text_cursor), Pointer::default());
     }
 
     #[test]

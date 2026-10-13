@@ -11,6 +11,14 @@ pub mod stream;
 pub mod surface;
 pub mod wire;
 
+/// Whether the remote cursor's image and visibility reach home's pointer: off. A headless
+/// output has no cursor plane (aquamarine's headless backend), so the remote's Hyprland draws
+/// its cursor into every frame, and the capture copies it whatever it asks: a second pointer,
+/// lagging behind home's. So while a mode runs the remote hides its cursor (`cursor:invisible`),
+/// which also blanks the image its cursor capture gives, and home shows its own default arrow.
+/// Turned on, the remote leaves its cursor alone and home draws the remote's image again (#7).
+pub const REMOTE_CURSOR: bool = false;
+
 /// Where a part of a running mode says why it cannot go on (the surface went away, home cannot
 /// decode): the mode then ends.
 pub type Ended = tokio::sync::mpsc::UnboundedSender<String>;
