@@ -635,6 +635,33 @@ struct Playback<G: Graph> {
     session: u32,
     jitter: Arc<Mutex<Jitter>>,
     decoder: Decoder,
+    undecoded: Undecoded,
+}
+
+/// The packets of a session that could not be decoded: the first is told, the rest counted and
+/// told once the session ends, as a broken stream would otherwise fill the log a line a frame.
+struct Undecoded(u64, &'static str);
+
+impl Undecoded {
+    fn new(what: &'static str) -> Self {
+        Self(0, what)
+    }
+
+    fn failed(&mut self, e: io::Error) -> io::Result<()> {
+        self.0 += 1;
+        if self.0 == 1 { Err(e) } else { Ok(()) }
+    }
+}
+
+impl Drop for Undecoded {
+    fn drop(&mut self) {
+        if self.0 > 1 {
+            eprintln!(
+                "navette: {}: {} packets could not be decoded",
+                self.1, self.0
+            );
+        }
+    }
 }
 
 /// Home's side: asks the remote for its sound and plays it. Its calls wait for PipeWire and
@@ -671,6 +698,7 @@ impl<G: Graph> Home<G> {
             session,
             jitter,
             decoder: Decoder::new()?,
+            undecoded: Undecoded::new("audio"),
         });
         self.order(Message::Start { session })
     }
@@ -698,8 +726,10 @@ impl<G: Graph> Home<G> {
             // Sent before home stopped: its numbering is not the new session's.
             && session == playback.session
         {
-            let pcm = playback.decoder.decode(seq, &packet)?;
-            lock(&playback.jitter).push(&pcm);
+            match playback.decoder.decode(seq, &packet) {
+                Ok(pcm) => lock(&playback.jitter).push(&pcm),
+                Err(e) => return playback.undecoded.failed(e),
+            }
         }
         Ok(())
     }
@@ -1053,6 +1083,25 @@ mod tests {
             out.iter().any(|s| s.abs() > 0.1),
             "the new session was not played"
         );
+    }
+
+    /// No Opus packet: its header asks for more frames than a packet holds.
+    pub(super) const BROKEN: [u8; 3] = [0xff, 0xff, 0xff];
+
+    #[test]
+    fn a_run_of_broken_packets_is_told_once() {
+        let (to_remote, _orders) = mpsc::channel(8);
+        let mut home = Home::new(FakeGraph::default(), to_remote);
+        home.start().unwrap();
+        let frame = |seq| Message::Frame {
+            session: 1,
+            seq,
+            packet: Bytes::from_static(&BROKEN),
+        };
+        assert!(home.received(frame(0)).is_err());
+        assert!(home.received(frame(1)).is_ok());
+        assert!(home.received(frame(2)).is_ok());
+        assert_eq!(home.playback.as_ref().unwrap().undecoded.0, 3);
     }
 
     #[tokio::test]

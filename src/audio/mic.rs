@@ -15,7 +15,8 @@ use tokio::sync::mpsc;
 use super::codec::Decoder;
 use super::jitter::Jitter;
 use super::{
-    Device, Graph, JITTER_MAX, JITTER_TARGET, Message, Saved, Switch, encoding, lock, repair_one,
+    Device, Graph, JITTER_MAX, JITTER_TARGET, Message, Saved, Switch, Undecoded, encoding, lock,
+    repair_one,
 };
 
 /// The remote's virtual source.
@@ -34,6 +35,7 @@ pub struct Voice<G: Graph> {
     jitter: Arc<Mutex<Jitter>>,
     session: u32,
     decoder: Decoder,
+    undecoded: Undecoded,
 }
 
 impl<G: Graph> Voice<G> {
@@ -50,6 +52,7 @@ impl<G: Graph> Voice<G> {
             jitter,
             session,
             decoder: Decoder::new()?,
+            undecoded: Undecoded::new("mic"),
         })
     }
 
@@ -58,8 +61,10 @@ impl<G: Graph> Voice<G> {
         if session != self.session {
             return Ok(());
         }
-        let pcm = self.decoder.decode(seq, packet)?;
-        lock(&self.jitter).push(&pcm);
+        match self.decoder.decode(seq, packet) {
+            Ok(pcm) => lock(&self.jitter).push(&pcm),
+            Err(e) => return self.undecoded.failed(e),
+        }
         Ok(())
     }
 
@@ -542,6 +547,18 @@ mod tests {
         let mut out = vec![0.0; 10 * FRAME_SAMPLES];
         jitter.lock().unwrap().pull(&mut out);
         assert!(out.iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn a_run_of_broken_mic_packets_is_told_once() {
+        let graph = FakeGraph::default();
+        let (_tmp, saved) = saved();
+        let mut voice = Voice::start(graph, saved, 1).unwrap();
+        let broken = super::super::tests::BROKEN;
+        assert!(voice.received(1, 0, &broken).is_err());
+        assert!(voice.received(1, 1, &broken).is_ok());
+        assert!(voice.received(1, 2, &broken).is_ok());
+        assert_eq!(voice.undecoded.0, 3);
     }
 
     #[tokio::test]
