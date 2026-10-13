@@ -119,7 +119,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
             // The clipboard bridge is not `Send`: it runs on this thread, in a local set.
-            let attach = |wire| clipboard::attach(Side::Client, Target::default(), wire);
+            let attach =
+                |wire| clipboard::attach(Side::Client, clipboard::hypr(Target::default()), wire);
             tokio::task::LocalSet::new()
                 .run_until(link::serve(acceptor, Heartbeat::default(), events, attach))
                 .await;
@@ -129,7 +130,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let dialer = link::remote_dialer(&store)?;
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
-            let attach = |wire| clipboard::attach(Side::Server, Target::default(), wire);
+            let attach =
+                |wire| clipboard::attach(Side::Server, clipboard::hypr(Target::default()), wire);
             tokio::task::LocalSet::new()
                 .run_until(link::agent(
                     dialer,

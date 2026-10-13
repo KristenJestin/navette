@@ -21,13 +21,16 @@
 //!
 //! The home machine is gliff's client side of the engine (odd request ids) and the remote
 //! machine its server side (even ones), so two transfers in opposite directions never share an
-//! id. Everything here runs on one thread, in a `LocalSet`.
+//! id. Everything here runs on the link's thread, in a `LocalSet`; the compositor calls that
+//! block run on other threads, so they never hold up the link's heartbeats.
 
 use std::cell::{Cell, RefCell};
+use std::future::Future;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -45,7 +48,7 @@ use hypr_input::{Clipboard, ClipboardEvent, Target};
 use tokio::io::AsyncReadExt;
 use tokio::net::unix::pipe;
 use tokio::sync::OnceCell;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::link::Wire;
 
@@ -55,13 +58,43 @@ const URI_LIST_MAX: usize = 1024 * 1024;
 /// How long to wait before looking for the compositor again when it is not there, or went.
 const COMPOSITOR_RETRY: Duration = Duration::from_secs(5);
 
-/// The machine's clipboard, as the bridge needs it (a port: tests use a fake).
-pub trait Compositor {
+/// The machine's clipboard, as the bridge needs it (a port: tests use a fake). Starting it,
+/// [`Compositor::receive`] and dropping it may block: the bridge does them on other threads.
+pub trait Compositor: Send + Sync + 'static {
     /// Become the selection, offering these mime types; each paste arrives as
-    /// [`Selected::Paste`]. An empty list withdraws our selection.
+    /// [`Selected::Paste`]. An empty list withdraws our selection. Must not block.
     fn offer(&self, mime_types: Vec<String>);
     /// A pipe that yields the current selection in `mime_type`, then EOF.
     fn receive(&self, mime_type: String) -> io::Result<OwnedFd>;
+}
+
+/// The bridge's compositor. Its last owner on the link's thread drops it on a thread of its
+/// own, since dropping the real one joins its Wayland thread.
+struct OffThread<C: Compositor>(Option<Arc<C>>);
+
+impl<C: Compositor> OffThread<C> {
+    fn get(&self) -> &Arc<C> {
+        self.0.as_ref().expect("only taken on drop")
+    }
+}
+
+impl<C: Compositor> Drop for OffThread<C> {
+    fn drop(&mut self) {
+        if let Some(compositor) = self.0.take() {
+            std::thread::spawn(move || drop(compositor));
+        }
+    }
+}
+
+/// [`Compositor::receive`], on a blocking thread.
+async fn receive<C: Compositor>(
+    compositor: Arc<C>,
+    mime_type: String,
+) -> io::Result<pipe::Receiver> {
+    tokio::task::spawn_blocking(move || compositor.receive(mime_type))
+        .await
+        .map_err(io::Error::other)?
+        .and_then(pipe::Receiver::from_owned_fd)
 }
 
 /// What the compositor reports.
@@ -93,28 +126,36 @@ struct RemoteOffer {
 }
 
 /// The two ends of one link's clipboard: the peer's messages in, the compositor's events in.
-pub struct Bridge<C> {
+pub struct Bridge<C: Compositor> {
     transfers: Transfers,
     jobs: Jobs,
-    compositor: C,
-    /// Where the files of a peer's offer are spooled for a paste.
-    spool_base: PathBuf,
+    compositor: OffThread<C>,
+    /// Where the files of a peer's offer are spooled for a paste; none without a home folder.
+    spool_base: Option<PathBuf>,
     local: Rc<RefCell<LocalOffer>>,
     remote: Rc<RefCell<RemoteOffer>>,
-    /// Bumped per selection so a slow offer build for a stale one is dropped.
+    /// Bumped per selection so a slow offer build for a stale one is dropped. It is the
+    /// link's, not the bridge's: a later bridge on the same link never reuses a serial the
+    /// peer may still request.
     selection_gen: Rc<Cell<u64>>,
 }
 
 impl<C: Compositor> Bridge<C> {
-    pub fn new(transfers: Transfers, jobs: Jobs, compositor: C, spool_base: PathBuf) -> Self {
+    pub fn new(
+        transfers: Transfers,
+        jobs: Jobs,
+        compositor: Arc<C>,
+        spool_base: Option<PathBuf>,
+        serials: Rc<Cell<u64>>,
+    ) -> Self {
         Self {
             transfers,
             jobs,
-            compositor,
+            compositor: OffThread(Some(compositor)),
             spool_base,
             local: Rc::default(),
             remote: Rc::default(),
-            selection_gen: Rc::new(Cell::new(0)),
+            selection_gen: serials,
         }
     }
 
@@ -152,7 +193,7 @@ impl<C: Compositor> Bridge<C> {
         if let Some(spool) = previous.spool {
             retire(spool);
         }
-        self.compositor.offer(advertise);
+        self.compositor.get().offer(advertise);
     }
 
     fn on_request(&self, id: u32, serial: u32, item: ClipboardItem) {
@@ -169,17 +210,17 @@ impl<C: Compositor> Bridge<C> {
                     self.transfers.refuse(id);
                     return;
                 };
-                match self
-                    .compositor
-                    .receive(actual.to_string())
-                    .and_then(pipe::Receiver::from_owned_fd)
-                {
-                    Ok(rx) => self.transfers.serve(id, ReadSource(rx)),
-                    Err(e) => {
-                        log(format_args!("cannot read the selection: {e}"));
-                        self.transfers.refuse(id);
+                let (compositor, actual) = (self.compositor.get().clone(), actual.to_string());
+                let transfers = self.transfers.clone();
+                tokio::task::spawn_local(async move {
+                    match receive(compositor, actual).await {
+                        Ok(rx) => transfers.serve(id, ReadSource(rx)),
+                        Err(e) => {
+                            log(format_args!("cannot read the selection: {e}"));
+                            transfers.refuse(id);
+                        }
                     }
-                }
+                });
             }
             ClipboardItem::File(_) => {
                 let Some(path) = self.local.borrow().files.path_for(&item).map(PathBuf::from)
@@ -213,21 +254,20 @@ impl<C: Compositor> Bridge<C> {
         let offered = forwardable_mimes(&mime_types);
         // Read the file list as whichever file-list type the selection advertises; the parser
         // handles both bodies.
-        let uri_list = mime_types.iter().find(|m| is_file_mime(m)).and_then(|m| {
-            match self.compositor.receive(m.clone()) {
-                Ok(fd) => Some(fd),
-                Err(e) => {
-                    log(format_args!("cannot read the copied file list: {e}"));
-                    None
-                }
-            }
-        });
+        let uri_list = mime_types.iter().find(|m| is_file_mime(m)).cloned();
+        let compositor = self.compositor.get().clone();
         let transfers = self.transfers.clone();
         let local = self.local.clone();
         let selection_gen = self.selection_gen.clone();
         tokio::task::spawn_local(async move {
             let files = match uri_list {
-                Some(fd) => local_files_from_pipe(fd).await,
+                Some(mime) => match receive(compositor, mime).await {
+                    Ok(rx) => local_files_from_pipe(rx).await,
+                    Err(e) => {
+                        log(format_args!("cannot read the copied file list: {e}"));
+                        LocalFiles::default()
+                    }
+                },
                 None => LocalFiles::default(),
             };
             if selection_gen.get() != generation {
@@ -261,7 +301,13 @@ impl<C: Compositor> Bridge<C> {
                     return;
                 }
                 if remote.spool.is_none() {
-                    match Spool::create_in(&self.spool_base) {
+                    let Some(base) = &self.spool_base else {
+                        log(format_args!(
+                            "no cache folder for pasted files: $HOME is not set"
+                        ));
+                        return;
+                    };
+                    match Spool::create_in(base) {
                         Ok(s) => remote.spool = Some(Rc::new(s)),
                         Err(e) => {
                             log(format_args!("cannot make a folder for pasted files: {e}"));
@@ -305,10 +351,7 @@ impl<C: Compositor> Bridge<C> {
 }
 
 /// Read the compositor's `text/uri-list` and list the files it names.
-async fn local_files_from_pipe(fd: OwnedFd) -> LocalFiles {
-    let Ok(mut rx) = pipe::Receiver::from_owned_fd(fd) else {
-        return LocalFiles::default();
-    };
+async fn local_files_from_pipe(mut rx: pipe::Receiver) -> LocalFiles {
     let mut body = Vec::new();
     let read = tokio::time::timeout(
         Duration::from_secs(5),
@@ -339,20 +382,21 @@ async fn local_files_from_pipe(fd: OwnedFd) -> LocalFiles {
 
 /// Runs one link's bridge until the link's clipboard channel closes (`true`) or the compositor
 /// side does (`false`). Takes the wire by reference so a new compositor connection can pick
-/// the same link up again.
+/// the same link up again; `serials` is the link's.
 pub async fn run<C: Compositor>(
     side: Side,
     wire: &mut Wire,
-    compositor: C,
+    compositor: Arc<C>,
     mut events: UnboundedReceiver<Selected>,
-    spool_base: PathBuf,
+    spool_base: Option<PathBuf>,
+    serials: Rc<Cell<u64>>,
 ) -> bool {
-    let jobs = Jobs::new(report);
     let bridge = Bridge::new(
         Transfers::new(wire.to_peer.clone(), side),
-        jobs,
+        Jobs::new(report),
         compositor,
         spool_base,
+        serials,
     );
     loop {
         tokio::select! {
@@ -380,7 +424,7 @@ fn log(message: std::fmt::Arguments) {
 }
 
 /// The Wayland clipboard of the machine, through `ext-data-control`.
-struct Hypr(Clipboard);
+pub struct Hypr(Clipboard);
 
 impl Compositor for Hypr {
     fn offer(&self, mime_types: Vec<String>) {
@@ -392,26 +436,62 @@ impl Compositor for Hypr {
     }
 }
 
-/// The service of a link on this machine: the clipboard bridge on `target`'s compositor. It
-/// looks for the compositor again when it is not there yet or went away, since the agent can
-/// start before the session does; the link stays up meanwhile. Needs a `LocalSet`.
-pub async fn attach(side: Side, target: Target, mut wire: Wire) {
+/// Starts [`Hypr`] on `target`'s compositor, reporting its events to the bridge. Blocks until
+/// the compositor answers.
+pub fn hypr(
+    target: Target,
+) -> impl Fn(UnboundedSender<Selected>) -> io::Result<Hypr> + Clone + Send + 'static {
+    move |events| {
+        let sink = Box::new(move |event| {
+            let _ = events.send(match event {
+                ClipboardEvent::Selection { mime_types } => Selected::Selection { mime_types },
+                ClipboardEvent::Paste { mime_type, fd } => Selected::Paste { mime_type, fd },
+            });
+        });
+        Clipboard::start(target.clone(), sink)
+            .map(Hypr)
+            .map_err(io::Error::other)
+    }
+}
+
+/// The service of a link on this machine: the clipboard bridge on the compositor that `start`
+/// connects to (on a blocking thread). It looks for the compositor again when it is not there
+/// yet or went away, since the agent can start before the session does; the link stays up
+/// meanwhile, and the peer's messages are drained: its requests refused, its offers dropped.
+/// Needs a `LocalSet`.
+pub async fn attach<C, S>(side: Side, start: S, mut wire: Wire)
+where
+    C: Compositor,
+    S: Fn(UnboundedSender<Selected>) -> io::Result<C> + Clone + Send + 'static,
+{
+    let serials = Rc::new(Cell::new(0));
+    let spool = spool_base();
     let mut warned = false;
     loop {
         let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
-        let started = Clipboard::start(
-            target.clone(),
-            Box::new(move |event| {
-                let _ = events_tx.send(match event {
-                    ClipboardEvent::Selection { mime_types } => Selected::Selection { mime_types },
-                    ClipboardEvent::Paste { mime_type, fd } => Selected::Paste { mime_type, fd },
-                });
-            }),
-        );
+        let start = start.clone();
+        let starting = async {
+            tokio::task::spawn_blocking(move || start(events_tx))
+                .await
+                .map_err(io::Error::other)?
+        };
+        let Some(started) = draining(&mut wire, starting).await else {
+            return;
+        };
         match started {
-            Ok(clipboard) => {
+            Ok(compositor) => {
                 warned = false;
-                if run(side, &mut wire, Hypr(clipboard), events, spool_base()).await {
+                let compositor = Arc::new(compositor);
+                if run(
+                    side,
+                    &mut wire,
+                    compositor,
+                    events,
+                    spool.clone(),
+                    serials.clone(),
+                )
+                .await
+                {
                     return;
                 }
                 log(format_args!("the compositor's clipboard went away"));
@@ -422,27 +502,48 @@ pub async fn attach(side: Side, target: Target, mut wire: Wire) {
                 }
             }
         }
-        tokio::time::sleep(COMPOSITOR_RETRY).await;
+        if draining(&mut wire, tokio::time::sleep(COMPOSITOR_RETRY))
+            .await
+            .is_none()
+        {
+            return;
+        }
+    }
+}
+
+/// Runs `work` while no bridge reads the wire: the peer's requests are refused, so its pastes
+/// fail at once, and the rest is dropped. `None` when the link ended first.
+async fn draining<T>(wire: &mut Wire, work: impl Future<Output = T>) -> Option<T> {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            done = &mut work => return Some(done),
+            clip = wire.from_peer.recv() => match clip {
+                Some((ClipboardMsg::Request { id, .. }, _)) => {
+                    let _ = wire.to_peer.send((ClipboardMsg::Abort { id }, Bytes::new())).await;
+                }
+                Some(_) => {}
+                None => return None,
+            },
+        }
     }
 }
 
 /// `$XDG_CACHE_HOME/navette/clipboard`: on disk, not in the RAM-backed runtime folder, since
-/// a pasted file can be large.
-fn spool_base() -> PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
+/// a pasted file can be large, and never in the shared temporary folder.
+fn spool_base() -> Option<PathBuf> {
+    let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("navette")
-        .join("clipboard")
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(cache.join("navette").join("clipboard"))
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::future::Future;
     use std::io::Write;
     use std::os::fd::OwnedFd;
+    use std::sync::Mutex;
 
     use gliff_proto::ClipboardMsg;
     use gliff_transport::clipboard::outbound_channel;
@@ -452,6 +553,7 @@ mod tests {
 
     use super::*;
     use crate::link::{self, Heartbeat};
+    use crate::wire::LinkMsg;
 
     const TEXT: &str = "text/plain;charset=utf-8";
     const URI_LIST: &str = "text/uri-list";
@@ -472,19 +574,23 @@ mod tests {
     /// A machine's clipboard: what is selected on it, and every offer the bridge made on it.
     #[derive(Default)]
     struct Fake {
-        selected: RefCell<HashMap<String, Vec<u8>>>,
-        offered: RefCell<Vec<Vec<String>>>,
+        selected: Mutex<HashMap<String, Vec<u8>>>,
+        offered: Mutex<Vec<Vec<String>>>,
+        /// How long `receive` blocks its caller, like a compositor that answers late.
+        slow: Mutex<Duration>,
     }
 
-    impl Compositor for Rc<Fake> {
+    impl Compositor for Fake {
         fn offer(&self, mime_types: Vec<String>) {
-            self.offered.borrow_mut().push(mime_types);
+            self.offered.lock().unwrap().push(mime_types);
         }
 
         fn receive(&self, mime_type: String) -> io::Result<OwnedFd> {
+            std::thread::sleep(*self.slow.lock().unwrap());
             let data = self
                 .selected
-                .borrow()
+                .lock()
+                .unwrap()
                 .get(&mime_type)
                 .cloned()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not selected"))?;
@@ -499,7 +605,7 @@ mod tests {
 
     impl Fake {
         fn select(&self, items: &[(&str, &[u8])]) -> Vec<String> {
-            *self.selected.borrow_mut() = items
+            *self.selected.lock().unwrap() = items
                 .iter()
                 .map(|(mime, data)| (mime.to_string(), data.to_vec()))
                 .collect();
@@ -509,7 +615,7 @@ mod tests {
 
     /// One machine of a test desk: its clipboard and the way to act on it.
     struct Machine {
-        clipboard: Rc<Fake>,
+        clipboard: Arc<Fake>,
         events: mpsc::UnboundedSender<Selected>,
     }
 
@@ -542,12 +648,12 @@ mod tests {
         /// The bridge has offered the peer's copy on this machine `count` times.
         async fn offered(&self, count: usize) -> Vec<String> {
             within("the offer", async {
-                while self.clipboard.offered.borrow().len() < count {
+                while self.clipboard.offered.lock().unwrap().len() < count {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             })
             .await;
-            self.clipboard.offered.borrow()[count - 1].clone()
+            self.clipboard.offered.lock().unwrap()[count - 1].clone()
         }
     }
 
@@ -561,12 +667,13 @@ mod tests {
     }
 
     fn machine(side: Side, stream: tokio::io::DuplexStream, spool: std::path::PathBuf) -> Machine {
-        let clipboard = Rc::new(Fake::default());
+        let clipboard = Arc::new(Fake::default());
         let (events, selected) = mpsc::unbounded_channel();
         let bridge = clipboard.clone();
         tokio::task::spawn_local(async move {
             let service = |mut wire| async move {
-                super::run(side, &mut wire, bridge, selected, spool).await;
+                let serials = Rc::default();
+                super::run(side, &mut wire, bridge, selected, Some(spool), serials).await;
             };
             link::run(stream, heartbeat(), service).await;
         });
@@ -678,12 +785,13 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let (out, mut sent) = outbound_channel();
-                let clipboard = Rc::new(Fake::default());
+                let clipboard = Arc::new(Fake::default());
                 let bridge = Bridge::new(
                     Transfers::new(out, Side::Client),
                     Jobs::new(|_, _| {}),
                     clipboard.clone(),
-                    tmp.path().into(),
+                    Some(tmp.path().into()),
+                    Rc::default(),
                 );
                 let mut next = async || within("a message", sent.recv()).await.unwrap();
 
@@ -737,7 +845,7 @@ mod tests {
                 remote.offered(1).await;
                 // The data is no longer there when the paste asks: the peer refuses, and the
                 // application reads nothing, then EOF.
-                home.clipboard.selected.borrow_mut().clear();
+                home.clipboard.selected.lock().unwrap().clear();
                 assert!(remote.paste(TEXT).await.is_empty());
             })
             .await;
@@ -827,12 +935,160 @@ mod tests {
                     instance: None,
                 };
                 let ended = tokio::task::spawn_local(link::run(home_end, heartbeat(), {
-                    |wire| super::attach(Side::Client, missing, wire)
+                    |wire| super::attach(Side::Client, hypr(missing), wire)
                 }));
                 let peer =
                     tokio::task::spawn_local(link::run(remote_end, heartbeat(), async |_| {}));
                 tokio::time::sleep(heartbeat().interval * 10).await;
                 assert!(!ended.is_finished() && !peer.is_finished());
+            })
+            .await;
+    }
+
+    /// Fast heartbeats, and a peer on a thread of its own: it sees the silence of a link
+    /// whose thread is blocked, where a peer on the same thread would be blocked too.
+    fn eager() -> Heartbeat {
+        Heartbeat {
+            interval: Duration::from_millis(20),
+            timeout: Duration::from_millis(300),
+        }
+    }
+
+    fn peer_on_its_own_thread(
+        stream: tokio::io::DuplexStream,
+    ) -> std::sync::mpsc::Receiver<io::Error> {
+        let (ended, end) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = ended.send(runtime.block_on(link::run(stream, eager(), async |_| {})));
+        });
+        end
+    }
+
+    /// Asserts the peer kept the link up for `long`.
+    async fn the_peer_stays(end: &std::sync::mpsc::Receiver<io::Error>, long: Duration) {
+        tokio::time::sleep(long).await;
+        if let Ok(e) = end.try_recv() {
+            panic!("the link went down: {e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_heartbeats_flow_while_the_compositor_is_slow_to_hand_over_the_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home_end, remote_end) = tokio::io::duplex(64 * 1024);
+                let end = peer_on_its_own_thread(remote_end);
+                let clipboard = Arc::new(Fake::default());
+                *clipboard.slow.lock().unwrap() = Duration::from_secs(1);
+                let (events, selected) = mpsc::unbounded_channel();
+                let bridge = clipboard.clone();
+                let spool = tmp.path().to_path_buf();
+                tokio::task::spawn_local(link::run(home_end, eager(), |mut wire| async move {
+                    let serials = Rc::default();
+                    super::run(
+                        Side::Client,
+                        &mut wire,
+                        bridge,
+                        selected,
+                        Some(spool),
+                        serials,
+                    )
+                    .await;
+                }));
+                let mime_types = clipboard.select(&[(URI_LIST, b"file:///nowhere\r\n")]);
+                events.send(Selected::Selection { mime_types }).unwrap();
+                the_peer_stays(&end, Duration::from_millis(1500)).await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_heartbeats_flow_while_the_compositor_is_slow_to_start() {
+        LocalSet::new()
+            .run_until(async {
+                let (home_end, remote_end) = tokio::io::duplex(64 * 1024);
+                let end = peer_on_its_own_thread(remote_end);
+                let slow = |_| -> io::Result<Fake> {
+                    std::thread::sleep(Duration::from_secs(1));
+                    Err(io::Error::other("no compositor"))
+                };
+                tokio::task::spawn_local(link::run(home_end, eager(), move |wire| {
+                    super::attach(Side::Client, slow, wire)
+                }));
+                the_peer_stays(&end, Duration::from_millis(1500)).await;
+            })
+            .await;
+    }
+
+    /// A compositor connection that takes its time to close, like the real one joining its
+    /// Wayland thread.
+    struct SlowToClose;
+
+    impl Compositor for SlowToClose {
+        fn offer(&self, _: Vec<String>) {}
+
+        fn receive(&self, _: String) -> io::Result<OwnedFd> {
+            Err(io::ErrorKind::NotFound.into())
+        }
+    }
+
+    impl Drop for SlowToClose {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_heartbeats_flow_while_the_compositor_is_slow_to_close() {
+        LocalSet::new()
+            .run_until(async {
+                let (home_end, remote_end) = tokio::io::duplex(64 * 1024);
+                let end = peer_on_its_own_thread(remote_end);
+                // The compositor goes away as soon as it is there: the bridge closes it.
+                let gone = |events| {
+                    drop(events);
+                    Ok(SlowToClose)
+                };
+                tokio::task::spawn_local(link::run(home_end, eager(), move |wire| {
+                    super::attach(Side::Client, gone, wire)
+                }));
+                the_peer_stays(&end, Duration::from_millis(1500)).await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_paste_from_the_peer_is_refused_while_the_compositor_is_missing() {
+        LocalSet::new()
+            .run_until(async {
+                let (home_end, remote_end) = tokio::io::duplex(64 * 1024);
+                let missing = |_| -> io::Result<Fake> { Err(io::Error::other("no compositor")) };
+                tokio::task::spawn_local(link::run(home_end, heartbeat(), move |wire| {
+                    super::attach(Side::Client, missing, wire)
+                }));
+                let mut peer = gliff_transport::Framed::new(remote_end);
+                let request = ClipboardMsg::Request {
+                    id: 2,
+                    serial: 1,
+                    item: ClipboardItem::Mime(TEXT.into()),
+                };
+                peer.write_msg(&LinkMsg::from(request)).await.unwrap();
+                let refused = async {
+                    loop {
+                        let msg: LinkMsg = peer.read_msg().await.unwrap();
+                        if let LinkMsg::ClipboardAbort { id: 2 } = msg {
+                            return;
+                        }
+                    }
+                };
+                tokio::time::timeout(Duration::from_secs(2), refused)
+                    .await
+                    .expect("the request refused at once, not left to time out");
             })
             .await;
     }
