@@ -441,15 +441,15 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
             screen.pictures(),
             ended_tx,
         )?;
-        // Last, as nothing after it can fail: a mode without its mic is still a mode.
-        let mic = mic.and_then(|mic| match mic.start() {
-            Ok(()) => Some(MicSent(mic)),
-            Err(e) => {
+        // Last, as nothing after it can fail: a mode without its mic is still a mode. Kept
+        // when it failed, so that the stop clears what it says.
+        let mic = mic.map(|mic| {
+            if let Err(e) = mic.start() {
                 eprintln!(
                     "navette: mic: it stays home, it could not go to the remote machine: {e}"
                 );
-                None
             }
+            MicSent(mic)
         });
         Ok((screen, decoding, desk, mic))
     })
@@ -512,15 +512,13 @@ async fn open_desk(
                 .map_err(desk_error)?;
         }
         // Live over the remote's monitor too, where every other shortcut goes to the remote.
+        // A mode without its hotkey is still a mode: the bar and `navette mic` switch it.
         if let Some((keys, command)) = mic_bind {
             let name = desk.rule_name("mic");
-            desk.apply(Change::bind(
-                &name,
-                &keys,
-                &command,
-                "Navette: switch the mic",
-            ))
-            .map_err(desk_error)?;
+            let bind = Change::bind(&name, &keys, &command, "Navette: switch the mic");
+            if let Err(e) = desk.apply(bind) {
+                eprintln!("navette: mic: its hotkey `{keys}` could not be bound: {e}");
+            }
         }
         Ok(desk)
     })
@@ -952,7 +950,17 @@ mod tests {
         let _remote = started(&desk).await;
         assert_eq!(*desk.covered.lock().unwrap(), ["DP-2"]);
         answer(ask(&desk, false).await).await.unwrap();
-        // It never went: there is nothing to bring home.
+        // Stopped all the same, so that it no longer says it failed.
+        assert_eq!(mic_log(&desk), ["start", "stop"]);
+    }
+
+    #[tokio::test]
+    async fn a_hotkey_hyprland_refuses_leaves_the_mode_running() {
+        let desk = desk_with("monitor = DP-2\nmic_hotkey = NOT A KEY\n");
+        let _remote = started(&desk).await;
+        assert_eq!(*desk.covered.lock().unwrap(), ["DP-2"]);
+        let binds = desk.hypr.binds();
+        assert!(binds.iter().all(|b| !b.contains("hl.bind(")), "{binds:?}");
         assert_eq!(mic_log(&desk), ["start"]);
     }
 

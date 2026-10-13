@@ -467,6 +467,10 @@ pub mod fake {
             if let Some(lua) = command.strip_prefix("eval ")
                 && (lua.contains("hl.bind(") || lua.contains(":set_enabled(false)"))
             {
+                // Keys Hyprland cannot read: invented, as its answer.
+                if lua.contains("hl.bind(\"NOT A KEY") {
+                    return Ok("error: hl.bind: invalid key".into());
+                }
                 state.binds.push(lua.to_string());
                 return Ok("ok".into());
             }

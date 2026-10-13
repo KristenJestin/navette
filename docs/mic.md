@@ -58,7 +58,9 @@ binary `navette serve` was started from. Like the window rule, it goes through t
 undone when the mode stops, when the link drops and at the next start after a crash, and bound
 again after a config reload. Hyprland 0.56 removes a bind only together with every other bind on
 the same keys, so Navette disables its own instead; `hyprctl binds` lists the disabled ones until
-the next reload. A bind of the user's on the same keys still fires as well: pick free keys.
+the next reload. A bind of the user's on the same keys still fires as well: pick free keys. Keys
+Hyprland refuses do not stop the mode: it runs without the hotkey, `navette serve` says why, and
+the bar and `navette mic` still switch the mic.
 
 ## Showing it in a bar
 
