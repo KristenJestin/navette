@@ -2,6 +2,7 @@
 //! fakes. The binary (`src/main.rs`) only parses the command line and calls into it.
 
 pub mod frame;
+pub mod hypr;
 pub mod identity;
 pub mod link;
 pub mod pair;
