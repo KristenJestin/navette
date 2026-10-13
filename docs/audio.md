@@ -132,5 +132,11 @@ them as concealed or lost.
    laptop's click and the one from the home speakers, read in Audacity, is Navette's latency.
    Repeat five times and report the values.
 
+8. Crackles: with `navette serve --audio` in a terminal and the laptop on Wi-Fi, play music on
+   the laptop for ten minutes or more. Listen for crackles, and note the last
+   `navette: audio:` line home printed: each counter says which kind of event a crackle was.
+   Also run `journalctl --user -u navette-agent | grep 'frames dropped'` on the laptop.
+   Report the last line, the laptop's lines, and how many crackles were heard.
+
 On loopback, between two private PipeWire instances with a 1024-sample quantum, the gap was
 26 to 41 ms.
