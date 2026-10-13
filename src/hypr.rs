@@ -74,6 +74,11 @@ pub struct HyprIpc {
     dir: PathBuf,
 }
 
+/// Hyprland 0.56.2 reads a request 1023 bytes at a time and takes a shorter read as its end
+/// (`hyprCtlFDTick` in `src/debug/HyprCtl.cpp`): a longer request can be cut, or hang when its
+/// length is a multiple of 1023. It also stops at a NUL byte.
+const MAX_REQUEST: usize = 1023;
+
 /// Long enough for a busy compositor, short enough that a hung one does not hang Navette.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -100,7 +105,19 @@ impl HyprIpc {
     }
 
     /// Sends one request to the command socket and returns the whole answer.
+    ///
+    /// No `[flags]/` prefix: Hyprland looks for flags only before the first space, so a `/`
+    /// in an `eval` chunk is never taken for the separator.
     pub fn request(&self, request: &str) -> io::Result<String> {
+        if request.len() > MAX_REQUEST || request.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "a Hyprland request must be at most {MAX_REQUEST} bytes with no NUL; this one is {}",
+                    request.len()
+                ),
+            ));
+        }
         let mut stream = UnixStream::connect(self.dir.join(".socket.sock"))?;
         stream.set_read_timeout(Some(REPLY_TIMEOUT))?;
         stream.set_write_timeout(Some(REPLY_TIMEOUT))?;
@@ -128,7 +145,8 @@ impl Hyprland for HyprIpc {
     }
 }
 
-/// The event stream; it ends when Hyprland exits.
+/// The event stream; it ends when Hyprland exits. Reconnecting to the next instance and calling
+/// [`crate::desk::Desk::reapply`] is the mode runner's job (#6).
 pub struct Events {
     lines: BufReader<UnixStream>,
 }
@@ -221,6 +239,25 @@ mod tests {
             server.join().unwrap(),
             "eval hl.window_rule({ name = \"x\", enabled = false })"
         );
+    }
+
+    #[test]
+    fn a_slash_in_the_chunk_is_sent_as_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = fake_command_socket(dir.path(), "ok");
+        let chunk = r#"hl.window_rule({ name = "a/b", match = { class = "^x/y$" } })"#;
+        HyprIpc::new(dir.path()).eval(chunk).unwrap();
+        assert_eq!(server.join().unwrap(), format!("eval {chunk}"));
+    }
+
+    #[test]
+    fn a_request_longer_than_hyprland_reads_is_refused_before_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = format!("hl.window_rule({{ name = \"{}\" }})", "x".repeat(1100));
+        let err = HyprIpc::new(dir.path()).request(&format!("eval {long}"));
+        assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let err = HyprIpc::new(dir.path()).request("eval nul\0byte");
+        assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
