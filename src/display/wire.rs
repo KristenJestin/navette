@@ -17,6 +17,10 @@ use minicbor::{Decode, Encode};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
+/// The largest cursor taken, as gliff's client, in pixels a side: a cursor image declaring
+/// more ends the link.
+pub const MAX_CURSOR: u32 = 1024;
+
 /// What the display sends.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {

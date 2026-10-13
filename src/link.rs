@@ -26,7 +26,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinSet;
 
 use crate::audio::{self, codec::MAX_PACKET};
-use crate::display::wire::{Incoming, Outbox, Peer};
+use crate::display::wire::{Incoming, MAX_CURSOR, Outbox, Peer};
 use crate::frame::{read_frame, write_frame};
 use crate::input;
 use crate::store::{Role, Store};
@@ -308,7 +308,9 @@ async fn receive<R: AsyncRead + Unpin>(
                     ServerMsg::CursorShape { argb_len, .. } => (*argb_len, 0),
                     _ => (0, 0),
                 };
-                if main.max(aux) > MAX_VIDEO_PAYLOAD {
+                const MAX_CURSOR_BYTES: u32 = MAX_CURSOR * MAX_CURSOR * 4;
+                let cursor = matches!(msg, ServerMsg::CursorShape { .. });
+                if main.max(aux) > MAX_VIDEO_PAYLOAD || (cursor && main > MAX_CURSOR_BYTES) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "a video frame or a cursor larger than any screen's",
@@ -1211,6 +1213,34 @@ pub(crate) mod tests {
         let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), nothing))
             .await
             .expect("the link must give up on an oversized keymap");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_cursor_larger_than_any_cursor_ends_the_link() {
+        let side = MAX_CURSOR;
+        let argb_len = side * side * 4 + 4;
+        let (a, mut b) = tokio::io::duplex(argb_len as usize + 1024);
+        let shape = ServerMsg::CursorShape {
+            id: 1,
+            width: side,
+            height: side + 1,
+            hot_x: 0,
+            hot_y: 0,
+            argb_len,
+        };
+        // The image comes whole: only its size is wrong.
+        let body = minicbor::to_vec(LinkMsg::Video(shape)).unwrap();
+        let mut bytes = (body.len() as u32).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&argb_len.to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.resize(bytes.len() + argb_len as usize, 255);
+        tokio::io::AsyncWriteExt::write_all(&mut b, &bytes)
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), nothing))
+            .await
+            .expect("the link must give up on an oversized cursor");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 

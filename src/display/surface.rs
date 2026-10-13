@@ -69,6 +69,7 @@ use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 use super::Ended;
 use super::decode::Picture;
+use super::wire::MAX_CURSOR;
 use crate::input::{self, Capture, Grab, Hotkey, Seat};
 
 /// How long the compositor has to place the surface.
@@ -116,9 +117,6 @@ pub struct Cursor {
     pub hot_y: i32,
     pub argb: bytes::Bytes,
 }
-
-/// The largest cursor taken, as gliff's client.
-const MAX_CURSOR: u32 = 1024;
 
 impl Cursor {
     /// Whether it can be shown: a sane size, its pixels all there, and a visible shape (not
