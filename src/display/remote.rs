@@ -7,6 +7,10 @@
 //! it is started again. When one has failed [`ATTEMPTS`] times in a row, the whole mode ends:
 //! home cannot show a desk with a hole in it.
 //!
+//! An output's start blocks (Hyprland requests, the encoder's and the capture's start), so it
+//! runs as a task while the loop goes on serving the outputs that run: one start at a time,
+//! leftmost first, as each output's place depends on the size of the ones left of it.
+//!
 //! Home's input is injected on an output while its stream runs: the injector starts and stops
 //! with the stream, so it always points at the output that is there, and it is gone (every key
 //! and button released) before the output is removed.
@@ -127,6 +131,10 @@ struct Active {
     caps: ClientCaps,
     outputs: Vec<Output>,
     told_no_input: bool,
+    /// Until every output has run once: home waits for its answer, and a failure ends it.
+    starting: bool,
+    /// The output being started, and its start.
+    up: Option<(usize, tokio::task::JoinHandle<io::Result<Running>>)>,
 }
 
 struct Output {
@@ -136,31 +144,70 @@ struct Output {
 }
 
 impl Active {
-    fn run(&mut self, index: usize, running: Running, outbox: &Outbox) {
-        if let Err(reason) = &running.input
-            && !self.told_no_input
-        {
-            self.told_no_input = true;
-            outbox.send(Msg::NoInput(reason.clone()), Vec::new());
+    /// Gives output `index` its stream, its injector getting what home said of its surface
+    /// and its locks, up to now.
+    fn run(&mut self, index: usize, running: Running, home: &Home, outbox: &Outbox) {
+        match &running.input {
+            Ok(input) => {
+                for event in [&home.areas[index], &home.locked].into_iter().flatten() {
+                    input.send(event);
+                }
+            }
+            Err(reason) if !self.told_no_input => {
+                self.told_no_input = true;
+                outbox.send(Msg::NoInput(reason.clone()), Vec::new());
+            }
+            Err(_) => {}
         }
         self.scales[index] = Some(running.scale);
         self.outputs[index].stream = Stream::Running(running);
     }
 
+    /// Starts output `index`'s stream and injector as a task, on the output if it is still
+    /// there as asked, else on a new one. A panic in the encoder's or the capture's start is a
+    /// failure like another.
+    fn bring_up(&mut self, index: usize, ports: &Ports, home: &Home, outbox: &Outbox) {
+        let (copies, scales, caps, ports) = (
+            self.copies.clone(),
+            self.scales.clone(),
+            self.caps.clone(),
+            ports.clone(),
+        );
+        let outbox = outbox.on(index as u8);
+        let keymap = home.keymap.clone();
+        self.outputs[index].stream = Stream::Starting;
+        self.up = Some((
+            index,
+            tokio::task::spawn_blocking(move || {
+                start_blocking(
+                    (&copies, &scales),
+                    index,
+                    caps,
+                    &ports,
+                    keymap.as_deref(),
+                    outbox,
+                )
+            }),
+        ));
+    }
+
     fn running(&self, index: usize) -> Option<&Running> {
         match &self.outputs.get(index)?.stream {
             Stream::Running(running) => Some(running),
-            Stream::Lost(_) => None,
+            Stream::Lost(_) | Stream::Starting => None,
         }
     }
 
-    /// The earliest instant an output waits for to start again.
+    /// The earliest instant an output waits for to start again, while none is starting.
     fn retry_at(&self) -> Option<tokio::time::Instant> {
+        if self.starting || self.up.is_some() {
+            return None;
+        }
         self.outputs
             .iter()
             .filter_map(|o| match o.stream {
                 Stream::Lost(at) => Some(at),
-                Stream::Running(_) => None,
+                Stream::Running(_) | Stream::Starting => None,
             })
             .min()
     }
@@ -170,6 +217,15 @@ enum Stream {
     Running(Running),
     /// Lost; started again at this instant, kept across loop turns.
     Lost(tokio::time::Instant),
+    Starting,
+}
+
+/// What a running mode's tasks bring to the loop.
+enum Landed {
+    /// A running stream stopped on its own, and why.
+    Ended(usize, io::Error),
+    /// An output's start is done.
+    Up(usize, io::Result<Running>),
 }
 
 struct Running {
@@ -205,18 +261,15 @@ pub async fn serve_peer(
                     stop(&mut active, hypr).await;
                     let mut copies = vec![output];
                     copies.extend(others.unwrap_or_default());
-                    let reply = match start(copies, caps, ports, &home, &peer.outbox).await {
-                        Ok(mode) => {
-                            let names: Vec<_> = (0..mode.copies.len()).map(output::name).collect();
+                    match start(copies, caps) {
+                        Ok(mut mode) => {
+                            mode.bring_up(0, ports, &home, &peer.outbox);
                             active = Some(mode);
-                            Display::Started {
-                                output: names[0].clone(),
-                                others: (names.len() > 1).then(|| names[1..].to_vec()),
-                            }
                         }
-                        Err(reason) => Display::Failed { reason },
-                    };
-                    peer.outbox.send(Msg::Display(reply), Vec::new());
+                        Err(reason) => peer
+                            .outbox
+                            .send(Msg::Display(Display::Failed { reason }), Vec::new()),
+                    }
                 }
                 Some(Incoming::Display(Display::Stop)) => stop(&mut active, hypr).await,
                 Some(Incoming::Feedback { output, msg }) => {
@@ -266,35 +319,49 @@ pub async fn serve_peer(
                     }
                 }
             }
-            (index, reason) = ended(&mut active) => {
-                let Some(mode) = &mut active else { continue };
-                let lost = std::mem::replace(
-                    &mut mode.outputs[index].stream,
-                    Stream::Lost(tokio::time::Instant::now()),
-                );
-                if let Stream::Running(running) = lost {
-                    if running.since.elapsed() >= STEADY {
-                        mode.outputs[index].failures = 0;
+            landed = landed(&mut active) => match landed {
+                Landed::Ended(index, reason) => {
+                    let Some(mode) = &mut active else { continue };
+                    let lost = std::mem::replace(
+                        &mut mode.outputs[index].stream,
+                        Stream::Lost(tokio::time::Instant::now()),
+                    );
+                    if let Stream::Running(running) = lost {
+                        if running.since.elapsed() >= STEADY {
+                            mode.outputs[index].failures = 0;
+                        }
+                        // Its thread is joined: not on the executor.
+                        let _ = tokio::task::spawn_blocking(move || drop(running)).await;
                     }
-                    // Its thread is joined: not on the executor.
-                    let _ = tokio::task::spawn_blocking(move || drop(running)).await;
+                    eprintln!("navette: the stream of {} stopped ({reason})", output::name(index));
+                    failed(&mut active, index, reason, hypr, &peer.outbox).await;
                 }
-                eprintln!("navette: the stream of {} stopped ({reason})", output::name(index));
-                failed(&mut active, index, reason, hypr, &peer.outbox).await;
-            }
-            () = sleep_until(retry_at), if retry_at.is_some() => {
-                let Some(mode) = &mut active else { continue };
-                let now = tokio::time::Instant::now();
-                let due: Vec<usize> = (0..mode.outputs.len())
-                    .filter(|&i| matches!(mode.outputs[i].stream, Stream::Lost(at) if at <= now))
-                    .collect();
-                for index in due {
-                    let Some(mode) = &mut active else { break };
-                    let started =
-                        bring_up(mode, index, ports, &home, &peer.outbox).await;
+                Landed::Up(index, started) => {
+                    let Some(mode) = &mut active else { continue };
                     match started {
-                        Ok(running) => mode.run(index, running, &peer.outbox),
+                        Ok(running) => {
+                            mode.run(index, running, &home, &peer.outbox);
+                            let next = index + 1;
+                            if mode.starting && next < mode.copies.len() {
+                                mode.bring_up(next, ports, &home, &peer.outbox);
+                            } else if mode.starting {
+                                mode.starting = false;
+                                let names: Vec<_> =
+                                    (0..mode.copies.len()).map(output::name).collect();
+                                let started = Display::Started {
+                                    output: names[0].clone(),
+                                    others: (names.len() > 1).then(|| names[1..].to_vec()),
+                                };
+                                peer.outbox.send(Msg::Display(started), Vec::new());
+                            }
+                        }
+                        Err(e) if mode.starting => {
+                            stop(&mut active, hypr).await;
+                            let reason = Display::Failed { reason: start_failed(index, e) };
+                            peer.outbox.send(Msg::Display(reason), Vec::new());
+                        }
                         Err(e) => {
+                            mode.outputs[index].stream = Stream::Lost(tokio::time::Instant::now());
                             eprintln!(
                                 "navette: the stream of {} could not start again ({e})",
                                 output::name(index)
@@ -302,6 +369,16 @@ pub async fn serve_peer(
                             failed(&mut active, index, e, hypr, &peer.outbox).await;
                         }
                     }
+                }
+            },
+            () = sleep_until(retry_at), if retry_at.is_some() => {
+                let Some(mode) = &mut active else { continue };
+                let now = tokio::time::Instant::now();
+                // Leftmost first: the others wait for it to land.
+                let due = (0..mode.outputs.len())
+                    .find(|&i| matches!(mode.outputs[i].stream, Stream::Lost(at) if at <= now));
+                if let Some(index) = due {
+                    mode.bring_up(index, ports, &home, &peer.outbox);
                 }
             }
         }
@@ -316,15 +393,8 @@ async fn sleep_until(at: Option<tokio::time::Instant>) {
     }
 }
 
-/// Makes every output, leftmost first, and starts its stream; on a failure, takes away what
-/// was made and says why.
-async fn start(
-    copies: Vec<OutputCopy>,
-    caps: ClientCaps,
-    ports: &Ports,
-    home: &Home,
-    outbox: &Outbox,
-) -> Result<Active, String> {
+/// A mode for these copies, none of them started yet.
+fn start(copies: Vec<OutputCopy>, caps: ClientCaps) -> Result<Active, String> {
     if copies.len() > usize::from(MAX_OUTPUTS) {
         return Err(format!(
             "{} monitors asked, {MAX_OUTPUTS} at most",
@@ -332,7 +402,7 @@ async fn start(
         ));
     }
     let now = tokio::time::Instant::now();
-    let mut mode = Some(Active {
+    Ok(Active {
         outputs: (0..copies.len())
             .map(|_| Output {
                 failures: 0,
@@ -343,27 +413,23 @@ async fn start(
         copies,
         caps,
         told_no_input: false,
-    });
-    for index in 0..mode.as_ref().map_or(0, |m| m.copies.len()) {
-        let m = mode.as_mut().expect("made above");
-        match bring_up(m, index, ports, home, outbox).await {
-            Ok(running) => m.run(index, running, outbox),
-            Err(e) => {
-                stop(&mut mode, &ports.hypr).await;
-                let name = output::name(index);
-                // A GPU's encoder may take fewer sessions than there are outputs.
-                return Err(if index > 0 {
-                    format!(
-                        "{name} could not stream, though the outputs left of it did \
-                         (the remote machine's encoder may not take one more): {e}"
-                    )
-                } else {
-                    format!("{name}: {e}")
-                });
-            }
-        }
+        starting: true,
+        up: None,
+    })
+}
+
+/// Why the mode could not start: output `index` would not.
+fn start_failed(index: usize, e: io::Error) -> String {
+    let name = output::name(index);
+    // A GPU's encoder may take fewer sessions than there are outputs.
+    if index > 0 {
+        format!(
+            "{name} could not stream, though the outputs left of it did \
+             (the remote machine's encoder may not take one more): {e}"
+        )
+    } else {
+        format!("{name}: {e}")
     }
-    Ok(mode.expect("made above"))
 }
 
 /// Counts one more failure of output `index`: waits longer before its next attempt, or gives
@@ -395,65 +461,37 @@ async fn failed(
     output.stream = Stream::Lost(tokio::time::Instant::now() + wait);
 }
 
-/// The first running stream to stop on its own, and why; pending forever when none runs. A
-/// stream that ended without a word ended all the same.
-async fn ended(active: &mut Option<Active>) -> (usize, io::Error) {
+/// The next thing a mode's tasks bring: an output's start done, or the first running stream
+/// to stop on its own; pending forever when there is no mode. A stream that ended without a
+/// word ended all the same.
+async fn landed(active: &mut Option<Active>) -> Landed {
     let Some(mode) = active else {
         return std::future::pending().await;
     };
     std::future::poll_fn(|cx| {
+        if let Some((index, start)) = &mut mode.up
+            && let Poll::Ready(result) = Pin::new(start).poll(cx)
+        {
+            let index = *index;
+            mode.up = None;
+            let started = result.unwrap_or_else(|e| {
+                Err(io::Error::other(format!(
+                    "the picture's start crashed: {e}"
+                )))
+            });
+            return Poll::Ready(Landed::Up(index, started));
+        }
         for (index, output) in mode.outputs.iter_mut().enumerate() {
             if let Stream::Running(running) = &mut output.stream
                 && let Poll::Ready(result) = Pin::new(&mut running.ended).poll(cx)
             {
                 let reason = result.unwrap_or_else(|_| io::Error::other("the stream ended"));
-                return Poll::Ready((index, reason));
+                return Poll::Ready(Landed::Ended(index, reason));
             }
         }
         Poll::Pending
     })
     .await
-}
-
-/// Starts output `index`'s stream and injector, on the output if it is still there as asked,
-/// else on a new one. A panic in the encoder's or the capture's start is a failure like another.
-async fn bring_up(
-    mode: &Active,
-    index: usize,
-    ports: &Ports,
-    home: &Home,
-    outbox: &Outbox,
-) -> io::Result<Running> {
-    let (copies, scales, caps, ports) = (
-        mode.copies.clone(),
-        mode.scales.clone(),
-        mode.caps.clone(),
-        ports.clone(),
-    );
-    let outbox = outbox.on(index as u8);
-    let keymap = home.keymap.clone();
-    let replay: Vec<_> = [&home.areas[index], &home.locked]
-        .into_iter()
-        .flatten()
-        .cloned()
-        .collect();
-    tokio::task::spawn_blocking(move || {
-        start_blocking(
-            (&copies, &scales),
-            index,
-            caps,
-            &ports,
-            keymap.as_deref(),
-            &replay,
-            outbox,
-        )
-    })
-    .await
-    .unwrap_or_else(|e| {
-        Err(io::Error::other(format!(
-            "the picture's start crashed: {e}"
-        )))
-    })
 }
 
 fn start_blocking(
@@ -462,7 +500,6 @@ fn start_blocking(
     caps: ClientCaps,
     ports: &Ports,
     keymap: Option<&str>,
-    replay: &[input::Event],
     outbox: Outbox,
 ) -> io::Result<Running> {
     let hypr = &*ports.hypr;
@@ -480,21 +517,13 @@ fn start_blocking(
     let stream = ports
         .streams
         .start(source, caps, outbox, feedback_rx, ended_tx)?;
-    let input = ports
-        .injectors
-        .start(&name, keymap)
-        .inspect(|input| {
-            for event in replay {
-                input.send(event);
-            }
-        })
-        .map_err(|e| {
-            eprintln!(
-                "navette: home's input cannot be injected on {name}, the picture goes on \
+    let input = ports.injectors.start(&name, keymap).map_err(|e| {
+        eprintln!(
+            "navette: home's input cannot be injected on {name}, the picture goes on \
                  without it: {e}"
-            );
-            e.to_string()
-        });
+        );
+        e.to_string()
+    });
     Ok(Running {
         _stream: stream,
         input,
@@ -505,13 +534,20 @@ fn start_blocking(
     })
 }
 
-/// Stops every stream first, then removes the outputs they captured, and shows the cursor.
+/// Waits for the start under way, stops every stream, then removes the outputs they captured,
+/// and shows the cursor.
 async fn stop(active: &mut Option<Active>, hypr: &Arc<dyn Hypr>) {
-    let Some(mode) = active.take() else {
+    let Some(mut mode) = active.take() else {
         return;
+    };
+    // A start cannot be cut short: removed now, its output would be made again after.
+    let starting = match mode.up.take() {
+        Some((_, start)) => start.await.ok(),
+        None => None,
     };
     let hypr = hypr.clone();
     let removed = tokio::task::spawn_blocking(move || {
+        drop(starting);
         drop(mode);
         output::remove_all(&*hypr)
     })
@@ -542,6 +578,8 @@ mod tests {
         refuse: Mutex<bool>,
         /// Refuses the stream of this output only: an encoder out of sessions.
         refuse_on: Mutex<Option<String>>,
+        /// Takes this long to start the stream of this output: an encoder slow to open.
+        slow_on: Mutex<Option<(String, Duration)>>,
         /// Each stream's feedback from home.
         feedback: Mutex<Vec<(String, UnboundedReceiver<ClientMsg>)>>,
         panic: Mutex<bool>,
@@ -579,6 +617,7 @@ mod tests {
                 started: Mutex::default(),
                 refuse: Mutex::default(),
                 refuse_on: Mutex::default(),
+                slow_on: Mutex::default(),
                 feedback: Mutex::default(),
                 panic: Mutex::default(),
                 dropped: Arc::default(),
@@ -597,6 +636,12 @@ mod tests {
         ) -> io::Result<Box<dyn Send + Sync>> {
             if *self.panic.lock().unwrap() {
                 panic!("the encoder library crashed");
+            }
+            let slow = self.slow_on.lock().unwrap().clone();
+            if let Some((output, wait)) = slow
+                && output == source.output
+            {
+                std::thread::sleep(wait);
             }
             if *self.refuse.lock().unwrap()
                 || self.refuse_on.lock().unwrap().as_ref() == Some(&source.output)
@@ -1452,5 +1497,50 @@ mod tests {
         two(&agent).await;
         // 1920 at 1.2 is 1600 wide.
         assert_eq!(agent.hypr.monitor(SECOND).unwrap().x, 1920 + 1600);
+    }
+
+    #[tokio::test]
+    async fn input_to_the_first_output_keeps_flowing_while_the_second_starts_again() {
+        let agent = agent();
+        two(&agent).await;
+        until(|| agent.injected(1).is_some()).await;
+        *agent.streams.slow_on.lock().unwrap() = Some((SECOND.into(), Duration::from_secs(2)));
+        agent.streams.end(SECOND);
+        // The second stream's start is under way, for two seconds.
+        tokio::time::sleep(RETRY * 3).await;
+        let sent = tokio::time::Instant::now();
+        agent.input.push(key(true));
+        until(|| agent.injected(0).unwrap().2.contains(&key(true))).await;
+        assert!(
+            sent.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            sent.elapsed()
+        );
+        until(|| agent.streams.started_on(SECOND) == 2).await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_a_start_again_waits_for_it_and_leaves_no_output() {
+        let agent = agent();
+        two(&agent).await;
+        *agent.streams.slow_on.lock().unwrap() = Some((SECOND.into(), Duration::from_millis(300)));
+        agent
+            .hypr
+            .request(&format!("output remove {SECOND}"))
+            .unwrap();
+        agent.streams.end(SECOND);
+        tokio::time::sleep(RETRY * 3).await;
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        until(|| agent.streams.started_on(SECOND) == 2).await;
+        until(|| agent.streams.dropped.lock().unwrap().len() == 3).await;
+        assert!(agent.hypr.monitor(FIRST).is_none());
+        assert!(agent.hypr.monitor(SECOND).is_none());
+        assert!(!agent.hypr.cursor_invisible());
+        // The first is the stream whose output went away; the stop's come after.
+        let dropped = agent.streams.dropped.lock().unwrap();
+        assert!(dropped[1..].iter().all(|d| d.output_there), "{dropped:?}");
     }
 }
