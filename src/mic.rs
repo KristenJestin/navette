@@ -407,13 +407,20 @@ pub async fn serve(listener: UnixListener, mic: Arc<dyn Routing>) {
             let word = line.trim();
             if word == "watch" {
                 let mut changes = mic.watch();
+                let mut byte = [0; 1];
                 loop {
                     let status = *changes.borrow_and_update();
                     let line = format!("{}\n", status.word());
-                    if write.write_all(line.as_bytes()).await.is_err()
-                        || changes.changed().await.is_err()
-                    {
+                    if write.write_all(line.as_bytes()).await.is_err() {
                         return;
+                    }
+                    // A watcher says nothing more: anything it does, closing included, ends it,
+                    // rather than at the next change, which may be hours away.
+                    tokio::select! {
+                        changed = changes.changed() => if changed.is_err() {
+                            return;
+                        },
+                        _ = tokio::io::AsyncReadExt::read(&mut read, &mut byte) => return,
                     }
                 }
             }
@@ -856,6 +863,30 @@ mod tests {
         let stopped = mic.clone();
         blocking(move || stopped.stop()).await;
         assert_eq!(next(&mut hears).await, Status::Off);
+    }
+
+    #[tokio::test]
+    async fn a_watcher_that_goes_away_is_noticed_without_waiting_for_a_change() {
+        let (_graph, mic, _remote, _tmp) = mic();
+        let (_dir, path) = served(mic.clone());
+        let mut stream = UnixStream::connect(&path).await.unwrap();
+        stream.write_all(b"watch\n").await.unwrap();
+        let mut line = String::new();
+        BufReader::new(&mut stream)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        assert_eq!(line, "off\n");
+        assert_eq!(mic.shared.status.receiver_count(), 1);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mic.shared.status.receiver_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the watcher noticed gone");
     }
 
     #[tokio::test]
