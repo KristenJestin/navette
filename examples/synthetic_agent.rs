@@ -237,13 +237,14 @@ async fn main() -> io::Result<()> {
     let (hypr_events, hypr_events_rx) = mpsc::unbounded_channel();
     hypr::watch_events(hypr_events);
     let hypr: Arc<dyn Hypr> = Arc::new(hypr::Live);
-    tokio::spawn(remote::serve(
-        peers_rx,
+    let ports = remote::Ports {
         hypr,
-        Arc::new(Synthetic),
-        Arc::new(navette::input::LiveInjectors),
-        hypr_events_rx,
-    ));
+        streams: Arc::new(Synthetic),
+        injectors: Arc::new(navette::input::LiveInjectors),
+        logind: Arc::new(navette::lid::LiveLogind),
+        lid_record: navette::lid::record_path()?,
+    };
+    tokio::spawn(remote::serve(peers_rx, ports, hypr_events_rx));
     // The display only: no clipboard bridge here.
     let attach = move |mut wire: link::Wire| {
         if let Some(display) = wire.display.take() {

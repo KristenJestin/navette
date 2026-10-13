@@ -31,6 +31,7 @@ use super::stream::{self, Source};
 use crate::display::wire::{Display, Incoming, MAX_OUTPUTS, Msg, Outbox, OutputCopy, Peer};
 use crate::hypr::{self, Hypr};
 use crate::input::{self, Inject, Injectors};
+use crate::lid::{self, Logind};
 
 /// The first wait before a lost stream is started again, doubled after each failure up to
 /// [`LONGEST_WAIT`].
@@ -45,6 +46,13 @@ const LONGEST_WAIT: Duration = Duration::from_secs(30);
 const ATTEMPTS: u32 = 6;
 /// A stream that ran this long was not failing: the count starts again.
 const STEADY: Duration = Duration::from_secs(30);
+/// How often the lid is looked at while a mode runs with `closed_lid = on`: the inhibitor lock
+/// keeps the laptop up meanwhile, so a second is soon enough.
+const LID_POLL: Duration = if cfg!(test) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_secs(1)
+};
 
 /// Starts the picture path for an output (the port behind which tests put a fake). The stream
 /// runs until the returned guard is dropped; `ended` says why if it stops on its own.
@@ -77,41 +85,48 @@ impl Streams for LiveStreams {
     }
 }
 
-/// Serves every link the agent brings up, one after the other. The outputs left by an agent
-/// that crashed go first: no window must stay on a screen nobody sees.
+/// Serves every link the agent brings up, one after the other. What an agent that crashed
+/// left goes first: no window must stay on a screen nobody sees, and the laptop's own screen,
+/// disabled for a closed lid, comes back.
 pub async fn serve(
     mut peers: UnboundedReceiver<Peer>,
-    hypr: Arc<dyn Hypr>,
-    streams: Arc<dyn Streams>,
-    injectors: Arc<dyn Injectors>,
+    ports: Ports,
     mut events: UnboundedReceiver<hypr::Event>,
 ) {
-    let removed = {
-        let hypr = hypr.clone();
-        tokio::task::spawn_blocking(move || output::remove_all(&*hypr)).await
-    };
-    match removed {
-        Ok(Err(e)) if e.kind() != io::ErrorKind::NotFound => {
-            eprintln!("navette: could not remove a leftover remote output: {e}");
+    let (hypr, record) = (ports.hypr.clone(), ports.lid_record.clone());
+    let left = tokio::task::spawn_blocking(move || {
+        // The laptop's screen first: the copies may be the only outputs on.
+        (lid::open(&*hypr, &record), output::remove_all(&*hypr))
+    })
+    .await;
+    if let Ok((opened, removed)) = left {
+        match opened {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                eprintln!("navette: could not bring the laptop's screen back: {e}");
+            }
+            _ => {}
         }
-        _ => {}
+        match removed {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                eprintln!("navette: could not remove a leftover remote output: {e}");
+            }
+            _ => {}
+        }
     }
     while let Some(peer) = peers.recv().await {
-        let ports = Ports {
-            hypr: hypr.clone(),
-            streams: streams.clone(),
-            injectors: injectors.clone(),
-        };
         serve_peer(peer, &ports, &mut events).await;
     }
 }
 
-/// What the agent drives: Hyprland, the picture path and the input injection.
+/// What the agent drives: Hyprland, the picture path, the input injection and logind, with
+/// the file that brings the laptop's screen back.
 #[derive(Clone)]
 pub struct Ports {
     pub hypr: Arc<dyn Hypr>,
     pub streams: Arc<dyn Streams>,
     pub injectors: Arc<dyn Injectors>,
+    pub logind: Arc<dyn Logind>,
+    pub lid_record: std::path::PathBuf,
 }
 
 /// What home said of its input, kept for the next injector: its keymap, each surface's size
@@ -135,6 +150,74 @@ struct Active {
     starting: bool,
     /// The output being started, and its start.
     up: Option<(usize, tokio::task::JoinHandle<io::Result<Running>>)>,
+    /// With `closed_lid = on` and logind's lock held.
+    lid: Option<Lid>,
+}
+
+/// The lid during a mode that lets it close.
+struct Lid {
+    _lock: Box<dyn Send + Sync>,
+    /// As last seen: closed, the laptop's screen is kept disabled.
+    closed: bool,
+    next: tokio::time::Instant,
+    /// A failure to look at it was said, and not since it worked again.
+    told: bool,
+}
+
+impl Lid {
+    /// Takes logind's lock; without it, the lid is left alone and the agent says why.
+    async fn take(logind: &Arc<dyn Logind>) -> Option<Lid> {
+        let logind = logind.clone();
+        match tokio::task::spawn_blocking(move || logind.inhibit_lid()).await {
+            Ok(Ok(lock)) => Some(Lid {
+                _lock: lock,
+                closed: false,
+                next: tokio::time::Instant::now(),
+                told: false,
+            }),
+            Ok(Err(e)) => {
+                eprintln!(
+                    "navette: closed_lid: the laptop cannot be kept up with its lid closed, \
+                     so the lid does as it always does: {e}"
+                );
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Looks at the lid and keeps the laptop's screen as it says: disabled while closed (again
+    /// after a reload or a restart turned it on), back once open.
+    async fn look(&mut self, ports: &Ports) {
+        self.next = tokio::time::Instant::now() + LID_POLL;
+        let (logind, hypr, record, was) = (
+            ports.logind.clone(),
+            ports.hypr.clone(),
+            ports.lid_record.clone(),
+            self.closed,
+        );
+        let looked = tokio::task::spawn_blocking(move || -> io::Result<bool> {
+            let closed = logind.lid_closed()?;
+            if closed {
+                lid::close(&*hypr, &record)?;
+            } else if was {
+                lid::open(&*hypr, &record)?;
+            }
+            Ok(closed)
+        })
+        .await;
+        match looked {
+            Ok(Ok(closed)) => {
+                self.closed = closed;
+                self.told = false;
+            }
+            Ok(Err(e)) if !self.told => {
+                self.told = true;
+                eprintln!("navette: closed_lid: {e}");
+            }
+            _ => {}
+        }
+    }
 }
 
 struct Output {
@@ -254,16 +337,20 @@ pub async fn serve_peer(
     let mut input_open = true;
     loop {
         let retry_at = active.as_ref().and_then(Active::retry_at);
+        let lid_at = active.as_ref().and_then(|a| Some(a.lid.as_ref()?.next));
         let had_mode = active.is_some();
         tokio::select! {
             msg = peer.inbox.recv() => match msg {
                 None => break,
-                Some(Incoming::Display(Display::Start { output, caps, others })) => {
-                    stop(&mut active, hypr).await;
+                Some(Incoming::Display(Display::Start { output, caps, others, closed_lid })) => {
+                    stop(&mut active, ports).await;
                     let mut copies = vec![output];
                     copies.extend(others.unwrap_or_default());
                     match start(copies, caps) {
                         Ok(mut mode) => {
+                            if closed_lid == Some(true) {
+                                mode.lid = Lid::take(&ports.logind).await;
+                            }
                             mode.bring_up(0, ports, &home, &peer.outbox);
                             active = Some(mode);
                         }
@@ -272,7 +359,7 @@ pub async fn serve_peer(
                             .send(Msg::Display(Display::Failed { reason }), Vec::new()),
                     }
                 }
-                Some(Incoming::Display(Display::Stop)) => stop(&mut active, hypr).await,
+                Some(Incoming::Display(Display::Stop)) => stop(&mut active, ports).await,
                 Some(Incoming::Feedback { output, msg }) => {
                     if let Some(running) = active.as_ref().and_then(|a| a.running(output.into())) {
                         let _ = running.feedback.send(msg);
@@ -308,6 +395,10 @@ pub async fn serve_peer(
                 None => input_open = false,
             },
             Some(event) = events.recv() => {
+                // A reload, or a script on the lid, may have turned the laptop's screen on.
+                if let Some(lid) = active.as_mut().and_then(|a| a.lid.as_mut()) {
+                    lid.next = tokio::time::Instant::now();
+                }
                 if let (hypr::Event::ConfigReloaded, Some(mode)) = (event, &active) {
                     let (hypr, copies, scales) =
                         (hypr.clone(), mode.copies.clone(), mode.scales.clone());
@@ -335,7 +426,7 @@ pub async fn serve_peer(
                         let _ = tokio::task::spawn_blocking(move || drop(running)).await;
                     }
                     eprintln!("navette: the stream of {} stopped ({reason})", output::name(index));
-                    failed(&mut active, index, reason, hypr, &peer.outbox).await;
+                    failed(&mut active, index, reason, ports, &peer.outbox).await;
                 }
                 Landed::Up(index, started) => {
                     let Some(mode) = &mut active else { continue };
@@ -357,7 +448,7 @@ pub async fn serve_peer(
                             }
                         }
                         Err(e) if mode.starting => {
-                            stop(&mut active, hypr).await;
+                            stop(&mut active, ports).await;
                             let reason = Display::Failed { reason: start_failed(index, e) };
                             peer.outbox.send(Msg::Display(reason), Vec::new());
                         }
@@ -367,11 +458,16 @@ pub async fn serve_peer(
                                 "navette: the stream of {} could not start again ({e})",
                                 output::name(index)
                             );
-                            failed(&mut active, index, e, hypr, &peer.outbox).await;
+                            failed(&mut active, index, e, ports, &peer.outbox).await;
                         }
                     }
                 }
             },
+            () = sleep_until(lid_at), if lid_at.is_some() => {
+                if let Some(lid) = active.as_mut().and_then(|a| a.lid.as_mut()) {
+                    lid.look(ports).await;
+                }
+            }
             () = sleep_until(retry_at), if retry_at.is_some() => {
                 let Some(mode) = &mut active else { continue };
                 let now = tokio::time::Instant::now();
@@ -389,7 +485,7 @@ pub async fn serve_peer(
             home.areas = Default::default();
         }
     }
-    stop(&mut active, hypr).await;
+    stop(&mut active, ports).await;
 }
 
 async fn sleep_until(at: Option<tokio::time::Instant>) {
@@ -421,6 +517,7 @@ fn start(copies: Vec<OutputCopy>, caps: ClientCaps) -> Result<Active, String> {
         told_no_input: false,
         starting: true,
         up: None,
+        lid: None,
     })
 }
 
@@ -444,7 +541,7 @@ async fn failed(
     active: &mut Option<Active>,
     index: usize,
     reason: io::Error,
-    hypr: &Arc<dyn Hypr>,
+    ports: &Ports,
     outbox: &Outbox,
 ) {
     let Some(mode) = active else { return };
@@ -457,7 +554,7 @@ async fn failed(
             output.failures
         );
         eprintln!("navette: {reason}; the mode ends");
-        stop(active, hypr).await;
+        stop(active, ports).await;
         outbox.send(Msg::Display(Display::Failed { reason }), Vec::new());
         return;
     }
@@ -540,9 +637,9 @@ fn start_blocking(
     })
 }
 
-/// Waits for the start under way, stops every stream, then removes the outputs they captured,
-/// and shows the cursor.
-async fn stop(active: &mut Option<Active>, hypr: &Arc<dyn Hypr>) {
+/// Waits for the start under way, brings the laptop's screen back, stops every stream, then
+/// removes the outputs they captured, shows the cursor, and releases logind's lock last.
+async fn stop(active: &mut Option<Active>, ports: &Ports) {
     let Some(mut mode) = active.take() else {
         return;
     };
@@ -551,15 +648,25 @@ async fn stop(active: &mut Option<Active>, hypr: &Arc<dyn Hypr>) {
         Some((_, start)) => start.await.ok(),
         None => None,
     };
-    let hypr = hypr.clone();
-    let removed = tokio::task::spawn_blocking(move || {
+    let (hypr, record) = (ports.hypr.clone(), ports.lid_record.clone());
+    let lid = mode.lid.take();
+    let undone = tokio::task::spawn_blocking(move || {
         drop(starting);
+        // Before the copies go: with the screen still disabled, no output would be on.
+        let opened = lid.as_ref().map(|_| lid::open(&*hypr, &record));
         drop(mode);
-        output::remove_all(&*hypr)
+        let removed = output::remove_all(&*hypr);
+        drop(lid);
+        (opened, removed)
     })
     .await;
-    if let Ok(Err(e)) = removed {
-        eprintln!("navette: could not remove the remote outputs: {e}");
+    if let Ok((opened, removed)) = undone {
+        if let Some(Err(e)) = opened {
+            eprintln!("navette: could not bring the laptop's screen back: {e}");
+        }
+        if let Err(e) = removed {
+            eprintln!("navette: could not remove the remote outputs: {e}");
+        }
     }
 }
 
@@ -571,6 +678,7 @@ mod tests {
 
     use super::*;
     use crate::hypr::fake::{FakeHypr, FakeMonitor};
+    use crate::lid::fake::FakeLogind;
 
     const FIRST: &str = "NAVETTE-1";
     const SECOND: &str = "NAVETTE-2";
@@ -729,6 +837,26 @@ mod tests {
                 features: Vec::new(),
             },
             others: (!others.is_empty()).then_some(others),
+            closed_lid: None,
+        })
+    }
+
+    /// A start with `closed_lid = on`.
+    fn start_with_the_lid() -> Incoming {
+        let Incoming::Display(Display::Start {
+            output,
+            caps,
+            others,
+            ..
+        }) = start()
+        else {
+            unreachable!()
+        };
+        Incoming::Display(Display::Start {
+            output,
+            caps,
+            others,
+            closed_lid: Some(true),
         })
     }
 
@@ -799,6 +927,9 @@ mod tests {
         streams: Arc<FakeStreams>,
         injected: Arc<Mutex<Vec<Injected>>>,
         refuse_input: Arc<Mutex<bool>>,
+        logind: Arc<FakeLogind>,
+        record: std::path::PathBuf,
+        _dir: tempfile::TempDir,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -819,6 +950,9 @@ mod tests {
             pointer: tokio::sync::watch::channel(Default::default()).1,
             input: wire.clone(),
         };
+        let logind = Arc::new(FakeLogind::default());
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("navette").join("lid");
         let ports = Ports {
             hypr: hypr.clone(),
             streams: streams.clone(),
@@ -827,6 +961,8 @@ mod tests {
                 started: injected.clone(),
                 refuse: refuse_input.clone(),
             }),
+            logind: logind.clone(),
+            lid_record: record.clone(),
         };
         let task = tokio::spawn(async move {
             serve_peer(peer, &ports, &mut events_rx).await;
@@ -840,6 +976,9 @@ mod tests {
             streams,
             injected,
             refuse_input,
+            logind,
+            record,
+            _dir: dir,
             task,
         }
     }
@@ -1199,6 +1338,25 @@ mod tests {
         }
     }
 
+    /// The ports of an agent that starts on `hypr`, its lid record at `record` (none there by
+    /// default).
+    fn starting_agent(hypr: &Arc<FakeHypr>, record: Option<&std::path::Path>) -> Ports {
+        Ports {
+            hypr: hypr.clone(),
+            streams: Arc::new(FakeStreams::new(hypr.clone())),
+            injectors: Arc::new(FakeInjectors {
+                hypr: hypr.clone(),
+                started: Arc::default(),
+                refuse: Arc::default(),
+            }),
+            logind: Arc::new(FakeLogind::default()),
+            lid_record: record.map_or_else(
+                || std::path::PathBuf::from("/nonexistent/navette/lid"),
+                std::path::Path::to_path_buf,
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn a_leftover_output_is_removed_when_the_agent_starts() {
         let hypr = Arc::new(FakeHypr::with(vec![
@@ -1207,13 +1365,7 @@ mod tests {
         ]));
         let (_peers, peers_rx) = mpsc::unbounded_channel();
         let (_events, events_rx) = mpsc::unbounded_channel();
-        let streams = Arc::new(FakeStreams::new(hypr.clone()));
-        let injectors = Arc::new(FakeInjectors {
-            hypr: hypr.clone(),
-            started: Arc::default(),
-            refuse: Arc::default(),
-        });
-        tokio::spawn(serve(peers_rx, hypr.clone(), streams, injectors, events_rx));
+        tokio::spawn(serve(peers_rx, starting_agent(&hypr, None), events_rx));
         until(|| hypr.monitor(FIRST).is_none()).await;
     }
 
@@ -1227,13 +1379,7 @@ mod tests {
             .unwrap();
         let (_peers, peers_rx) = mpsc::unbounded_channel();
         let (_events, events_rx) = mpsc::unbounded_channel();
-        let streams = Arc::new(FakeStreams::new(hypr.clone()));
-        let injectors = Arc::new(FakeInjectors {
-            hypr: hypr.clone(),
-            started: Arc::default(),
-            refuse: Arc::default(),
-        });
-        tokio::spawn(serve(peers_rx, hypr.clone(), streams, injectors, events_rx));
+        tokio::spawn(serve(peers_rx, starting_agent(&hypr, None), events_rx));
         until(|| !hypr.cursor_invisible()).await;
     }
 
@@ -1475,14 +1621,168 @@ mod tests {
         ]));
         let (_peers, peers_rx) = mpsc::unbounded_channel();
         let (_events, events_rx) = mpsc::unbounded_channel();
-        let streams = Arc::new(FakeStreams::new(hypr.clone()));
-        let injectors = Arc::new(FakeInjectors {
-            hypr: hypr.clone(),
-            started: Arc::default(),
-            refuse: Arc::default(),
-        });
-        tokio::spawn(serve(peers_rx, hypr.clone(), streams, injectors, events_rx));
+        tokio::spawn(serve(peers_rx, starting_agent(&hypr, None), events_rx));
         until(|| hypr.monitor(FIRST).is_none() && hypr.monitor(SECOND).is_none()).await;
+    }
+
+    fn laptop_disabled(agent: &Agent) -> bool {
+        agent.hypr.monitor("eDP-1").unwrap().disabled
+    }
+
+    /// A mode with `closed_lid = on`, its output streaming.
+    async fn running_with_the_lid(agent: &Agent) {
+        agent.inbox.try_send(start_with_the_lid()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+    }
+
+    #[tokio::test]
+    async fn a_lid_closed_during_a_mode_disables_the_laptop_screen_and_opened_brings_it_back() {
+        let agent = agent();
+        running_with_the_lid(&agent).await;
+        assert!(!laptop_disabled(&agent));
+        agent.logind.close(true);
+        until(|| laptop_disabled(&agent)).await;
+        // Navette's output goes on.
+        assert!(agent.hypr.monitor(FIRST).is_some_and(|m| !m.disabled));
+        agent.logind.close(false);
+        until(|| !laptop_disabled(&agent)).await;
+        assert_eq!(
+            agent.hypr.monitor("eDP-1").unwrap(),
+            FakeMonitor::new("eDP-1", 1920, 1200, 0)
+        );
+        assert!(!agent.record.exists());
+    }
+
+    #[tokio::test]
+    async fn the_lock_is_taken_with_the_mode_and_released_when_it_stops() {
+        let agent = agent();
+        running_with_the_lid(&agent).await;
+        assert_eq!((agent.logind.taken(), agent.logind.held()), (1, 1));
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        until(|| agent.logind.held() == 0).await;
+    }
+
+    #[tokio::test]
+    async fn stopping_the_mode_with_the_lid_closed_brings_the_laptop_screen_back() {
+        let agent = agent();
+        running_with_the_lid(&agent).await;
+        agent.logind.close(true);
+        until(|| laptop_disabled(&agent)).await;
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        until(|| agent.hypr.monitor(FIRST).is_none()).await;
+        assert!(!laptop_disabled(&agent));
+        assert_eq!(agent.logind.held(), 0);
+        // The screen came back before the copy went: some output was on all along.
+        let changes = agent.hypr.changes();
+        let back = changes.iter().position(|c| c.contains("disabled = false"));
+        let gone = changes.iter().position(|c| c == "output remove NAVETTE-1");
+        assert!(back.unwrap() < gone.unwrap(), "{changes:?}");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_or_a_stopped_agent_brings_the_laptop_screen_back() {
+        let agent = agent();
+        running_with_the_lid(&agent).await;
+        agent.logind.close(true);
+        until(|| laptop_disabled(&agent)).await;
+        let Agent {
+            inbox,
+            task,
+            hypr,
+            logind,
+            record,
+            _dir,
+            ..
+        } = agent;
+        drop(inbox);
+        task.await.unwrap();
+        assert!(!hypr.monitor("eDP-1").unwrap().disabled);
+        assert_eq!(logind.held(), 0);
+        assert!(!record.exists());
+    }
+
+    #[tokio::test]
+    async fn a_laptop_screen_left_disabled_by_an_agent_that_crashed_comes_back_when_it_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("lid");
+        let hypr = Arc::new(FakeHypr::with(vec![
+            FakeMonitor::new("eDP-1", 1920, 1200, 0),
+            FakeMonitor::new(FIRST, 1920, 1080, 1920),
+        ]));
+        crate::lid::close(&*hypr, &record).unwrap();
+        assert!(hypr.monitor("eDP-1").unwrap().disabled);
+        let (_peers, peers_rx) = mpsc::unbounded_channel();
+        let (_events, events_rx) = mpsc::unbounded_channel();
+        tokio::spawn(serve(
+            peers_rx,
+            starting_agent(&hypr, Some(&record)),
+            events_rx,
+        ));
+        until(|| hypr.monitor(FIRST).is_none()).await;
+        until(|| !hypr.monitor("eDP-1").unwrap().disabled).await;
+        assert!(!record.exists());
+    }
+
+    #[tokio::test]
+    async fn a_refused_lock_is_reported_and_the_lid_is_left_alone() {
+        let agent = agent();
+        *agent.logind.refuse.lock().unwrap() = Some("Access denied".into());
+        agent.logind.close(true);
+        running_with_the_lid(&agent).await;
+        // The mode runs all the same, and the lid is never looked at.
+        until(|| agent.outbox.queued().len() == 2).await;
+        tokio::time::sleep(LID_POLL * 5).await;
+        assert_eq!(agent.logind.looked(), 0);
+        assert!(!laptop_disabled(&agent));
+        assert!(failed(&agent.outbox).is_none());
+    }
+
+    #[tokio::test]
+    async fn with_the_option_off_the_lid_changes_nothing() {
+        let agent = agent();
+        agent.logind.close(true);
+        agent.inbox.try_send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+        tokio::time::sleep(LID_POLL * 5).await;
+        assert_eq!((agent.logind.taken(), agent.logind.looked()), (0, 0));
+        assert!(!laptop_disabled(&agent));
+    }
+
+    #[tokio::test]
+    async fn a_reload_with_the_lid_closed_disables_the_laptop_screen_again() {
+        let agent = agent();
+        running_with_the_lid(&agent).await;
+        agent.logind.close(true);
+        until(|| laptop_disabled(&agent)).await;
+        agent.hypr.reload();
+        assert!(!laptop_disabled(&agent));
+        agent.events.send(hypr::Event::ConfigReloaded).unwrap();
+        until(|| laptop_disabled(&agent)).await;
+        agent.logind.close(false);
+        until(|| !laptop_disabled(&agent)).await;
+    }
+
+    #[tokio::test]
+    async fn the_laptop_screen_is_disabled_again_after_a_hyprland_restart_once_its_copy_is_back() {
+        let agent = agent();
+        running_with_the_lid(&agent).await;
+        agent.logind.close(true);
+        until(|| laptop_disabled(&agent)).await;
+        agent.hypr.set_down(true, Vec::new());
+        agent.streams.end_last();
+        tokio::time::sleep(RETRY * 2).await;
+        agent
+            .hypr
+            .set_down(false, vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
+        until(|| agent.streams.count() == 2).await;
+        until(|| laptop_disabled(&agent)).await;
+        assert!(agent.hypr.monitor(FIRST).is_some_and(|m| !m.disabled));
     }
 
     #[tokio::test]

@@ -588,6 +588,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
             output: first,
             caps,
             others: (!others.is_empty()).then_some(others),
+            closed_lid: None,
         }),
         Vec::new(),
     );

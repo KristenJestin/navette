@@ -82,6 +82,10 @@ pub enum Display {
         /// The other monitors, outputs 1, 2…, in home's left-to-right order.
         #[n(2)]
         others: Option<Vec<OutputCopy>>,
+        /// `closed_lid = on` in home's `mode.conf`: the remote laptop works with its lid
+        /// closed while the mode runs (`crate::lid`). An agent that does not know it ignores it.
+        #[n(3)]
+        closed_lid: Option<bool>,
     },
     /// Home to remote: stop streaming and remove the output.
     #[n(1)]

@@ -19,7 +19,7 @@ pub fn name(index: usize) -> String {
 }
 
 /// A copy made by Navette, whichever: `NAVETTE-<n>`.
-fn is_copy(name: &str) -> bool {
+pub fn is_copy(name: &str) -> bool {
     name.strip_prefix("NAVETTE-")
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
@@ -39,7 +39,7 @@ pub fn rule(index: usize, copy: &OutputCopy, x: i32) -> String {
 }
 
 /// Thousandths written as Hyprland reads them: `165`, `59.94`, `1.25`.
-fn decimal(milli: u32) -> String {
+pub fn decimal(milli: u32) -> String {
     let text = format!("{}.{:03}", milli / 1000, milli % 1000);
     text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
