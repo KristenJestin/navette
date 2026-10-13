@@ -9,7 +9,8 @@
 //! through the desk recorder so they are undone on stop, on a dropped link and after a crash,
 //! and made again after a config reload. A home window that lands on a given monitor all the
 //! same (moved, dragged, opened on an explicit workspace) is sent back to a home monitor as
-//! Hyprland reports it (#31). The home mic goes to the remote machine for as long as the mode runs.
+//! Hyprland reports it (#31). The remote's sound plays at home, and the home mic goes to the
+//! remote machine, for as long as the mode runs.
 //!
 //! `navette serve` owns the link and the surface, so the two commands reach it over a Unix
 //! socket in `$XDG_RUNTIME_DIR/navette`, private to the user.
@@ -182,6 +183,24 @@ impl Drop for MicSent {
     }
 }
 
+/// The remote's sound, played at home while a mode runs (the port behind which tests put a
+/// fake). Its calls wait for PipeWire and the link: they are made off the executor.
+pub trait Sound: Send + Sync {
+    /// The remote's sound comes home.
+    fn start(&self) -> io::Result<()>;
+    /// The remote plays it on its own output again.
+    fn stop(&self);
+}
+
+/// The remote's sound played at home, until dropped.
+struct SoundPlayed(Arc<dyn Sound>);
+
+impl Drop for SoundPlayed {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
 /// Covers a home monitor (the port behind which tests put a fake).
 pub trait Screens: Send + Sync {
     /// Covers `monitor`; the guard takes the cover away when dropped. Home's input over it goes
@@ -252,6 +271,8 @@ pub struct Home {
     pub desk_record: PathBuf,
     /// The mic, when home plays the remote's sound.
     pub mic: Option<Arc<dyn Mic>>,
+    /// The remote's sound, with `navette serve --audio`.
+    pub sound: Option<Arc<dyn Sound>>,
 }
 
 /// The workspace each given monitor showed when home windows were last sent home.
@@ -260,6 +281,7 @@ type Seen = Vec<(String, i64)>;
 struct Active {
     /// Home first, before the rest goes.
     _mic: Option<MicSent>,
+    _sound: Option<SoundPlayed>,
     /// The monitors given, left to right: monitor `i` shows output `i`.
     monitors: Vec<String>,
     /// The home monitor that takes the home windows the cover would hide; none when every
@@ -593,15 +615,16 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
     // Off the executor, and so is the undo when one fails: the desk drops with the closure.
     let (ended_tx, ended) = tokio::sync::mpsc::unbounded_channel();
     let (released_tx, released) = tokio::sync::mpsc::unbounded_channel();
-    let (screens, gpu, outbox, input, mic) = (
+    let (screens, gpu, outbox, input, mic, sound) = (
         home.screens.clone(),
         home.gpu.clone(),
         peer.outbox.clone(),
         peer.input.to_peer.clone(),
         home.mic.clone(),
+        home.sound.clone(),
     );
     let covered = names.clone();
-    let (shown, desk, mic) = blocking(move || {
+    let (shown, desk, mic, sound) = blocking(move || {
         let gpus = decoding_gpus(gpu, &covered, decode::open_gpu)?;
         let mut shown = Vec::new();
         for ((index, name), gpu) in covered.iter().enumerate().zip(gpus) {
@@ -621,8 +644,14 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
             )?;
             shown.push(Shown { decoding, screen });
         }
-        // Last, as nothing after it can fail: a mode without its mic is still a mode. Kept
-        // when it failed, so that the stop clears what it says.
+        // Last, as nothing after them can fail: a mode without its sound or its mic is still
+        // a mode. The mic is kept when it failed, so that the stop clears what it says.
+        let sound = sound.map(|sound| {
+            if let Err(e) = sound.start() {
+                eprintln!("navette: audio: the remote's sound could not come home: {e}");
+            }
+            SoundPlayed(sound)
+        });
         let mic = mic.map(|mic| {
             if let Err(e) = mic.start() {
                 eprintln!(
@@ -631,7 +660,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
             }
             MicSent(mic)
         });
-        Ok((shown, desk, mic))
+        Ok((shown, desk, mic, sound))
     })
     .await?;
     let caps = decode::caps(&home.gpu, (3840, 2160));
@@ -648,6 +677,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
     let sending = (names.clone(), home_monitor.clone(), seen.clone());
     *active = Some(Active {
         _mic: mic,
+        _sound: sound,
         monitors: names,
         home_monitor,
         seen,
@@ -979,10 +1009,28 @@ mod tests {
         }
     }
 
+    /// The remote's sound, logging what the mode asks of it.
+    #[derive(Default)]
+    struct FakeSound {
+        log: Mutex<Vec<&'static str>>,
+    }
+
+    impl Sound for FakeSound {
+        fn start(&self) -> io::Result<()> {
+            self.log.lock().unwrap().push("start");
+            Ok(())
+        }
+
+        fn stop(&self) {
+            self.log.lock().unwrap().push("stop");
+        }
+    }
+
     struct Desk {
         _config: tempfile::TempDir,
         hypr: Arc<FakeHypr>,
         mic: Arc<FakeMic>,
+        sound: Arc<FakeSound>,
         covered: Arc<Mutex<Vec<String>>>,
         ends: Arc<Mutex<Vec<Ended>>>,
         hotkeys: Arc<Mutex<Vec<Option<Hotkey>>>>,
@@ -1014,6 +1062,7 @@ mod tests {
         let config = tempfile::tempdir().unwrap();
         std::fs::write(config.path().join(CONFIG_FILE), config_text).unwrap();
         let mic = Arc::new(mic);
+        let sound = Arc::new(FakeSound::default());
         let hypr = Arc::new(FakeHypr::with(monitors));
         let screens = FakeScreens::default();
         let covered = screens.covered.clone();
@@ -1032,12 +1081,14 @@ mod tests {
             gpu: None,
             desk_record: config.path().join("desk"),
             mic: Some(mic.clone()),
+            sound: Some(sound.clone()),
         };
         tokio::spawn(serve(home, peers_rx, orders_rx, events_rx));
         Desk {
             _config: config,
             hypr,
             mic,
+            sound,
             covered,
             ends,
             hotkeys,
@@ -1201,6 +1252,41 @@ mod tests {
 
     fn mic_log(desk: &Desk) -> Vec<&'static str> {
         desk.mic.log.lock().unwrap().clone()
+    }
+
+    fn sound_log(desk: &Desk) -> Vec<&'static str> {
+        desk.sound.log.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn no_sound_comes_home_without_a_mode() {
+        let desk = desk("DP-2");
+        let _remote = connect(&desk);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(sound_log(&desk).is_empty());
+    }
+
+    #[tokio::test]
+    async fn starting_a_mode_brings_the_remote_sound_home() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        assert_eq!(sound_log(&desk), ["start"]);
+    }
+
+    #[tokio::test]
+    async fn stopping_the_mode_stops_the_remote_sound() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(sound_log(&desk), ["start", "stop"]);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_stops_the_remote_sound() {
+        let desk = desk("DP-2");
+        let remote = started(&desk).await;
+        drop(remote);
+        until(|| sound_log(&desk) == ["start", "stop"]).await;
     }
 
     #[tokio::test]

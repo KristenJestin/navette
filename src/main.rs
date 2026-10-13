@@ -2,7 +2,7 @@
 //! the work laptop ("remote"), then `navette serve` at home and `navette agent` on the laptop
 //! keep an authenticated link between them. `navette mode start` gives one home monitor to the
 //! remote machine, `navette mode stop` gives it back; `navette serve --audio` brings the remote
-//! machine's sound home while the link is up, and sends the home mic there while a mode runs;
+//! machine's sound home and sends the home mic there while a mode runs;
 //! `navette mic` switches it.
 
 use std::io::BufRead;
@@ -67,8 +67,8 @@ enum Command {
         /// The LAN address and port to listen on [default: the one used to pair].
         #[arg(long, value_name = "ADDR:PORT")]
         listen: Option<SocketAddr>,
-        /// Play the remote machine's sound here, mixed with home sound, while the link is up
-        /// (until the modes take this over), and send it the home mic while a mode runs.
+        /// While a mode runs, play the remote machine's sound here, mixed with home sound, and
+        /// send it the home mic.
         #[arg(long)]
         audio: bool,
     },
@@ -210,6 +210,9 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let mic = graph
                 .clone()
                 .map(|graph| Arc::new(Mic::new(graph, saved, toggle)));
+            let sound = graph
+                .is_some()
+                .then(|| Arc::new(audio::HomeSound::default()));
             let routing: Arc<dyn Routing> = match &mic {
                 Some(mic) => mic.clone(),
                 None => Arc::new(NoSound::default()),
@@ -222,6 +225,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 gpu,
                 desk_record: Desk::<Eval>::default_record()?,
                 mic: mic.clone().map(|mic| mic as Arc<dyn mode::Mic>),
+                sound: sound.clone().map(|sound| sound as Arc<dyn mode::Sound>),
             };
             let (peers, peers_rx) = mpsc::unbounded_channel();
             let (orders, orders_rx) = mpsc::unbounded_channel();
@@ -236,12 +240,13 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                     let _ = peers.send(display);
                 }
                 if let Some(graph) = &graph
+                    && let Some(played) = &sound
                     && let Some(sound) = wire.audio.take()
                 {
                     if let Some(mic) = &mic {
                         mic.attach(sound.to_peer.clone());
                     }
-                    if let Err(e) = audio::home(graph.clone(), sound) {
+                    if let Err(e) = audio::home(graph.clone(), sound, played) {
                         eprintln!("navette: audio: {e}");
                     }
                 }
