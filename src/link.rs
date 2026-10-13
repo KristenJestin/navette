@@ -623,6 +623,32 @@ pub(crate) mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn a_malformed_message_ends_the_link() {
+        // A message this build knows, with a field of the wrong type: not a newer peer's.
+        #[derive(minicbor::Encode)]
+        enum Malformed {
+            #[n(4)]
+            ClipboardAck {
+                #[n(0)]
+                id: String,
+                #[n(1)]
+                received: u64,
+            },
+        }
+        let (a, b) = tokio::io::duplex(1024);
+        let mut peer = Framed::new(b);
+        let ack = Malformed::ClipboardAck {
+            id: "one".into(),
+            received: 0,
+        };
+        peer.write_msg(&ack).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), nothing))
+            .await
+            .expect("the link must give up on a malformed message");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn the_backoff_doubles_up_to_its_cap_and_resets() {
         let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(5));
