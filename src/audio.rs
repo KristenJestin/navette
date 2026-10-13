@@ -9,9 +9,11 @@
 //! PipeWire is reached through [`Graph`]; tests drive a fake one.
 //!
 //! The audio messages, one block of the link's message types:
-//! - `START` (home → remote): make the sink the default output and send its sound.
+//! - `START` (home → remote): a big-endian `u32` session number; make the sink the default
+//!   output and send its sound under that number.
 //! - `STOP` (home → remote): put the previous default back and stop sending.
-//! - `FRAME` (remote → home): a big-endian `u32` sequence number, then one Opus packet.
+//! - `FRAME` (remote → home): the session number and a sequence number (big-endian `u32`s),
+//!   then one Opus packet.
 
 pub mod codec;
 #[cfg(test)]
@@ -47,19 +49,36 @@ const JITTER_MAX: usize = 12 * FRAME_SAMPLES;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Message {
-    Start,
+    /// Home numbers each time it asks, so that frames still on the way from the time before
+    /// are told apart.
+    Start {
+        session: u32,
+    },
     Stop,
-    Frame { seq: u32, packet: Vec<u8> },
+    Frame {
+        session: u32,
+        seq: u32,
+        packet: Vec<u8>,
+    },
 }
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Message::Start => vec![START],
+            Message::Start { session } => {
+                let mut frame = vec![START];
+                frame.extend_from_slice(&session.to_be_bytes());
+                frame
+            }
             Message::Stop => vec![STOP],
-            Message::Frame { seq, packet } => {
-                let mut frame = Vec::with_capacity(5 + packet.len());
+            Message::Frame {
+                session,
+                seq,
+                packet,
+            } => {
+                let mut frame = Vec::with_capacity(9 + packet.len());
                 frame.push(FRAME);
+                frame.extend_from_slice(&session.to_be_bytes());
                 frame.extend_from_slice(&seq.to_be_bytes());
                 frame.extend_from_slice(packet);
                 frame
@@ -69,12 +88,19 @@ impl Message {
 
     pub fn decode(frame: &[u8]) -> io::Result<Self> {
         match frame {
-            [START] => Ok(Message::Start),
-            [STOP] => Ok(Message::Stop),
-            [FRAME, a, b, c, d, packet @ ..] => Ok(Message::Frame {
-                seq: u32::from_be_bytes([*a, *b, *c, *d]),
-                packet: packet.to_vec(),
+            [START, session @ ..] if session.len() == 4 => Ok(Message::Start {
+                session: u32::from_be_bytes(session.try_into().unwrap_or_default()),
             }),
+            [STOP] => Ok(Message::Stop),
+            [FRAME, header @ ..] if header.len() >= 8 => {
+                let (session, rest) = header.split_at(4);
+                let (seq, packet) = rest.split_at(4);
+                Ok(Message::Frame {
+                    session: u32::from_be_bytes(session.try_into().unwrap_or_default()),
+                    seq: u32::from_be_bytes(seq.try_into().unwrap_or_default()),
+                    packet: packet.to_vec(),
+                })
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "not an audio message",
@@ -238,13 +264,17 @@ impl<G: Graph> Drop for RemoteSink<G> {
 }
 
 /// Encodes the sink's sound and sends it home, on PipeWire's thread.
-fn sender(home: mpsc::Sender<Vec<u8>>) -> io::Result<OnSound> {
+fn sender(home: mpsc::Sender<Vec<u8>>, session: u32) -> io::Result<OnSound> {
     let mut encoder = Encoder::new()?;
     let mut seq = 0u32;
     Ok(Box::new(move |pcm| match encoder.push(pcm) {
         Ok(packets) => {
             for packet in packets {
-                let frame = Message::Frame { seq, packet };
+                let frame = Message::Frame {
+                    session,
+                    seq,
+                    packet,
+                };
                 seq = seq.wrapping_add(1);
                 // Late sound is worse than lost sound: a full link drops the frame, and home
                 // fills the gap.
@@ -274,15 +304,17 @@ pub fn remote<G: Graph>(
             let mut sink = None;
             while let Some(frame) = peer.received.blocking_recv() {
                 match Message::decode(&frame) {
-                    Ok(Message::Start) if sink.is_none() => {
-                        match sender(peer.send.clone()).and_then(|on_sound| {
+                    Ok(Message::Start { session }) => {
+                        // A new session replaces the one running, if any.
+                        drop(sink.take());
+                        match sender(peer.send.clone(), session).and_then(|on_sound| {
                             RemoteSink::start(graph.clone(), saved.clone(), on_sound)
                         }) {
-                            Ok(started) => sink = Some(started),
+                            Ok(started) => drop(sink.replace(started)),
                             Err(e) => eprintln!("navette: audio: could not start the sink: {e}"),
                         }
                     }
-                    Ok(Message::Stop) => sink = None,
+                    Ok(Message::Stop) => drop(sink.take()),
                     Ok(_) => {}
                     Err(e) => eprintln!("navette: audio: {e}"),
                 }
@@ -292,6 +324,7 @@ pub fn remote<G: Graph>(
 
 struct Playback<G: Graph> {
     _node: G::Node,
+    session: u32,
     jitter: Arc<Mutex<Jitter>>,
     decoder: Decoder,
 }
@@ -302,6 +335,7 @@ pub struct Home<G: Graph> {
     graph: G,
     remote: mpsc::Sender<Vec<u8>>,
     playback: Option<Playback<G>>,
+    sessions: u32,
 }
 
 impl<G: Graph> Home<G> {
@@ -310,6 +344,7 @@ impl<G: Graph> Home<G> {
             graph,
             remote,
             playback: None,
+            sessions: 0,
         }
     }
 
@@ -321,12 +356,15 @@ impl<G: Graph> Home<G> {
         let node = self
             .graph
             .open_playback(PLAYBACK, PLAYBACK_DESCRIPTION, jitter.clone())?;
+        self.sessions = self.sessions.wrapping_add(1);
+        let session = self.sessions;
         self.playback = Some(Playback {
             _node: node,
+            session,
             jitter,
             decoder: Decoder::new()?,
         });
-        self.order(Message::Start)
+        self.order(Message::Start { session })
     }
 
     pub fn stop(&mut self) -> io::Result<()> {
@@ -340,10 +378,17 @@ impl<G: Graph> Home<G> {
             .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "the link is down"))
     }
 
-    /// A message from the remote; its sound is ignored unless home is playing.
+    /// A message from the remote; its sound is ignored unless home is playing, and plays only
+    /// when it belongs to the session home asked for last.
     pub fn received(&mut self, frame: &[u8]) -> io::Result<()> {
-        if let Message::Frame { seq, packet } = Message::decode(frame)?
+        if let Message::Frame {
+            session,
+            seq,
+            packet,
+        } = Message::decode(frame)?
             && let Some(playback) = &mut self.playback
+            // Sent before home stopped: its numbering is not the new session's.
+            && session == playback.session
         {
             let pcm = playback.decoder.decode(seq, &packet)?;
             playback.jitter.lock().unwrap().push(&pcm);
@@ -421,16 +466,18 @@ mod tests {
     #[test]
     fn the_audio_messages_round_trip() {
         for message in [
-            Message::Start,
+            Message::Start { session: 7 },
             Message::Stop,
             Message::Frame {
+                session: 7,
                 seq: 0x0102_0304,
                 packet: vec![9, 8, 7],
             },
         ] {
             assert_eq!(Message::decode(&message.encode()).unwrap(), message);
         }
-        assert!(Message::decode(&[FRAME, 0, 0]).is_err());
+        assert!(Message::decode(&[FRAME, 0, 0, 0, 0, 0, 0]).is_err());
+        assert!(Message::decode(&[START]).is_err());
         assert!(Message::decode(&[0x02]).is_err());
     }
 
@@ -622,7 +669,11 @@ mod tests {
         let (_tmp, saved) = saved();
         let (home_peer, remote_peer, link) = linked();
         let audio = remote(remote_graph.clone(), saved.clone(), remote_peer, None).unwrap();
-        home_peer.send.send(Message::Start.encode()).await.unwrap();
+        home_peer
+            .send
+            .send(Message::Start { session: 1 }.encode())
+            .await
+            .unwrap();
         until(&remote_graph, |s| !s.sinks.is_empty()).await;
 
         link.abort();
@@ -635,13 +686,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn late_frames_of_a_stopped_session_do_not_hold_up_the_next_one() {
+        let graph = FakeGraph::default();
+        let (to_remote, mut orders) = mpsc::channel(8);
+        let mut home = Home::new(graph.clone(), to_remote);
+        let packets = Encoder::new().unwrap().push(&tone(20)).unwrap();
+        let session = |orders: &mut mpsc::Receiver<Vec<u8>>| match Message::decode(
+            &orders.try_recv().unwrap(),
+        )
+        .unwrap()
+        {
+            Message::Start { session } => session,
+            other => panic!("{other:?}"),
+        };
+        let frame = |session, seq: u32| {
+            Message::Frame {
+                session,
+                seq,
+                packet: packets[seq as usize % packets.len()].clone(),
+            }
+            .encode()
+        };
+
+        home.start().unwrap();
+        let first = session(&mut orders);
+        for seq in 100..105 {
+            home.received(&frame(first, seq)).unwrap();
+        }
+        home.stop().unwrap();
+        orders.try_recv().unwrap();
+        home.start().unwrap();
+        let second = session(&mut orders);
+        assert_ne!(first, second);
+        // Still on its way when home stopped.
+        home.received(&frame(first, 105)).unwrap();
+        for seq in 0..10 {
+            home.received(&frame(second, seq)).unwrap();
+        }
+        let jitter = graph.state().playbacks[0].1.clone();
+        let mut out = vec![0.0; 10 * FRAME_SAMPLES];
+        jitter.lock().unwrap().pull(&mut out);
+        assert!(
+            out.iter().any(|s| s.abs() > 0.1),
+            "the new session was not played"
+        );
+    }
+
     #[tokio::test]
     async fn a_new_link_waits_for_the_previous_one_to_put_the_default_back() {
         let remote_graph = FakeGraph::with_default("laptop-speakers");
         let (_tmp, saved) = saved();
         let (home_peer, remote_peer, link) = linked();
         let first = remote(remote_graph.clone(), saved.clone(), remote_peer, None).unwrap();
-        home_peer.send.send(Message::Start.encode()).await.unwrap();
+        home_peer
+            .send
+            .send(Message::Start { session: 1 }.encode())
+            .await
+            .unwrap();
         until(&remote_graph, |s| !s.sinks.is_empty()).await;
 
         // The link drops and comes back at once, while the first thread is still putting the
@@ -656,7 +758,11 @@ mod tests {
             Some(first),
         )
         .unwrap();
-        home_peer.send.send(Message::Start.encode()).await.unwrap();
+        home_peer
+            .send
+            .send(Message::Start { session: 1 }.encode())
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         until(&remote_graph, |s| {
             s.default == Some(DefaultSink::named(SINK))

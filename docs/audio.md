@@ -38,9 +38,12 @@ One block of the link's message types, the first byte of each frame:
 
 | Type | Direction | Body |
 |---|---|---|
-| `0x30` start | home → remote | none |
+| `0x30` start | home → remote | a big-endian `u32` session number |
 | `0x31` stop | home → remote | none |
-| `0x32` frame | remote → home | a big-endian `u32` sequence number, then one Opus packet |
+| `0x32` frame | remote → home | the session number and a sequence number (big-endian `u32`s), then one Opus packet |
+
+Home numbers each start: a frame of an earlier session, still on its way when home stopped,
+is dropped rather than taken for a late frame of the new one.
 
 A full link drops a frame rather than delay the ones after it; home fills a missing frame from
 the next packet's FEC, or by concealment.
