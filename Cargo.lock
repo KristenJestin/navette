@@ -819,7 +819,6 @@ name = "navette"
 version = "0.0.0"
 dependencies = [
  "bytes",
- "calloop",
  "clap",
  "drm-fourcc",
  "gliff-proto",

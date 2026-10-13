@@ -8,4 +8,5 @@ pub mod output;
 pub mod rate;
 pub mod remote;
 pub mod stream;
+pub mod surface;
 pub mod wire;
