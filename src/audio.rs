@@ -50,9 +50,10 @@ const SINK_DESCRIPTION: &str = "Home speakers (Navette)";
 pub const PLAYBACK: &str = "navette-remote-sound";
 const PLAYBACK_DESCRIPTION: &str = "Remote machine (Navette)";
 
-/// Home starts playing once 30 ms are buffered, and keeps at most 120 ms.
-const JITTER_TARGET: usize = 3 * FRAME_SAMPLES;
-const JITTER_MAX: usize = 12 * FRAME_SAMPLES;
+/// The jitter buffers keep 10 ms beyond what the playback takes in a cycle, more when the
+/// link falls behind, up to 100 ms.
+const JITTER_FLOOR: usize = FRAME_SAMPLES;
+const JITTER_CEILING: usize = 10 * FRAME_SAMPLES;
 
 /// How often the remote checks that its sink is still there: PipeWire may restart under it.
 const CHECK: Duration = Duration::from_millis(250);
@@ -752,7 +753,7 @@ impl<G: Graph> Home<G> {
         if self.playback.is_some() {
             return Ok(());
         }
-        let jitter = Arc::new(Mutex::new(Jitter::new(JITTER_TARGET, JITTER_MAX)));
+        let jitter = Arc::new(Mutex::new(Jitter::new(JITTER_FLOOR, JITTER_CEILING)));
         let node = self
             .graph
             .open_playback(PLAYBACK, PLAYBACK_DESCRIPTION, jitter.clone())?;
@@ -787,8 +788,11 @@ impl<G: Graph> Home<G> {
         let counts = jitter.counts();
         let gaps = playback.decoder.gaps();
         Some(format!(
-            "buffer {} ms; underruns {}, trims {}, concealed {}, lost {}, late {}, dropped {dropped}",
+            "buffer {} ms, target {} ms, rate {:+.3} %; underruns {}, trims {}, concealed {}, \
+             lost {}, late {}, dropped {dropped}",
             jitter.buffered() / MS,
+            jitter.target() / MS,
+            (jitter.rate() - 1.0) * 100.0,
             counts.underruns,
             counts.trims,
             gaps.concealed,
@@ -1257,8 +1261,38 @@ mod tests {
         }
         assert_eq!(
             home.stats(2).as_deref(),
-            Some("buffer 50 ms; underruns 0, trims 0, concealed 1, lost 0, late 0, dropped 2")
+            Some(
+                "buffer 50 ms, target 10 ms, rate +0.000 %; underruns 0, trims 0, concealed 1, \
+                 lost 0, late 0, dropped 2"
+            )
         );
+    }
+
+    #[test]
+    fn home_asks_the_playback_to_catch_up_when_the_remote_runs_ahead() {
+        let graph = FakeGraph::default();
+        let (to_remote, _orders) = mpsc::channel(8);
+        let mut home = Home::new(graph.clone(), to_remote);
+        home.start().unwrap();
+        let jitter = graph.state().playbacks[0].1.clone();
+        let packets = codec::tests::packets(&mut Encoder::new().unwrap(), &tone(10));
+        let mut seq = 0u32;
+        let mut out = vec![0.0; 2048];
+        // The remote's clock runs fast: a frame more than home plays every few cycles.
+        for cycle in 0..2000 {
+            let frames = if cycle % 4 == 0 { 3 } else { 2 };
+            for _ in 0..frames {
+                home.received(Message::Frame {
+                    session: 1,
+                    seq,
+                    packet: Bytes::from(packets[seq as usize % packets.len()].clone()),
+                })
+                .unwrap();
+                seq += 1;
+            }
+            jitter.lock().unwrap().pull(&mut out);
+        }
+        assert!(jitter.lock().unwrap().rate() > 1.0);
     }
 
     #[tokio::test]

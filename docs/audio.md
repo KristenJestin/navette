@@ -11,9 +11,28 @@ mixed with home sound. There is no output toggle: both machines are heard at onc
   meanwhile, the agent sees its sink gone within a quarter of a second, opens it again and
   makes it the default again; what it puts back at the end is still the default from before.
 - **At home**, a playback stream, *Remote machine (Navette)* (`navette-remote-sound`), plays it
-  through a small jitter buffer (30 ms before playing, 120 ms at most). PipeWire mixes it like
-  any application, so it has its own volume in the mixer. Home's own default output is never
-  changed.
+  through a small jitter buffer. PipeWire mixes it like any application, so it has its own
+  volume in the mixer. Home's own default output is never changed.
+
+## The jitter buffer
+
+What the buffer keeps after each cycle of the playback (its *target*) starts at a cycle's worth
+plus 10 ms: with PipeWire's default quantum (1024 samples, 21 ms), about 31 ms are left after
+each cycle, 52 ms on average before it. The extra cycle is there because the laptop sends a
+cycle of its own at a time: as the two clocks drift, one of them now and then reaches home just
+after the cycle it used to be in time for, and that cycle finds 21 ms less. Without it, the
+buffer ran dry every few minutes even on a cable (about every 7 minutes at 50 ppm of drift).
+
+- **The link falls behind** (Wi-Fi): each time the buffer runs dry (an *underrun*, a gap of
+  silence), the target grows by 10 ms, up to 100 ms. Two minutes in which the buffer always
+  had 30 ms to spare lower it by 10 ms, down to the start.
+- **The clocks drift**: the two sound cards never run at quite the same rate. Rather than drop
+  sound once the buffer is too full, or run dry once it is empty, home asks the playback to take
+  the sound up to 0.5 % faster or slower (0.1 % for each 10 ms off the target), which
+  PipeWire's own resampler does on the stream (`SPA_PROP_rate`). A drift of 200 ppm costs
+  0.02 %, which nobody hears.
+- **A burst** after a long stall, more than 100 ms beyond the start, is dropped (a *trim*): the
+  sound would otherwise lag that much behind until the rate caught up.
 
 ## Trying it
 
@@ -63,10 +82,12 @@ remote's sound fares; each kind of event is heard as a crackle, and is counted s
 started:
 
 ```
-navette: audio: buffer 31 ms; underruns 0, trims 0, concealed 0, lost 0, late 0, dropped 0
+navette: audio: buffer 52 ms, target 31 ms, rate +0.004 %; underruns 0, trims 0, concealed 0, lost 0, late 0, dropped 0
 ```
 
-- *buffer*: what the jitter buffer holds now.
+- *buffer*: what the jitter buffer holds now; *target*, what it aims to keep after each
+  cycle of the playback; *rate*, how much faster (or slower) than the graph the playback takes
+  the sound, to stay on that target while the two clocks drift.
 - *underruns*: the playback found the buffer empty: a gap of silence, then a wait for the
   buffer to fill again.
 - *trims*: the buffer was past its maximum and its oldest sound was dropped: a jump.

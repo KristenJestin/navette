@@ -586,10 +586,13 @@ fn read_samples(bytes: &[u8], samples: &mut Vec<f32>) {
     );
 }
 
-/// What the playback plays next. A panic on the other side of the lock leaves the buffer
-/// usable, and a panic here would cross PipeWire's C code.
-fn fill(jitter: &Mutex<Jitter>, out: &mut [f32]) {
-    lock(jitter).pull(out);
+/// What the playback plays next, and how fast it should take the sound from now on. A panic
+/// on the other side of the lock leaves the buffer usable, and a panic here would cross
+/// PipeWire's C code.
+fn fill(jitter: &Mutex<Jitter>, out: &mut [f32]) -> f64 {
+    let mut jitter = lock(jitter);
+    jitter.pull(out);
+    jitter.rate()
 }
 
 fn open_sink(
@@ -746,8 +749,8 @@ fn playing(
     let stream = pw::stream::StreamRc::new(core.clone(), name, props).map_err(pw_error)?;
     let samples = vec![0.0f32; SAMPLES_PER_CYCLE];
     let listener = stream
-        .add_local_listener_with_user_data((jitter, samples))
-        .process(|stream, (jitter, samples)| {
+        .add_local_listener_with_user_data((jitter, samples, 1.0f32))
+        .process(|stream, (jitter, samples, applied)| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -764,7 +767,15 @@ fn playing(
                         frames = frames.min(requested);
                     }
                     let samples = &mut samples[..frames * CHANNELS];
-                    fill(jitter, samples);
+                    let rate = fill(jitter, samples) as f32;
+                    // The stream's resampler takes the sound at this rate, which keeps the
+                    // buffer on its target while the two machines' clocks drift.
+                    // Within 10 ppm, nothing is told: a fraction of a ms over a minute.
+                    if (rate - *applied).abs() >= 1e-5
+                        && stream.set_control(spa::sys::SPA_PROP_rate, &[rate]).is_ok()
+                    {
+                        *applied = rate;
+                    }
                     for (out, sample) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(samples.iter())
                     {
                         out.copy_from_slice(&sample.to_le_bytes());
@@ -884,7 +895,12 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(during(|| read_samples(&bytes, &mut samples)), 0);
             assert_eq!(samples.len(), 2048);
-            assert_eq!(during(|| fill(&jitter, &mut out[..2048])), 0);
+            assert_eq!(
+                during(|| {
+                    fill(&jitter, &mut out[..2048]);
+                }),
+                0
+            );
         }
     }
 
