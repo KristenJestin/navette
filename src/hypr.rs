@@ -217,10 +217,10 @@ pub fn dispatch(hypr: &dyn Hypr, command: &str) -> io::Result<()> {
     }
 }
 
-/// Gives the keyboard to the home window that had it last, among those shown on a monitor other
-/// than `covered` (Hyprland's focus history), without moving the pointer: its address, or
+/// Gives the keyboard to the home window that had it last, among those shown on a monitor not
+/// `covered` (Hyprland's focus history), without moving the pointer: its address, or
 /// `None` when there is no such window.
-pub fn focus_last_window(hypr: &dyn Hypr, covered: &str) -> io::Result<Option<String>> {
+pub fn focus_last_window(hypr: &dyn Hypr, covered: &[String]) -> io::Result<Option<String>> {
     let json = |request: &str| -> io::Result<serde_json::Value> {
         serde_json::from_str(&hypr.request(request)?).map_err(|e| {
             io::Error::new(
@@ -236,7 +236,7 @@ pub fn focus_last_window(hypr: &dyn Hypr, covered: &str) -> io::Result<Option<St
     let shown_at_home = |window: &serde_json::Value| {
         monitors.as_array().into_iter().flatten().any(|m| {
             m["id"] == window["monitor"]
-                && m["name"] != covered
+                && !covered.iter().any(|c| m["name"] == c.as_str())
                 && m["activeWorkspace"]["id"] == window["workspace"]["id"]
         })
     };
@@ -847,7 +847,7 @@ mod port_tests {
             FakeWindow::new("0xb2", "DP-3", 0),
             FakeWindow::new("0xc3", "DP-1", 2),
         ]);
-        let focused = focus_last_window(&hypr, "DP-2").unwrap();
+        let focused = focus_last_window(&hypr, &["DP-2".to_string()]).unwrap();
         assert_eq!(focused.as_deref(), Some("0xb2"));
         assert_eq!(hypr.focused(), [("0xb2".to_string(), false)]);
         // Put back as it was.
@@ -866,15 +866,34 @@ mod port_tests {
             FakeWindow::new("0xf6", "DP-3", 2),
         ]);
         assert_eq!(
-            focus_last_window(&hypr, "DP-2").unwrap().as_deref(),
+            focus_last_window(&hypr, &["DP-2".to_string()])
+                .unwrap()
+                .as_deref(),
             Some("0xf6")
+        );
+    }
+
+    #[test]
+    fn a_window_under_any_of_the_covered_monitors_is_passed_over() {
+        let hypr = home_with_windows(&[
+            FakeWindow::new("0xa1", "DP-1", 2),
+            FakeWindow::new("0xe5", "DP-2", 0),
+            FakeWindow::new("0xf6", "DP-3", 1),
+        ]);
+        let covered = ["DP-2".to_string(), "DP-3".to_string()];
+        assert_eq!(
+            focus_last_window(&hypr, &covered).unwrap().as_deref(),
+            Some("0xa1")
         );
     }
 
     #[test]
     fn with_no_home_window_shown_the_keyboard_is_left_as_it_is() {
         let hypr = home_with_windows(&[FakeWindow::new("0xe5", "DP-2", 0)]);
-        assert_eq!(focus_last_window(&hypr, "DP-2").unwrap(), None);
+        assert_eq!(
+            focus_last_window(&hypr, &["DP-2".to_string()]).unwrap(),
+            None
+        );
         assert_eq!(hypr.changes(), [] as [&str; 0]);
     }
 
@@ -882,7 +901,7 @@ mod port_tests {
     fn no_warps_set_by_the_user_stays_set() {
         let hypr = home_with_windows(&[FakeWindow::new("0xa1", "DP-1", 0)]);
         hypr.set_no_warps(true);
-        focus_last_window(&hypr, "DP-2").unwrap();
+        focus_last_window(&hypr, &["DP-2".to_string()]).unwrap();
         assert_eq!(hypr.focused(), [("0xa1".to_string(), false)]);
         assert!(hypr.no_warps());
     }

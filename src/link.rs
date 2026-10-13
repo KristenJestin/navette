@@ -26,12 +26,12 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::audio::{self, codec::MAX_PACKET};
-use crate::display::wire::{Cursor, Incoming, MAX_CURSOR, Outbox, Peer, Pointer};
+use crate::display::wire::{Cursor, Incoming, MAX_CURSOR, MAX_OUTPUTS, Outbox, Peer, Pointer};
 use crate::frame::{read_frame, write_frame};
 use crate::input;
 use crate::store::{Role, Store};
 use crate::transport::{Accept, Dial, TlsAcceptor, TlsDialer};
-use crate::wire::{Clip, LinkMsg, checked};
+use crate::wire::{Clip, LinkMsg, checked, output_id};
 
 /// The version of the link's messages; peers of another version refuse each other.
 pub const VERSION: u8 = 2;
@@ -161,7 +161,7 @@ where
     let (to_peer, outbound_rx) = outbound_channel();
     let outbox = Outbox::default();
     let (display_tx, display_rx) = mpsc::channel(DISPLAY_INBOUND);
-    let (pointer_tx, pointer) = watch::channel(Pointer::default());
+    let (pointer_tx, pointer) = watch::channel(Vec::new());
     let input = input::Wire::default();
     let display = Peer {
         outbox: outbox.clone(),
@@ -233,8 +233,11 @@ async fn send<W: AsyncWrite + Unpin>(
         tokio::select! {
             // Input first: a key must not wait behind a video frame already queued.
             biased;
-            Some(event) = input.next() => {
-                writer.write_msg(&LinkMsg::Input(event)).await.map_err(io_error)?
+            Some((output, event)) = input.next() => {
+                writer
+                    .write_msg(&LinkMsg::Input(event, output_id(output)))
+                    .await
+                    .map_err(io_error)?
             }
             msg = sound.recv(), if sound_open => match msg {
                 Some(msg) => {
@@ -258,17 +261,37 @@ async fn send<W: AsyncWrite + Unpin>(
                     .map_err(io_error)?,
                 None => open = false,
             },
-            (msg, payloads) = display.next() => {
+            (output, msg, payloads) = display.next() => {
                 let parts: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
                 let begin = Instant::now();
                 writer
-                    .write_msg_with_payloads(&LinkMsg::from(msg), &parts)
+                    .write_msg_with_payloads(&LinkMsg::from((output, msg)), &parts)
                     .await
                     .map_err(io_error)?;
-                display.report_write(begin.elapsed());
+                display.report_write(output, begin.elapsed());
             }
         }
     }
+}
+
+/// The output a message names; one past the most a mode streams ends the link.
+fn output_of(id: Option<u8>) -> io::Result<u8> {
+    match id.unwrap_or(0) {
+        output if output < MAX_OUTPUTS => Ok(output),
+        output => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("a message for output {output}, past the {MAX_OUTPUTS} a mode streams"),
+        )),
+    }
+}
+
+/// An output's pointer, the ones before it made if none came yet.
+fn pointer_of(pointers: &mut Vec<Pointer>, output: u8) -> &mut Pointer {
+    let index = usize::from(output);
+    if pointers.len() <= index {
+        pointers.resize(index + 1, Pointer::default());
+    }
+    &mut pointers[index]
 }
 
 async fn receive<R: AsyncRead + Unpin>(
@@ -276,7 +299,7 @@ async fn receive<R: AsyncRead + Unpin>(
     timeout: Duration,
     inbound: mpsc::Sender<Clip>,
     sound: audio::ToAudio,
-    (display, pointer): (mpsc::Sender<Incoming>, watch::Sender<Pointer>),
+    (display, pointer): (mpsc::Sender<Incoming>, watch::Sender<Vec<Pointer>>),
     outbox: &Outbox,
     input: &input::Queue,
 ) -> io::Result<Infallible> {
@@ -310,7 +333,8 @@ async fn receive<R: AsyncRead + Unpin>(
                 }
                 continue;
             }
-            LinkMsg::Video(msg) => {
+            LinkMsg::Video(msg, output) => {
+                let output = output_of(output)?;
                 let (main, aux) = match &msg {
                     ServerMsg::VideoFrame {
                         data_len, aux_len, ..
@@ -338,7 +362,8 @@ async fn receive<R: AsyncRead + Unpin>(
                 .map_err(|_| silent())?
                 .map_err(io_error)?;
                 if let ServerMsg::CursorPos { visible, .. } = msg {
-                    pointer.send_if_modified(|pointer| {
+                    pointer.send_if_modified(|pointers| {
+                        let pointer = pointer_of(pointers, output);
                         std::mem::replace(&mut pointer.visible, visible) != visible
                     });
                     continue;
@@ -358,30 +383,37 @@ async fn receive<R: AsyncRead + Unpin>(
                         hot_y,
                         argb: main,
                     };
-                    pointer.send_modify(|pointer| pointer.shape = Some(shape));
+                    pointer
+                        .send_modify(|pointers| pointer_of(pointers, output).shape = Some(shape));
                     continue;
                 }
-                let video = Incoming::Video { msg, main, aux };
+                let video = Incoming::Video {
+                    output,
+                    msg,
+                    main,
+                    aux,
+                };
                 if let Err(mpsc::error::TrySendError::Full(Incoming::Video { msg, .. })) =
                     display.try_send(video)
                 {
-                    outbox.refuse_frame(&msg);
+                    outbox.on(output).refuse_frame(&msg);
                 }
                 continue;
             }
-            LinkMsg::Input(input::Event::Keymap(text)) if text.len() > input::MAX_KEYMAP => {
+            LinkMsg::Input(input::Event::Keymap(text), _) if text.len() > input::MAX_KEYMAP => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "a keymap larger than any keyboard's",
                 ));
             }
             // Never waits: the queue's own policy keeps it bounded and no key held.
-            LinkMsg::Input(event) => {
-                input.push(event);
+            LinkMsg::Input(event, output) => {
+                input.on(output_of(output)?).push(event);
                 continue;
             }
-            LinkMsg::Feedback(msg) => {
-                let _ = display.try_send(Incoming::Feedback(msg));
+            LinkMsg::Feedback(msg, output) => {
+                let output = output_of(output)?;
+                let _ = display.try_send(Incoming::Feedback { output, msg });
                 continue;
             }
             LinkMsg::NoInput { reason } => {
@@ -1237,14 +1269,15 @@ pub(crate) mod tests {
     async fn newest_cursor(peer: &mut Peer) -> Cursor {
         tokio::time::timeout(
             Duration::from_secs(5),
-            peer.pointer.wait_for(|pointer| pointer.shape.is_some()),
+            peer.pointer
+                .wait_for(|pointers| pointers.first().is_some_and(|p| p.shape.is_some())),
         )
         .await
         .expect("a cursor in time")
-        .expect("the link is up")
-        .shape
-        .clone()
-        .unwrap()
+        .expect("the link is up")[0]
+            .shape
+            .clone()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1262,14 +1295,74 @@ pub(crate) mod tests {
             ends.remote.outbox.send(seen(visible), Vec::new());
             tokio::time::timeout(
                 Duration::from_secs(5),
-                ends.home
-                    .pointer
-                    .wait_for(|pointer| pointer.visible == visible),
+                ends.home.pointer.wait_for(|pointers| {
+                    pointers.first().cloned().unwrap_or_default().visible == visible
+                }),
             )
             .await
             .expect("the cursor's visibility in time")
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn each_output_s_frames_and_cursor_reach_home_apart() {
+        let mut ends = display_link(64 * 1024).await;
+        let second = ends.remote.outbox.on(1);
+        let (msg, payloads) = video_frame(4, 16);
+        second.send(msg, payloads);
+        let shape = ServerMsg::CursorShape {
+            id: 1,
+            width: 1,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            argb_len: 4,
+        };
+        second.send(DisplayMsg::Video(shape), vec![vec![3; 4]]);
+        match incoming(&mut ends.home).await {
+            Incoming::Video { output, .. } => assert_eq!(output, 1),
+            other => panic!("expected a video frame, got {other:?}"),
+        }
+        let pointers = tokio::time::timeout(
+            Duration::from_secs(5),
+            ends.home.pointer.wait_for(|pointers| pointers.len() == 2),
+        )
+        .await
+        .expect("output 1's cursor in time")
+        .unwrap()
+        .clone();
+        assert_eq!(pointers[0], Pointer::default());
+        assert_eq!(&pointers[1].shape.as_ref().unwrap().argb[..], &[3; 4]);
+        // Home's acks, and home's input, go back to output 1.
+        ends.home
+            .outbox
+            .on(1)
+            .send(DisplayMsg::Feedback(ClientMsg::RequestKeyframe), Vec::new());
+        match incoming(&mut ends.remote).await {
+            Incoming::Feedback { output, msg } => {
+                assert_eq!((output, msg), (1, ClientMsg::RequestKeyframe))
+            }
+            other => panic!("expected feedback, got {other:?}"),
+        }
+        ends.home.input.to_peer.on(1).push(input::Event::ReleaseAll);
+        let got = tokio::time::timeout(Duration::from_secs(5), ends.remote.input.from_peer.next())
+            .await
+            .expect("the event in time");
+        assert_eq!(got, Some((1, input::Event::ReleaseAll)));
+    }
+
+    #[tokio::test]
+    async fn a_message_for_an_output_past_the_most_a_mode_streams_ends_the_link() {
+        let (a, b) = tokio::io::duplex(4096);
+        let mut peer = Framed::new(b);
+        let event = LinkMsg::Input(input::Event::ReleaseAll, Some(MAX_OUTPUTS));
+        peer.write_msg(&event).await.unwrap();
+        let nothing = |_: Wire| std::future::ready(());
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), nothing))
+            .await
+            .expect("the link must give up");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
@@ -1297,9 +1390,12 @@ pub(crate) mod tests {
             .send(DisplayMsg::Video(shape(2)), vec![vec![2; 4]]);
         tokio::time::timeout(
             Duration::from_secs(5),
-            ends.home
-                .pointer
-                .wait_for(|pointer| pointer.shape.as_ref().is_some_and(|c| c.argb[..] == [2; 4])),
+            ends.home.pointer.wait_for(|pointers| {
+                pointers
+                    .first()
+                    .and_then(|p| p.shape.as_ref())
+                    .is_some_and(|c| c.argb[..] == [2; 4])
+            }),
         )
         .await
         .expect("the newer cursor in time")
@@ -1324,7 +1420,7 @@ pub(crate) mod tests {
         let (a, mut b) = tokio::io::duplex(64 * 1024);
         // The frame's header says 100 kB follow; the peer sends 10 and is heard no more.
         let (msg, _) = video_frame(0, 100_000);
-        let body = minicbor::to_vec(LinkMsg::from(msg)).unwrap();
+        let body = minicbor::to_vec(LinkMsg::from((0, msg))).unwrap();
         let mut bytes = (body.len() as u32).to_le_bytes().to_vec();
         bytes.extend_from_slice(&100_003u32.to_le_bytes());
         bytes.extend_from_slice(&body);
@@ -1357,7 +1453,7 @@ pub(crate) mod tests {
                 tokio::time::timeout(Duration::from_secs(5), ends.remote.input.from_peer.next())
                     .await
                     .expect("an event in time");
-            assert_eq!(got, Some(event));
+            assert_eq!(got, Some((0, event)));
         }
     }
 
@@ -1377,10 +1473,13 @@ pub(crate) mod tests {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let mut peer = Framed::new(b);
         for code in 0..(4 * input::QUEUE as u32) {
-            peer.write_msg(&LinkMsg::Input(input::Event::Key {
-                code,
-                pressed: true,
-            }))
+            peer.write_msg(&LinkMsg::Input(
+                input::Event::Key {
+                    code,
+                    pressed: true,
+                },
+                None,
+            ))
             .await
             .unwrap();
         }
@@ -1399,7 +1498,7 @@ pub(crate) mod tests {
         let (a, b) = tokio::io::duplex(2 * input::MAX_KEYMAP);
         let mut peer = Framed::new(b);
         let keymap = input::Event::Keymap("x".repeat(input::MAX_KEYMAP + 1));
-        peer.write_msg(&LinkMsg::Input(keymap)).await.unwrap();
+        peer.write_msg(&LinkMsg::Input(keymap, None)).await.unwrap();
         let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), nothing))
             .await
             .expect("the link must give up on an oversized keymap");
@@ -1420,7 +1519,7 @@ pub(crate) mod tests {
             argb_len,
         };
         // The image comes whole: only its size is wrong.
-        let body = minicbor::to_vec(LinkMsg::Video(shape)).unwrap();
+        let body = minicbor::to_vec(LinkMsg::Video(shape, None)).unwrap();
         let mut bytes = (body.len() as u32).to_le_bytes().to_vec();
         bytes.extend_from_slice(&argb_len.to_le_bytes());
         bytes.extend_from_slice(&body);
@@ -1444,8 +1543,14 @@ pub(crate) mod tests {
         }
         loop {
             match incoming(&mut ends.remote).await {
-                Incoming::Feedback(ClientMsg::RequestKeyframe) => break,
-                Incoming::Feedback(ClientMsg::FrameAck { .. }) => {}
+                Incoming::Feedback {
+                    msg: ClientMsg::RequestKeyframe,
+                    ..
+                } => break,
+                Incoming::Feedback {
+                    msg: ClientMsg::FrameAck { .. },
+                    ..
+                } => {}
                 other => panic!("unexpected {other:?}"),
             }
         }

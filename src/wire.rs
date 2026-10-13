@@ -67,18 +67,20 @@ pub enum LinkMsg {
         #[n(0)]
         id: u32,
     },
-    // The display's (`crate::display`), a block of numbers of its own.
+    // The display's (`crate::display`), a block of numbers of its own. A stream's message
+    // names its output, none for output 0 (so a one-output mode reads as before).
     #[n(20)]
     Display(#[n(0)] Display),
     /// Remote to home; a video frame's two streams (`data_len`, then `aux_len` bytes) follow.
     #[n(21)]
-    Video(#[n(0)] ServerMsg),
+    Video(#[n(0)] ServerMsg, #[n(1)] Option<u8>),
     /// Home to remote.
     #[n(22)]
-    Feedback(#[n(0)] ClientMsg),
-    // Input (`crate::input`), home to remote, a block of numbers of its own.
+    Feedback(#[n(0)] ClientMsg, #[n(1)] Option<u8>),
+    // Input (`crate::input`), home to remote, a block of numbers of its own; an event names
+    // the output it is for as a stream's message does.
     #[n(30)]
-    Input(#[n(0)] input::Event),
+    Input(#[n(0)] input::Event, #[n(1)] Option<u8>),
     /// Remote to home, once a mode: the picture runs without input.
     #[n(31)]
     NoInput {
@@ -136,12 +138,17 @@ pub enum LinkMsg {
     },
 }
 
-impl From<Msg> for LinkMsg {
-    fn from(msg: Msg) -> Self {
+/// An output id as the link writes it: none for output 0.
+pub fn output_id(output: u8) -> Option<u8> {
+    (output != 0).then_some(output)
+}
+
+impl From<(u8, Msg)> for LinkMsg {
+    fn from((output, msg): (u8, Msg)) -> Self {
         match msg {
             Msg::Display(display) => Self::Display(display),
-            Msg::Video(msg) => Self::Video(msg),
-            Msg::Feedback(msg) => Self::Feedback(msg),
+            Msg::Video(msg) => Self::Video(msg, output_id(output)),
+            Msg::Feedback(msg) => Self::Feedback(msg, output_id(output)),
             Msg::NoInput(reason) => Self::NoInput { reason },
         }
     }
@@ -221,9 +228,9 @@ impl LinkMsg {
         Some(match self {
             Self::Heartbeat
             | Self::Display(_)
-            | Self::Video(_)
-            | Self::Feedback(_)
-            | Self::Input(_)
+            | Self::Video(..)
+            | Self::Feedback(..)
+            | Self::Input(..)
             | Self::NoInput { .. }
             | Self::AudioStart { .. }
             | Self::AudioStop
@@ -350,6 +357,32 @@ mod tests {
         assert_eq!(
             read.read_msg::<LinkMsg>().await.unwrap(),
             LinkMsg::Heartbeat
+        );
+    }
+
+    #[test]
+    fn a_stream_message_keeps_its_output_and_output_0_is_written_as_before() {
+        let ping = ServerMsg::Ping { t: 3 };
+        let second = LinkMsg::from((1, Msg::Video(ping.clone())));
+        let bytes = minicbor::to_vec(&second).unwrap();
+        assert_eq!(
+            minicbor::decode::<LinkMsg>(&bytes).unwrap(),
+            LinkMsg::Video(ping.clone(), Some(1))
+        );
+        // What a build of one output wrote, and reads.
+        #[derive(Encode, Decode)]
+        enum Before {
+            #[n(21)]
+            Video(#[n(0)] ServerMsg),
+        }
+        let first = minicbor::to_vec(LinkMsg::from((0, Msg::Video(ping.clone())))).unwrap();
+        assert_eq!(
+            first,
+            minicbor::to_vec(Before::Video(ping.clone())).unwrap()
+        );
+        assert_eq!(
+            minicbor::decode::<LinkMsg>(&first).unwrap(),
+            LinkMsg::Video(ping, None)
         );
     }
 }

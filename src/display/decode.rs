@@ -282,7 +282,7 @@ impl Thread {
         let mut decoder: Option<VideoDecoder> = None;
         let mut config = (0, 0, ChromaMode::Single420);
         let mut gpu_decoded = false;
-        let mut stats = Stats::new();
+        let mut stats = Stats::new(self.outbox.output());
         loop {
             let video = match rx.recv_timeout(IDLE_DRAIN) {
                 Ok(video) => video,
@@ -381,6 +381,8 @@ fn now_us() -> u64 {
 /// Frames decoded, decode time, and the time from the remote's encode start to the decoded
 /// picture (meaningful when both clocks agree: on one machine, or synchronised by NTP).
 struct Stats {
+    /// The remote output whose stream this is, named in the report.
+    output: u8,
     since: Instant,
     total: u64,
     decode_ms: Vec<f32>,
@@ -388,8 +390,9 @@ struct Stats {
 }
 
 impl Stats {
-    fn new() -> Self {
+    fn new(output: u8) -> Self {
         Self {
+            output,
             since: Instant::now(),
             total: 0,
             decode_ms: Vec::new(),
@@ -413,8 +416,9 @@ impl Stats {
         let secs = self.since.elapsed().as_secs_f32();
         if !self.decode_ms.is_empty() {
             eprintln!(
-                "navette: {} frames in {secs:.1} s ({:.1} fps) on the {}, {} total; decode \
+                "navette: {}: {} frames in {secs:.1} s ({:.1} fps) on the {}, {} total; decode \
                  p50 {:.2} ms p95 {:.2} ms; encode-to-decoded p50 {:.1} ms p95 {:.1} ms",
+                super::output::name(usize::from(self.output)),
                 self.decode_ms.len(),
                 self.decode_ms.len() as f32 / secs,
                 tier.unwrap_or("?"),
