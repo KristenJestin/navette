@@ -198,7 +198,17 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             // Without `--audio`, home never reaches PipeWire.
             let graph = audio.then(PipeWire::default);
             let toggle = mic::toggle_command(&std::env::current_exe()?);
-            let mic = graph.clone().map(|graph| Arc::new(Mic::new(graph, toggle)));
+            let saved = audio::Saved::in_dir(audio::Saved::default_dir()?);
+            if let Some(graph) = graph.clone() {
+                // Home's mic back first, if a previous run died with it away.
+                let saved = saved.clone();
+                tokio::task::spawn_blocking(move || audio::mic::repair_home(&graph, &saved))
+                    .await
+                    .map_err(std::io::Error::other)?;
+            }
+            let mic = graph
+                .clone()
+                .map(|graph| Arc::new(Mic::new(graph, saved, toggle)));
             let routing: Arc<dyn Routing> = match &mic {
                 Some(mic) => mic.clone(),
                 None => Arc::new(NoSound::default()),

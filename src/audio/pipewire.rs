@@ -27,6 +27,8 @@ use super::{DefaultNode, Device, Graph, OnSound, lock};
 
 const CONFIGURED_SINK: &str = "default.configured.audio.sink";
 const CONFIGURED_SOURCE: &str = "default.configured.audio.source";
+/// The source the session manager gives the apps: the configured one, or its own pick.
+const SOURCE_IN_USE: &str = "default.audio.source";
 /// Long enough for a busy PipeWire, short enough that a hung one does not hang the link.
 const ANSWER: Duration = Duration::from_secs(5);
 const BYTES_PER_FRAME: usize = CHANNELS * size_of::<f32>();
@@ -38,6 +40,7 @@ type Pending = Rc<RefCell<Vec<(spa::utils::result::AsyncSeq, Reply<()>)>>>;
 enum Command {
     DefaultNode(Device, Reply<Option<DefaultNode>>),
     SetDefaultNode(Device, Option<DefaultNode>, Reply<()>),
+    MicInUse(Reply<Option<String>>),
     Open {
         name: String,
         description: String,
@@ -54,7 +57,7 @@ enum Opening {
     Sink(OnSound),
     Playback(Arc<Mutex<Jitter>>),
     Source(Arc<Mutex<Jitter>>),
-    Mic(OnSound),
+    Mic { mic: String, on_sound: OnSound },
 }
 
 /// The way to one PipeWire loop: its commands, and whether it still runs.
@@ -196,8 +199,19 @@ impl Graph for PipeWire {
         self.open(name, description, Opening::Source(jitter))
     }
 
-    fn open_mic(&self, name: &str, description: &str, on_sound: OnSound) -> io::Result<Node> {
-        self.open(name, description, Opening::Mic(on_sound))
+    fn mic_in_use(&self) -> io::Result<Option<String>> {
+        Ok(self.call(Command::MicInUse)?.0)
+    }
+
+    fn open_mic(
+        &self,
+        name: &str,
+        description: &str,
+        mic: &str,
+        on_sound: OnSound,
+    ) -> io::Result<Node> {
+        let mic = mic.to_owned();
+        self.open(name, description, Opening::Mic { mic, on_sound })
     }
 
     fn is_gone(&self, node: &Node) -> bool {
@@ -375,6 +389,12 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
             let value = configured.borrow_mut().of(device).clone();
             let _ = reply.send(Ok(value.map(DefaultNode)));
         }
+        Command::MicInUse(reply) => {
+            let value = configured.borrow().source_in_use.clone();
+            let _ = reply.send(Ok(
+                value.and_then(|v| DefaultNode(v).name().map(str::to_owned))
+            ));
+        }
         Command::SetDefaultNode(device, node, reply) => {
             let result = match metadata.borrow().as_ref() {
                 Some((metadata, _)) => {
@@ -412,7 +432,9 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
                 Opening::Sink(on_sound) => open_sink(&core, &name, &description, on_sound),
                 Opening::Playback(jitter) => open_playback(&core, &name, &description, jitter),
                 Opening::Source(jitter) => open_source(&core, &name, &description, jitter),
-                Opening::Mic(on_sound) => open_mic(&context, &core, &name, &description, on_sound),
+                Opening::Mic { mic, on_sound } => {
+                    open_mic(&context, &core, &name, &description, &mic, on_sound)
+                }
             };
             let result = opened.map(|open| {
                 streams.borrow_mut().insert(id, open);
@@ -431,11 +453,12 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
     Ok(())
 }
 
-/// The configured defaults, as the `default` metadata last said them.
+/// The configured defaults, and the source in use, as the `default` metadata last said them.
 #[derive(Debug, Default, PartialEq)]
 struct Configured {
     sink: Option<String>,
     source: Option<String>,
+    source_in_use: Option<String>,
 }
 
 impl Configured {
@@ -463,6 +486,7 @@ fn follow(configured: &mut Configured, subject: u32, key: Option<&str>, value: O
     match key {
         Some(CONFIGURED_SINK) => configured.sink = value.map(str::to_owned),
         Some(CONFIGURED_SOURCE) => configured.source = value.map(str::to_owned),
+        Some(SOURCE_IN_USE) => configured.source_in_use = value.map(str::to_owned),
         // Every key of the core cleared.
         None => *configured = Configured::default(),
         _ => {}
@@ -617,15 +641,17 @@ fn open_source(
     playing(core, name, props, pw::stream::StreamFlags::empty(), jitter)
 }
 
-/// PipeWire's echo canceller (WebRTC), loaded here: it captures the default mic, and the
-/// monitor of the default output as what to cancel, so that home's own default output is
-/// left as it is. Its source is no default: only this stream records from it.
-fn echo_cancel_args(name: &str, description: &str) -> String {
+/// PipeWire's echo canceller (WebRTC), loaded here: it captures `mic`, named rather than the
+/// default, which goes silent while the mic is away, and the monitor of the default output as
+/// what to cancel, so that home's own default output is left as it is. Its source is no
+/// default: only this stream records from it.
+fn echo_cancel_args(name: &str, description: &str, mic: &str) -> String {
     let quoted = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
     format!(
         "{{ library.name = aec/libspa-aec-webrtc monitor.mode = true \
          node.description = {description} \
-         capture.props = {{ node.name = {capture} node.description = {description} }} \
+         capture.props = {{ node.name = {capture} node.description = {description} \
+         target.object = {mic} }} \
          sink.props = {{ node.name = {reference} node.description = {description} }} \
          source.props = {{ node.name = {source} node.description = {description} \
          priority.session = 0 priority.driver = 0 }} }}",
@@ -633,6 +659,7 @@ fn echo_cancel_args(name: &str, description: &str) -> String {
         capture = quoted(&format!("{name}-capture")),
         reference = quoted(&format!("{name}-reference")),
         source = quoted(&echo_cancelled(name)),
+        mic = quoted(mic),
     )
 }
 
@@ -646,12 +673,13 @@ fn open_mic(
     core: &pw::core::CoreRc,
     name: &str,
     description: &str,
+    mic: &str,
     on_sound: OnSound,
 ) -> io::Result<Open> {
     let module = load_module(
         context,
         "libpipewire-module-echo-cancel",
-        &echo_cancel_args(name, description),
+        &echo_cancel_args(name, description, mic),
     )?;
     let mut props = properties(name, description);
     props.insert(*pw::keys::MEDIA_TYPE, "Audio");
@@ -799,6 +827,10 @@ mod tests {
                         Command::DefaultNode(_, reply) => {
                             let _ = reply.send(Ok(None));
                             "default?".to_owned()
+                        }
+                        Command::MicInUse(reply) => {
+                            let _ = reply.send(Ok(None));
+                            "mic?".to_owned()
                         }
                         Command::SetDefaultNode(_, sink, reply) => {
                             if !hung {
@@ -955,10 +987,33 @@ mod tests {
     }
 
     #[test]
+    fn the_mic_in_use_follows_the_session_managers_own_key() {
+        let mut configured = Configured::default();
+        follow(&mut configured, 0, Some(SOURCE_IN_USE), Some(MIC));
+        assert_eq!(configured.source_in_use.as_deref(), Some(MIC));
+        assert_eq!(configured.source, None);
+        follow(&mut configured, 0, None, None);
+        assert_eq!(configured, Configured::default());
+    }
+
+    #[test]
+    fn the_echo_canceller_captures_the_mic_it_is_given_not_the_default() {
+        let args = echo_cancel_args("navette-mic", "Mic", "invented-mic");
+        assert!(
+            args.contains(
+                "capture.props = { node.name = \"navette-mic-capture\" \
+                 node.description = \"Mic\" target.object = \"invented-mic\" }"
+            ),
+            "{args}"
+        );
+    }
+
+    #[test]
     fn a_clear_on_another_subject_keeps_the_default() {
         let mut configured = Configured {
             sink: Some(SPEAKERS.to_owned()),
             source: Some(MIC.to_owned()),
+            ..Configured::default()
         };
         // A node's own metadata cleared (its id as the subject), not the core's.
         follow(&mut configured, 42, None, None);

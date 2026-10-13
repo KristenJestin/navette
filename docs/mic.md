@@ -15,11 +15,20 @@ machine's sound at home ([the sound](audio.md)).
   crash as soon as the agent is connected again, as the default output is, and a source gone with a PipeWire restart is opened again within a quarter of a second.
 - **At home**, Navette loads PipeWire's echo canceller (`libpipewire-module-echo-cancel`,
   WebRTC) into its own process for the mode, and unloads it after; a crash takes it away too. It
-  captures the default mic, and cancels what the default output plays, read from its monitor
-  (`monitor.mode`): home's own default output and default mic are never changed, and the
-  canceller's source is no default. What it hears is Opus-encoded (48 kHz stereo, 10 ms
-  frames, in-band FEC) and sent while the mic goes to the remote machine. Home apps still have
-  the mic: Navette only decides whether the remote machine hears it.
+  captures the mic home's apps have when the mode starts, by its name, and cancels what the
+  default output plays, read from its monitor (`monitor.mode`): home's default output is never
+  changed, and the canceller's source is no default. What it hears is Opus-encoded (48 kHz
+  stereo, 10 ms frames, in-band FEC) and sent while the mic goes to the remote machine. The
+  capture stays open for the whole mode, the mic home included: the canceller takes some six
+  seconds to adapt, and would start over at each switch.
+- **Home apps do not hear the mic while it is remote.** Home's default mic is then a silent
+  source of Navette's, *Mic away (Navette)* (`navette-mic-away`): the apps that follow the
+  default (most do, a call included) move to it and hear silence, and move back when the mic
+  comes home. Muting the mic itself would silence the echo canceller too, which captures it by
+  name. The default it replaces is saved in `$XDG_STATE_HOME/navette/previous-default-source`
+  (0600) and put back when the mic comes home, when the mode stops, when the link drops, and
+  after a crash as soon as `navette serve` starts again. An app set to record from the mic
+  itself, by its name rather than the default, still hears it.
 
 ## Switching it
 
@@ -102,7 +111,10 @@ never is.
 4. Press `SUPER + CTRL + M` with the pointer over the work monitor: `navette mic status` says
    `home`, and the call hears silence. Press it again over a home monitor: they hear you again.
    Do the same with the bar item, mid-call.
-5. `navette mode stop`: on the laptop, `wpctl status` shows the previous default source again.
+5. Meanwhile, at home, `wpctl status` shows *Mic away (Navette)* as the default source while
+   the mic is remote, and the home mic again while it is home; a home app recording from the
+   default hears silence, then the mic.
+6. `navette mode stop`: on the laptop, `wpctl status` shows the previous default source again.
 
 Between two private PipeWire instances, with the speakers' monitor looped back into a virtual
 mic as the echo, the canceller took the echo down by 6 to 20 dB once it had adapted, after some

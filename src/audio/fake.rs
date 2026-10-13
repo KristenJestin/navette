@@ -154,7 +154,19 @@ impl Graph for FakeGraph {
         })
     }
 
-    fn open_mic(&self, name: &str, _description: &str, on_sound: OnSound) -> io::Result<FakeNode> {
+    fn mic_in_use(&self) -> io::Result<Option<String>> {
+        let state = self.state();
+        let configured = state.default_source.as_ref().and_then(|node| node.name());
+        Ok(configured.map(str::to_owned))
+    }
+
+    fn open_mic(
+        &self,
+        name: &str,
+        _description: &str,
+        mic: &str,
+        on_sound: OnSound,
+    ) -> io::Result<FakeNode> {
         let mut state = self.state();
         if state.refuse_mics {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no echo canceller"));
@@ -162,7 +174,7 @@ impl Graph for FakeGraph {
         state
             .mics
             .push((name.to_owned(), Arc::new(Mutex::new(on_sound))));
-        state.log.push(format!("mic {name}"));
+        state.log.push(format!("mic {name} <- {mic}"));
         Ok(FakeNode {
             graph: self.clone(),
             name: name.to_owned(),

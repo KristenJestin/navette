@@ -312,9 +312,18 @@ pub trait Graph: Clone + Send + 'static {
         description: &str,
         jitter: Arc<Mutex<Jitter>>,
     ) -> io::Result<Self::Node>;
-    /// The machine's mic, with the echo of what its speakers play cancelled: what it hears
+    /// The mic the session manager gives the apps now: the configured default, or its own
+    /// pick when there is none.
+    fn mic_in_use(&self) -> io::Result<Option<String>>;
+    /// The mic named `mic`, with the echo of what the speakers play cancelled: what it hears
     /// goes to `on_sound`. The echo canceller goes with the node.
-    fn open_mic(&self, name: &str, description: &str, on_sound: OnSound) -> io::Result<Self::Node>;
+    fn open_mic(
+        &self,
+        name: &str,
+        description: &str,
+        mic: &str,
+        on_sound: OnSound,
+    ) -> io::Result<Self::Node>;
     /// Whether `node` went with the PipeWire it was opened on (restarted, say).
     fn is_gone(&self, node: &Self::Node) -> bool;
 }
@@ -381,7 +390,12 @@ pub(crate) fn repair<G: Graph>(graph: &G, saved: &Saved) {
     }
 }
 
-fn repair_one<G: Graph>(graph: &G, saved: &Saved, device: Device, ours: &str) -> io::Result<()> {
+pub(super) fn repair_one<G: Graph>(
+    graph: &G,
+    saved: &Saved,
+    device: Device,
+    ours: &str,
+) -> io::Result<()> {
     let Some(previous) = saved.load(device)? else {
         return Ok(());
     };

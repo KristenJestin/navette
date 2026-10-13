@@ -10,7 +10,6 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,7 +18,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch};
 
 use crate::audio::mic::HomeMic;
-use crate::audio::{Graph, Message, lock};
+use crate::audio::{Graph, Message, Saved, lock};
 
 /// Where the mic goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,9 +93,9 @@ pub trait Routing: Send + Sync {
 /// The home mic, at home.
 pub struct Mic<G: Graph> {
     graph: G,
+    /// Where home's default mic is kept while the mic is away.
+    saved: Saved,
     state: Mutex<State<G>>,
-    /// Read by the mic's callback, on PipeWire's thread.
-    remote: Arc<AtomicBool>,
     status: watch::Sender<Status>,
     toggle_command: String,
 }
@@ -110,15 +109,15 @@ struct State<G: Graph> {
 
 impl<G: Graph> Mic<G> {
     /// `toggle_command` is what the hotkey runs ([`toggle_command`]).
-    pub fn new(graph: G, toggle_command: String) -> Self {
+    pub fn new(graph: G, saved: Saved, toggle_command: String) -> Self {
         Self {
             graph,
+            saved,
             state: Mutex::new(State {
                 link: None,
                 running: None,
                 sessions: 0,
             }),
-            remote: Arc::default(),
             status: watch::Sender::new(Status::Off),
             toggle_command,
         }
@@ -143,11 +142,15 @@ impl<G: Graph> Mic<G> {
         state.sessions = state.sessions.wrapping_add(1);
         let session = state.sessions;
         send(&link, Message::MicStart { session })?;
-        self.remote.store(true, Ordering::Relaxed);
-        match HomeMic::start(&self.graph, link.clone(), session, self.remote.clone()) {
+        let started = HomeMic::start(
+            self.graph.clone(),
+            self.saved.clone(),
+            link.clone(),
+            session,
+        );
+        match started {
             Ok(mic) => state.running = Some(mic),
             Err(e) => {
-                self.remote.store(false, Ordering::Relaxed);
                 let _ = send(&link, Message::MicStop);
                 return Err(e);
             }
@@ -162,7 +165,6 @@ impl<G: Graph> Mic<G> {
         let Some(mic) = state.running.take() else {
             return;
         };
-        self.remote.store(false, Ordering::Relaxed);
         // Closed first, so that no frame follows the stop.
         drop(mic);
         if let Some(link) = &state.link {
@@ -181,22 +183,22 @@ fn send(link: &mpsc::Sender<Message>, message: Message) -> io::Result<()> {
 
 impl<G: Graph + Sync> Routing for Mic<G> {
     fn order(&self, order: Order) -> io::Result<Status> {
-        let state = lock(&self.state);
+        let mut state = lock(&self.state);
         let current = *self.status.borrow();
-        if state.running.is_none() {
+        let Some(mic) = &mut state.running else {
             return match order {
                 Order::Status => Ok(current),
                 _ => Err(io::Error::other(
                     "no mode is running: the mic is home until one starts",
                 )),
             };
-        }
+        };
         let to = match (order, current) {
             (Order::Status, _) => return Ok(current),
             (Order::Remote, _) | (Order::Toggle, Status::Home) => Status::Remote,
             (Order::Home, _) | (Order::Toggle, _) => Status::Home,
         };
-        self.remote.store(to == Status::Remote, Ordering::Relaxed);
+        mic.send_to(to == Status::Remote)?;
         self.status.send_replace(to);
         Ok(to)
     }
@@ -371,15 +373,31 @@ impl<G: Graph + Sync> crate::mode::Mic for Mic<G> {
 mod tests {
     use super::*;
     use crate::audio::fake::FakeGraph;
-    use crate::audio::mic::MIC;
+    use crate::audio::mic::{AWAY, MIC};
+    use crate::audio::{DefaultNode, Saved};
 
-    /// A mic at home, and the remote's end of its link.
-    fn mic() -> (FakeGraph, Arc<Mic<FakeGraph>>, mpsc::Receiver<Message>) {
+    /// A mic at home, `desk-mic`, and the remote's end of its link.
+    fn mic() -> (
+        FakeGraph,
+        Arc<Mic<FakeGraph>>,
+        mpsc::Receiver<Message>,
+        tempfile::TempDir,
+    ) {
         let graph = FakeGraph::default();
-        let mic = Arc::new(Mic::new(graph.clone(), "navette mic toggle".into()));
+        graph.state().default_source = Some(DefaultNode::named("desk-mic"));
+        let tmp = tempfile::tempdir().unwrap();
+        let saved = Saved::in_dir(tmp.path().to_owned());
+        let mic = Arc::new(Mic::new(graph.clone(), saved, "navette mic toggle".into()));
         let (link, remote) = mpsc::channel(crate::audio::QUEUE);
         mic.attach(link);
-        (graph, mic, remote)
+        (graph, mic, remote, tmp)
+    }
+
+    /// The name of home's default mic.
+    fn home_default(graph: &FakeGraph) -> String {
+        let state = graph.state();
+        let node = state.default_source.as_ref().unwrap();
+        node.name().unwrap().to_owned()
     }
 
     /// The mic's calls block: off the runtime, as `navette serve` makes them.
@@ -403,7 +421,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_mode_start_sends_the_mic_to_the_remote() {
-        let (graph, mic, mut remote) = mic();
+        let (graph, mic, mut remote, _tmp) = mic();
         let started = mic.clone();
         blocking(move || started.start()).await.unwrap();
         assert_eq!(mic.order(Order::Status).unwrap(), Status::Remote);
@@ -414,13 +432,17 @@ mod tests {
 
     #[tokio::test]
     async fn toggling_switches_the_mic_both_ways() {
-        let (graph, mic, mut remote) = mic();
+        let (graph, mic, mut remote, _tmp) = mic();
         let started = mic.clone();
         blocking(move || started.start()).await.unwrap();
         assert_eq!(orders(&mut remote), [Message::MicStart { session: 1 }]);
+        assert_eq!(home_default(&graph), AWAY);
         assert_eq!(mic.order(Order::Toggle).unwrap(), Status::Home);
         assert!(!sends(&graph, &mut remote));
+        // Home's apps have the mic again.
+        assert_eq!(home_default(&graph), "desk-mic");
         assert_eq!(mic.order(Order::Toggle).unwrap(), Status::Remote);
+        assert_eq!(home_default(&graph), AWAY);
         // Switching is no order to the remote: its source stays its default mic.
         assert!(orders(&mut remote).is_empty());
         assert!(sends(&graph, &mut remote));
@@ -428,7 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn home_and_remote_send_the_mic_one_way_whatever_the_state() {
-        let (graph, mic, mut remote) = mic();
+        let (graph, mic, mut remote, _tmp) = mic();
         let started = mic.clone();
         blocking(move || started.start()).await.unwrap();
         assert_eq!(mic.order(Order::Home).unwrap(), Status::Home);
@@ -441,16 +463,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_mode_stop_brings_the_mic_home_and_closes_the_echo_canceller() {
-        let (graph, mic, mut remote) = mic();
+        let (graph, mic, mut remote, _tmp) = mic();
         let started = mic.clone();
         blocking(move || started.start()).await.unwrap();
         let stopped = mic.clone();
         blocking(move || stopped.stop()).await;
         assert_eq!(mic.order(Order::Status).unwrap(), Status::Off);
         assert!(graph.state().mics.is_empty());
+        assert_eq!(home_default(&graph), "desk-mic");
+        let away = DefaultNode::named(AWAY).0;
+        let desk = DefaultNode::named("desk-mic").0;
         assert_eq!(
             graph.state().log,
-            [format!("mic {MIC}"), format!("remove {MIC}")]
+            [
+                format!("mic {MIC} <- desk-mic"),
+                format!("source {AWAY}"),
+                format!("default source {away}"),
+                format!("default source {desk}"),
+                format!("remove {AWAY}"),
+                format!("remove {MIC}"),
+            ]
         );
         assert_eq!(
             orders(&mut remote),
@@ -460,7 +492,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_no_mode_the_mic_cannot_be_switched() {
-        let (_graph, mic, mut remote) = mic();
+        let (_graph, mic, mut remote, _tmp) = mic();
         for order in [Order::Toggle, Order::Remote, Order::Home] {
             let error = mic.order(order).unwrap_err();
             assert!(error.to_string().contains("no mode is running"), "{error}");
@@ -471,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn each_mode_numbers_its_session_afresh() {
-        let (_graph, mic, mut remote) = mic();
+        let (_graph, mic, mut remote, _tmp) = mic();
         for _ in 0..2 {
             let cycled = mic.clone();
             blocking(move || {
@@ -493,7 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_mic_that_cannot_open_stays_home_and_tells_the_remote() {
-        let (graph, mic, mut remote) = mic();
+        let (graph, mic, mut remote, _tmp) = mic();
         graph.state().refuse_mics = true;
         let started = mic.clone();
         assert!(blocking(move || started.start()).await.is_err());
@@ -506,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_link_dropping_brings_the_mic_home() {
-        let (graph, mic, remote) = mic();
+        let (graph, mic, remote, _tmp) = mic();
         let started = mic.clone();
         blocking(move || started.start()).await.unwrap();
         // The link goes; the mode ends with it and stops the mic.
@@ -519,7 +551,9 @@ mod tests {
 
     #[tokio::test]
     async fn without_a_link_the_mic_cannot_start() {
-        let mic = Arc::new(Mic::new(FakeGraph::default(), String::new()));
+        let tmp = tempfile::tempdir().unwrap();
+        let saved = Saved::in_dir(tmp.path().to_owned());
+        let mic = Arc::new(Mic::new(FakeGraph::default(), saved, String::new()));
         let started = mic.clone();
         let error = blocking(move || started.start()).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
@@ -527,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_link_takes_the_next_mode() {
-        let (_graph, mic, mut old) = mic();
+        let (_graph, mic, mut old, _tmp) = mic();
         let (link, mut new) = mpsc::channel(crate::audio::QUEUE);
         mic.attach(link);
         let started = mic.clone();
@@ -568,7 +602,7 @@ mod tests {
 
     #[tokio::test]
     async fn navette_mic_switches_it_over_the_control_socket() {
-        let (_graph, mic, _remote) = mic();
+        let (_graph, mic, _remote, _tmp) = mic();
         let (_dir, path) = served(mic.clone());
         let error = ask(&path, Order::Toggle).await.unwrap_err();
         assert!(error.to_string().contains("no mode is running"), "{error}");
@@ -583,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_hears_every_change_the_current_one_first() {
-        let (_graph, mic, _remote) = mic();
+        let (_graph, mic, _remote, _tmp) = mic();
         let (_dir, path) = served(mic.clone());
         let (heard, mut hears) = mpsc::unbounded_channel();
         tokio::spawn(async move {
@@ -626,7 +660,7 @@ mod tests {
         let first = tokio::time::timeout(Duration::from_secs(5), hears.recv()).await;
         assert_eq!(first.unwrap(), Some(Status::Off));
 
-        let (_graph, mic, _remote) = mic();
+        let (_graph, mic, _remote, _tmp) = mic();
         let started = mic.clone();
         blocking(move || started.start()).await.unwrap();
         let listener = crate::mode::listen(&path).unwrap();
