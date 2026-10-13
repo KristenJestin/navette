@@ -70,6 +70,19 @@ impl Encoder {
 pub struct Decoder {
     opus: opus::Decoder,
     next: Option<u32>,
+    gaps: Gaps,
+}
+
+/// The frames that did not come as they should, since the decoder was made, for the periodic
+/// stats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Gaps {
+    /// Frames that never came, filled from the next packet's FEC or by concealment.
+    pub concealed: u64,
+    /// Frames that never came, in a gap too long to fill: the sound jumps over them.
+    pub lost: u64,
+    /// Packets that came after a later one: too late to play.
+    pub late: u64,
 }
 
 impl Decoder {
@@ -77,7 +90,12 @@ impl Decoder {
         Ok(Self {
             opus: opus::Decoder::new(RATE, opus::Channels::Stereo).map_err(opus_error)?,
             next: None,
+            gaps: Gaps::default(),
         })
+    }
+
+    pub fn gaps(&self) -> Gaps {
+        self.gaps
     }
 
     /// Decodes packet `seq` into interleaved stereo samples. A gap before it is filled first:
@@ -86,7 +104,10 @@ impl Decoder {
     pub fn decode(&mut self, seq: u32, packet: &[u8]) -> io::Result<Vec<f32>> {
         let missing = match self.next {
             None => 0,
-            Some(next) if seq.wrapping_sub(next) > u32::MAX / 2 => return Ok(Vec::new()),
+            Some(next) if seq.wrapping_sub(next) > u32::MAX / 2 => {
+                self.gaps.late += 1;
+                return Ok(Vec::new());
+            }
             Some(next) => seq.wrapping_sub(next),
         };
         let mut pcm = Vec::new();
@@ -95,6 +116,9 @@ impl Decoder {
                 self.decode_into(&[], false, &mut pcm)?;
             }
             self.decode_into(packet, true, &mut pcm)?;
+            self.gaps.concealed += u64::from(missing);
+        } else if missing > MAX_CONCEALED {
+            self.gaps.lost += u64::from(missing);
         }
         self.decode_into(packet, false, &mut pcm)?;
         self.next = Some(seq.wrapping_add(1));
@@ -189,6 +213,57 @@ pub(crate) mod tests {
             output.extend(decoder.decode(seq, &packets[seq as usize]).unwrap());
         }
         assert_eq!(output.len(), 4 * FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn a_concealed_frame_is_counted() {
+        let mut encoder = Encoder::new().unwrap();
+        let mut decoder = Decoder::new().unwrap();
+        let packets = packets(&mut encoder, &tone(5));
+        for seq in [0u32, 1, 4] {
+            decoder.decode(seq, &packets[seq as usize]).unwrap();
+        }
+        assert_eq!(
+            decoder.gaps(),
+            Gaps {
+                concealed: 2,
+                ..Gaps::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_gap_too_long_to_fill_is_counted_as_lost() {
+        let mut encoder = Encoder::new().unwrap();
+        let mut decoder = Decoder::new().unwrap();
+        let packets = packets(&mut encoder, &tone(10));
+        decoder.decode(0, &packets[0]).unwrap();
+        decoder.decode(9, &packets[9]).unwrap();
+        assert_eq!(
+            decoder.gaps(),
+            Gaps {
+                lost: 8,
+                ..Gaps::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_late_frame_is_counted() {
+        let mut encoder = Encoder::new().unwrap();
+        let mut decoder = Decoder::new().unwrap();
+        let packets = packets(&mut encoder, &tone(3));
+        decoder.decode(0, &packets[0]).unwrap();
+        decoder.decode(2, &packets[2]).unwrap();
+        decoder.decode(1, &packets[1]).unwrap();
+        assert_eq!(
+            decoder.gaps(),
+            Gaps {
+                concealed: 1,
+                late: 1,
+                ..Gaps::default()
+            }
+        );
     }
 
     #[test]

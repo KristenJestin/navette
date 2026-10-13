@@ -114,6 +114,7 @@ impl Dial for TlsDialer {
     async fn dial(&self) -> io::Result<Self::Stream> {
         let connect = async {
             let tcp = TcpStream::connect(self.address).await?;
+            send_at_once(&tcp)?;
             // The name is not checked (the certificate is pinned), but TLS needs one.
             let name = ServerName::try_from("navette").expect("a valid DNS name");
             self.connector.connect(name, tcp).await
@@ -176,6 +177,7 @@ impl Accept for TlsAcceptor {
                 }
                 accepted = self.listener.accept(), if self.handshakes.len() < MAX_HANDSHAKES => {
                     let (tcp, peer) = accepted?;
+                    send_at_once(&tcp)?;
                     let acceptor = self.acceptor.clone();
                     let timeout = self.timeout;
                     self.handshakes.spawn(async move {
@@ -195,6 +197,13 @@ impl Accept for TlsAcceptor {
             }
         }
     }
+}
+
+/// Nagle off: a 10 ms sound frame or a keystroke is a small write, which the kernel would
+/// otherwise hold until the peer acknowledges the last one, and with its delayed
+/// acknowledgements that is up to 40 ms on Wi-Fi.
+fn send_at_once(tcp: &TcpStream) -> io::Result<()> {
+    tcp.set_nodelay(true)
 }
 
 fn provider() -> Arc<CryptoProvider> {
@@ -382,6 +391,21 @@ mod tests {
         home.write_all(b"pong").await.unwrap();
         remote.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"pong");
+    }
+
+    #[tokio::test]
+    async fn both_ends_send_each_message_without_waiting_for_an_ack() {
+        let m = machines();
+        let mut acceptor = home_acceptor(&m).await;
+        let dialer = TlsDialer::new(
+            &m.remote,
+            m.home.fingerprint(),
+            acceptor.local_addr().unwrap(),
+        )
+        .unwrap();
+        let (home, remote) = tokio::join!(acceptor.accept(), dialer.dial());
+        assert!(home.unwrap().get_ref().0.nodelay().unwrap());
+        assert!(remote.unwrap().get_ref().0.nodelay().unwrap());
     }
 
     #[tokio::test]

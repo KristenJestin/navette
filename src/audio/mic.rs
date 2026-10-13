@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use super::codec::Decoder;
 use super::jitter::Jitter;
 use super::{
-    Device, Graph, JITTER_MAX, JITTER_TARGET, Message, Saved, Switch, Undecoded, encoding, lock,
+    Device, Graph, JITTER_CEILING, JITTER_FLOOR, Message, Saved, Switch, Undecoded, encoding, lock,
     repair_one,
 };
 
@@ -41,7 +41,7 @@ pub struct Voice<G: Graph> {
 impl<G: Graph> Voice<G> {
     pub fn start(graph: G, saved: Saved, session: u32) -> io::Result<Self> {
         let switch = Switch::save(graph, saved, Device::Source, SOURCE)?;
-        let jitter = Arc::new(Mutex::new(Jitter::new(JITTER_TARGET, JITTER_MAX)));
+        let jitter = Arc::new(Mutex::new(Jitter::new(JITTER_FLOOR, JITTER_CEILING)));
         let node = switch
             .graph
             .open_source(SOURCE, SOURCE_DESCRIPTION, jitter.clone())?;
@@ -206,6 +206,8 @@ fn open_capture<G: Graph>(graph: &G, mic: &str, sending: &Sending) -> io::Result
         sending.session,
         sending.seq.clone(),
         sending.failures.clone(),
+        // Not reported: the remote's mic fills the gap, and only the remote's sound is counted.
+        Arc::default(),
         |session, seq, packet| Message::MicFrame {
             session,
             seq,
@@ -228,7 +230,7 @@ fn open_capture<G: Graph>(graph: &G, mic: &str, sending: &Sending) -> io::Result
 
 /// A source that nothing plays into: silence.
 fn open_away<G: Graph>(graph: &G) -> io::Result<G::Node> {
-    let silence = Arc::new(Mutex::new(Jitter::new(JITTER_TARGET, JITTER_MAX)));
+    let silence = Arc::new(Mutex::new(Jitter::new(JITTER_FLOOR, JITTER_CEILING)));
     graph.open_source(AWAY, AWAY_DESCRIPTION, silence)
 }
 

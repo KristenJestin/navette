@@ -21,7 +21,7 @@ use pw::metadata::{Metadata, MetadataListener};
 use pw::spa;
 use pw::types::ObjectType;
 
-use super::codec::{CHANNELS, FRAME, RATE, SAMPLES_PER_CYCLE};
+use super::codec::{CHANNELS, RATE, SAMPLES_PER_CYCLE};
 use super::jitter::Jitter;
 use super::{DefaultNode, Device, Graph, OnSound, lock};
 
@@ -546,14 +546,19 @@ fn format() -> Vec<u8> {
     .into_inner()
 }
 
+/// The graph cycle Navette's nodes ask for, in samples.
+const CYCLE: u32 = 512;
+
 fn properties(name: &str, description: &str) -> pw::properties::PropertiesBox {
     pw::properties::properties! {
         *pw::keys::NODE_NAME => name,
         *pw::keys::NODE_DESCRIPTION => description,
         *pw::keys::MEDIA_NAME => description,
         *pw::keys::APP_NAME => "Navette",
-        // One 10 ms frame per cycle when the graph allows it.
-        *pw::keys::NODE_LATENCY => format!("{FRAME}/{RATE}"),
+        // Cycles of 512 samples (11 ms) at most. PipeWire rounds a latency down to a power of
+        // two: asking for a 10 ms frame (480) ran the whole graph, the user's own apps
+        // included, in cycles of 256 (5 ms), short enough for a busy desk to miss some.
+        *pw::keys::NODE_LATENCY => format!("{CYCLE}/{RATE}"),
     }
 }
 
@@ -564,11 +569,14 @@ fn connect_stream(
 ) -> io::Result<()> {
     let format = format();
     let mut params = [spa::pod::Pod::from_bytes(&format).expect("a serialized pod")];
+    // The callbacks run on PipeWire's realtime thread, not this loop's: they neither block nor
+    // allocate, and a loop that is late by a cycle, the desk busy with a build, would cost the
+    // graph that cycle, heard as a crackle that no buffer can absorb.
     stream
         .connect(
             direction,
             None,
-            flags | pw::stream::StreamFlags::MAP_BUFFERS,
+            flags | pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
             &mut params,
         )
         .map_err(pw_error)
@@ -586,10 +594,13 @@ fn read_samples(bytes: &[u8], samples: &mut Vec<f32>) {
     );
 }
 
-/// What the playback plays next. A panic on the other side of the lock leaves the buffer
-/// usable, and a panic here would cross PipeWire's C code.
-fn fill(jitter: &Mutex<Jitter>, out: &mut [f32]) {
-    lock(jitter).pull(out);
+/// What the playback plays next, and how fast it should take the sound from now on. A panic
+/// on the other side of the lock leaves the buffer usable, and a panic here would cross
+/// PipeWire's C code.
+fn fill(jitter: &Mutex<Jitter>, out: &mut [f32]) -> f64 {
+    let mut jitter = lock(jitter);
+    jitter.pull(out);
+    jitter.rate()
 }
 
 fn open_sink(
@@ -746,8 +757,8 @@ fn playing(
     let stream = pw::stream::StreamRc::new(core.clone(), name, props).map_err(pw_error)?;
     let samples = vec![0.0f32; SAMPLES_PER_CYCLE];
     let listener = stream
-        .add_local_listener_with_user_data((jitter, samples))
-        .process(|stream, (jitter, samples)| {
+        .add_local_listener_with_user_data((jitter, samples, 1.0f32))
+        .process(|stream, (jitter, samples, applied)| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -764,7 +775,15 @@ fn playing(
                         frames = frames.min(requested);
                     }
                     let samples = &mut samples[..frames * CHANNELS];
-                    fill(jitter, samples);
+                    let rate = fill(jitter, samples) as f32;
+                    // The stream's resampler takes the sound at this rate, which keeps the
+                    // buffer on its target while the two machines' clocks drift.
+                    // Within 10 ppm, nothing is told: a fraction of a ms over a minute.
+                    if (rate - *applied).abs() >= 1e-5
+                        && stream.set_control(spa::sys::SPA_PROP_rate, &[rate]).is_ok()
+                    {
+                        *applied = rate;
+                    }
                     for (out, sample) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(samples.iter())
                     {
                         out.copy_from_slice(&sample.to_le_bytes());
@@ -884,7 +903,12 @@ mod tests {
         for _ in 0..3 {
             assert_eq!(during(|| read_samples(&bytes, &mut samples)), 0);
             assert_eq!(samples.len(), 2048);
-            assert_eq!(during(|| fill(&jitter, &mut out[..2048])), 0);
+            assert_eq!(
+                during(|| {
+                    fill(&jitter, &mut out[..2048]);
+                }),
+                0
+            );
         }
     }
 

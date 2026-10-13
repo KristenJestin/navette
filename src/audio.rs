@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
@@ -50,12 +50,20 @@ const SINK_DESCRIPTION: &str = "Home speakers (Navette)";
 pub const PLAYBACK: &str = "navette-remote-sound";
 const PLAYBACK_DESCRIPTION: &str = "Remote machine (Navette)";
 
-/// Home starts playing once 30 ms are buffered, and keeps at most 120 ms.
-const JITTER_TARGET: usize = 3 * FRAME_SAMPLES;
-const JITTER_MAX: usize = 12 * FRAME_SAMPLES;
+/// The jitter buffers keep 10 ms beyond what the playback takes in a cycle, more when the
+/// link falls behind, up to 100 ms.
+const JITTER_FLOOR: usize = FRAME_SAMPLES;
+const JITTER_CEILING: usize = 10 * FRAME_SAMPLES;
 
 /// How often the remote checks that its sink is still there: PipeWire may restart under it.
 const CHECK: Duration = Duration::from_millis(250);
+
+/// How often each side tells how the remote's sound fares, beside the video's stats: which
+/// kind of event a crackle was.
+const REPORT_EVERY: Duration = Duration::from_secs(10);
+
+/// Interleaved samples in a millisecond.
+const MS: usize = FRAME_SAMPLES / 10;
 
 /// The audio messages; on the link, they are top-level variants of
 /// [`LinkMsg`](crate::wire::LinkMsg).
@@ -110,9 +118,16 @@ pub struct Inbox {
     messages: std::sync::mpsc::Receiver<Message>,
     /// Frames sent and not yet taken.
     frames: Arc<AtomicUsize>,
+    /// Frames dropped for a full queue.
+    dropped: Arc<AtomicU64>,
 }
 
 impl Inbox {
+    /// Frames dropped so far because the audio thread had [`QUEUE`] waiting.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
     pub fn recv(&self) -> Result<Message, std::sync::mpsc::RecvError> {
         self.messages.recv().map(|m| self.taken(m))
     }
@@ -138,6 +153,7 @@ impl Inbox {
 pub struct ToAudio {
     messages: std::sync::mpsc::Sender<Message>,
     frames: Arc<AtomicUsize>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl ToAudio {
@@ -145,6 +161,7 @@ impl ToAudio {
     pub fn send(&self, message: Message) -> Result<(), std::sync::mpsc::SendError<Message>> {
         if message.is_frame() && self.frames.fetch_add(1, Ordering::Relaxed) >= QUEUE {
             self.frames.fetch_sub(1, Ordering::Relaxed);
+            self.dropped.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         self.messages.send(message)
@@ -160,17 +177,23 @@ pub struct LinkEnd {
 pub fn wire() -> (Wire, LinkEnd) {
     let (messages, received) = std::sync::mpsc::channel();
     let frames = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicU64::new(0));
     let (to_peer, from_audio) = mpsc::channel(QUEUE);
     (
         Wire {
             from_peer: Inbox {
                 messages: received,
                 frames: frames.clone(),
+                dropped: dropped.clone(),
             },
             to_peer,
         },
         LinkEnd {
-            to_audio: ToAudio { messages, frames },
+            to_audio: ToAudio {
+                messages,
+                frames,
+                dropped,
+            },
             from_audio,
         },
     )
@@ -450,22 +473,30 @@ fn sender(
     session: u32,
     seq: Arc<AtomicU32>,
     failures: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
 ) -> io::Result<OnSound> {
-    encoding(home, session, seq, failures, |session, seq, packet| {
-        Message::Frame {
+    encoding(
+        home,
+        session,
+        seq,
+        failures,
+        dropped,
+        |session, seq, packet| Message::Frame {
             session,
             seq,
             packet,
-        }
-    })
+        },
+    )
 }
 
-/// Encodes what a node hears and sends each frame as `frame` makes it, on PipeWire's thread.
+/// Encodes what a node hears and sends each frame as `frame` makes it, on PipeWire's thread;
+/// the frames the link had no room for are counted in `dropped`.
 fn encoding(
     to: mpsc::Sender<Message>,
     session: u32,
     seq: Arc<AtomicU32>,
     failures: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
     frame: fn(u32, u32, Bytes) -> Message,
 ) -> io::Result<OnSound> {
     let mut encoder = Encoder::new()?;
@@ -484,7 +515,9 @@ fn encoding(
             );
             // Late sound is worse than lost sound: a full link drops the frame, and the other
             // side fills the gap.
-            let _ = to.try_send(frame);
+            if to.try_send(frame).is_err() {
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
         });
         if sent.is_err() {
             failures.fetch_add(1, Ordering::Relaxed);
@@ -501,6 +534,9 @@ struct Capture<G: Graph> {
     /// frames numbered from 0 again as late.
     seq: Arc<AtomicU32>,
     failures: Arc<AtomicU64>,
+    /// Frames the link had no room for, and how many of them were told already.
+    dropped: Arc<AtomicU64>,
+    told: u64,
 }
 
 impl<G: Graph> Capture<G> {
@@ -512,14 +548,32 @@ impl<G: Graph> Capture<G> {
     ) -> io::Result<Self> {
         let seq = Arc::new(AtomicU32::new(0));
         let failures = Arc::new(AtomicU64::new(0));
-        let on_sound = sender(home.clone(), session, seq.clone(), failures.clone())?;
+        let dropped = Arc::new(AtomicU64::new(0));
+        let on_sound = sender(
+            home.clone(),
+            session,
+            seq.clone(),
+            failures.clone(),
+            dropped.clone(),
+        )?;
         Ok(Self {
             sink: RemoteSink::start(graph, saved, on_sound)?,
             home,
             session,
             seq,
             failures,
+            dropped,
+            told: 0,
         })
+    }
+
+    /// The frames dropped since the last report, if any: the remote's part of the periodic
+    /// stats, said only when there is something to say.
+    fn report(&mut self) -> Option<String> {
+        let dropped = self.dropped.load(Ordering::Relaxed);
+        let new = dropped - self.told;
+        self.told = dropped;
+        (new > 0).then(|| format!("{new} frames dropped, the link had no room"))
     }
 
     /// Opens the sink again if PipeWire restarted under it.
@@ -532,6 +586,7 @@ impl<G: Graph> Capture<G> {
             self.session,
             self.seq.clone(),
             self.failures.clone(),
+            self.dropped.clone(),
         )?;
         self.sink.reopen(on_sound)
     }
@@ -568,6 +623,7 @@ pub fn remote<G: Graph>(
             // Told once per outage, not at each check while PipeWire is still away.
             let mut lost = false;
             let mut voice_lost = false;
+            let mut due = Instant::now() + REPORT_EVERY;
             loop {
                 match wire.from_peer.recv_timeout(CHECK) {
                     Ok(Message::Start { session }) => {
@@ -628,6 +684,12 @@ pub fn remote<G: Graph>(
                             lost = true;
                         }
                         Err(_) => {}
+                    }
+                    if Instant::now() >= due {
+                        due = Instant::now() + REPORT_EVERY;
+                        if let Some(report) = capture.report() {
+                            eprintln!("navette: audio: {report}");
+                        }
                     }
                 }
             }
@@ -691,7 +753,7 @@ impl<G: Graph> Home<G> {
         if self.playback.is_some() {
             return Ok(());
         }
-        let jitter = Arc::new(Mutex::new(Jitter::new(JITTER_TARGET, JITTER_MAX)));
+        let jitter = Arc::new(Mutex::new(Jitter::new(JITTER_FLOOR, JITTER_CEILING)));
         let node = self
             .graph
             .open_playback(PLAYBACK, PLAYBACK_DESCRIPTION, jitter.clone())?;
@@ -716,6 +778,27 @@ impl<G: Graph> Home<G> {
         self.remote
             .blocking_send(message)
             .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "the link is down"))
+    }
+
+    /// How the remote's sound fares, while it plays: what is buffered, and each kind of event
+    /// that is heard as a crackle, counted since it started, `dropped` with them.
+    pub fn stats(&self, dropped: u64) -> Option<String> {
+        let playback = self.playback.as_ref()?;
+        let jitter = lock(&playback.jitter);
+        let counts = jitter.counts();
+        let gaps = playback.decoder.gaps();
+        Some(format!(
+            "buffer {} ms, target {} ms, rate {:+.3} %; underruns {}, trims {}, concealed {}, \
+             lost {}, late {}, dropped {dropped}",
+            jitter.buffered() / MS,
+            jitter.target() / MS,
+            (jitter.rate() - 1.0) * 100.0,
+            counts.underruns,
+            counts.trims,
+            gaps.concealed,
+            gaps.lost,
+            gaps.late,
+        ))
     }
 
     /// A message from the remote; its sound is ignored unless home is playing, and plays only
@@ -749,10 +832,29 @@ pub fn home<G: Graph>(graph: G, wire: Wire) -> io::Result<JoinHandle<()>> {
             if let Err(e) = home.start() {
                 eprintln!("navette: audio: could not start the playback: {e}");
             }
-            while let Ok(message) = wire.from_peer.recv() {
-                if let Err(e) = home.received(message) {
-                    eprintln!("navette: audio: {e}");
+            let mut due = Instant::now() + REPORT_EVERY;
+            loop {
+                match wire
+                    .from_peer
+                    .recv_timeout(due.saturating_duration_since(Instant::now()))
+                {
+                    Ok(message) => {
+                        if let Err(e) = home.received(message) {
+                            eprintln!("navette: audio: {e}");
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
+                if Instant::now() >= due {
+                    due = Instant::now() + REPORT_EVERY;
+                    if let Some(stats) = home.stats(wire.from_peer.dropped()) {
+                        eprintln!("navette: audio: {stats}");
+                    }
+                }
+            }
+            if let Some(stats) = home.stats(wire.from_peer.dropped()) {
+                eprintln!("navette: audio: at the end, {stats}");
             }
         })
 }
@@ -1106,6 +1208,91 @@ mod tests {
         assert!(home.received(frame(1)).is_ok());
         assert!(home.received(frame(2)).is_ok());
         assert_eq!(home.playback.as_ref().unwrap().undecoded.0, 3);
+    }
+
+    #[test]
+    fn a_frame_dropped_in_a_full_queue_is_counted() {
+        let (wire, link) = super::wire();
+        let frame = |seq| Message::Frame {
+            session: 1,
+            seq,
+            packet: Bytes::new(),
+        };
+        for seq in 0..QUEUE as u32 + 3 {
+            link.to_audio.send(frame(seq)).unwrap();
+        }
+        assert_eq!(wire.from_peer.dropped(), 3);
+        // Orders are never dropped, nor counted.
+        link.to_audio.send(Message::Stop).unwrap();
+        assert_eq!(wire.from_peer.dropped(), 3);
+    }
+
+    #[test]
+    fn a_frame_the_link_cannot_take_is_counted() {
+        let graph = FakeGraph::with_default("laptop-speakers");
+        let (_tmp, saved) = saved();
+        let (to_home, _frames) = mpsc::channel(1);
+        let mut capture = Capture::start(graph.clone(), saved, to_home, 1).unwrap();
+        let sink = graph.state().sinks[0].1.clone();
+        (sink.lock().unwrap())(&tone(4));
+        assert_eq!(
+            capture.report().as_deref(),
+            Some("3 frames dropped, the link had no room")
+        );
+        // Told once.
+        assert_eq!(capture.report(), None);
+    }
+
+    #[test]
+    fn the_periodic_stats_name_each_kind() {
+        let graph = FakeGraph::default();
+        let (to_remote, _orders) = mpsc::channel(8);
+        let mut home = Home::new(graph.clone(), to_remote);
+        assert_eq!(home.stats(0), None, "nothing plays yet");
+        home.start().unwrap();
+        let packets = codec::tests::packets(&mut Encoder::new().unwrap(), &tone(10));
+        for seq in [0u32, 1, 2, 4] {
+            home.received(Message::Frame {
+                session: 1,
+                seq,
+                packet: Bytes::from(packets[seq as usize].clone()),
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            home.stats(2).as_deref(),
+            Some(
+                "buffer 50 ms, target 10 ms, rate +0.000 %; underruns 0, trims 0, concealed 1, \
+                 lost 0, late 0, dropped 2"
+            )
+        );
+    }
+
+    #[test]
+    fn home_asks_the_playback_to_catch_up_when_the_remote_runs_ahead() {
+        let graph = FakeGraph::default();
+        let (to_remote, _orders) = mpsc::channel(8);
+        let mut home = Home::new(graph.clone(), to_remote);
+        home.start().unwrap();
+        let jitter = graph.state().playbacks[0].1.clone();
+        let packets = codec::tests::packets(&mut Encoder::new().unwrap(), &tone(10));
+        let mut seq = 0u32;
+        let mut out = vec![0.0; 2048];
+        // The remote's clock runs fast: a frame more than home plays every few cycles.
+        for cycle in 0..2000 {
+            let frames = if cycle % 4 == 0 { 3 } else { 2 };
+            for _ in 0..frames {
+                home.received(Message::Frame {
+                    session: 1,
+                    seq,
+                    packet: Bytes::from(packets[seq as usize % packets.len()].clone()),
+                })
+                .unwrap();
+                seq += 1;
+            }
+            jitter.lock().unwrap().pull(&mut out);
+        }
+        assert!(jitter.lock().unwrap().rate() > 1.0);
     }
 
     #[tokio::test]
