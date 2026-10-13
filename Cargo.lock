@@ -539,7 +539,7 @@ dependencies = [
 [[package]]
 name = "gliff-proto"
 version = "0.3.1"
-source = "git+https://github.com/KristenJestin/navette-gliff?rev=58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
 dependencies = [
  "minicbor",
  "rayon",
@@ -549,7 +549,7 @@ dependencies = [
 [[package]]
 name = "gliff-sw"
 version = "0.3.1"
-source = "git+https://github.com/KristenJestin/navette-gliff?rev=58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
 dependencies = [
  "gliff-proto",
  "openh264",
@@ -562,7 +562,7 @@ dependencies = [
 [[package]]
 name = "gliff-transport"
 version = "0.3.1"
-source = "git+https://github.com/KristenJestin/navette-gliff?rev=58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
 dependencies = [
  "bytes",
  "gliff-proto",
@@ -575,7 +575,7 @@ dependencies = [
 [[package]]
 name = "gliff-va"
 version = "0.3.1"
-source = "git+https://github.com/KristenJestin/navette-gliff?rev=58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
 dependencies = [
  "pkg-config",
  "thiserror",
@@ -585,7 +585,7 @@ dependencies = [
 [[package]]
 name = "gliff-vk"
 version = "0.3.1"
-source = "git+https://github.com/KristenJestin/navette-gliff?rev=58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
 dependencies = [
  "ash",
  "drm-fourcc",
@@ -628,7 +628,7 @@ dependencies = [
 [[package]]
 name = "hypr-capture"
 version = "0.3.1"
-source = "git+https://github.com/KristenJestin/navette-gliff?rev=58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
@@ -643,9 +643,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hypr-input"
+version = "0.3.1"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
+dependencies = [
+ "calloop",
+ "calloop-wayland-source",
+ "hypr-wl",
+ "nix",
+ "thiserror",
+ "tracing",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
+ "xkbcommon",
+]
+
+[[package]]
 name = "hypr-ipc"
 version = "0.3.1"
-source = "git+https://github.com/KristenJestin/navette-gliff?rev=58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
 dependencies = [
  "serde",
  "serde_json",
@@ -656,7 +674,7 @@ dependencies = [
 [[package]]
 name = "hypr-wl"
 version = "0.3.1"
-source = "git+https://github.com/KristenJestin/navette-gliff?rev=58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
@@ -828,6 +846,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "hypr-capture",
+ "hypr-input",
  "hypr-ipc",
  "hypr-wl",
  "minicbor",
@@ -1870,6 +1889,17 @@ name = "xcursor"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "163b33ed8786455e2fa5d72f554057ce3f3182425434f756cd39c99839d88e23"
+
+[[package]]
+name = "xkbcommon"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7a974f48060a14e95705c01f24ad9c3345022f4d97441b8a36beb7ed5c4a02d"
+dependencies = [
+ "libc",
+ "memmap2",
+ "xkeysym",
+]
 
 [[package]]
 name = "xkeysym"

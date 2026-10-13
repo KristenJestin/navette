@@ -428,7 +428,7 @@ mod tests {
     }
 
     struct Agent {
-        inbox: UnboundedSender<Incoming>,
+        inbox: mpsc::Sender<Incoming>,
         outbox: Outbox,
         events: UnboundedSender<hypr::Event>,
         hypr: Arc<FakeHypr>,
@@ -441,7 +441,7 @@ mod tests {
             "eDP-1", 1920, 1200, 0,
         )]));
         let streams = Arc::new(FakeStreams::new(hypr.clone()));
-        let (inbox, inbox_rx) = mpsc::unbounded_channel();
+        let (inbox, inbox_rx) = mpsc::channel(64);
         let (events, mut events_rx) = mpsc::unbounded_channel();
         let outbox = Outbox::default();
         let peer = Peer {
@@ -478,7 +478,7 @@ mod tests {
     #[tokio::test]
     async fn starting_makes_the_output_and_streams_it() {
         let agent = agent();
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| agent.hypr.monitor(output::NAME).is_some()).await;
         until(|| agent.streams.count() == 1).await;
         assert_eq!(agent.streams.started.lock().unwrap()[0].0, output::NAME);
@@ -494,9 +494,12 @@ mod tests {
     #[tokio::test]
     async fn stopping_the_mode_removes_the_remote_output() {
         let agent = agent();
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| agent.hypr.monitor(output::NAME).is_some()).await;
-        agent.inbox.send(Incoming::Display(Display::Stop)).unwrap();
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
         until(|| agent.hypr.monitor(output::NAME).is_none()).await;
         assert_eq!(
             agent.hypr.changes().last().unwrap(),
@@ -507,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_link_removes_the_remote_output() {
         let agent = agent();
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| agent.hypr.monitor(output::NAME).is_some()).await;
         drop(agent.inbox);
         agent.task.await.unwrap();
@@ -518,7 +521,7 @@ mod tests {
     async fn a_stream_that_cannot_start_leaves_no_output_and_says_why() {
         let agent = agent();
         *agent.streams.refuse.lock().unwrap() = true;
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| !agent.outbox.queued().is_empty()).await;
         assert_eq!(
             agent.outbox.queued(),
@@ -536,7 +539,7 @@ mod tests {
     #[tokio::test]
     async fn the_output_comes_back_after_a_hyprland_restart() {
         let agent = agent();
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| agent.streams.count() == 1).await;
 
         // Hyprland exits: the capture stops, the output is gone with it.
@@ -556,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn a_stream_that_ends_without_a_reason_is_started_again() {
         let agent = agent();
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| agent.streams.count() == 1).await;
         agent.streams.drop_last();
         until(|| agent.streams.count() == 2).await;
@@ -580,7 +583,7 @@ mod tests {
     #[tokio::test]
     async fn a_lost_stream_starts_again_on_the_same_output() {
         let agent = agent();
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| agent.streams.count() == 1).await;
         agent.streams.end_last();
         until(|| agent.streams.count() == 2).await;
@@ -591,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn a_stream_that_keeps_failing_tells_home_and_removes_the_output() {
         let agent = agent();
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| agent.streams.count() == 1).await;
         *agent.streams.refuse.lock().unwrap() = true;
         agent.streams.end_last();
@@ -609,7 +612,7 @@ mod tests {
     #[tokio::test]
     async fn a_storm_of_monitor_events_does_not_hold_the_retry_back() {
         let agent = agent();
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| agent.streams.count() == 1).await;
         agent.streams.end_last();
         let storm = async {
@@ -641,7 +644,7 @@ mod tests {
     async fn the_stream_gets_the_scale_hyprland_chose() {
         let agent = agent();
         agent.hypr.choose_scale(1.2);
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| agent.streams.count() == 1).await;
         assert_eq!(agent.streams.started.lock().unwrap()[0].1, 1.2);
     }
@@ -650,12 +653,15 @@ mod tests {
     async fn a_stream_is_stopped_off_the_executor_before_its_output_goes() {
         let executor = std::thread::current().id();
         let agent = agent();
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| agent.streams.count() == 1).await;
         agent.streams.end_last();
         until(|| agent.streams.dropped.lock().unwrap().len() == 1).await;
         until(|| agent.streams.count() == 2).await;
-        agent.inbox.send(Incoming::Display(Display::Stop)).unwrap();
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
         until(|| agent.streams.dropped.lock().unwrap().len() == 2).await;
         let dropped = agent.streams.dropped.lock().unwrap();
         assert!(dropped.iter().all(|d| d.thread != executor), "{dropped:?}");
@@ -666,18 +672,18 @@ mod tests {
     async fn a_stream_start_that_panics_is_a_failure_and_the_agent_goes_on() {
         let agent = agent();
         *agent.streams.panic.lock().unwrap() = true;
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| failed(&agent.outbox).is_some()).await;
         assert!(agent.hypr.monitor(output::NAME).is_none());
         *agent.streams.panic.lock().unwrap() = false;
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| agent.streams.count() == 1).await;
     }
 
     #[tokio::test]
     async fn a_reload_gets_the_monitor_rule_back() {
         let agent = agent();
-        agent.inbox.send(start()).unwrap();
+        agent.inbox.try_send(start()).unwrap();
         until(|| agent.hypr.monitor(output::NAME).is_some()).await;
         agent.hypr.reload();
         assert_eq!(agent.hypr.monitor(output::NAME).unwrap().scale, 2.0);

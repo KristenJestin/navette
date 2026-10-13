@@ -621,12 +621,12 @@ mod tests {
     /// A remote machine on the other end of an in-memory peer.
     struct Remote {
         outbox: Outbox,
-        to_home: UnboundedSender<Incoming>,
+        to_home: mpsc::Sender<Incoming>,
     }
 
     fn connect(desk: &Desk) -> Remote {
         let outbox = Outbox::default();
-        let (to_home, inbox) = mpsc::unbounded_channel();
+        let (to_home, inbox) = mpsc::channel(64);
         desk.peers
             .send(Peer {
                 outbox: outbox.clone(),
@@ -695,7 +695,7 @@ mod tests {
         );
         remote
             .to_home
-            .send(Incoming::Display(Display::Started {
+            .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
             }))
             .unwrap();
@@ -716,7 +716,7 @@ mod tests {
         until(|| !starts(&remote).is_empty()).await;
         remote
             .to_home
-            .send(Incoming::Display(Display::Started {
+            .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
             }))
             .unwrap();
@@ -755,7 +755,7 @@ mod tests {
         until(|| starts(&remote).len() == 2).await;
         remote
             .to_home
-            .send(Incoming::Display(Display::Started {
+            .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
             }))
             .unwrap();
@@ -825,7 +825,7 @@ mod tests {
         until(|| !starts(&remote).is_empty()).await;
         remote
             .to_home
-            .send(Incoming::Display(Display::Started {
+            .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
             }))
             .unwrap();
@@ -847,7 +847,7 @@ mod tests {
         until(|| !starts(&remote).is_empty()).await;
         remote
             .to_home
-            .send(Incoming::Display(Display::Failed {
+            .try_send(Incoming::Display(Display::Failed {
                 reason: "no encoder".into(),
             }))
             .unwrap();
@@ -864,7 +864,7 @@ mod tests {
         until(|| !starts(&remote).is_empty()).await;
         remote
             .to_home
-            .send(Incoming::Display(Display::Started {
+            .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
             }))
             .unwrap();

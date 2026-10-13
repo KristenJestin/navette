@@ -192,12 +192,19 @@ async fn main() -> io::Result<()> {
         Arc::new(Synthetic),
         hypr_events_rx,
     ));
+    // The display only: no clipboard bridge here.
+    let attach = move |mut wire: link::Wire| {
+        if let Some(display) = wire.display.take() {
+            let _ = peers.send(display);
+        }
+        std::future::ready(())
+    };
     link::agent(
         dialer,
         Heartbeat::default(),
         Backoff::default(),
         events,
-        peers,
+        attach,
     )
     .await;
     Ok(())

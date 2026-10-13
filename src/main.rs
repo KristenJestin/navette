@@ -10,10 +10,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use gliff_transport::clipboard::Side;
+use hypr_input::Target;
+use navette::clipboard;
 use navette::desk::Desk;
 use navette::display::{decode, remote};
 use navette::hypr::{self, Eval};
-use navette::link::{self, Backoff, Event, Heartbeat};
+use navette::link::{self, Backoff, Event, Heartbeat, Wire};
 use navette::mode::{self, Home};
 use navette::pair::{self, Pin, Timeouts};
 use navette::store::Store;
@@ -162,10 +165,22 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             hypr::watch_events(hypr_events);
             let modes = tokio::spawn(mode::serve(home, peers_rx, orders_rx, hypr_events_rx));
             let control = tokio::spawn(mode::accept_orders(control, orders));
-            tokio::select! {
-                () = link::serve(acceptor, Heartbeat::default(), events, peers) => {}
-                () = stopped() => {}
-            }
+            // The display takes its part of each link; the clipboard bridge, not `Send`, runs
+            // on this thread, in a local set.
+            let attach = move |mut wire: Wire| {
+                if let Some(display) = wire.display.take() {
+                    let _ = peers.send(display);
+                }
+                clipboard::attach(Side::Client, clipboard::hypr(Target::default()), wire)
+            };
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    tokio::select! {
+                        () = link::serve(acceptor, Heartbeat::default(), events, attach) => {}
+                        () = stopped() => {}
+                    }
+                })
+                .await;
             // Closing every way in ends the mode, which gives the monitor back.
             control.abort();
             let _ = control.await;
@@ -185,17 +200,27 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 Arc::new(remote::LiveStreams),
                 hypr_events_rx,
             ));
-            tokio::select! {
-                () = link::agent(
-                    dialer,
-                    Heartbeat::default(),
-                    Backoff::default(),
-                    events,
-                    peers,
-                ) => {}
-                () = stopped() => {}
-            }
-            // The link task is gone with its peers: the display removes its output.
+            let attach = move |mut wire: Wire| {
+                if let Some(display) = wire.display.take() {
+                    let _ = peers.send(display);
+                }
+                clipboard::attach(Side::Server, clipboard::hypr(Target::default()), wire)
+            };
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    tokio::select! {
+                        () = link::agent(
+                            dialer,
+                            Heartbeat::default(),
+                            Backoff::default(),
+                            events,
+                            attach,
+                        ) => {}
+                        () = stopped() => {}
+                    }
+                })
+                .await;
+            // The link is gone with its peers: the display removes its output.
             let _ = display.await;
             Ok(())
         }
