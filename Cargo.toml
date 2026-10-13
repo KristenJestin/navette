@@ -43,3 +43,17 @@ xkbcommon = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
+
+# The tests encode and decode real pictures on the CPU: unoptimised, OpenH264 and the colour
+# conversion are too slow for a picture to be refined at the pace the session keeps.
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+
+[profile.dev.package.openh264]
+opt-level = 3
+
+[profile.dev.package.gliff-sw]
+opt-level = 3
+
+[profile.dev.package.gliff-proto]
+opt-level = 3

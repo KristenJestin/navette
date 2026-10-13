@@ -105,3 +105,22 @@ cannot be read (an NVIDIA GPU's headless Hyprland gives only tiled buffers).
 ```
 cargo run --release --example synthetic_agent -- <remote config dir>
 ```
+
+## Measuring how sharp still text gets
+
+A still picture is first sent at the rate the link controller has reached, then re-encoded up to
+eight times, every 200 ms, at the controller's ceiling, so small text sharpens within about a
+second once the screen stops changing. `still_text_measure` measures it with no compositor and
+no network: the real stream session encodes a page of invented text on the CPU, over a simulated
+LAN to a home that decodes it, and prints the PSNR of each decoded frame against the page, then
+the frame rate and latency while the page scrolls.
+
+```
+tools/still-text-page.sh /tmp/page.ppm 2560 1440
+NAVETTE_PAGE=/tmp/page.ppm cargo test --release --lib still_text_measure -- --ignored --nocapture
+```
+
+The CPU encoder (OpenH264) stands in for the remote's VA-API encoder here, and it is a poor
+stand-in for refinement: its rate control is not the same, and every change of rate or frame
+rate rebuilds it and sends a keyframe, which throws the refined picture away. The remote
+machine's own numbers are checked on it.
