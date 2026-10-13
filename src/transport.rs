@@ -23,11 +23,15 @@ use rustls::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
 
 use crate::identity::{Fingerprint, Identity};
 
 /// How long a peer has to finish connecting before it is dropped.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many connections home handshakes with at once.
+const MAX_HANDSHAKES: usize = 8;
 
 /// An authenticated byte stream to the paired machine.
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
@@ -125,6 +129,7 @@ pub struct TlsAcceptor {
     listener: TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
     timeout: Duration,
+    handshakes: JoinSet<io::Result<tokio_rustls::server::TlsStream<TcpStream>>>,
 }
 
 impl TlsAcceptor {
@@ -144,6 +149,7 @@ impl TlsAcceptor {
             listener: bind_lan(address).await?,
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
             timeout: HANDSHAKE_TIMEOUT,
+            handshakes: JoinSet::new(),
         })
     }
 
@@ -161,17 +167,32 @@ impl Accept for TlsAcceptor {
     type Stream = tokio_rustls::server::TlsStream<TcpStream>;
 
     async fn accept(&mut self) -> io::Result<Self::Stream> {
-        let (tcp, peer) = self.listener.accept().await?;
-        match tokio::time::timeout(self.timeout, self.acceptor.accept(tcp)).await {
-            Ok(Ok(stream)) => Ok(stream),
-            Ok(Err(e)) => Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("refused {peer}: {e}"),
-            )),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("dropped {peer}: no handshake in time"),
-            )),
+        // Handshakes run side by side, so a silent connection holds one slot for its timeout
+        // and not the whole listener. Past the last slot the kernel's backlog waits.
+        loop {
+            tokio::select! {
+                Some(done) = self.handshakes.join_next() => {
+                    return done.map_err(io::Error::other)?;
+                }
+                accepted = self.listener.accept(), if self.handshakes.len() < MAX_HANDSHAKES => {
+                    let (tcp, peer) = accepted?;
+                    let acceptor = self.acceptor.clone();
+                    let timeout = self.timeout;
+                    self.handshakes.spawn(async move {
+                        match tokio::time::timeout(timeout, acceptor.accept(tcp)).await {
+                            Ok(Ok(stream)) => Ok(stream),
+                            Ok(Err(e)) => Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                format!("refused {peer}: {e}"),
+                            )),
+                            Err(_) => Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                format!("dropped {peer}: no handshake in time"),
+                            )),
+                        }
+                    });
+                }
+            }
         }
     }
 }
@@ -449,5 +470,36 @@ mod tests {
             .expect("the handshake timeout must fire")
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn silent_clients_do_not_keep_the_paired_remote_out() {
+        let m = machines();
+        // A timeout far longer than the test: only concurrency can let the remote through.
+        let mut acceptor = home_acceptor(&m)
+            .await
+            .with_handshake_timeout(Duration::from_secs(60));
+        let address = acceptor.local_addr().unwrap();
+        let _silent: Vec<TcpStream> = connect_silently(address, 5).await;
+        let dialer = TlsDialer::new(&m.remote, m.home.fingerprint(), address).unwrap();
+        let home = tokio::spawn(async move { acceptor.accept().await });
+        let remote = tokio::time::timeout(Duration::from_secs(5), dialer.dial())
+            .await
+            .expect("the paired remote must get through the silent clients")
+            .unwrap();
+        let home = tokio::time::timeout(Duration::from_secs(5), home)
+            .await
+            .expect("home must hand on the verified stream")
+            .unwrap()
+            .unwrap();
+        drop((home, remote));
+    }
+
+    async fn connect_silently(address: SocketAddr, count: usize) -> Vec<TcpStream> {
+        let mut clients = Vec::new();
+        for _ in 0..count {
+            clients.push(TcpStream::connect(address).await.unwrap());
+        }
+        clients
     }
 }
