@@ -425,9 +425,12 @@ impl Capture {
         }
     }
 
-    /// The keyboard went elsewhere while the pointer stayed: the keys held go up there.
+    /// The keyboard went elsewhere while the pointer stayed: the keys held go up there. When
+    /// the pointer left first, it released them already.
     pub fn keyboard_left(&mut self) {
-        self.release();
+        if !self.held_keys.is_empty() || !self.held_buttons.is_empty() {
+            self.release();
+        }
     }
 
     pub fn motion(&mut self, x: f64, y: f64) {
@@ -698,7 +701,6 @@ mod tests {
         assert_eq!(sent(&queue), [locked(&["Mod2"])]);
         // The keyboard comes again: the remote may have lost them, they are sent again.
         capture.keyboard_left();
-        let _ = sent(&queue);
         capture.keyboard_entered(&[]);
         capture.modifiers(0, 0, NUM, 0);
         assert_eq!(sent(&queue), [locked(&["Mod2"])]);
@@ -711,6 +713,16 @@ mod tests {
         capture.modifiers(SHIFT, 0, 0, 0);
         assert_eq!(capture.key(KEY_ESC, true), Some(Focus::Give));
         assert_eq!(sent(&queue), [locked(&[]), Event::ReleaseAll]);
+    }
+
+    #[test]
+    fn the_pointer_leaving_releases_everything_once() {
+        let (mut capture, queue) = armed(DEFAULT_HOTKEY);
+        capture.key(KEY_T, true);
+        capture.leave();
+        // Giving the keyboard back makes it leave too.
+        capture.keyboard_left();
+        assert_eq!(sent(&queue), [key(KEY_T, true), Event::ReleaseAll]);
     }
 
     #[test]
