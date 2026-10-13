@@ -21,7 +21,7 @@ use pw::metadata::{Metadata, MetadataListener};
 use pw::spa;
 use pw::types::ObjectType;
 
-use super::codec::{CHANNELS, FRAME, RATE, SAMPLES_PER_CYCLE};
+use super::codec::{CHANNELS, RATE, SAMPLES_PER_CYCLE};
 use super::jitter::Jitter;
 use super::{DefaultNode, Device, Graph, OnSound, lock};
 
@@ -546,14 +546,19 @@ fn format() -> Vec<u8> {
     .into_inner()
 }
 
+/// The graph cycle Navette's nodes ask for, in samples.
+const CYCLE: u32 = 512;
+
 fn properties(name: &str, description: &str) -> pw::properties::PropertiesBox {
     pw::properties::properties! {
         *pw::keys::NODE_NAME => name,
         *pw::keys::NODE_DESCRIPTION => description,
         *pw::keys::MEDIA_NAME => description,
         *pw::keys::APP_NAME => "Navette",
-        // One 10 ms frame per cycle when the graph allows it.
-        *pw::keys::NODE_LATENCY => format!("{FRAME}/{RATE}"),
+        // Cycles of 512 samples (11 ms) at most. PipeWire rounds a latency down to a power of
+        // two: asking for a 10 ms frame (480) ran the whole graph, the user's own apps
+        // included, in cycles of 256 (5 ms), short enough for a busy desk to miss some.
+        *pw::keys::NODE_LATENCY => format!("{CYCLE}/{RATE}"),
     }
 }
 

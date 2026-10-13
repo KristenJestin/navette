@@ -16,13 +16,18 @@ mixed with home sound. There is no output toggle: both machines are heard at onc
 
 ## The jitter buffer
 
+Navette's nodes ask PipeWire for cycles of 512 samples (11 ms) at most; a graph whose other
+apps ask for less runs shorter ones. (Asking for one 10 ms frame, 480 samples, ran both graphs
+in cycles of 256, as PipeWire rounds down to a power of two: 5 ms, short enough for a busy desk
+to miss some, heard as crackles that no buffer can absorb.)
+
 What the buffer keeps after each cycle of the playback (its *target*) is at least a cycle's
-worth plus 10 ms: with PipeWire's default quantum (1024 samples, 21 ms), about 31 ms are left
-after each cycle, 52 ms on average before it. It starts 20 ms above that, as the link has not
-shown how it behaves yet, and comes down once it is calm. The extra cycle is there because the laptop sends a
-cycle of its own at a time: as the two clocks drift, one of them now and then reaches home just
-after the cycle it used to be in time for, and that cycle finds 21 ms less. Without it, the
-buffer ran dry every few minutes even on a cable (about every 7 minutes at 50 ppm of drift).
+worth plus 10 ms: in cycles of 512, about 21 ms are left after each cycle, 32 ms before it; in
+PipeWire's default cycles of 1024 (21 ms), 31 ms and 52 ms. It starts 20 ms above that, as the
+link has not shown how it behaves yet, and comes down once it is calm. The extra cycle is
+there because the laptop sends a cycle of its own at a time: as the two clocks drift, one of
+them now and then reaches home just after the cycle it used to be in time for, and that cycle
+finds a cycle's worth less. Without it, the buffer ran dry every few minutes even on a cable.
 
 - **The link falls behind** (Wi-Fi): each time the buffer runs dry (an *underrun*, a gap of
   silence), the target grows by 10 ms, up to 100 ms. A silence of more than half a second is
