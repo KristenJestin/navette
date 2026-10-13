@@ -92,6 +92,24 @@ pub enum LinkMsg {
         #[n(2)]
         data_len: u32,
     },
+    // Home's mic (`crate::audio::mic`), home to remote, a block of numbers of its own.
+    #[n(51)]
+    MicStart {
+        #[n(0)]
+        session: u32,
+    },
+    #[n(52)]
+    MicStop,
+    /// One Opus packet of `data_len` bytes follows the message.
+    #[n(53)]
+    MicFrame {
+        #[n(0)]
+        session: u32,
+        #[n(1)]
+        seq: u32,
+        #[n(2)]
+        data_len: u32,
+    },
 }
 
 impl From<Msg> for LinkMsg {
@@ -151,6 +169,17 @@ impl From<&audio::Message> for LinkMsg {
                 seq: *seq,
                 data_len: packet.len() as u32,
             },
+            audio::Message::MicStart { session } => Self::MicStart { session: *session },
+            audio::Message::MicStop => Self::MicStop,
+            audio::Message::MicFrame {
+                session,
+                seq,
+                packet,
+            } => Self::MicFrame {
+                session: *session,
+                seq: *seq,
+                data_len: packet.len() as u32,
+            },
         }
     }
 }
@@ -165,7 +194,10 @@ impl LinkMsg {
             | Self::Feedback(_)
             | Self::AudioStart { .. }
             | Self::AudioStop
-            | Self::AudioFrame { .. } => return None,
+            | Self::AudioFrame { .. }
+            | Self::MicStart { .. }
+            | Self::MicStop
+            | Self::MicFrame { .. } => return None,
             Self::ClipboardOffer {
                 serial,
                 mime_types,

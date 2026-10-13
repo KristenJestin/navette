@@ -38,21 +38,23 @@ type Pending = Rc<RefCell<Vec<(spa::utils::result::AsyncSeq, Reply<()>)>>>;
 enum Command {
     DefaultNode(Device, Reply<Option<DefaultNode>>),
     SetDefaultNode(Device, Option<DefaultNode>, Reply<()>),
-    OpenSink {
+    Open {
         name: String,
         description: String,
-        on_sound: OnSound,
-        reply: Reply<u64>,
-    },
-    OpenPlayback {
-        name: String,
-        description: String,
-        jitter: Arc<Mutex<Jitter>>,
+        what: Opening,
         reply: Reply<u64>,
     },
     Close(u64),
     /// Ends a loop that stopped answering, and with it every stream it holds.
     Quit,
+}
+
+/// What a node of ours is.
+enum Opening {
+    Sink(OnSound),
+    Playback(Arc<Mutex<Jitter>>),
+    Source(Arc<Mutex<Jitter>>),
+    Mic(OnSound),
 }
 
 /// The way to one PipeWire loop: its commands, and whether it still runs.
@@ -149,8 +151,14 @@ impl PipeWire {
         ))
     }
 
-    fn node(&self, id: u64, on: Loop) -> Node {
-        Node { on, id }
+    fn open(&self, name: &str, description: &str, what: Opening) -> io::Result<Node> {
+        let (id, on) = self.call(|reply| Command::Open {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            what,
+            reply,
+        })?;
+        Ok(Node { on, id })
     }
 }
 
@@ -167,13 +175,7 @@ impl Graph for PipeWire {
     }
 
     fn open_sink(&self, name: &str, description: &str, on_sound: OnSound) -> io::Result<Node> {
-        let id = self.call(|reply| Command::OpenSink {
-            name: name.to_owned(),
-            description: description.to_owned(),
-            on_sound,
-            reply,
-        })?;
-        Ok(self.node(id.0, id.1))
+        self.open(name, description, Opening::Sink(on_sound))
     }
 
     fn open_playback(
@@ -182,13 +184,20 @@ impl Graph for PipeWire {
         description: &str,
         jitter: Arc<Mutex<Jitter>>,
     ) -> io::Result<Node> {
-        let id = self.call(|reply| Command::OpenPlayback {
-            name: name.to_owned(),
-            description: description.to_owned(),
-            jitter,
-            reply,
-        })?;
-        Ok(self.node(id.0, id.1))
+        self.open(name, description, Opening::Playback(jitter))
+    }
+
+    fn open_source(
+        &self,
+        name: &str,
+        description: &str,
+        jitter: Arc<Mutex<Jitter>>,
+    ) -> io::Result<Node> {
+        self.open(name, description, Opening::Source(jitter))
+    }
+
+    fn open_mic(&self, name: &str, description: &str, on_sound: OnSound) -> io::Result<Node> {
+        self.open(name, description, Opening::Mic(on_sound))
     }
 
     fn is_gone(&self, node: &Node) -> bool {
@@ -225,10 +234,51 @@ fn connect() -> io::Result<Loop> {
     })
 }
 
-/// A stream of ours, its listener dropped first so it unhooks from a live stream.
+/// A stream of ours, its listener dropped first so it unhooks from a live stream, and the
+/// module it records from, if any, last.
 struct Open {
     _listener: Box<dyn std::any::Any>,
     _stream: pw::stream::StreamRc,
+    _module: Option<Module>,
+}
+
+/// A module loaded into this process's own context: its nodes live here, and go when it is
+/// destroyed, or when the process ends, crash included.
+struct Module(std::ptr::NonNull<pw::sys::pw_impl_module>);
+
+impl Drop for Module {
+    fn drop(&mut self) {
+        // SAFETY: the module was loaded into the context of this thread's loop, which outlives
+        // every `Open` (they are dropped before it), and it is destroyed only here, once.
+        unsafe { pw::sys::pw_impl_module_destroy(self.0.as_ptr()) }
+    }
+}
+
+fn load_module(context: &pw::context::ContextRc, name: &str, args: &str) -> io::Result<Module> {
+    let (name, args) = (
+        std::ffi::CString::new(name).map_err(io::Error::other)?,
+        std::ffi::CString::new(args).map_err(io::Error::other)?,
+    );
+    // SAFETY: the context is alive and used from its loop's thread; the strings are copied by
+    // the call; no properties are passed.
+    let module = unsafe {
+        pw::sys::pw_context_load_module(
+            context.as_raw_ptr(),
+            name.as_ptr(),
+            args.as_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    std::ptr::NonNull::new(module).map(Module).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "PipeWire could not load {}: {}",
+                name.to_string_lossy(),
+                io::Error::last_os_error()
+            ),
+        )
+    })
 }
 
 fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Result<()> {
@@ -341,27 +391,20 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
                 }
             }
         }
-        Command::OpenSink {
+        Command::Open {
             name,
             description,
-            on_sound,
+            what,
             reply,
         } => {
             let id = next_id.replace(next_id.get() + 1);
-            let result = open_sink(&core, &name, &description, on_sound).map(|open| {
-                streams.borrow_mut().insert(id, open);
-                id
-            });
-            let _ = reply.send(result);
-        }
-        Command::OpenPlayback {
-            name,
-            description,
-            jitter,
-            reply,
-        } => {
-            let id = next_id.replace(next_id.get() + 1);
-            let result = open_playback(&core, &name, &description, jitter).map(|open| {
+            let opened = match what {
+                Opening::Sink(on_sound) => open_sink(&core, &name, &description, on_sound),
+                Opening::Playback(jitter) => open_playback(&core, &name, &description, jitter),
+                Opening::Source(jitter) => open_source(&core, &name, &description, jitter),
+                Opening::Mic(on_sound) => open_mic(&context, &core, &name, &description, on_sound),
+            };
+            let result = opened.map(|open| {
                 streams.borrow_mut().insert(id, open);
                 id
             });
@@ -523,6 +566,109 @@ fn open_sink(
 ) -> io::Result<Open> {
     let mut props = properties(name, description);
     props.insert(*pw::keys::MEDIA_CLASS, "Audio/Sink");
+    // Not autoconnected: the session manager links the apps to it, as to any sink.
+    recording(
+        core,
+        name,
+        props,
+        pw::stream::StreamFlags::empty(),
+        on_sound,
+    )
+}
+
+fn open_playback(
+    core: &pw::core::CoreRc,
+    name: &str,
+    description: &str,
+    jitter: Arc<Mutex<Jitter>>,
+) -> io::Result<Open> {
+    let mut props = properties(name, description);
+    props.insert(*pw::keys::MEDIA_TYPE, "Audio");
+    props.insert(*pw::keys::MEDIA_CATEGORY, "Playback");
+    playing(
+        core,
+        name,
+        props,
+        pw::stream::StreamFlags::AUTOCONNECT,
+        jitter,
+    )
+}
+
+/// A virtual mic the way PipeWire's loopback module makes one: a stream with the `Audio/Source`
+/// media class, not autoconnected, that the session manager lists among the sources.
+fn open_source(
+    core: &pw::core::CoreRc,
+    name: &str,
+    description: &str,
+    jitter: Arc<Mutex<Jitter>>,
+) -> io::Result<Open> {
+    let mut props = properties(name, description);
+    props.insert(*pw::keys::MEDIA_CLASS, "Audio/Source");
+    playing(core, name, props, pw::stream::StreamFlags::empty(), jitter)
+}
+
+/// PipeWire's echo canceller (WebRTC), loaded here: it captures the default mic, and the
+/// monitor of the default output as what to cancel, so that home's own default output is
+/// left as it is. Its source is no default: only this stream records from it.
+fn echo_cancel_args(name: &str, description: &str) -> String {
+    let quoted = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    format!(
+        "{{ library.name = aec/libspa-aec-webrtc monitor.mode = true \
+         node.description = {description} \
+         capture.props = {{ node.name = {capture} node.description = {description} }} \
+         sink.props = {{ node.name = {reference} node.description = {description} }} \
+         source.props = {{ node.name = {source} node.description = {description} \
+         priority.session = 0 priority.driver = 0 }} }}",
+        description = quoted(description),
+        capture = quoted(&format!("{name}-capture")),
+        reference = quoted(&format!("{name}-reference")),
+        source = quoted(&echo_cancelled(name)),
+    )
+}
+
+/// The echo canceller's source, which the mic records from.
+fn echo_cancelled(name: &str) -> String {
+    format!("{name}-echo-cancelled")
+}
+
+fn open_mic(
+    context: &pw::context::ContextRc,
+    core: &pw::core::CoreRc,
+    name: &str,
+    description: &str,
+    on_sound: OnSound,
+) -> io::Result<Open> {
+    let module = load_module(
+        context,
+        "libpipewire-module-echo-cancel",
+        &echo_cancel_args(name, description),
+    )?;
+    let mut props = properties(name, description);
+    props.insert(*pw::keys::MEDIA_TYPE, "Audio");
+    props.insert(*pw::keys::MEDIA_CATEGORY, "Capture");
+    props.insert(*pw::keys::MEDIA_ROLE, "Communication");
+    props.insert(*pw::keys::TARGET_OBJECT, echo_cancelled(name));
+    // Never the raw mic in its place: what the remote hears would echo.
+    props.insert(*pw::keys::NODE_DONT_RECONNECT, "true");
+    let mut open = recording(
+        core,
+        name,
+        props,
+        pw::stream::StreamFlags::AUTOCONNECT,
+        on_sound,
+    )?;
+    open._module = Some(module);
+    Ok(open)
+}
+
+/// A stream that takes sound in and hands it to `on_sound`.
+fn recording(
+    core: &pw::core::CoreRc,
+    name: &str,
+    props: pw::properties::PropertiesBox,
+    flags: pw::stream::StreamFlags,
+    on_sound: OnSound,
+) -> io::Result<Open> {
     let stream = pw::stream::StreamRc::new(core.clone(), name, props).map_err(pw_error)?;
     let samples = Vec::with_capacity(SAMPLES_PER_CYCLE);
     let listener = stream
@@ -543,27 +689,22 @@ fn open_sink(
         })
         .register()
         .map_err(pw_error)?;
-    // Not autoconnected: the session manager links the apps to it, as to any sink.
-    connect_stream(
-        &stream,
-        spa::utils::Direction::Input,
-        pw::stream::StreamFlags::empty(),
-    )?;
+    connect_stream(&stream, spa::utils::Direction::Input, flags)?;
     Ok(Open {
         _listener: Box::new(listener),
         _stream: stream,
+        _module: None,
     })
 }
 
-fn open_playback(
+/// A stream that plays what `jitter` holds.
+fn playing(
     core: &pw::core::CoreRc,
     name: &str,
-    description: &str,
+    props: pw::properties::PropertiesBox,
+    flags: pw::stream::StreamFlags,
     jitter: Arc<Mutex<Jitter>>,
 ) -> io::Result<Open> {
-    let mut props = properties(name, description);
-    props.insert(*pw::keys::MEDIA_TYPE, "Audio");
-    props.insert(*pw::keys::MEDIA_CATEGORY, "Playback");
     let stream = pw::stream::StreamRc::new(core.clone(), name, props).map_err(pw_error)?;
     let samples = vec![0.0f32; SAMPLES_PER_CYCLE];
     let listener = stream
@@ -601,14 +742,11 @@ fn open_playback(
         })
         .register()
         .map_err(pw_error)?;
-    connect_stream(
-        &stream,
-        spa::utils::Direction::Output,
-        pw::stream::StreamFlags::AUTOCONNECT,
-    )?;
+    connect_stream(&stream, spa::utils::Direction::Output, flags)?;
     Ok(Open {
         _listener: Box::new(listener),
         _stream: stream,
+        _module: None,
     })
 }
 
@@ -658,7 +796,7 @@ mod tests {
                             }
                             format!("default {}", sink.map_or("cleared".into(), |s| s.0))
                         }
-                        Command::OpenSink { reply, .. } | Command::OpenPlayback { reply, .. } => {
+                        Command::Open { reply, .. } => {
                             let _ = reply.send(Ok(next_id));
                             next_id += 1;
                             format!("open {}", next_id - 1)

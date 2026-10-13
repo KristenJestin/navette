@@ -14,6 +14,10 @@
 //! - `AudioStop` (home → remote): put the previous default back and stop sending.
 //! - `AudioFrame` (remote → home), with the session and a sequence number: one Opus packet
 //!   follows it.
+//!
+//! Home's mic goes the other way ([`mic`]): `MicStart` and `MicStop` (home → remote) open and
+//! close the remote's virtual source, the default mic while a mode runs, and `MicFrame` (home
+//! → remote) carries what the home mic hears while it goes to the remote machine.
 
 #[cfg(test)]
 pub(crate) mod allocations;
@@ -21,6 +25,7 @@ pub mod codec;
 #[cfg(test)]
 pub mod fake;
 pub mod jitter;
+pub mod mic;
 pub mod pipewire;
 
 use std::io;
@@ -63,6 +68,18 @@ pub enum Message {
     },
     Stop,
     Frame {
+        session: u32,
+        seq: u32,
+        packet: Bytes,
+    },
+    /// Home's mic, the other way (`mic`): the remote's source becomes the default mic for
+    /// the session.
+    MicStart {
+        session: u32,
+    },
+    MicStop,
+    /// Home → remote: one Opus packet of what the home mic hears.
+    MicFrame {
         session: u32,
         seq: u32,
         packet: Bytes,
@@ -227,6 +244,17 @@ pub trait Graph: Clone + Send + 'static {
         description: &str,
         jitter: Arc<Mutex<Jitter>>,
     ) -> io::Result<Self::Node>;
+    /// A virtual source, which the machine's apps record from as from a mic: it plays what
+    /// `jitter` holds.
+    fn open_source(
+        &self,
+        name: &str,
+        description: &str,
+        jitter: Arc<Mutex<Jitter>>,
+    ) -> io::Result<Self::Node>;
+    /// The machine's mic, with the echo of what its speakers play cancelled: what it hears
+    /// goes to `on_sound`. The echo canceller goes with the node.
+    fn open_mic(&self, name: &str, description: &str, on_sound: OnSound) -> io::Result<Self::Node>;
     /// Whether `node` went with the PipeWire it was opened on (restarted, say).
     fn is_gone(&self, node: &Self::Node) -> bool;
 }
@@ -324,6 +352,23 @@ fn sender(
     seq: Arc<AtomicU32>,
     failures: Arc<AtomicU64>,
 ) -> io::Result<OnSound> {
+    encoding(home, session, seq, failures, |session, seq, packet| {
+        Message::Frame {
+            session,
+            seq,
+            packet,
+        }
+    })
+}
+
+/// Encodes what a node hears and sends each frame as `frame` makes it, on PipeWire's thread.
+fn encoding(
+    to: mpsc::Sender<Message>,
+    session: u32,
+    seq: Arc<AtomicU32>,
+    failures: Arc<AtomicU64>,
+    frame: fn(u32, u32, Bytes) -> Message,
+) -> io::Result<OnSound> {
     let mut encoder = Encoder::new()?;
     // The packets are cut from one block, so a frame costs no allocation of its own.
     let mut arena = BytesMut::with_capacity(ARENA);
@@ -333,14 +378,14 @@ fn sender(
                 arena.reserve(ARENA);
             }
             arena.extend_from_slice(packet);
-            let frame = Message::Frame {
+            let frame = frame(
                 session,
-                seq: seq.fetch_add(1, Ordering::Relaxed),
-                packet: arena.split().freeze(),
-            };
-            // Late sound is worse than lost sound: a full link drops the frame, and home fills
-            // the gap.
-            let _ = home.try_send(frame);
+                seq.fetch_add(1, Ordering::Relaxed),
+                arena.split().freeze(),
+            );
+            // Late sound is worse than lost sound: a full link drops the frame, and the other
+            // side fills the gap.
+            let _ = to.try_send(frame);
         });
         if sent.is_err() {
             failures.fetch_add(1, Ordering::Relaxed);
@@ -419,8 +464,10 @@ pub fn remote<G: Graph>(
                 let _ = previous.join();
             }
             let mut sink = None;
+            let mut voice: Option<mic::Voice<G>> = None;
             // Told once per outage, not at each check while PipeWire is still away.
             let mut lost = false;
+            let mut voice_lost = false;
             loop {
                 match wire.from_peer.recv_timeout(CHECK) {
                     Ok(Message::Start { session }) => {
@@ -437,8 +484,37 @@ pub fn remote<G: Graph>(
                         }
                     }
                     Ok(Message::Stop) => drop(sink.take()),
+                    Ok(Message::MicStart { session }) => {
+                        drop(voice.take());
+                        match mic::Voice::start(graph.clone(), saved.clone(), session) {
+                            Ok(started) => voice = Some(started),
+                            Err(e) => eprintln!("navette: mic: could not start the source: {e}"),
+                        }
+                    }
+                    Ok(Message::MicStop) => drop(voice.take()),
+                    Ok(Message::MicFrame {
+                        session,
+                        seq,
+                        packet,
+                    }) => {
+                        if let Some(voice) = &mut voice
+                            && let Err(e) = voice.received(session, seq, &packet)
+                        {
+                            eprintln!("navette: mic: {e}");
+                        }
+                    }
                     Ok(Message::Frame { .. }) | Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
+                }
+                if let Some(voice) = &mut voice {
+                    match voice.recover() {
+                        Ok(()) => voice_lost = false,
+                        Err(e) if !voice_lost => {
+                            eprintln!("navette: mic: could not open the source again: {e}");
+                            voice_lost = true;
+                        }
+                        Err(_) => {}
+                    }
                 }
                 if let Some(capture) = &mut sink {
                     match capture.recover() {
@@ -555,11 +631,11 @@ mod tests {
     use super::*;
     use crate::link;
 
-    const WAIT: Duration = Duration::from_secs(10);
+    pub(super) const WAIT: Duration = Duration::from_secs(10);
 
     /// The audio wires of the two ends of a link in memory, and home's end of the link, to
     /// drop it.
-    async fn linked() -> (Wire, Wire, tokio::task::JoinHandle<io::Error>) {
+    pub(super) async fn linked() -> (Wire, Wire, tokio::task::JoinHandle<io::Error>) {
         let (home_stream, remote_stream) = tokio::io::duplex(64 * 1024);
         let heartbeat = link::Heartbeat::default();
         let end = |stream| {
@@ -576,7 +652,7 @@ mod tests {
         (home.await.unwrap(), remote.await.unwrap(), home_end)
     }
 
-    async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    pub(super) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
         tokio::time::timeout(WAIT, tokio::task::spawn_blocking(f))
             .await
             .expect("in time")
@@ -584,7 +660,7 @@ mod tests {
     }
 
     /// Polls `check` on the fake graph until it holds.
-    async fn until(graph: &FakeGraph, check: impl Fn(&fake::State) -> bool) {
+    pub(super) async fn until(graph: &FakeGraph, check: impl Fn(&fake::State) -> bool) {
         tokio::time::timeout(WAIT, async {
             while !check(&graph.state()) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -594,7 +670,7 @@ mod tests {
         .expect("the graph reached the expected state in time");
     }
 
-    fn tone(frames: usize) -> Vec<f32> {
+    pub(super) fn tone(frames: usize) -> Vec<f32> {
         (0..frames * codec::FRAME)
             .flat_map(|i| {
                 let v = 0.5 * (i as f32 * 440.0 * std::f32::consts::TAU / codec::RATE as f32).sin();
@@ -614,12 +690,19 @@ mod tests {
                 packet: Bytes::from_static(&[9, 8, 7]),
             },
             Message::Stop,
+            Message::MicStart { session: 8 },
+            Message::MicFrame {
+                session: 8,
+                seq: 0x0506_0708,
+                packet: Bytes::from_static(&[6, 5]),
+            },
+            Message::MicStop,
         ];
         for message in &messages {
             home.to_peer.send(message.clone()).await.unwrap();
         }
         let received = blocking(move || {
-            (0..3)
+            (0..6)
                 .map(|_| remote.from_peer.recv_timeout(WAIT).unwrap())
                 .collect::<Vec<_>>()
         })
@@ -628,7 +711,7 @@ mod tests {
     }
 
     /// A saved-default file of its own, in a temporary directory.
-    fn saved() -> (tempfile::TempDir, Saved) {
+    pub(super) fn saved() -> (tempfile::TempDir, Saved) {
         let tmp = tempfile::tempdir().unwrap();
         let saved = Saved::in_dir(tmp.path().join("state"));
         (tmp, saved)

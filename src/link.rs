@@ -225,7 +225,8 @@ async fn send<W: AsyncWrite + Unpin>(
             msg = sound.recv(), if sound_open => match msg {
                 Some(msg) => {
                     let packet = match &msg {
-                        audio::Message::Frame { packet, .. } => &packet[..],
+                        audio::Message::Frame { packet, .. }
+                        | audio::Message::MicFrame { packet, .. } => &packet[..],
                         _ => &[],
                     };
                     writer
@@ -271,7 +272,12 @@ async fn receive<R: AsyncRead + Unpin>(
             .map_err(|_| silent())?
             .map_err(io_error)?;
         let clip = match msg {
-            LinkMsg::AudioStart { .. } | LinkMsg::AudioStop | LinkMsg::AudioFrame { .. } => {
+            LinkMsg::AudioStart { .. }
+            | LinkMsg::AudioStop
+            | LinkMsg::AudioFrame { .. }
+            | LinkMsg::MicStart { .. }
+            | LinkMsg::MicStop
+            | LinkMsg::MicFrame { .. } => {
                 let sound_msg = audio_received(&mut reader, timeout, msg).await?;
                 // Like the clipboard's, a sound the audio thread is not ready for is dropped.
                 let _ = sound.try_send(sound_msg);
@@ -369,12 +375,26 @@ async fn audio_received<R: AsyncRead + Unpin>(
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the peer went silent"))?
                 .map_err(io_error)?,
         },
-        LinkMsg::AudioFrame { .. } => {
+        LinkMsg::MicStart { session } => audio::Message::MicStart { session },
+        LinkMsg::MicFrame {
+            session,
+            seq,
+            data_len,
+        } if data_len as usize <= MAX_PACKET => audio::Message::MicFrame {
+            session,
+            seq,
+            packet: tokio::time::timeout(timeout, reader.read_payload(data_len))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the peer went silent"))?
+                .map_err(io_error)?,
+        },
+        LinkMsg::AudioFrame { .. } | LinkMsg::MicFrame { .. } => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "an audio packet larger than Opus makes",
             ));
         }
+        LinkMsg::MicStop => audio::Message::MicStop,
         _ => audio::Message::Stop,
     })
 }
@@ -669,6 +689,27 @@ pub(crate) mod tests {
         let data = vec![0u8; MAX_PACKET + 1];
         peer.write_msg_with_payloads(
             &LinkMsg::AudioFrame {
+                session: 1,
+                seq: 0,
+                data_len: data.len() as u32,
+            },
+            &[&data],
+        )
+        .await
+        .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), nothing))
+            .await
+            .expect("the link must give up on an oversized packet");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_mic_packet_larger_than_opus_makes_ends_the_link() {
+        let (a, b) = tokio::io::duplex(2 * MAX_PACKET);
+        let mut peer = Framed::new(b);
+        let data = vec![0u8; MAX_PACKET + 1];
+        peer.write_msg_with_payloads(
+            &LinkMsg::MicFrame {
                 session: 1,
                 seq: 0,
                 data_len: data.len() as u32,

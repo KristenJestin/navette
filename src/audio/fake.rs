@@ -13,6 +13,11 @@ pub struct State {
     pub default_source: Option<DefaultNode>,
     pub sinks: Vec<(String, Arc<Mutex<OnSound>>)>,
     pub playbacks: Vec<(String, Arc<Mutex<Jitter>>)>,
+    pub sources: Vec<(String, Arc<Mutex<Jitter>>)>,
+    /// The echo-cancelled mics open, each with where its sound goes.
+    pub mics: Vec<(String, Arc<Mutex<OnSound>>)>,
+    /// Opening a mic fails, as with no echo canceller installed.
+    pub refuse_mics: bool,
     /// What was done, in order.
     pub log: Vec<String>,
     /// Changes of the default fail, as when PipeWire is gone.
@@ -43,6 +48,8 @@ impl FakeGraph {
         state.restarts += 1;
         state.sinks.clear();
         state.playbacks.clear();
+        state.sources.clear();
+        state.mics.clear();
         state.log.push("restart".to_owned());
     }
 }
@@ -62,6 +69,8 @@ impl Drop for FakeNode {
         }
         state.sinks.retain(|(name, _)| *name != self.name);
         state.playbacks.retain(|(name, _)| *name != self.name);
+        state.sources.retain(|(name, _)| *name != self.name);
+        state.mics.retain(|(name, _)| *name != self.name);
         state.log.push(format!("remove {}", self.name));
     }
 }
@@ -122,6 +131,38 @@ impl Graph for FakeGraph {
         let mut state = self.state();
         state.playbacks.push((name.to_owned(), jitter));
         state.log.push(format!("playback {name}"));
+        Ok(FakeNode {
+            graph: self.clone(),
+            name: name.to_owned(),
+            restarts: state.restarts,
+        })
+    }
+
+    fn open_source(
+        &self,
+        name: &str,
+        _description: &str,
+        jitter: Arc<Mutex<Jitter>>,
+    ) -> io::Result<FakeNode> {
+        let mut state = self.state();
+        state.sources.push((name.to_owned(), jitter));
+        state.log.push(format!("source {name}"));
+        Ok(FakeNode {
+            graph: self.clone(),
+            name: name.to_owned(),
+            restarts: state.restarts,
+        })
+    }
+
+    fn open_mic(&self, name: &str, _description: &str, on_sound: OnSound) -> io::Result<FakeNode> {
+        let mut state = self.state();
+        if state.refuse_mics {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no echo canceller"));
+        }
+        state
+            .mics
+            .push((name.to_owned(), Arc::new(Mutex::new(on_sound))));
+        state.log.push(format!("mic {name}"));
         Ok(FakeNode {
             graph: self.clone(),
             name: name.to_owned(),
