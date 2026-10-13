@@ -7,7 +7,9 @@
 //! decoder are gliff's; the GTK hand-off becomes a plain callback.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -15,6 +17,7 @@ use gliff_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg, features}
 use gliff_sw::VideoMode;
 use gliff_vk::{Decoder, DisplayFrame, Gpu};
 
+use super::Ended;
 use super::wire::{Msg, Outbox};
 
 /// The CPU decoder holds the newest picture of a High-profile stream until the next access
@@ -22,6 +25,9 @@ use super::wire::{Msg, Outbox};
 const IDLE_DRAIN: Duration = Duration::from_millis(150);
 /// How often the numbers are written to the log.
 const REPORT_EVERY: Duration = Duration::from_secs(10);
+/// Frames waiting for the decoder; past this, home has fallen behind and drops frames until a
+/// keyframe rather than queue them without end.
+const QUEUE: usize = 4;
 
 /// A decoded picture, for the surface.
 pub enum Picture {
@@ -75,26 +81,109 @@ pub struct Video {
 
 /// The decode thread; it ends when this is dropped.
 pub struct Decoding {
-    video: Sender<Video>,
+    video: Option<Sender<Video>>,
+    /// Frames sent to the thread and not taken yet.
+    queued: Arc<AtomicUsize>,
+    /// A frame was dropped: the next ones are too, until a keyframe.
+    skipping: AtomicBool,
+    outbox: Outbox,
+    thread: Option<JoinHandle<()>>,
 }
+
+/// Makes the CPU decoder (a port, so a test can make it fail).
+type CpuDecoder = fn(bool) -> Result<gliff_sw::Decoder, String>;
 
 impl Decoding {
     /// `dmabuf`: the surface takes the GPU's pictures as dmabufs; otherwise they are read back.
+    /// `ended` hears why decoding cannot go on.
     pub fn start(
         gpu: Option<Arc<Gpu>>,
         dmabuf: bool,
         outbox: Outbox,
         show: Box<dyn FnMut(Picture) + Send>,
+        ended: Ended,
     ) -> std::io::Result<Self> {
-        let (video, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("navette-decode".into())
-            .spawn(move || run(gpu, dmabuf, outbox, show, rx))?;
-        Ok(Self { video })
+        Self::start_with(gpu, dmabuf, outbox, show, ended, |dual| {
+            gliff_sw::Decoder::new(dual).map_err(|e| e.to_string())
+        })
     }
 
+    fn start_with(
+        gpu: Option<Arc<Gpu>>,
+        dmabuf: bool,
+        outbox: Outbox,
+        show: Box<dyn FnMut(Picture) + Send>,
+        ended: Ended,
+        cpu: CpuDecoder,
+    ) -> std::io::Result<Self> {
+        let (video, rx) = std::sync::mpsc::channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let thread = {
+            let (outbox, queued) = (outbox.clone(), queued.clone());
+            std::thread::Builder::new()
+                .name("navette-decode".into())
+                .spawn(move || {
+                    let thread = Thread {
+                        gpu,
+                        dmabuf,
+                        cpu,
+                        outbox,
+                        queued,
+                        ended,
+                    };
+                    thread.run(show, rx)
+                })?
+        };
+        Ok(Self {
+            video: Some(video),
+            queued,
+            skipping: AtomicBool::new(false),
+            outbox,
+            thread: Some(thread),
+        })
+    }
+
+    /// Hands a message to the thread; a frame that would wait behind [`QUEUE`] others is
+    /// dropped, and so are the next ones until a keyframe, which is asked for. A dropped frame is
+    /// acked all the same: the remote paces on acks.
     pub fn video(&self, video: Video) {
-        let _ = self.video.send(video);
+        if let ServerMsg::VideoFrame {
+            frame_id, keyframe, ..
+        } = video.msg
+        {
+            let full = self.queued.load(Ordering::Relaxed) >= QUEUE;
+            let skipping = self.skipping.load(Ordering::Relaxed);
+            if full || (skipping && !keyframe) {
+                if !skipping || keyframe {
+                    self.outbox
+                        .send(Msg::Feedback(ClientMsg::RequestKeyframe), Vec::new());
+                }
+                self.skipping.store(true, Ordering::Relaxed);
+                self.outbox.send(
+                    Msg::Feedback(ClientMsg::FrameAck {
+                        frame_id,
+                        decoded_at_ms: now_us() / 1000,
+                    }),
+                    Vec::new(),
+                );
+                return;
+            }
+            self.skipping.store(false, Ordering::Relaxed);
+            self.queued.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(sender) = &self.video {
+            let _ = sender.send(video);
+        }
+    }
+}
+
+impl Drop for Decoding {
+    /// The thread is joined: once this returns, no picture is on its way to the surface.
+    fn drop(&mut self) {
+        self.video = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -104,21 +193,23 @@ enum VideoDecoder {
 }
 
 impl VideoDecoder {
-    fn new(gpu: &Option<Arc<Gpu>>, chroma: ChromaMode, width: u32, height: u32) -> Option<Self> {
+    fn new(
+        gpu: &Option<Arc<Gpu>>,
+        cpu: CpuDecoder,
+        chroma: ChromaMode,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
         let dual = chroma != ChromaMode::Single420;
         if let Some(gpu) = gpu {
             match Decoder::new(gpu, dual, width, height) {
-                Ok(d) => return Some(Self::Gpu(Box::new(d))),
+                Ok(d) => return Ok(Self::Gpu(Box::new(d))),
                 Err(e) => eprintln!("navette: cannot create the GPU decoder ({e}); using the CPU"),
             }
         }
-        match gliff_sw::Decoder::new(dual) {
-            Ok(d) => Some(Self::Cpu(Box::new(d))),
-            Err(e) => {
-                eprintln!("navette: cannot create the CPU decoder: {e}");
-                None
-            }
-        }
+        cpu(dual)
+            .map(|d| Self::Cpu(Box::new(d)))
+            .map_err(|e| format!("home cannot decode the picture: {e}"))
     }
 
     fn label(&self) -> &'static str {
@@ -160,94 +251,124 @@ impl VideoDecoder {
     }
 }
 
-fn run(
-    mut gpu: Option<Arc<Gpu>>,
+/// What the decode thread owns.
+struct Thread {
+    gpu: Option<Arc<Gpu>>,
     dmabuf: bool,
+    cpu: CpuDecoder,
     outbox: Outbox,
-    mut show: Box<dyn FnMut(Picture) + Send>,
-    rx: Receiver<Video>,
-) {
-    let mut decoder: Option<VideoDecoder> = None;
-    let mut config = (0, 0, ChromaMode::Single420);
-    let mut gpu_decoded = false;
-    let mut stats = Stats::new();
-    let feedback = |msg: ClientMsg| outbox.send(Msg::Feedback(msg), Vec::new());
-    loop {
-        let video = match rx.recv_timeout(IDLE_DRAIN) {
-            Ok(video) => video,
-            Err(RecvTimeoutError::Timeout) => {
-                if let Some(VideoDecoder::Cpu(d)) = &mut decoder
-                    && d.has_pending()
-                    && let Ok(Some(frame)) = d.flush()
-                {
-                    show(Picture::Bgra(frame));
-                }
-                stats.report_if_due(decoder.as_ref().map(VideoDecoder::label));
-                continue;
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
-        match video.msg {
-            ServerMsg::StreamConfig {
-                width,
-                height,
-                chroma,
-                ..
-            } => {
-                // A pace-only change must not reset the decoder.
-                if (width, height, chroma) != config || decoder.is_none() {
-                    config = (width, height, chroma);
-                    decoder = VideoDecoder::new(&gpu, chroma, width, height);
-                    if let Some(d) = &decoder {
-                        let handover = match d {
-                            VideoDecoder::Gpu(_) if dmabuf => "shown as a dmabuf",
-                            _ => "copied to the surface",
-                        };
-                        eprintln!(
-                            "navette: decoding {width}x{height} {chroma:?} on the {}, {handover}",
-                            d.label()
-                        );
-                    }
-                }
-            }
-            ServerMsg::VideoFrame {
-                frame_id, pts_us, ..
-            } => {
-                let Some(d) = &mut decoder else { continue };
-                let t0 = Instant::now();
-                let decoded = d.decode(&video.main, &video.aux, dmabuf, (config.0, config.1));
-                let decode_ms = t0.elapsed().as_secs_f32() * 1000.0;
-                // Ack at once so the remote keeps pacing.
-                feedback(ClientMsg::FrameAck {
-                    frame_id,
-                    decoded_at_ms: now_us() / 1000,
-                });
-                match decoded {
-                    Ok(Some(picture)) => {
-                        gpu_decoded |= matches!(d, VideoDecoder::Gpu(_));
-                        stats.note(decode_ms, now_us().saturating_sub(pts_us));
-                        show(picture);
-                    }
-                    Ok(None) => {}
-                    Err(e) if matches!(d, VideoDecoder::Gpu(_)) && !gpu_decoded => {
-                        // A driver path that cannot work here: the CPU takes over for good.
-                        eprintln!("navette: the GPU decode failed ({e}); decoding on the CPU");
-                        gpu = None;
-                        decoder = VideoDecoder::new(&None, config.2, config.0, config.1);
-                        feedback(ClientMsg::RequestKeyframe);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "decode error; requesting a keyframe");
-                        feedback(ClientMsg::RequestKeyframe);
-                    }
-                }
-            }
-            ServerMsg::Ping { t } => feedback(ClientMsg::Pong { t }),
-            _ => {}
-        }
-        stats.report_if_due(decoder.as_ref().map(VideoDecoder::label));
+    queued: Arc<AtomicUsize>,
+    ended: Ended,
+}
+
+impl Thread {
+    fn feedback(&self, msg: ClientMsg) {
+        self.outbox.send(Msg::Feedback(msg), Vec::new());
     }
-    stats.report(decoder.as_ref().map(VideoDecoder::label));
+
+    /// A decoder, or the mode is told it cannot go on.
+    fn decoder(&self, chroma: ChromaMode, width: u32, height: u32) -> Option<VideoDecoder> {
+        match VideoDecoder::new(&self.gpu, self.cpu, chroma, width, height) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("navette: {e}");
+                let _ = self.ended.send(e);
+                None
+            }
+        }
+    }
+
+    fn run(mut self, mut show: Box<dyn FnMut(Picture) + Send>, rx: Receiver<Video>) {
+        let mut decoder: Option<VideoDecoder> = None;
+        let mut config = (0, 0, ChromaMode::Single420);
+        let mut gpu_decoded = false;
+        let mut stats = Stats::new();
+        loop {
+            let video = match rx.recv_timeout(IDLE_DRAIN) {
+                Ok(video) => video,
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(VideoDecoder::Cpu(d)) = &mut decoder
+                        && d.has_pending()
+                        && let Ok(Some(frame)) = d.flush()
+                    {
+                        show(Picture::Bgra(frame));
+                    }
+                    stats.report_if_due(decoder.as_ref().map(VideoDecoder::label));
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            match video.msg {
+                ServerMsg::StreamConfig {
+                    width,
+                    height,
+                    chroma,
+                    ..
+                } => {
+                    // A pace-only change must not reset the decoder.
+                    if (width, height, chroma) != config || decoder.is_none() {
+                        config = (width, height, chroma);
+                        decoder = self.decoder(chroma, width, height);
+                        if let Some(d) = &decoder {
+                            let handover = match d {
+                                VideoDecoder::Gpu(_) if self.dmabuf => "shown as a dmabuf",
+                                _ => "copied to the surface",
+                            };
+                            eprintln!(
+                                "navette: decoding {width}x{height} {chroma:?} on the {}, {handover}",
+                                d.label()
+                            );
+                        }
+                    }
+                }
+                ServerMsg::VideoFrame {
+                    frame_id, pts_us, ..
+                } => {
+                    self.queued.fetch_sub(1, Ordering::Relaxed);
+                    let Some(d) = &mut decoder else {
+                        // Acked all the same, so the remote keeps pacing until the mode ends.
+                        self.feedback(ClientMsg::FrameAck {
+                            frame_id,
+                            decoded_at_ms: now_us() / 1000,
+                        });
+                        continue;
+                    };
+                    let t0 = Instant::now();
+                    let decoded =
+                        d.decode(&video.main, &video.aux, self.dmabuf, (config.0, config.1));
+                    let decode_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                    // Ack at once so the remote keeps pacing.
+                    self.feedback(ClientMsg::FrameAck {
+                        frame_id,
+                        decoded_at_ms: now_us() / 1000,
+                    });
+                    match decoded {
+                        Ok(Some(picture)) => {
+                            gpu_decoded |= matches!(d, VideoDecoder::Gpu(_));
+                            stats.note(decode_ms, now_us().saturating_sub(pts_us));
+                            show(picture);
+                        }
+                        Ok(None) => {}
+                        Err(e) if matches!(d, VideoDecoder::Gpu(_)) && !gpu_decoded => {
+                            // A driver path that cannot work here: the CPU takes over for good.
+                            eprintln!("navette: the GPU decode failed ({e}); decoding on the CPU");
+                            self.gpu = None;
+                            decoder = self.decoder(config.2, config.0, config.1);
+                            self.feedback(ClientMsg::RequestKeyframe);
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "decode error; requesting a keyframe");
+                            self.feedback(ClientMsg::RequestKeyframe);
+                        }
+                    }
+                }
+                ServerMsg::Ping { t } => self.feedback(ClientMsg::Pong { t }),
+                _ => {}
+            }
+            stats.report_if_due(decoder.as_ref().map(VideoDecoder::label));
+        }
+        stats.report(decoder.as_ref().map(VideoDecoder::label));
+    }
 }
 
 fn now_us() -> u64 {
@@ -370,6 +491,7 @@ mod tests {
                         shown.lock().unwrap().push((f.width, f.height, f.pixels));
                     }
                 }),
+                tokio::sync::mpsc::unbounded_channel().0,
             )
             .unwrap()
         };
@@ -427,6 +549,107 @@ mod tests {
             .filter(|m| matches!(m, Msg::Feedback(ClientMsg::FrameAck { .. })))
             .count();
         assert_eq!(acks, frames);
+    }
+
+    fn acks(outbox: &Outbox) -> usize {
+        outbox
+            .queued()
+            .into_iter()
+            .filter(|m| matches!(m, Msg::Feedback(ClientMsg::FrameAck { .. })))
+            .count()
+    }
+
+    fn encoded(encoder: &mut gliff_sw::Encoder, id: usize, (w, h): (u32, u32)) -> Video {
+        let encoded = encoder
+            .encode_bgra(&picture(w as usize, h as usize, id), id == 0)
+            .unwrap();
+        Video {
+            msg: ServerMsg::VideoFrame {
+                frame_id: id as u64,
+                pts_us: now_us(),
+                keyframe: encoded.keyframe,
+                damage: Vec::new(),
+                data_len: encoded.main.len() as u32,
+                aux_len: 0,
+            },
+            main: Bytes::from(encoded.main),
+            aux: Bytes::new(),
+        }
+    }
+
+    fn encoder((width, height): (u32, u32)) -> gliff_sw::Encoder {
+        gliff_sw::Encoder::new(
+            gliff_sw::EncoderSettings {
+                width,
+                height,
+                bitrate: 4_000_000,
+                framerate: 30,
+            },
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_home_that_cannot_decode_ends_the_mode_and_still_acks() {
+        let size = (320, 240);
+        let outbox = Outbox::default();
+        let (ended, mut why) = tokio::sync::mpsc::unbounded_channel();
+        let decoding =
+            Decoding::start_with(None, false, outbox.clone(), Box::new(|_| {}), ended, |_| {
+                Err("no OpenH264".into())
+            })
+            .unwrap();
+        decoding.video(config(size.0, size.1));
+        let mut encoder = encoder(size);
+        for id in 0..3 {
+            decoding.video(encoded(&mut encoder, id, size));
+        }
+        drop(decoding);
+        let why = why.try_recv().expect("the mode is told");
+        assert!(why.contains("no OpenH264"), "{why}");
+        assert_eq!(acks(&outbox), 3);
+    }
+
+    #[test]
+    fn a_decoder_falling_behind_drops_frames_until_a_keyframe() {
+        let size = (320, 240);
+        let outbox = Outbox::default();
+        let (hold, held) = std::sync::mpsc::channel::<()>();
+        let shown = Arc::new(Mutex::new(0));
+        let decoding = {
+            let shown = shown.clone();
+            Decoding::start(
+                None,
+                false,
+                outbox.clone(),
+                // The surface is stuck until the test lets it go.
+                Box::new(move |_| {
+                    let _ = held.recv();
+                    *shown.lock().unwrap() += 1;
+                }),
+                tokio::sync::mpsc::unbounded_channel().0,
+            )
+            .unwrap()
+        };
+        decoding.video(config(size.0, size.1));
+        let mut encoder = encoder(size);
+        let frames = 30;
+        for id in 0..frames {
+            decoding.video(encoded(&mut encoder, id, size));
+        }
+        drop(hold);
+        drop(decoding);
+        let queued = outbox.queued();
+        assert!(
+            queued
+                .iter()
+                .any(|m| matches!(m, Msg::Feedback(ClientMsg::RequestKeyframe))),
+            "a keyframe is asked for"
+        );
+        // Every frame is acked, decoded or dropped, so the remote keeps its pace.
+        assert_eq!(acks(&outbox), frames);
+        assert!(*shown.lock().unwrap() < frames);
     }
 
     #[test]

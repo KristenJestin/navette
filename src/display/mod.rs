@@ -10,3 +10,7 @@ pub mod remote;
 pub mod stream;
 pub mod surface;
 pub mod wire;
+
+/// Where a part of a running mode says why it cannot go on (the surface went away, home cannot
+/// decode): the mode then ends.
+pub type Ended = tokio::sync::mpsc::UnboundedSender<String>;
