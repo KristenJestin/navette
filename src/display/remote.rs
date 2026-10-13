@@ -15,8 +15,19 @@ use super::stream::{self, Source};
 use crate::display::wire::{Display, Incoming, Msg, Outbox, OutputCopy, Peer};
 use crate::hypr::{self, Hypr};
 
-/// How often a lost output is made again.
-const RETRY: Duration = Duration::from_secs(1);
+/// The first wait before a lost stream is started again, doubled after each failure up to
+/// [`LONGEST_WAIT`].
+const RETRY: Duration = if cfg!(test) {
+    Duration::from_millis(20)
+} else {
+    Duration::from_secs(1)
+};
+const LONGEST_WAIT: Duration = Duration::from_secs(30);
+/// Failures in a row before home is told the mode cannot go on: about a minute of waits, long
+/// enough for Hyprland to restart.
+const ATTEMPTS: u32 = 6;
+/// A stream that ran this long was not failing: the count starts again.
+const STEADY: Duration = Duration::from_secs(30);
 
 /// Starts the picture path for an output (the port behind which tests put a fake). The stream
 /// runs until the returned guard is dropped; `ended` says why if it stops on its own.
@@ -49,13 +60,24 @@ impl Streams for LiveStreams {
     }
 }
 
-/// Serves every link the agent brings up, one after the other.
+/// Serves every link the agent brings up, one after the other. An output left by an agent that
+/// crashed goes first: no window must stay on a screen nobody sees.
 pub async fn serve(
     mut peers: UnboundedReceiver<Peer>,
     hypr: Arc<dyn Hypr>,
     streams: Arc<dyn Streams>,
     mut events: UnboundedReceiver<hypr::Event>,
 ) {
+    let removed = {
+        let hypr = hypr.clone();
+        tokio::task::spawn_blocking(move || output::remove(&*hypr)).await
+    };
+    match removed {
+        Ok(Err(e)) if e.kind() != io::ErrorKind::NotFound => {
+            eprintln!("navette: could not remove a leftover remote output: {e}");
+        }
+        _ => {}
+    }
     while let Some(peer) = peers.recv().await {
         serve_peer(peer, hypr.clone(), streams.clone(), &mut events).await;
     }
@@ -65,13 +87,22 @@ pub async fn serve(
 struct Active {
     copy: OutputCopy,
     caps: ClientCaps,
-    running: Option<Running>,
+    /// Failures in a row: streams that would not start, or stopped before [`STEADY`].
+    failures: u32,
+    stream: Stream,
+}
+
+enum Stream {
+    Running(Running),
+    /// Lost; started again at this instant, kept across loop turns.
+    Lost(tokio::time::Instant),
 }
 
 struct Running {
     _stream: Box<dyn Send + Sync>,
     feedback: UnboundedSender<ClientMsg>,
     ended: oneshot::Receiver<io::Error>,
+    since: tokio::time::Instant,
 }
 
 /// One link, until it drops; the output never outlives it. Hyprland requests and the stream's
@@ -84,26 +115,39 @@ pub async fn serve_peer(
 ) {
     let mut active: Option<Active> = None;
     loop {
-        let lost = active.as_ref().is_some_and(|a| a.running.is_none());
+        let retry_at = match &active {
+            Some(Active {
+                stream: Stream::Lost(at),
+                ..
+            }) => Some(*at),
+            _ => None,
+        };
         tokio::select! {
             msg = peer.inbox.recv() => match msg {
                 None => break,
                 Some(Incoming::Display(Display::Start { output, caps })) => {
                     stop(&mut active, &hypr).await;
-                    let mode = Active { copy: output, caps, running: None };
-                    let (mode, result) = bring_up(mode, &hypr, &streams, &peer.outbox).await;
-                    let reply = match result {
-                        Ok(()) => {
-                            active = Some(mode);
+                    let started = bring_up(&output, &caps, &hypr, &streams, &peer.outbox).await;
+                    let reply = match started {
+                        Ok(running) => {
+                            active = Some(Active {
+                                copy: output,
+                                caps,
+                                failures: 0,
+                                stream: Stream::Running(running),
+                            });
                             Display::Started { output: output::NAME.into() }
                         }
-                        Err(e) => Display::Failed { reason: e.to_string() },
+                        Err(e) => {
+                            remove(&hypr).await;
+                            Display::Failed { reason: e.to_string() }
+                        }
                     };
                     peer.outbox.send(Msg::Display(reply), Vec::new());
                 }
                 Some(Incoming::Display(Display::Stop)) => stop(&mut active, &hypr).await,
                 Some(Incoming::Feedback(msg)) => {
-                    if let Some(running) = active.as_ref().and_then(|a| a.running.as_ref()) {
+                    if let Some(Active { stream: Stream::Running(running), .. }) = &active {
                         let _ = running.feedback.send(msg);
                     }
                 }
@@ -120,14 +164,26 @@ pub async fn serve_peer(
                 }
             }
             Some(reason) = ended(&mut active) => {
-                eprintln!("navette: the stream stopped ({reason}); making the output again");
-                if let Some(mode) = &mut active {
-                    mode.running = None;
+                let Some(mode) = &mut active else { continue };
+                let lost = std::mem::replace(&mut mode.stream, Stream::Lost(tokio::time::Instant::now()));
+                if let Stream::Running(running) = lost {
+                    if running.since.elapsed() >= STEADY {
+                        mode.failures = 0;
+                    }
+                    // Its thread is joined: not on the executor.
+                    let _ = tokio::task::spawn_blocking(move || drop(running)).await;
                 }
+                eprintln!("navette: the stream stopped ({reason})");
+                failed(&mut active, reason, &hypr, &peer.outbox).await;
             }
-            _ = tokio::time::sleep(RETRY), if lost => {
-                if let Some(mode) = active.take() {
-                    active = Some(bring_up(mode, &hypr, &streams, &peer.outbox).await.0);
+            () = sleep_until(retry_at), if retry_at.is_some() => {
+                let Some(mode) = &mut active else { continue };
+                match bring_up(&mode.copy, &mode.caps, &hypr, &streams, &peer.outbox).await {
+                    Ok(running) => mode.stream = Stream::Running(running),
+                    Err(e) => {
+                        eprintln!("navette: the stream could not start again ({e})");
+                        failed(&mut active, e, &hypr, &peer.outbox).await;
+                    }
                 }
             }
         }
@@ -135,61 +191,98 @@ pub async fn serve_peer(
     stop(&mut active, &hypr).await;
 }
 
-/// Why a running stream stopped on its own; pending forever when none runs. A stream that
-/// ended without a word ended all the same.
-async fn ended(active: &mut Option<Active>) -> Option<io::Error> {
-    match active.as_mut().and_then(|a| a.running.as_mut()) {
-        Some(running) => Some(
-            (&mut running.ended)
-                .await
-                .unwrap_or_else(|_| io::Error::other("the stream ended")),
-        ),
+async fn sleep_until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
     }
 }
 
-/// Makes the output and starts its stream; on failure, nothing is left behind.
+/// Counts one more failure: waits longer before the next attempt, or gives up and tells home.
+async fn failed(
+    active: &mut Option<Active>,
+    reason: io::Error,
+    hypr: &Arc<dyn Hypr>,
+    outbox: &Outbox,
+) {
+    let Some(mode) = active else { return };
+    mode.failures += 1;
+    if mode.failures >= ATTEMPTS {
+        let reason = format!(
+            "the remote picture failed {} times in a row, the last: {reason}",
+            mode.failures
+        );
+        eprintln!("navette: {reason}; the mode ends");
+        stop(active, hypr).await;
+        outbox.send(Msg::Display(Display::Failed { reason }), Vec::new());
+        return;
+    }
+    let wait = RETRY
+        .saturating_mul(1 << (mode.failures - 1).min(16))
+        .min(LONGEST_WAIT);
+    mode.stream = Stream::Lost(tokio::time::Instant::now() + wait);
+}
+
+/// Why a running stream stopped on its own; pending forever when none runs. A stream that
+/// ended without a word ended all the same.
+async fn ended(active: &mut Option<Active>) -> Option<io::Error> {
+    match active {
+        Some(Active {
+            stream: Stream::Running(running),
+            ..
+        }) => Some(
+            (&mut running.ended)
+                .await
+                .unwrap_or_else(|_| io::Error::other("the stream ended")),
+        ),
+        _ => std::future::pending().await,
+    }
+}
+
+/// Starts the stream, on the output if it is still there as asked, else on a new one. A panic
+/// in the encoder's or the capture's start is a failure like another.
 async fn bring_up(
-    mut mode: Active,
+    copy: &OutputCopy,
+    caps: &ClientCaps,
     hypr: &Arc<dyn Hypr>,
     streams: &Arc<dyn Streams>,
     outbox: &Outbox,
-) -> (Active, io::Result<()>) {
+) -> io::Result<Running> {
+    let (copy, caps) = (copy.clone(), caps.clone());
     let (hypr, streams, outbox) = (hypr.clone(), streams.clone(), outbox.clone());
-    let task = tokio::task::spawn_blocking(move || {
-        let result = start_blocking(&mut mode, &*hypr, &*streams, outbox);
-        (mode, result)
-    });
-    task.await.expect("bringing the output up does not panic")
+    tokio::task::spawn_blocking(move || start_blocking(&copy, caps, &*hypr, &*streams, outbox))
+        .await
+        .unwrap_or_else(|e| {
+            Err(io::Error::other(format!(
+                "the picture's start crashed: {e}"
+            )))
+        })
 }
 
 fn start_blocking(
-    mode: &mut Active,
+    copy: &OutputCopy,
+    caps: ClientCaps,
     hypr: &dyn Hypr,
     streams: &dyn Streams,
     outbox: Outbox,
-) -> io::Result<()> {
-    output::create(hypr, &mode.copy)?;
+) -> io::Result<Running> {
+    let scale = match output::live(hypr, copy)? {
+        Some(scale) => scale,
+        None => output::create(hypr, copy)?,
+    };
     let (feedback, feedback_rx) = mpsc::unbounded_channel();
     let (ended_tx, ended) = oneshot::channel();
     let source = Source {
         output: output::NAME.into(),
-        scale: mode.copy.scale_milli as f32 / 1000.0,
+        scale,
     };
-    match streams.start(source, mode.caps.clone(), outbox, feedback_rx, ended_tx) {
-        Ok(stream) => {
-            mode.running = Some(Running {
-                _stream: stream,
-                feedback,
-                ended,
-            });
-            Ok(())
-        }
-        Err(e) => {
-            let _ = output::remove(hypr);
-            Err(e)
-        }
-    }
+    let stream = streams.start(source, caps, outbox, feedback_rx, ended_tx)?;
+    Ok(Running {
+        _stream: stream,
+        feedback,
+        ended,
+        since: tokio::time::Instant::now(),
+    })
 }
 
 /// Stops the stream first, then removes the output it captured.
@@ -199,11 +292,18 @@ async fn stop(active: &mut Option<Active>, hypr: &Arc<dyn Hypr>) {
     };
     let hypr = hypr.clone();
     let removed = tokio::task::spawn_blocking(move || {
-        drop(mode.running);
+        drop(mode);
         output::remove(&*hypr)
     })
     .await;
     if let Ok(Err(e)) = removed {
+        eprintln!("navette: could not remove the remote output: {e}");
+    }
+}
+
+async fn remove(hypr: &Arc<dyn Hypr>) {
+    let hypr = hypr.clone();
+    if let Ok(Err(e)) = tokio::task::spawn_blocking(move || output::remove(&*hypr)).await {
         eprintln!("navette: could not remove the remote output: {e}");
     }
 }
@@ -217,12 +317,48 @@ mod tests {
     use super::*;
     use crate::hypr::fake::{FakeHypr, FakeMonitor};
 
-    /// Streams that send one config message, and can be ended from the test.
-    #[derive(Default)]
+    /// Streams that send one config message, and can be ended from the test. Each one says,
+    /// when dropped, on which thread and whether its output was still there.
     struct FakeStreams {
+        hypr: Arc<FakeHypr>,
         ends: Mutex<Vec<oneshot::Sender<io::Error>>>,
-        started: Mutex<Vec<String>>,
+        started: Mutex<Vec<(String, f32)>>,
         refuse: Mutex<bool>,
+        panic: Mutex<bool>,
+        dropped: Arc<Mutex<Vec<Dropped>>>,
+    }
+
+    #[derive(Debug)]
+    struct Dropped {
+        thread: std::thread::ThreadId,
+        output_there: bool,
+    }
+
+    struct FakeStream {
+        hypr: Arc<FakeHypr>,
+        dropped: Arc<Mutex<Vec<Dropped>>>,
+    }
+
+    impl Drop for FakeStream {
+        fn drop(&mut self) {
+            self.dropped.lock().unwrap().push(Dropped {
+                thread: std::thread::current().id(),
+                output_there: self.hypr.monitor(output::NAME).is_some(),
+            });
+        }
+    }
+
+    impl FakeStreams {
+        fn new(hypr: Arc<FakeHypr>) -> Self {
+            Self {
+                hypr,
+                ends: Mutex::default(),
+                started: Mutex::default(),
+                refuse: Mutex::default(),
+                panic: Mutex::default(),
+                dropped: Arc::default(),
+            }
+        }
     }
 
     impl Streams for FakeStreams {
@@ -234,13 +370,22 @@ mod tests {
             _feedback: UnboundedReceiver<ClientMsg>,
             ended: oneshot::Sender<io::Error>,
         ) -> io::Result<Box<dyn Send + Sync>> {
+            if *self.panic.lock().unwrap() {
+                panic!("the encoder library crashed");
+            }
             if *self.refuse.lock().unwrap() {
                 return Err(io::Error::other("no encoder"));
             }
-            self.started.lock().unwrap().push(source.output);
+            self.started
+                .lock()
+                .unwrap()
+                .push((source.output, source.scale));
             self.ends.lock().unwrap().push(ended);
             outbox.send(Msg::Video(ServerMsg::Ping { t: 1 }), Vec::new());
-            Ok(Box::new(()))
+            Ok(Box::new(FakeStream {
+                hypr: self.hypr.clone(),
+                dropped: self.dropped.clone(),
+            }))
         }
     }
 
@@ -252,6 +397,10 @@ mod tests {
         fn end_last(&self) {
             let end = self.ends.lock().unwrap().pop().unwrap();
             let _ = end.send(io::Error::other("capture stopped"));
+        }
+
+        fn count(&self) -> usize {
+            self.started.lock().unwrap().len()
         }
     }
 
@@ -291,7 +440,7 @@ mod tests {
         let hypr = Arc::new(FakeHypr::with(vec![FakeMonitor::new(
             "eDP-1", 1920, 1200, 0,
         )]));
-        let streams = Arc::new(FakeStreams::default());
+        let streams = Arc::new(FakeStreams::new(hypr.clone()));
         let (inbox, inbox_rx) = mpsc::unbounded_channel();
         let (events, mut events_rx) = mpsc::unbounded_channel();
         let outbox = Outbox::default();
@@ -331,8 +480,8 @@ mod tests {
         let agent = agent();
         agent.inbox.send(start()).unwrap();
         until(|| agent.hypr.monitor(output::NAME).is_some()).await;
-        until(|| agent.streams.started.lock().unwrap().len() == 1).await;
-        assert_eq!(agent.streams.started.lock().unwrap()[0], output::NAME);
+        until(|| agent.streams.count() == 1).await;
+        assert_eq!(agent.streams.started.lock().unwrap()[0].0, output::NAME);
         until(|| agent.outbox.queued().len() == 2).await;
         assert_eq!(
             agent.outbox.queued()[1],
@@ -388,7 +537,7 @@ mod tests {
     async fn the_output_comes_back_after_a_hyprland_restart() {
         let agent = agent();
         agent.inbox.send(start()).unwrap();
-        until(|| agent.streams.started.lock().unwrap().len() == 1).await;
+        until(|| agent.streams.count() == 1).await;
 
         // Hyprland exits: the capture stops, the output is gone with it.
         agent.hypr.set_down(true, Vec::new());
@@ -400,7 +549,7 @@ mod tests {
         agent
             .hypr
             .set_down(false, vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
-        until(|| agent.streams.started.lock().unwrap().len() == 2).await;
+        until(|| agent.streams.count() == 2).await;
         assert_eq!(agent.hypr.monitor(output::NAME).unwrap().width, 1920);
     }
 
@@ -408,10 +557,121 @@ mod tests {
     async fn a_stream_that_ends_without_a_reason_is_started_again() {
         let agent = agent();
         agent.inbox.send(start()).unwrap();
-        until(|| agent.streams.started.lock().unwrap().len() == 1).await;
+        until(|| agent.streams.count() == 1).await;
         agent.streams.drop_last();
-        until(|| agent.streams.started.lock().unwrap().len() == 2).await;
+        until(|| agent.streams.count() == 2).await;
         assert!(!agent.task.is_finished());
+    }
+
+    fn created(hypr: &FakeHypr) -> usize {
+        hypr.changes()
+            .iter()
+            .filter(|c| c.starts_with("output create"))
+            .count()
+    }
+
+    fn failed(outbox: &Outbox) -> Option<String> {
+        outbox.queued().into_iter().find_map(|msg| match msg {
+            Msg::Display(Display::Failed { reason }) => Some(reason),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_lost_stream_starts_again_on_the_same_output() {
+        let agent = agent();
+        agent.inbox.send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+        agent.streams.end_last();
+        until(|| agent.streams.count() == 2).await;
+        // The output stayed: the windows on it were not sent to the laptop's screen and back.
+        assert_eq!(created(&agent.hypr), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_keeps_failing_tells_home_and_removes_the_output() {
+        let agent = agent();
+        agent.inbox.send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+        *agent.streams.refuse.lock().unwrap() = true;
+        agent.streams.end_last();
+        until(|| failed(&agent.outbox).is_some()).await;
+        assert!(
+            failed(&agent.outbox).unwrap().contains("no encoder"),
+            "{:?}",
+            failed(&agent.outbox)
+        );
+        until(|| agent.hypr.monitor(output::NAME).is_none()).await;
+        assert_eq!(created(&agent.hypr), 1);
+        assert!(!agent.task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn a_storm_of_monitor_events_does_not_hold_the_retry_back() {
+        let agent = agent();
+        agent.inbox.send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+        agent.streams.end_last();
+        let storm = async {
+            loop {
+                let _ = agent.events.send(hypr::Event::MonitorAdded("DP-9".into()));
+                tokio::time::sleep(RETRY / 4).await;
+            }
+        };
+        tokio::select! {
+            () = storm => {}
+            () = until(|| agent.streams.count() == 2) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn a_leftover_output_is_removed_when_the_agent_starts() {
+        let hypr = Arc::new(FakeHypr::with(vec![
+            FakeMonitor::new("eDP-1", 1920, 1200, 0),
+            FakeMonitor::new(output::NAME, 1920, 1080, 1920),
+        ]));
+        let (_peers, peers_rx) = mpsc::unbounded_channel();
+        let (_events, events_rx) = mpsc::unbounded_channel();
+        let streams = Arc::new(FakeStreams::new(hypr.clone()));
+        tokio::spawn(serve(peers_rx, hypr.clone(), streams, events_rx));
+        until(|| hypr.monitor(output::NAME).is_none()).await;
+    }
+
+    #[tokio::test]
+    async fn the_stream_gets_the_scale_hyprland_chose() {
+        let agent = agent();
+        agent.hypr.choose_scale(1.2);
+        agent.inbox.send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+        assert_eq!(agent.streams.started.lock().unwrap()[0].1, 1.2);
+    }
+
+    #[tokio::test]
+    async fn a_stream_is_stopped_off_the_executor_before_its_output_goes() {
+        let executor = std::thread::current().id();
+        let agent = agent();
+        agent.inbox.send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+        agent.streams.end_last();
+        until(|| agent.streams.dropped.lock().unwrap().len() == 1).await;
+        until(|| agent.streams.count() == 2).await;
+        agent.inbox.send(Incoming::Display(Display::Stop)).unwrap();
+        until(|| agent.streams.dropped.lock().unwrap().len() == 2).await;
+        let dropped = agent.streams.dropped.lock().unwrap();
+        assert!(dropped.iter().all(|d| d.thread != executor), "{dropped:?}");
+        assert!(dropped[1].output_there, "{dropped:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_start_that_panics_is_a_failure_and_the_agent_goes_on() {
+        let agent = agent();
+        *agent.streams.panic.lock().unwrap() = true;
+        agent.inbox.send(start()).unwrap();
+        until(|| failed(&agent.outbox).is_some()).await;
+        assert!(agent.hypr.monitor(output::NAME).is_none());
+        *agent.streams.panic.lock().unwrap() = false;
+        agent.inbox.send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
     }
 
     #[tokio::test]
