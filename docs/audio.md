@@ -7,7 +7,9 @@ mixed with home sound. There is no output toggle: both machines are heard at onc
   (`navette-home-speakers`), and makes it the default output: what the apps play goes into it.
   It is Opus-encoded (48 kHz stereo, 10 ms frames, in-band FEC) and sent home over the link.
   When home stops asking, when the link drops or when the agent stops, the previous default
-  output is put back, then the sink is removed.
+  output is put back, then the sink is removed. If PipeWire restarts on the remote machine
+  meanwhile, the agent sees its sink gone within a quarter of a second, opens it again and
+  makes it the default again; what it puts back at the end is still the default from before.
 - **At home**, a playback stream, *Remote machine (Navette)* (`navette-remote-sound`), plays it
   through a small jitter buffer (30 ms before playing, 120 ms at most). PipeWire mixes it like
   any application, so it has its own volume in the mixer. Home's own default output is never
@@ -34,19 +36,22 @@ finds the default still on the Navette sink, and puts back the saved one when it
 
 ## The messages
 
-One block of the link's message types, the first byte of each frame:
+Three top-level variants of the link's `LinkMsg` (`src/wire.rs`), numbered apart from the
+other services:
 
-| Type | Direction | Body |
+| Variant | Direction | Fields |
 |---|---|---|
-| `0x30` start | home → remote | a big-endian `u32` session number |
-| `0x31` stop | home → remote | none |
-| `0x32` frame | remote → home | the session number and a sequence number (big-endian `u32`s), then one Opus packet |
+| `48` `AudioStart` | home → remote | the session number |
+| `49` `AudioStop` | home → remote | none |
+| `50` `AudioFrame` | remote → home | the session and a sequence number, and `data_len`: the Opus packet follows as the message's payload (4000 bytes at most, or the link ends) |
 
 Home numbers each start: a frame of an earlier session, still on its way when home stopped,
 is dropped rather than taken for a late frame of the new one.
 
-A full link drops a frame rather than delay the ones after it; home fills a missing frame from
-the next packet's FEC, or by concealment.
+The sound has its own queues between the link and its audio thread, 64 messages each way
+(640 ms of frames). Neither side waits on a full one: the message is dropped rather than
+delay the ones after it, the link's reader and its heartbeats never wait on the sound, and
+home fills a missing frame from the next packet's FEC, or by concealment.
 
 ## Checking it on the two machines
 
@@ -59,7 +64,11 @@ the next packet's FEC, or by concealment.
 5. Stop `navette serve` (Ctrl-C): on the laptop, `wpctl status` shows its previous default sink
    again. Start it again, then `systemctl --user stop navette-agent` on the laptop: the previous
    default comes back too.
-6. Latency, a click test: put the laptop next to a home microphone. On the laptop, make a click
+6. With `navette serve --audio` running and a video playing on the laptop, restart its sound
+   server: `systemctl --user restart pipewire wireplumber`. Within a few seconds, the video is
+   heard at home again and `wpctl status` shows *Home speakers (Navette)* as the default; stop
+   `navette serve`, and the previous default sink comes back.
+7. Latency, a click test: put the laptop next to a home microphone. On the laptop, make a click
    (`sox -n -r 48000 -c 2 click.wav synth 0.005 sine 2000 pad 0.5 1.5`) and play it to the
    laptop's own speakers and to Navette at once:
    `pw-play --target <laptop-speakers-node-name> click.wav & pw-play click.wav`.

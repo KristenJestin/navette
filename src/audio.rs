@@ -8,12 +8,12 @@
 //!
 //! PipeWire is reached through [`Graph`]; tests drive a fake one.
 //!
-//! The audio messages, one block of the link's message types:
-//! - `START` (home → remote): a big-endian `u32` session number; make the sink the default
-//!   output and send its sound under that number.
-//! - `STOP` (home → remote): put the previous default back and stop sending.
-//! - `FRAME` (remote → home): the session number and a sequence number (big-endian `u32`s),
-//!   then one Opus packet.
+//! The audio messages are top-level variants of [`LinkMsg`](crate::wire::LinkMsg):
+//! - `AudioStart` (home → remote), with a session number: make the sink the default output and
+//!   send its sound under that number.
+//! - `AudioStop` (home → remote): put the previous default back and stop sending.
+//! - `AudioFrame` (remote → home), with the session and a sequence number: one Opus packet
+//!   follows it.
 
 #[cfg(test)]
 pub(crate) mod allocations;
