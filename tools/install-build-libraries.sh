@@ -8,7 +8,9 @@ set -eu
 
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
+  libclang-dev \
   libgbm-dev \
+  libpipewire-0.3-dev \
   libva-dev \
   libwayland-dev \
   libxkbcommon-dev

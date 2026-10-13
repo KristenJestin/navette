@@ -16,6 +16,7 @@ use gliff_proto::clipboard::validate_files;
 use gliff_proto::{ClientMsg, ClipboardFile, ClipboardItem, ClipboardMsg, ServerMsg};
 use minicbor::{Decode, Encode};
 
+use crate::audio;
 use crate::display::wire::{Display, Msg};
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
@@ -64,7 +65,7 @@ pub enum LinkMsg {
         #[n(0)]
         id: u32,
     },
-    // The display's, from 20: other services take the numbers below.
+    // The display's (`crate::display`), a block of numbers of its own.
     #[n(20)]
     Display(#[n(0)] Display),
     /// Remote to home; a video frame's two streams (`data_len`, then `aux_len` bytes) follow.
@@ -73,6 +74,24 @@ pub enum LinkMsg {
     /// Home to remote.
     #[n(22)]
     Feedback(#[n(0)] ClientMsg),
+    // The remote machine's sound (`crate::audio`), a block of numbers of its own.
+    #[n(48)]
+    AudioStart {
+        #[n(0)]
+        session: u32,
+    },
+    #[n(49)]
+    AudioStop,
+    /// One Opus packet of `data_len` bytes follows the message.
+    #[n(50)]
+    AudioFrame {
+        #[n(0)]
+        session: u32,
+        #[n(1)]
+        seq: u32,
+        #[n(2)]
+        data_len: u32,
+    },
 }
 
 impl From<Msg> for LinkMsg {
@@ -117,13 +136,36 @@ impl From<ClipboardMsg> for LinkMsg {
     }
 }
 
+impl From<&audio::Message> for LinkMsg {
+    /// A frame's packet goes after the message, as its payload.
+    fn from(msg: &audio::Message) -> Self {
+        match msg {
+            audio::Message::Start { session } => Self::AudioStart { session: *session },
+            audio::Message::Stop => Self::AudioStop,
+            audio::Message::Frame {
+                session,
+                seq,
+                packet,
+            } => Self::AudioFrame {
+                session: *session,
+                seq: *seq,
+                data_len: packet.len() as u32,
+            },
+        }
+    }
+}
+
 impl LinkMsg {
     /// The clipboard message this carries, or `None` for another.
     pub fn into_clipboard(self) -> Option<ClipboardMsg> {
         Some(match self {
-            Self::Heartbeat | Self::Display(_) | Self::Video(_) | Self::Feedback(_) => {
-                return None;
-            }
+            Self::Heartbeat
+            | Self::Display(_)
+            | Self::Video(_)
+            | Self::Feedback(_)
+            | Self::AudioStart { .. }
+            | Self::AudioStop
+            | Self::AudioFrame { .. } => return None,
             Self::ClipboardOffer {
                 serial,
                 mime_types,

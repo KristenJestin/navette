@@ -1190,6 +1190,7 @@ mod tests {
                     from_peer: inbound,
                     to_peer,
                     display: None,
+                    audio: None,
                 };
                 let serials = Rc::default();
                 let clipboard = Arc::new(Fake::default());

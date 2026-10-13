@@ -13,6 +13,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -24,6 +25,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinSet;
 
+use crate::audio::{self, codec::MAX_PACKET};
 use crate::display::wire::{Incoming, Outbox, Peer};
 use crate::frame::{read_frame, write_frame};
 use crate::store::{Role, Store};
@@ -58,6 +60,8 @@ pub struct Wire {
     pub from_peer: mpsc::Receiver<Clip>,
     pub to_peer: Outbound,
     pub display: Option<Peer>,
+    /// The sound's own queues, for whoever takes them.
+    pub audio: Option<audio::Wire>,
 }
 
 /// How often each side shows it is alive, and how long a silence ends the link.
@@ -160,18 +164,33 @@ where
         outbox: outbox.clone(),
         inbox: display_rx,
     };
+    let (sound, sound_end) = audio::wire();
     let service = async {
         attach(Wire {
             from_peer,
             to_peer,
             display: Some(display),
+            audio: Some(sound),
         })
         .await;
         std::future::pending::<Infallible>().await
     };
     let result = tokio::select! {
-        result = send(Framed::new(writer), heartbeat.interval, outbound_rx, &outbox) => result,
-        result = receive(Framed::new(reader), heartbeat.timeout, inbound_tx, display_tx, &outbox) => result,
+        result = send(
+            Framed::new(writer),
+            heartbeat.interval,
+            outbound_rx,
+            sound_end.from_audio,
+            &outbox,
+        ) => result,
+        result = receive(
+            Framed::new(reader),
+            heartbeat.timeout,
+            inbound_tx,
+            sound_end.to_audio,
+            display_tx,
+            &outbox,
+        ) => result,
         never = service => match never {},
     };
     outbox.close();
@@ -193,14 +212,29 @@ async fn send<W: AsyncWrite + Unpin>(
     mut writer: Framed<W>,
     interval: Duration,
     mut outbound: mpsc::Receiver<Clip>,
+    mut sound: mpsc::Receiver<audio::Message>,
     display: &Outbox,
 ) -> io::Result<Infallible> {
     let mut tick = tokio::time::interval(interval);
     // A long chunk write must not be followed by a burst of heartbeats.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut open = true;
+    let mut sound_open = true;
     loop {
         tokio::select! {
+            msg = sound.recv(), if sound_open => match msg {
+                Some(msg) => {
+                    let packet = match &msg {
+                        audio::Message::Frame { packet, .. } => &packet[..],
+                        _ => &[],
+                    };
+                    writer
+                        .write_msg_with_payloads(&LinkMsg::from(&msg), &[packet])
+                        .await
+                        .map_err(io_error)?
+                }
+                None => sound_open = false,
+            },
             _ = tick.tick() => writer.write_msg(&LinkMsg::Heartbeat).await.map_err(io_error)?,
             clip = outbound.recv(), if open => match clip {
                 Some((msg, payload)) => writer
@@ -226,6 +260,7 @@ async fn receive<R: AsyncRead + Unpin>(
     mut reader: Framed<R>,
     timeout: Duration,
     inbound: mpsc::Sender<Clip>,
+    sound: SyncSender<audio::Message>,
     display: mpsc::Sender<Incoming>,
     outbox: &Outbox,
 ) -> io::Result<Infallible> {
@@ -236,6 +271,12 @@ async fn receive<R: AsyncRead + Unpin>(
             .map_err(|_| silent())?
             .map_err(io_error)?;
         let clip = match msg {
+            LinkMsg::AudioStart { .. } | LinkMsg::AudioStop | LinkMsg::AudioFrame { .. } => {
+                let sound_msg = audio_received(&mut reader, timeout, msg).await?;
+                // Like the clipboard's, a sound the audio thread is not ready for is dropped.
+                let _ = sound.try_send(sound_msg);
+                continue;
+            }
             LinkMsg::Display(order) => {
                 if let Err(mpsc::error::TrySendError::Full(_)) =
                     display.try_send(Incoming::Display(order))
@@ -306,6 +347,36 @@ async fn receive<R: AsyncRead + Unpin>(
         // and its transfer fails on its own (gliff's idle timeout).
         let _ = inbound.try_send((clip, payload));
     }
+}
+
+/// An audio message, with the packet that follows a frame.
+async fn audio_received<R: AsyncRead + Unpin>(
+    reader: &mut Framed<R>,
+    timeout: Duration,
+    msg: LinkMsg,
+) -> io::Result<audio::Message> {
+    Ok(match msg {
+        LinkMsg::AudioStart { session } => audio::Message::Start { session },
+        LinkMsg::AudioFrame {
+            session,
+            seq,
+            data_len,
+        } if data_len as usize <= MAX_PACKET => audio::Message::Frame {
+            session,
+            seq,
+            packet: tokio::time::timeout(timeout, reader.read_payload(data_len))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the peer went silent"))?
+                .map_err(io_error)?,
+        },
+        LinkMsg::AudioFrame { .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "an audio packet larger than Opus makes",
+            ));
+        }
+        _ => audio::Message::Stop,
+    })
 }
 
 /// `navette agent`: dials home, keeps the link up, and dials again whenever it drops. `attach`
@@ -588,6 +659,54 @@ pub(crate) mod tests {
         let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), deaf))
             .await
             .expect("the reader must keep reading past a service that does not");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn an_audio_packet_larger_than_opus_makes_ends_the_link() {
+        let (a, b) = tokio::io::duplex(2 * MAX_PACKET);
+        let mut peer = Framed::new(b);
+        let data = vec![0u8; MAX_PACKET + 1];
+        peer.write_msg_with_payloads(
+            &LinkMsg::AudioFrame {
+                session: 1,
+                seq: 0,
+                data_len: data.len() as u32,
+            },
+            &[&data],
+        )
+        .await
+        .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), nothing))
+            .await
+            .expect("the link must give up on an oversized packet");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_sound_that_never_reads_does_not_stop_the_reader() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut peer = Framed::new(b);
+        // Far more frames than the sound's queue holds, then silence.
+        for seq in 0..(4 * audio::QUEUE as u32) {
+            peer.write_msg_with_payloads(
+                &LinkMsg::AudioFrame {
+                    session: 1,
+                    seq,
+                    data_len: 3,
+                },
+                &[&[1, 2, 3]],
+            )
+            .await
+            .unwrap();
+        }
+        let deaf = |wire: Wire| async move {
+            let _wire = wire;
+            std::future::pending::<()>().await
+        };
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), deaf))
+            .await
+            .expect("the reader must keep reading past a sound that does not");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 

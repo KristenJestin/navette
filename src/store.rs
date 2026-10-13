@@ -132,27 +132,32 @@ impl Store {
     }
 
     fn write_private(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
-        use std::io::Write;
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.dir)?;
-        // `mode` only applies to a directory this call creates; one made earlier (by hand, or
-        // by an older version) keeps whatever it had.
-        fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
-        let tmp = self.dir.join(format!(".{name}.tmp"));
-        let _ = fs::remove_file(&tmp);
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&tmp, self.dir.join(name))
+        write_private(&self.dir, name, bytes)
     }
+}
+
+/// Writes `dir/name` whole or not at all, readable by this user only (0600 in a 0700 directory).
+pub(crate) fn write_private(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    // `mode` only applies to a directory this call creates; one made earlier (by hand, or
+    // by an older version) keeps whatever it had.
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let _ = fs::remove_file(&tmp);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&tmp, dir.join(name))
 }
 
 fn read_if_exists(path: &Path) -> io::Result<Option<Vec<u8>>> {
