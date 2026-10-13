@@ -108,6 +108,9 @@ struct Waiting {
 struct Shared {
     waiting: Mutex<Waiting>,
     notify: Notify,
+    /// The keys home's surfaces sent down, on any output, and home still holds as far as they
+    /// know: the next surface to take the keyboard presses them again on its own output.
+    carried: Mutex<BTreeSet<u32>>,
 }
 
 /// One direction's queue (see the module's doc for its policy). What it is given is for output
@@ -426,14 +429,28 @@ impl Capture {
         Focus::Give
     }
 
-    /// The keyboard came, with the keys already held at home: they count for the hotkey, but
-    /// their releases stay home, the remote never having had their presses.
+    /// The keyboard came, with the keys already held at home: they count for the hotkey. Those
+    /// that went down on the remote over this surface or another of the link (the pointer
+    /// crossing from one work monitor to the next with Shift held) go down again on this
+    /// output, a virtual keyboard's modifiers being its own; the others' releases stay home,
+    /// the remote never having had their presses.
     pub fn keyboard_entered(&mut self, keys: &[u32]) {
         if let Some(state) = &mut self.keys {
             for &code in keys {
                 state.update(code, true);
             }
         }
+        let mut carried = self.queue.shared.carried.lock().unwrap();
+        carried.retain(|code| keys.contains(code));
+        for &code in carried.iter() {
+            if self.held_keys.insert(code) {
+                self.queue.push(Event::Key {
+                    code,
+                    pressed: true,
+                });
+            }
+        }
+        drop(carried);
         // The remote may have lost them since (its injector started again): sent again.
         self.locks_sent = None;
     }
@@ -496,6 +513,12 @@ impl Capture {
         // A release whose press the remote never got (held before the pointer came) stays home.
         if track(&mut self.held_keys, code, pressed) {
             self.queue.push(Event::Key { code, pressed });
+        }
+        let mut carried = self.queue.shared.carried.lock().unwrap();
+        if !pressed {
+            carried.remove(&code);
+        } else if self.held_keys.contains(&code) {
+            carried.insert(code);
         }
         None
     }
@@ -1156,5 +1179,63 @@ mod tests {
                 (0, key(KEY_LEFTSHIFT, false)),
             ]
         );
+    }
+
+    /// Every output's events, the pointer's left out, and the queue emptied.
+    fn sent_on(queue: &Queue) -> Vec<(u8, Event)> {
+        let events = queue.queued_on();
+        queue.shared.waiting.lock().unwrap().events.clear();
+        events
+            .into_iter()
+            .filter(|(_, e)| !matches!(e, Event::Keymap(_) | Event::Motion { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn shift_held_from_one_work_monitor_to_the_next_stays_down_and_goes_up_at_home() {
+        let queue = Queue::default();
+        let mut first = Capture::new(queue.clone(), None);
+        let mut second = Capture::new(queue.on(1), None);
+        first.enter(1900.0, 500.0);
+        first.key(KEY_LEFTSHIFT, true);
+        first.leave();
+        second.enter(10.0, 500.0);
+        second.keyboard_entered(&[KEY_LEFTSHIFT]);
+        second.key(KEY_T, true);
+        second.key(KEY_T, false);
+        assert_eq!(
+            sent_on(&queue),
+            [
+                (0, key(KEY_LEFTSHIFT, true)),
+                (0, Event::ReleaseAll),
+                (1, key(KEY_LEFTSHIFT, true)),
+                (1, key(KEY_T, true)),
+                (1, key(KEY_T, false)),
+            ]
+        );
+        // To a home monitor: everything goes up, the second output's Shift with it.
+        second.leave();
+        assert_eq!(sent_on(&queue), [(1, Event::ReleaseAll)]);
+        second.key(KEY_LEFTSHIFT, false);
+        assert_eq!(sent_on(&queue), []);
+    }
+
+    #[test]
+    fn a_key_let_go_at_home_is_not_pressed_on_the_next_work_monitor() {
+        let queue = Queue::default();
+        let mut first = Capture::new(queue.clone(), None);
+        let mut second = Capture::new(queue.on(1), None);
+        first.enter(1900.0, 500.0);
+        first.key(KEY_LEFTSHIFT, true);
+        first.leave();
+        // Let go over a home monitor, then the pointer comes to the second.
+        second.enter(10.0, 500.0);
+        second.keyboard_entered(&[]);
+        assert_eq!(
+            sent_on(&queue),
+            [(0, key(KEY_LEFTSHIFT, true)), (0, Event::ReleaseAll)]
+        );
+        second.keyboard_entered(&[KEY_LEFTSHIFT]);
+        assert_eq!(sent_on(&queue), []);
     }
 }
