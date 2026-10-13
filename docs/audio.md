@@ -48,10 +48,12 @@ other services:
 Home numbers each start: a frame of an earlier session, still on its way when home stopped,
 is dropped rather than taken for a late frame of the new one.
 
-The sound has its own queues between the link and its audio thread, 64 messages each way
-(640 ms of frames). Neither side waits on a full one: the message is dropped rather than
-delay the ones after it, the link's reader and its heartbeats never wait on the sound, and
-home fills a missing frame from the next packet's FEC, or by concealment.
+The sound has its own queues between the link and its audio thread, 64 frames each way
+(640 ms). Neither side waits on a full one: a frame is dropped rather than delay the ones
+after it, the link's reader and its heartbeats never wait on the sound, and home fills a
+missing frame from the next packet's FEC, or by concealment. The orders (start, stop) are
+never dropped: they wait in order with the frames, however many frames are dropped around them,
+so a stop always reaches an audio thread that is slow for a while.
 
 ## Checking it on the two machines
 

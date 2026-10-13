@@ -88,8 +88,8 @@ home → remote:
 | `53` `MicFrame` | the session and a sequence number, and `data_len`: the Opus packet follows (4000 bytes at most, or the link ends) |
 
 Home numbers each mode, and the remote drops a frame of another session. They share the
-sound's queues (64 messages each way): neither side waits on a full one, a frame is dropped
-rather than delay the next.
+sound's queues (64 frames each way): a frame is dropped rather than delay the next, an order
+never is.
 
 ## Checking it on the two machines
 

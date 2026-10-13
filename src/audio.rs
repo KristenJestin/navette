@@ -30,7 +30,7 @@ pub mod pipewire;
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -86,31 +86,91 @@ pub enum Message {
     },
 }
 
-/// Audio messages waiting between the link and the audio thread, each way: 64 frames are
-/// 640 ms of sound. The link's reader never waits on the audio thread, nor the sink's callback
-/// on the link: past this many, a message is dropped, and home fills the gap.
+/// Audio frames waiting between the link and the audio thread, each way: 64 frames are 640 ms
+/// of sound. The link's reader never waits on the audio thread, nor the sink's callback on the
+/// link: past this many, a frame is dropped, and the other side fills the gap. Orders (start,
+/// stop) are few, and never dropped: a lost stop would leave the remote's default on Navette.
 pub const QUEUE: usize = 64;
+
+impl Message {
+    fn is_frame(&self) -> bool {
+        matches!(self, Message::Frame { .. } | Message::MicFrame { .. })
+    }
+}
 
 /// What the audio thread of one link gets: the peer's audio messages, and where to put its own.
 /// The first ends when the link drops.
 pub struct Wire {
-    pub from_peer: std::sync::mpsc::Receiver<Message>,
+    pub from_peer: Inbox,
     pub to_peer: mpsc::Sender<Message>,
+}
+
+/// The peer's audio messages, in the order they came, for the audio thread.
+pub struct Inbox {
+    messages: std::sync::mpsc::Receiver<Message>,
+    /// Frames sent and not yet taken.
+    frames: Arc<AtomicUsize>,
+}
+
+impl Inbox {
+    pub fn recv(&self) -> Result<Message, std::sync::mpsc::RecvError> {
+        self.messages.recv().map(|m| self.taken(m))
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Message, RecvTimeoutError> {
+        self.messages.recv_timeout(timeout).map(|m| self.taken(m))
+    }
+
+    pub fn try_recv(&self) -> Result<Message, std::sync::mpsc::TryRecvError> {
+        self.messages.try_recv().map(|m| self.taken(m))
+    }
+
+    fn taken(&self, message: Message) -> Message {
+        if message.is_frame() {
+            self.frames.fetch_sub(1, Ordering::Relaxed);
+        }
+        message
+    }
+}
+
+/// The link's way into an [`Inbox`]: an order always goes in, a frame only while fewer than
+/// [`QUEUE`] wait.
+pub struct ToAudio {
+    messages: std::sync::mpsc::Sender<Message>,
+    frames: Arc<AtomicUsize>,
+}
+
+impl ToAudio {
+    /// Fails once the audio thread is gone; a frame dropped for a full queue is no failure.
+    pub fn send(&self, message: Message) -> Result<(), std::sync::mpsc::SendError<Message>> {
+        if message.is_frame() && self.frames.fetch_add(1, Ordering::Relaxed) >= QUEUE {
+            self.frames.fetch_sub(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        self.messages.send(message)
+    }
 }
 
 /// The link's end of a [`Wire`].
 pub struct LinkEnd {
-    pub to_audio: std::sync::mpsc::SyncSender<Message>,
+    pub to_audio: ToAudio,
     pub from_audio: mpsc::Receiver<Message>,
 }
 
 pub fn wire() -> (Wire, LinkEnd) {
-    let (to_audio, from_peer) = std::sync::mpsc::sync_channel(QUEUE);
+    let (messages, received) = std::sync::mpsc::channel();
+    let frames = Arc::new(AtomicUsize::new(0));
     let (to_peer, from_audio) = mpsc::channel(QUEUE);
     (
-        Wire { from_peer, to_peer },
+        Wire {
+            from_peer: Inbox {
+                messages: received,
+                frames: frames.clone(),
+            },
+            to_peer,
+        },
         LinkEnd {
-            to_audio,
+            to_audio: ToAudio { messages, frames },
             from_audio,
         },
     )
