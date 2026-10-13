@@ -491,22 +491,20 @@ fn start_blocking(
     })
 }
 
-/// Stops every stream first, then removes the outputs they captured.
+/// Stops every stream first, then removes the outputs they captured, and shows the cursor.
 async fn stop(active: &mut Option<Active>, hypr: &Arc<dyn Hypr>) {
     let Some(mode) = active.take() else {
         return;
     };
-    let (hypr, count) = (hypr.clone(), mode.outputs.len());
-    let _ = tokio::task::spawn_blocking(move || {
+    let hypr = hypr.clone();
+    let removed = tokio::task::spawn_blocking(move || {
         drop(mode);
-        // One that will not go does not keep the others.
-        for index in 0..count {
-            if let Err(e) = output::remove(&*hypr, index) {
-                eprintln!("navette: could not remove {}: {e}", output::name(index));
-            }
-        }
+        output::remove_all(&*hypr)
     })
     .await;
+    if let Ok(Err(e)) = removed {
+        eprintln!("navette: could not remove the remote outputs: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -978,6 +976,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_remote_cursor_is_hidden_while_the_mode_runs_and_back_when_it_stops() {
+        let agent = agent();
+        agent.inbox.try_send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+        assert!(agent.hypr.cursor_invisible());
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        until(|| agent.hypr.monitor(FIRST).is_none()).await;
+        assert!(!agent.hypr.cursor_invisible());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_shows_the_remote_cursor_again() {
+        let agent = agent();
+        agent.inbox.try_send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+        drop(agent.inbox);
+        agent.task.await.unwrap();
+        assert!(!agent.hypr.cursor_invisible());
+    }
+
+    #[tokio::test]
+    async fn the_remote_cursor_is_hidden_again_after_a_hyprland_restart() {
+        let agent = agent();
+        agent.inbox.try_send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+        agent.hypr.set_down(true, Vec::new());
+        agent.streams.end_last();
+        tokio::time::sleep(RETRY * 2).await;
+        agent
+            .hypr
+            .set_down(false, vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
+        until(|| agent.streams.count() == 2).await;
+        assert!(agent.hypr.cursor_invisible());
+    }
+
+    #[tokio::test]
     async fn a_dropped_link_removes_the_remote_output() {
         let agent = agent();
         agent.inbox.try_send(start()).unwrap();
@@ -1113,6 +1150,26 @@ mod tests {
         });
         tokio::spawn(serve(peers_rx, hypr.clone(), streams, injectors, events_rx));
         until(|| hypr.monitor(FIRST).is_none()).await;
+    }
+
+    #[tokio::test]
+    async fn the_cursor_hidden_by_an_agent_that_crashed_is_shown_when_the_agent_starts() {
+        let hypr = Arc::new(FakeHypr::with(vec![
+            FakeMonitor::new("eDP-1", 1920, 1200, 0),
+            FakeMonitor::new(FIRST, 1920, 1080, 1920),
+        ]));
+        hypr.request("eval hl.config({ cursor = { invisible = true } })")
+            .unwrap();
+        let (_peers, peers_rx) = mpsc::unbounded_channel();
+        let (_events, events_rx) = mpsc::unbounded_channel();
+        let streams = Arc::new(FakeStreams::new(hypr.clone()));
+        let injectors = Arc::new(FakeInjectors {
+            hypr: hypr.clone(),
+            started: Arc::default(),
+            refuse: Arc::default(),
+        });
+        tokio::spawn(serve(peers_rx, hypr.clone(), streams, injectors, events_rx));
+        until(|| !hypr.cursor_invisible()).await;
     }
 
     #[tokio::test]
@@ -1359,5 +1416,16 @@ mod tests {
         });
         tokio::spawn(serve(peers_rx, hypr.clone(), streams, injectors, events_rx));
         until(|| hypr.monitor(FIRST).is_none() && hypr.monitor(SECOND).is_none()).await;
+    }
+
+    #[tokio::test]
+    async fn a_reload_hides_the_remote_cursor_again() {
+        let agent = agent();
+        agent.inbox.try_send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+        agent.hypr.reload();
+        assert!(!agent.hypr.cursor_invisible());
+        agent.events.send(hypr::Event::ConfigReloaded).unwrap();
+        until(|| agent.hypr.cursor_invisible()).await;
     }
 }

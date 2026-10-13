@@ -9,6 +9,7 @@
 use std::io;
 use std::time::Duration;
 
+use crate::display::REMOTE_CURSOR;
 use crate::display::wire::OutputCopy;
 use crate::hypr::{self, Hypr, Monitor};
 
@@ -81,7 +82,7 @@ pub fn create(hypr: &dyn Hypr, copies: &[OutputCopy], index: usize) -> io::Resul
     }
     hypr::dispatch(hypr, &rule(index, copy, place(&monitors, copies, index)))?;
     hypr::dispatch(hypr, &format!("output create headless {name}"))?;
-    match check(hypr, &name, copy) {
+    match check(hypr, &name, copy).and_then(|scale| hide_cursor(hypr).map(|()| scale)) {
         Ok(scale) => Ok(scale),
         Err(e) => {
             let _ = remove(hypr, index);
@@ -127,16 +128,18 @@ fn check(hypr: &dyn Hypr, name: &str, copy: &OutputCopy) -> io::Result<f32> {
     }))
 }
 
-/// Declares every rule again, after a `hyprctl reload` dropped them.
+/// Declares every rule again, and hides the cursor again, after a `hyprctl reload` dropped
+/// them.
 pub fn reapply(hypr: &dyn Hypr, copies: &[OutputCopy]) -> io::Result<()> {
     let monitors = hypr::monitors(hypr)?;
     for (index, copy) in copies.iter().enumerate() {
         hypr::dispatch(hypr, &rule(index, copy, place(&monitors, copies, index)))?;
     }
-    Ok(())
+    hide_cursor(hypr)
 }
 
-/// Removes copy `index`; one already gone (Hyprland restarted) is not an error.
+/// Removes copy `index`, the others staying; one already gone (Hyprland restarted) is not an
+/// error. The cursor stays hidden: the mode goes on.
 pub fn remove(hypr: &dyn Hypr, index: usize) -> io::Result<()> {
     match hypr::dispatch(hypr, &format!("output remove {}", name(index))) {
         Err(e) if e.to_string().contains("output not found") => Ok(()),
@@ -144,14 +147,35 @@ pub fn remove(hypr: &dyn Hypr, index: usize) -> io::Result<()> {
     }
 }
 
-/// Removes every copy there is: those an agent that crashed left, however many.
+/// Hyprland paints its cursor into the copy's frames (see [`REMOTE_CURSOR`]): hidden while the
+/// copy is there.
+fn hide_cursor(hypr: &dyn Hypr) -> io::Result<()> {
+    if REMOTE_CURSOR {
+        return Ok(());
+    }
+    cursor_invisible(hypr, true)
+}
+
+fn cursor_invisible(hypr: &dyn Hypr, invisible: bool) -> io::Result<()> {
+    hypr::dispatch(
+        hypr,
+        &format!("eval hl.config({{ cursor = {{ invisible = {invisible} }} }})"),
+    )
+}
+
+/// Shows the cursor and removes every copy there is: the mode's, or those an agent that
+/// crashed left, however many. The cursor is shown even with no copy left: an agent that
+/// crashed may have left it hidden. One copy that will not go does not keep the others.
 pub fn remove_all(hypr: &dyn Hypr) -> io::Result<()> {
+    let mut result = cursor_invisible(hypr, false);
     for m in hypr::monitors(hypr)? {
-        if is_copy(&m.name) {
-            hypr::dispatch(hypr, &format!("output remove {}", m.name))?;
+        if is_copy(&m.name)
+            && let Err(e) = hypr::dispatch(hypr, &format!("output remove {}", m.name))
+        {
+            result = result.and(Err(e));
         }
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -179,6 +203,7 @@ mod tests {
                 "eval hl.monitor({ output = \"NAVETTE-1\", mode = \"2560x1440@59.94\", \
                  position = \"1920x0\", scale = 1.25, transform = 1 })",
                 "output create headless NAVETTE-1",
+                "eval hl.config({ cursor = { invisible = true } })",
             ]
         );
         let made = hypr.monitor("NAVETTE-1").unwrap();
@@ -229,6 +254,38 @@ mod tests {
     fn removing_a_copy_already_gone_is_fine() {
         let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1080, 0)]);
         remove(&hypr, 0).unwrap();
+    }
+
+    #[test]
+    fn the_remote_cursor_is_hidden_while_the_copy_is_there() {
+        let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
+        let copies = [copy(), copy()];
+        create(&hypr, &copies, 0).unwrap();
+        create(&hypr, &copies, 1).unwrap();
+        assert!(hypr.cursor_invisible());
+        // One copy made again: the other is still there, the cursor stays hidden.
+        remove(&hypr, 1).unwrap();
+        assert!(hypr.cursor_invisible());
+        remove_all(&hypr).unwrap();
+        assert!(!hypr.cursor_invisible());
+    }
+
+    #[test]
+    fn a_reload_hides_the_remote_cursor_again() {
+        let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
+        create(&hypr, &[copy()], 0).unwrap();
+        hypr.reload();
+        reapply(&hypr, &[copy()]).unwrap();
+        assert!(hypr.cursor_invisible());
+    }
+
+    #[test]
+    fn the_cursor_comes_back_even_when_the_copy_is_already_gone() {
+        let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1080, 0)]);
+        hypr.request("eval hl.config({ cursor = { invisible = true } })")
+            .unwrap();
+        remove_all(&hypr).unwrap();
+        assert!(!hypr.cursor_invisible());
     }
 
     #[test]
@@ -306,7 +363,13 @@ mod tests {
         }
         hypr.reload();
         reapply(&hypr, &copies).unwrap();
-        let rules: Vec<_> = hypr.changes().into_iter().rev().take(3).collect();
+        let rules: Vec<_> = hypr
+            .changes()
+            .into_iter()
+            .rev()
+            .filter(|c| c.contains("hl.monitor"))
+            .take(3)
+            .collect();
         assert!(rules[0].contains("NAVETTE-3") && rules[0].contains("\"5280x0\""));
         assert!(rules[2].contains("NAVETTE-1") && rules[2].contains("\"1920x0\""));
         assert_eq!(hypr.monitor("NAVETTE-3").unwrap().scale, 1.25);
