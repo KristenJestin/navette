@@ -156,16 +156,15 @@ fn cursor(output: &str, outbox: Outbox) -> io::Result<hypr_capture::Capturer> {
             .map_err(io::Error::other)?,
     );
     config.cursor = true;
-    let mut id = 0;
-    let sink = Box::new(move |event| {
-        if let hypr_capture::CaptureEvent::CursorShape {
+    let (mut id, mut shown) = (0, None);
+    let sink = Box::new(move |event| match event {
+        hypr_capture::CaptureEvent::CursorShape {
             width,
             height,
             hot_x,
             hot_y,
             argb,
-        } = event
-        {
+        } => {
             id += 1;
             let shape = ServerMsg::CursorShape {
                 id,
@@ -177,6 +176,18 @@ fn cursor(output: &str, outbox: Outbox) -> io::Result<hypr_capture::Capturer> {
             };
             outbox.send(Msg::Video(shape), vec![argb]);
         }
+        hypr_capture::CaptureEvent::CursorPos { visible, .. } => {
+            if shown.replace(visible) != Some(visible) {
+                let seen = ServerMsg::CursorPos {
+                    x: 0.0,
+                    y: 0.0,
+                    shape_id: id,
+                    visible,
+                };
+                outbox.send(Msg::Video(seen), Vec::new());
+            }
+        }
+        _ => {}
     });
     hypr_capture::Capturer::start(config, sink).map_err(io::Error::other)
 }
