@@ -1,13 +1,16 @@
 //! `navette`: the work-from-home mode. The machine with the monitors ("home") pairs once with
 //! the work laptop ("remote"), then `navette serve` at home and `navette agent` on the laptop
-//! keep an authenticated link between them. The modes come with the next issues.
+//! keep an authenticated link between them. The modes come with the next issues; until then,
+//! `navette serve --audio` brings the remote machine's sound home while the link is up.
 
 use std::io::BufRead;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
+use navette::audio::{self, pipewire::PipeWire};
 use navette::link::{self, Backoff, Event, Heartbeat};
 use navette::pair::{self, Pin, Timeouts};
 use navette::store::Store;
@@ -52,6 +55,10 @@ enum Command {
         /// The LAN address and port to listen on [default: the one used to pair].
         #[arg(long, value_name = "ADDR:PORT")]
         listen: Option<SocketAddr>,
+        /// Play the remote machine's sound here, mixed with home sound, while the link is up
+        /// (until the modes take this over).
+        #[arg(long)]
+        audio: bool,
     },
     /// Remote: dial the paired home machine and keep the link up (a systemd user service).
     Agent,
@@ -107,7 +114,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             Ok(())
         }
         Command::Pair { .. } => unreachable!("clap requires --listen or the home address"),
-        Command::Serve { listen } => {
+        Command::Serve { listen, audio } => {
             let acceptor = link::home_acceptor(&store, listen).await?;
             eprintln!(
                 "navette: waiting for the paired remote machine on {}",
@@ -115,23 +122,56 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             );
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
-            link::serve(acceptor, Heartbeat::default(), events, |_| {}).await;
+            let graph = PipeWire::default();
+            link::serve(acceptor, Heartbeat::default(), events, move |peer| {
+                if let Err(e) = audio::home(graph.clone(), peer, audio) {
+                    eprintln!("navette: audio: {e}");
+                }
+            })
+            .await;
             Ok(())
         }
         Command::Agent => {
             let dialer = link::remote_dialer(&store)?;
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
-            link::agent(
-                dialer,
-                Heartbeat::default(),
-                Backoff::default(),
-                events,
-                |_| {},
-            )
-            .await;
+            let graph = PipeWire::default();
+            let threads = Arc::new(Mutex::new(Vec::new()));
+            let agent = link::agent(dialer, Heartbeat::default(), Backoff::default(), events, {
+                let threads = threads.clone();
+                move |peer| match audio::remote(graph.clone(), peer) {
+                    Ok(thread) => {
+                        let mut threads = threads.lock().unwrap();
+                        threads.retain(|t: &std::thread::JoinHandle<()>| !t.is_finished());
+                        threads.push(thread);
+                    }
+                    Err(e) => eprintln!("navette: audio: {e}"),
+                }
+            });
+            tokio::select! {
+                () = agent => {}
+                result = stopped() => result?,
+            }
+            // The link is dropped: each audio thread removes its sink and puts the previous
+            // default output back, and the process waits for that before it exits.
+            let threads = std::mem::take(&mut *threads.lock().unwrap());
+            tokio::task::spawn_blocking(move || {
+                for thread in threads {
+                    let _ = thread.join();
+                }
+            })
+            .await?;
             Ok(())
         }
+    }
+}
+
+/// SIGTERM (`systemctl --user stop`) or Ctrl-C.
+async fn stopped() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = terminate.recv() => Ok(()),
+        result = tokio::signal::ctrl_c() => result,
     }
 }
 
