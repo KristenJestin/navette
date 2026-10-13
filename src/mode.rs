@@ -36,8 +36,15 @@ const CONFIG_FILE: &str = "mode.conf";
 const MIC_HOTKEY: &str = "SUPER + CTRL + M";
 /// How long the remote has to make its output.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long `navette mode` waits for `navette serve`: its checks, the surface, the remote.
-const ORDER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The remote makes its outputs one after the other.
+fn start_timeout(outputs: usize) -> Duration {
+    START_TIMEOUT * outputs as u32
+}
+/// How long `navette mode` waits for `navette serve`: its checks, the surfaces, the remote
+/// making the most outputs a mode has.
+const ORDER_TIMEOUT: Duration =
+    Duration::from_secs(20).saturating_add(START_TIMEOUT.saturating_mul(MAX_OUTPUTS as u32));
 /// How long, and how much, `navette serve` reads of an order.
 const ORDER_READ: Duration = if cfg!(test) {
     Duration::from_millis(100)
@@ -355,7 +362,7 @@ pub async fn serve(
                     match start(&home, peer.as_ref(), &mut active).await {
                         Ok(()) => {
                             if let Some(a) = &mut active {
-                                let at = tokio::time::Instant::now() + START_TIMEOUT;
+                                let at = tokio::time::Instant::now() + start_timeout(a.monitors.len());
                                 a.starting = Some((reply, at));
                             }
                         }
@@ -1704,5 +1711,13 @@ mod tests {
             "no GPU could be opened to decode DP-3 (home decodes on the GPU, each monitor on \
              a device of its own); nothing was changed"
         );
+    }
+
+    #[test]
+    fn the_remote_has_as_long_again_for_each_more_output() {
+        assert_eq!(start_timeout(1), START_TIMEOUT);
+        assert_eq!(start_timeout(3), START_TIMEOUT * 3);
+        // `navette mode` waits longer than serve does for the remote.
+        assert!(ORDER_TIMEOUT > start_timeout(MAX_OUTPUTS.into()));
     }
 }
