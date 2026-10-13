@@ -14,8 +14,41 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use gliff_proto::{ClientCaps, ClientMsg, ServerMsg};
 use minicbor::{Decode, Encode};
-use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{Notify, watch};
+
+/// The largest cursor taken, as gliff's client, in pixels a side: a cursor image declaring
+/// more ends the link.
+pub const MAX_CURSOR: u32 = 1024;
+
+/// The remote cursor's image: little-endian ARGB8888 in the output's pixels, its hotspot in
+/// them too.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cursor {
+    pub width: u32,
+    pub height: u32,
+    pub hot_x: i32,
+    pub hot_y: i32,
+    pub argb: Bytes,
+}
+
+/// The remote pointer as last heard. Only the newest counts, so it never waits behind the
+/// pictures, nor is it dropped with them when the display falls behind.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pointer {
+    /// `None` until the remote sends an image.
+    pub shape: Option<Cursor>,
+    pub visible: bool,
+}
+
+impl Default for Pointer {
+    fn default() -> Self {
+        Self {
+            shape: None,
+            visible: true,
+        }
+    }
+}
 
 /// What the display sends.
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +58,8 @@ pub enum Msg {
     Video(ServerMsg),
     /// Home to remote: gliff's answers to them (frame acks, keyframe requests, pongs).
     Feedback(ClientMsg),
+    /// Remote to home: the picture goes on, but home's input cannot be injected (the reason).
+    NoInput(String),
 }
 
 /// The display's orders and their answers.
@@ -85,12 +120,16 @@ pub enum Incoming {
         aux: Bytes,
     },
     Feedback(ClientMsg),
+    NoInput(String),
 }
 
-/// One live connection, as the display sees it. `inbox` ends when the link drops.
+/// One live connection, as the display and its input see it. `inbox` ends when the link drops.
 pub struct Peer {
     pub outbox: Outbox,
     pub inbox: mpsc::Receiver<Incoming>,
+    /// Remote to home; it ends with the inbox.
+    pub pointer: watch::Receiver<Pointer>,
+    pub input: crate::input::Wire,
 }
 
 #[derive(Default)]
@@ -125,13 +164,12 @@ impl Queue {
                     keep
                 });
             }
-            Msg::Video(ServerMsg::CursorShape { .. }) => self.packets.retain(|(msg, _)| {
-                !matches!(
-                    msg,
-                    Msg::Video(ServerMsg::CursorShape { .. } | ServerMsg::CursorPos { .. })
-                )
-            }),
-            Msg::Video(ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. })
+            // Unlike gliff's, a newer image leaves the visibility queued: home reads them apart.
+            Msg::Video(
+                ServerMsg::CursorShape { .. }
+                | ServerMsg::CursorPos { .. }
+                | ServerMsg::Pong { .. },
+            )
             | Msg::Feedback(ClientMsg::Pong { .. }) => {
                 let same = |queued: &Msg| match (queued, &msg) {
                     (Msg::Video(a), Msg::Video(b)) => {
@@ -280,6 +318,36 @@ mod tests {
         assert!(matches!(
             queue.packets[1].0,
             Msg::Video(ServerMsg::CursorPos { x: 99.0, .. })
+        ));
+    }
+
+    #[test]
+    fn a_newer_cursor_image_leaves_the_cursor_s_visibility_queued() {
+        let mut queue = Queue::default();
+        let hidden = Msg::Video(ServerMsg::CursorPos {
+            x: 0.0,
+            y: 0.0,
+            shape_id: 0,
+            visible: false,
+        });
+        queue.push(hidden.clone(), Vec::new());
+        for id in 1..=2 {
+            let shape = ServerMsg::CursorShape {
+                id,
+                width: 1,
+                height: 1,
+                hot_x: 0,
+                hot_y: 0,
+                argb_len: 4,
+            };
+            queue.push(Msg::Video(shape), vec![vec![0; 4]]);
+        }
+        let queued: Vec<_> = queue.packets.iter().map(|(msg, _)| msg.clone()).collect();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0], hidden);
+        assert!(matches!(
+            queued[1],
+            Msg::Video(ServerMsg::CursorShape { id: 2, .. })
         ));
     }
 
