@@ -848,6 +848,12 @@ fn start_capture(
     tx: UnboundedSender<Incoming>,
 ) -> io::Result<Capturer> {
     let mut config = CaptureConfig::new(output.to_string());
+    // The running Hyprland's display, not the one inherited from the environment.
+    config.target.display = Some(
+        crate::hypr::instance()?
+            .wayland_display()
+            .map_err(|e| other("capture", e))?,
+    );
     config.render_node = render_node.to_path_buf();
     // The pointer is home's own, drawn by home's compositor.
     config.cursor = false;

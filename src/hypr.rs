@@ -230,15 +230,34 @@ pub fn dispatch(hypr: &dyn Hypr, command: &str) -> io::Result<()> {
     }
 }
 
+/// The running Hyprland: the one this process was started in while it answers, else the
+/// newest that does. `hypr_ipc::Instance::discover` keeps to the inherited signature, which
+/// names a dead instance once Hyprland has restarted.
+pub fn instance() -> io::Result<hypr_ipc::Instance> {
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not set"))?;
+    let pinned = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
+    find_instance(std::path::Path::new(&runtime_dir), pinned.as_deref())
+}
+
+fn find_instance(
+    runtime_dir: &std::path::Path,
+    pinned: Option<&str>,
+) -> io::Result<hypr_ipc::Instance> {
+    pinned
+        .and_then(|sig| hypr_ipc::Instance::discover_in(runtime_dir, Some(sig)).ok())
+        .filter(|i| UnixStream::connect(i.socket_path()).is_ok())
+        .map_or_else(|| hypr_ipc::Instance::discover_in(runtime_dir, None), Ok)
+        .map_err(|e| io::Error::new(io::ErrorKind::NotFound, format!("no running Hyprland: {e}")))
+}
+
 /// The running Hyprland of this session.
 #[derive(Clone, Debug, Default)]
 pub struct Live;
 
 impl Hypr for Live {
     fn request(&self, command: &str) -> io::Result<String> {
-        let instance = hypr_ipc::Instance::discover(None).map_err(|e| {
-            io::Error::new(io::ErrorKind::NotFound, format!("no running Hyprland: {e}"))
-        })?;
+        let instance = instance()?;
         instance.request(command).map_err(|e| match e {
             hypr_ipc::Error::Io(e) => e,
             other => io::Error::other(other.to_string()),
@@ -251,9 +270,9 @@ impl Hypr for Live {
 pub fn watch_events(events: tokio::sync::mpsc::UnboundedSender<Event>) {
     std::thread::spawn(move || {
         while !events.is_closed() {
-            let socket = hypr_ipc::Instance::discover(None)
+            let socket = instance()
                 .map(|i| i.dir.join(".socket2.sock"))
-                .and_then(|path| Ok(std::os::unix::net::UnixStream::connect(path)?));
+                .and_then(std::os::unix::net::UnixStream::connect);
             let Ok(socket) = socket else {
                 std::thread::sleep(Duration::from_secs(1));
                 continue;
@@ -605,6 +624,35 @@ mod tests {
 mod port_tests {
     use super::fake::{FakeHypr, FakeMonitor};
     use super::*;
+
+    /// An instance directory under `runtime/hypr`, its socket answering while the listener lives.
+    fn instance_dir(
+        runtime: &std::path::Path,
+        signature: &str,
+    ) -> std::os::unix::net::UnixListener {
+        let dir = runtime.join("hypr").join(signature);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::net::UnixListener::bind(dir.join(".socket.sock")).unwrap()
+    }
+
+    #[test]
+    fn a_signature_from_a_hyprland_since_restarted_finds_the_running_one() {
+        let runtime = tempfile::tempdir().unwrap();
+        // The Hyprland the agent was started in: its socket stays, nothing answers it.
+        drop(instance_dir(runtime.path(), "before_1_1"));
+        let _running = instance_dir(runtime.path(), "after_2_2");
+        let found = find_instance(runtime.path(), Some("before_1_1")).unwrap();
+        assert_eq!(found.signature, "after_2_2");
+    }
+
+    #[test]
+    fn the_signature_of_a_running_hyprland_is_kept() {
+        let runtime = tempfile::tempdir().unwrap();
+        let _ours = instance_dir(runtime.path(), "ours_1_1");
+        let _nested = instance_dir(runtime.path(), "nested_2_2");
+        let found = find_instance(runtime.path(), Some("ours_1_1")).unwrap();
+        assert_eq!(found.signature, "ours_1_1");
+    }
 
     #[test]
     fn the_monitor_list_is_read_from_the_json_reply() {
