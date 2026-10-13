@@ -74,11 +74,15 @@ other monitor they stay home.
   the remote's outputs stand side by side, tops aligned, but the position on each comes from
   home. With two monitors of different heights, or not level at home, the pointer crosses at
   the point home puts it on the next monitor, and below the bottom of the shorter one it does
-  not cross, as at home. Each reserved monitor has
-  its own surface, and the remote machine its own virtual keyboard and pointer on each output:
-  keys held as the pointer crosses are released, as when it leaves for a home monitor. A drag
-  (a button held) stays on the monitor where it began: home's compositor keeps the pointer's
-  events for that surface until the button goes up.
+  not cross, as at home. Each reserved monitor has its own surface, and the remote machine its
+  own virtual keyboard and pointer on each output. A key held as the pointer crosses (Shift,
+  Ctrl, Super) stays down: it goes up on the output the pointer leaves and down again on the
+  next one, as a virtual keyboard's modifiers are its own; leaving for a home monitor releases
+  everything. A drag (a button held) stays on the monitor where it began: home's compositor
+  keeps the pointer's events for that surface until the button goes up. Carrying it to the
+  next output would take each surface knowing where home's other work monitors stand, and the
+  remote taking a press on one output's virtual pointer and the motion on another's as one
+  drag, which nothing here shows it does.
 
 - **Shortcuts.** While the pointer is over the reserved monitor, home's surface holds the
   keyboard and a shortcuts inhibitor, so home's binds do not fire. A bind flagged
