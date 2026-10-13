@@ -330,6 +330,12 @@ async fn receive<R: AsyncRead + Unpin>(
                 .await
                 .map_err(|_| silent())?
                 .map_err(io_error)?;
+                if let ServerMsg::CursorPos { visible, .. } = msg {
+                    pointer.send_if_modified(|pointer| {
+                        std::mem::replace(&mut pointer.visible, visible) != visible
+                    });
+                    continue;
+                }
                 if let ServerMsg::CursorShape {
                     width,
                     height,
@@ -1145,6 +1151,31 @@ pub(crate) mod tests {
         .shape
         .clone()
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_remote_hiding_its_cursor_is_heard_at_home() {
+        let mut ends = display_link(64 * 1024).await;
+        let seen = |visible| {
+            DisplayMsg::Video(ServerMsg::CursorPos {
+                x: 0.0,
+                y: 0.0,
+                shape_id: 0,
+                visible,
+            })
+        };
+        for visible in [false, true] {
+            ends.remote.outbox.send(seen(visible), Vec::new());
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                ends.home
+                    .pointer
+                    .wait_for(|pointer| pointer.visible == visible),
+            )
+            .await
+            .expect("the cursor's visibility in time")
+            .unwrap();
+        }
     }
 
     #[tokio::test]

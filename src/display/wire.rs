@@ -164,13 +164,12 @@ impl Queue {
                     keep
                 });
             }
-            Msg::Video(ServerMsg::CursorShape { .. }) => self.packets.retain(|(msg, _)| {
-                !matches!(
-                    msg,
-                    Msg::Video(ServerMsg::CursorShape { .. } | ServerMsg::CursorPos { .. })
-                )
-            }),
-            Msg::Video(ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. })
+            // Unlike gliff's, a newer image leaves the visibility queued: home reads them apart.
+            Msg::Video(
+                ServerMsg::CursorShape { .. }
+                | ServerMsg::CursorPos { .. }
+                | ServerMsg::Pong { .. },
+            )
             | Msg::Feedback(ClientMsg::Pong { .. }) => {
                 let same = |queued: &Msg| match (queued, &msg) {
                     (Msg::Video(a), Msg::Video(b)) => {
@@ -319,6 +318,36 @@ mod tests {
         assert!(matches!(
             queue.packets[1].0,
             Msg::Video(ServerMsg::CursorPos { x: 99.0, .. })
+        ));
+    }
+
+    #[test]
+    fn a_newer_cursor_image_leaves_the_cursor_s_visibility_queued() {
+        let mut queue = Queue::default();
+        let hidden = Msg::Video(ServerMsg::CursorPos {
+            x: 0.0,
+            y: 0.0,
+            shape_id: 0,
+            visible: false,
+        });
+        queue.push(hidden.clone(), Vec::new());
+        for id in 1..=2 {
+            let shape = ServerMsg::CursorShape {
+                id,
+                width: 1,
+                height: 1,
+                hot_x: 0,
+                hot_y: 0,
+                argb_len: 4,
+            };
+            queue.push(Msg::Video(shape), vec![vec![0; 4]]);
+        }
+        let queued: Vec<_> = queue.packets.iter().map(|(msg, _)| msg.clone()).collect();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0], hidden);
+        assert!(matches!(
+            queued[1],
+            Msg::Video(ServerMsg::CursorShape { id: 2, .. })
         ));
     }
 

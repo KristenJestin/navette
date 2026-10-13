@@ -27,8 +27,8 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
@@ -367,6 +367,7 @@ fn run(
         cursor_viewport: None,
         cursor_buffer: None,
         hotspot: None,
+        cursor_hidden: false,
         entered: None,
         physical_width: None,
     };
@@ -512,6 +513,7 @@ struct State {
     cursor_viewport: Option<wp_viewport::WpViewport>,
     cursor_buffer: Option<Buffer>,
     hotspot: Option<(i32, i32)>,
+    cursor_hidden: bool,
     /// The serial of the pointer's entry, while it is over the surface.
     entered: Option<u32>,
     /// The monitor's width in pixels, turned as laid out.
@@ -592,6 +594,7 @@ impl State {
 
     /// Draws the remote cursor's new image, and shows it if the pointer is over the surface.
     fn remote_cursor(&mut self, pointer: Pointer) {
+        self.cursor_hidden = !pointer.visible;
         let Some(cursor) = pointer.shape else {
             self.hotspot = None;
             self.set_cursor();
@@ -632,11 +635,16 @@ impl State {
         self.set_cursor();
     }
 
-    /// The pointer's image over the surface: the remote cursor's, else the default arrow.
+    /// The pointer's image over the surface: the remote cursor's, else the default arrow; none
+    /// while the remote hides its own.
     fn set_cursor(&self) {
         let (Some(serial), Some(pointer)) = (self.entered, &self.pointer) else {
             return;
         };
+        if self.cursor_hidden {
+            pointer.set_cursor(serial, None, 0, 0);
+            return;
+        }
         match (self.hotspot, &self.shape) {
             (Some((x, y)), _) => pointer.set_cursor(serial, Some(&self.cursor_surface), x, y),
             (None, Some(shape)) => {
