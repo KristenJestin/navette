@@ -14,15 +14,15 @@ bytes = "1"
 calloop = "0.14"
 clap = { version = "4.6", features = ["derive", "env"] }
 drm-fourcc = "2"
-gliff-proto = { git = "https://github.com/KristenJestin/navette-gliff", rev = "a2edd505f9868a0f3299eada3ddfbc342b0da0a7" }
-gliff-sw = { git = "https://github.com/KristenJestin/navette-gliff", rev = "a2edd505f9868a0f3299eada3ddfbc342b0da0a7" }
-gliff-transport = { git = "https://github.com/KristenJestin/navette-gliff", rev = "a2edd505f9868a0f3299eada3ddfbc342b0da0a7" }
-gliff-vk = { git = "https://github.com/KristenJestin/navette-gliff", rev = "a2edd505f9868a0f3299eada3ddfbc342b0da0a7" }
+gliff-proto = { git = "https://github.com/KristenJestin/navette-gliff", rev = "58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc" }
+gliff-sw = { git = "https://github.com/KristenJestin/navette-gliff", rev = "58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc" }
+gliff-transport = { git = "https://github.com/KristenJestin/navette-gliff", rev = "58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc" }
+gliff-vk = { git = "https://github.com/KristenJestin/navette-gliff", rev = "58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc" }
 hkdf = "0.12"
 hmac = "0.12"
-hypr-capture = { git = "https://github.com/KristenJestin/navette-gliff", rev = "a2edd505f9868a0f3299eada3ddfbc342b0da0a7" }
-hypr-ipc = { git = "https://github.com/KristenJestin/navette-gliff", rev = "a2edd505f9868a0f3299eada3ddfbc342b0da0a7" }
-hypr-wl = { git = "https://github.com/KristenJestin/navette-gliff", rev = "a2edd505f9868a0f3299eada3ddfbc342b0da0a7" }
+hypr-capture = { git = "https://github.com/KristenJestin/navette-gliff", rev = "58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc" }
+hypr-ipc = { git = "https://github.com/KristenJestin/navette-gliff", rev = "58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc" }
+hypr-wl = { git = "https://github.com/KristenJestin/navette-gliff", rev = "58273cb2b5e8efb4a8f2618385b1b83fc3c28cfc" }
 minicbor = { version = "2", features = ["derive", "alloc"] }
 rand = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
