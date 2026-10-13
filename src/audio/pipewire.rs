@@ -243,14 +243,19 @@ struct Open {
 }
 
 /// A module loaded into this process's own context: its nodes live here, and go when it is
-/// destroyed, or when the process ends, crash included.
-struct Module(std::ptr::NonNull<pw::sys::pw_impl_module>);
+/// destroyed, or when the process ends, crash included. It holds the context, which must
+/// outlive it.
+struct Module {
+    module: std::ptr::NonNull<pw::sys::pw_impl_module>,
+    _context: pw::context::ContextRc,
+}
 
 impl Drop for Module {
     fn drop(&mut self) {
-        // SAFETY: the module was loaded into the context of this thread's loop, which outlives
-        // every `Open` (they are dropped before it), and it is destroyed only here, once.
-        unsafe { pw::sys::pw_impl_module_destroy(self.0.as_ptr()) }
+        // SAFETY: `module` came from `pw_context_load_module` on `_context`, which this value
+        // keeps alive until after this call; it is destroyed only here, once, on the loop's
+        // thread (`Module` is not `Send`).
+        unsafe { pw::sys::pw_impl_module_destroy(self.module.as_ptr()) }
     }
 }
 
@@ -269,16 +274,21 @@ fn load_module(context: &pw::context::ContextRc, name: &str, args: &str) -> io::
             std::ptr::null_mut(),
         )
     };
-    std::ptr::NonNull::new(module).map(Module).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "PipeWire could not load {}: {}",
-                name.to_string_lossy(),
-                io::Error::last_os_error()
-            ),
-        )
-    })
+    std::ptr::NonNull::new(module)
+        .map(|module| Module {
+            module,
+            _context: context.clone(),
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "PipeWire could not load {}: {}",
+                    name.to_string_lossy(),
+                    io::Error::last_os_error()
+                ),
+            )
+        })
 }
 
 fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Result<()> {
