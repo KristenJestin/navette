@@ -57,7 +57,7 @@ pub async fn serve(
     mut events: UnboundedReceiver<hypr::Event>,
 ) {
     while let Some(peer) = peers.recv().await {
-        serve_peer(peer, &*hypr, &*streams, &mut events).await;
+        serve_peer(peer, hypr.clone(), streams.clone(), &mut events).await;
     }
 }
 
@@ -74,11 +74,12 @@ struct Running {
     ended: oneshot::Receiver<io::Error>,
 }
 
-/// One link, until it drops; the output never outlives it.
+/// One link, until it drops; the output never outlives it. Hyprland requests and the stream's
+/// start and stop block, so they run off the executor thread.
 pub async fn serve_peer(
     mut peer: Peer,
-    hypr: &dyn Hypr,
-    streams: &dyn Streams,
+    hypr: Arc<dyn Hypr>,
+    streams: Arc<dyn Streams>,
     events: &mut UnboundedReceiver<hypr::Event>,
 ) {
     let mut active: Option<Active> = None;
@@ -88,9 +89,10 @@ pub async fn serve_peer(
             msg = peer.inbox.recv() => match msg {
                 None => break,
                 Some(Incoming::Display(Display::Start { output, caps })) => {
-                    stop(&mut active, hypr);
-                    let mut mode = Active { copy: output, caps, running: None };
-                    let reply = match bring_up(&mut mode, hypr, streams, &peer.outbox) {
+                    stop(&mut active, &hypr).await;
+                    let mode = Active { copy: output, caps, running: None };
+                    let (mode, result) = bring_up(mode, &hypr, &streams, &peer.outbox).await;
+                    let reply = match result {
                         Ok(()) => {
                             active = Some(mode);
                             Display::Started { output: output::NAME.into() }
@@ -99,7 +101,7 @@ pub async fn serve_peer(
                     };
                     peer.outbox.send(Msg::Display(reply), Vec::new());
                 }
-                Some(Incoming::Display(Display::Stop)) => stop(&mut active, hypr),
+                Some(Incoming::Display(Display::Stop)) => stop(&mut active, &hypr).await,
                 Some(Incoming::Feedback(msg)) => {
                     if let Some(running) = active.as_ref().and_then(|a| a.running.as_ref()) {
                         let _ = running.feedback.send(msg);
@@ -108,10 +110,13 @@ pub async fn serve_peer(
                 Some(_) => {}
             },
             Some(event) = events.recv() => {
-                if let (hypr::Event::ConfigReloaded, Some(mode)) = (event, &active)
-                    && let Err(e) = output::reapply(hypr, &mode.copy)
-                {
-                    eprintln!("navette: could not restore the output after a reload: {e}");
+                if let (hypr::Event::ConfigReloaded, Some(mode)) = (event, &active) {
+                    let (hypr, copy) = (hypr.clone(), mode.copy.clone());
+                    let reapplied =
+                        tokio::task::spawn_blocking(move || output::reapply(&*hypr, &copy)).await;
+                    if let Ok(Err(e)) = reapplied {
+                        eprintln!("navette: could not restore the output after a reload: {e}");
+                    }
                 }
             }
             Some(reason) = ended(&mut active) => {
@@ -121,13 +126,13 @@ pub async fn serve_peer(
                 }
             }
             _ = tokio::time::sleep(RETRY), if lost => {
-                if let Some(mode) = &mut active {
-                    let _ = bring_up(mode, hypr, streams, &peer.outbox);
+                if let Some(mode) = active.take() {
+                    active = Some(bring_up(mode, &hypr, &streams, &peer.outbox).await.0);
                 }
             }
         }
     }
-    stop(&mut active, hypr);
+    stop(&mut active, &hypr).await;
 }
 
 /// The reason a running stream stopped on its own; pending forever when none runs.
@@ -138,11 +143,26 @@ async fn ended(active: &mut Option<Active>) -> Option<io::Error> {
     }
 }
 
-fn bring_up(
+/// Makes the output and starts its stream; on failure, nothing is left behind.
+async fn bring_up(
+    mut mode: Active,
+    hypr: &Arc<dyn Hypr>,
+    streams: &Arc<dyn Streams>,
+    outbox: &Outbox,
+) -> (Active, io::Result<()>) {
+    let (hypr, streams, outbox) = (hypr.clone(), streams.clone(), outbox.clone());
+    let task = tokio::task::spawn_blocking(move || {
+        let result = start_blocking(&mut mode, &*hypr, &*streams, outbox);
+        (mode, result)
+    });
+    task.await.expect("bringing the output up does not panic")
+}
+
+fn start_blocking(
     mode: &mut Active,
     hypr: &dyn Hypr,
     streams: &dyn Streams,
-    outbox: &Outbox,
+    outbox: Outbox,
 ) -> io::Result<()> {
     output::create(hypr, &mode.copy)?;
     let (feedback, feedback_rx) = mpsc::unbounded_channel();
@@ -151,13 +171,7 @@ fn bring_up(
         output: output::NAME.into(),
         scale: mode.copy.scale_milli as f32 / 1000.0,
     };
-    match streams.start(
-        source,
-        mode.caps.clone(),
-        outbox.clone(),
-        feedback_rx,
-        ended_tx,
-    ) {
+    match streams.start(source, mode.caps.clone(), outbox, feedback_rx, ended_tx) {
         Ok(stream) => {
             mode.running = Some(Running {
                 _stream: stream,
@@ -174,12 +188,18 @@ fn bring_up(
 }
 
 /// Stops the stream first, then removes the output it captured.
-fn stop(active: &mut Option<Active>, hypr: &dyn Hypr) {
-    if let Some(mode) = active.take() {
+async fn stop(active: &mut Option<Active>, hypr: &Arc<dyn Hypr>) {
+    let Some(mode) = active.take() else {
+        return;
+    };
+    let hypr = hypr.clone();
+    let removed = tokio::task::spawn_blocking(move || {
         drop(mode.running);
-        if let Err(e) = output::remove(hypr) {
-            eprintln!("navette: could not remove the remote output: {e}");
-        }
+        output::remove(&*hypr)
+    })
+    .await;
+    if let Ok(Err(e)) = removed {
+        eprintln!("navette: could not remove the remote output: {e}");
     }
 }
 
@@ -273,7 +293,7 @@ mod tests {
         let task = {
             let (hypr, streams) = (hypr.clone(), streams.clone());
             tokio::spawn(async move {
-                serve_peer(peer, &*hypr, &*streams, &mut events_rx).await;
+                serve_peer(peer, hypr, streams, &mut events_rx).await;
             })
         };
         Agent {
