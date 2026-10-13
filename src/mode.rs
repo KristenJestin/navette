@@ -28,6 +28,9 @@ use crate::display::wire::{Display, Incoming, Msg, OutputCopy, Peer};
 use crate::hypr::{self, Eval, Hypr, lua_string};
 
 const CONFIG_FILE: &str = "mode.conf";
+/// The keys that switch the mic, unless `mode.conf` names others (`mic_hotkey = ...`): free in
+/// Omarchy's own bindings.
+const MIC_HOTKEY: &str = "SUPER + CTRL + M";
 /// How long the remote has to make its output.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `navette mode` waits for `navette serve`: its checks, the surface, the remote.
@@ -70,6 +73,38 @@ pub fn monitor(config_dir: &Path) -> io::Result<String> {
                 ),
             )
         })
+}
+
+/// The keys that switch the mic: `mic_hotkey` in `mode.conf`, or [`MIC_HOTKEY`].
+fn mic_hotkey(config_dir: &Path) -> String {
+    std::fs::read_to_string(config_dir.join(CONFIG_FILE))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(key, _)| key.trim() == "mic_hotkey")
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|keys| !keys.is_empty())
+        .unwrap_or_else(|| MIC_HOTKEY.to_string())
+}
+
+/// The home mic, which goes to the remote machine while a mode runs (the port behind which
+/// tests put a fake). Its calls wait for PipeWire and the link: they are made off the executor.
+pub trait Mic: Send + Sync {
+    /// The mic goes to the remote machine.
+    fn start(&self) -> io::Result<()>;
+    /// It comes back home.
+    fn stop(&self);
+    /// The shell command the hotkey runs to switch it.
+    fn toggle_command(&self) -> String;
+}
+
+/// The mic sent to the remote machine, until dropped.
+struct MicSent(Arc<dyn Mic>);
+
+impl Drop for MicSent {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
 }
 
 /// Covers a home monitor (the port behind which tests put a fake).
@@ -121,9 +156,13 @@ pub struct Home {
     pub gpu: Option<Arc<Gpu>>,
     /// Where the desk recorder keeps what it must undo.
     pub desk_record: PathBuf,
+    /// The mic, when home plays the remote's sound.
+    pub mic: Option<Arc<dyn Mic>>,
 }
 
 struct Active {
+    /// Home first, before the rest goes.
+    _mic: Option<MicSent>,
     monitor: String,
     // Field order is drop order: the decoder stops before the surface goes.
     decoding: Decoding,
@@ -326,13 +365,14 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
     let desk = open_desk(home, &monitor, &monitors).await?;
     // Off the executor, and so is the undo when one fails: the desk drops with the closure.
     let (ended_tx, ended) = tokio::sync::mpsc::unbounded_channel();
-    let (screens, name, gpu, outbox) = (
+    let (screens, name, gpu, outbox, mic) = (
         home.screens.clone(),
         monitor.clone(),
         home.gpu.clone(),
         peer.outbox.clone(),
+        home.mic.clone(),
     );
-    let (screen, decoding, desk) = blocking(move || {
+    let (screen, decoding, desk, mic) = blocking(move || {
         let screen = screens.open(&name, ended_tx.clone())?;
         let decoding = Decoding::start(
             gpu,
@@ -341,7 +381,17 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
             screen.pictures(),
             ended_tx,
         )?;
-        Ok((screen, decoding, desk))
+        // Last, as nothing after it can fail: a mode without its mic is still a mode.
+        let mic = mic.and_then(|mic| match mic.start() {
+            Ok(()) => Some(MicSent(mic)),
+            Err(e) => {
+                eprintln!(
+                    "navette: mic: it stays home, it could not go to the remote machine: {e}"
+                );
+                None
+            }
+        });
+        Ok((screen, decoding, desk, mic))
     })
     .await?;
     let caps = decode::caps(&home.gpu, (3840, 2160));
@@ -350,6 +400,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
         Vec::new(),
     );
     *active = Some(Active {
+        _mic: mic,
         monitor,
         decoding,
         _screen: screen,
@@ -361,7 +412,8 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
 }
 
 /// Opens the desk (undoing what a previous run left) and keeps home windows off `monitor`:
-/// those that would open on any of its workspaces go to the leftmost other home monitor.
+/// those that would open on any of its workspaces go to the leftmost other home monitor. With
+/// a mic, binds its hotkey.
 async fn open_desk(
     home: &Home,
     monitor: &str,
@@ -377,6 +429,10 @@ async fn open_desk(
         home.desk_record.clone(),
         monitor.to_string(),
     );
+    let mic_bind = home
+        .mic
+        .as_ref()
+        .map(|mic| (mic_hotkey(&home.config_dir), mic.toggle_command()));
     blocking(move || {
         let mut desk = Desk::start(Eval(hypr.clone()), record).map_err(|e| match e {
             DeskError::Hypr(crate::hypr::HyprError::Io(e)) => io::Error::other(format!(
@@ -394,6 +450,17 @@ async fn open_desk(
             let name = desk.rule_name("home-windows");
             desk.apply(Change::window_rule(&name, &fields))
                 .map_err(desk_error)?;
+        }
+        // Live over the remote's monitor too, where every other shortcut goes to the remote.
+        if let Some((keys, command)) = mic_bind {
+            let name = desk.rule_name("mic");
+            desk.apply(Change::bind(
+                &name,
+                &keys,
+                &command,
+                "Navette: switch the mic",
+            ))
+            .map_err(desk_error)?;
         }
         Ok(desk)
     })
@@ -572,9 +639,35 @@ mod tests {
         }
     }
 
+    /// A mic that logs what the mode asks of it.
+    #[derive(Default)]
+    struct FakeMic {
+        log: Mutex<Vec<&'static str>>,
+        refuse: bool,
+    }
+
+    impl Mic for FakeMic {
+        fn start(&self) -> io::Result<()> {
+            self.log.lock().unwrap().push("start");
+            if self.refuse {
+                return Err(io::Error::other("no echo canceller"));
+            }
+            Ok(())
+        }
+
+        fn stop(&self) {
+            self.log.lock().unwrap().push("stop");
+        }
+
+        fn toggle_command(&self) -> String {
+            "'/opt/invented/navette' mic toggle".into()
+        }
+    }
+
     struct Desk {
         _config: tempfile::TempDir,
         hypr: Arc<FakeHypr>,
+        mic: Arc<FakeMic>,
         covered: Arc<Mutex<Vec<String>>>,
         ends: Arc<Mutex<Vec<Ended>>>,
         peers: UnboundedSender<Peer>,
@@ -583,12 +676,13 @@ mod tests {
     }
 
     fn desk(monitor: &str) -> Desk {
+        desk_with(&format!("monitor = {monitor}\n"), FakeMic::default())
+    }
+
+    fn desk_with(config_text: &str, mic: FakeMic) -> Desk {
         let config = tempfile::tempdir().unwrap();
-        std::fs::write(
-            config.path().join(CONFIG_FILE),
-            format!("monitor = {monitor}\n"),
-        )
-        .unwrap();
+        std::fs::write(config.path().join(CONFIG_FILE), config_text).unwrap();
+        let mic = Arc::new(mic);
         let hypr = Arc::new(FakeHypr::with(vec![
             FakeMonitor::new("DP-1", 1920, 1080, 0),
             FakeMonitor::new("DP-2", 2560, 1440, 1920),
@@ -605,11 +699,13 @@ mod tests {
             screens: Arc::new(screens),
             gpu: None,
             desk_record: config.path().join("desk"),
+            mic: Some(mic.clone()),
         };
         tokio::spawn(serve(home, peers_rx, orders_rx, events_rx));
         Desk {
             _config: config,
             hypr,
+            mic,
             covered,
             ends,
             peers,
@@ -722,6 +818,92 @@ mod tests {
             .unwrap();
         answer(pending).await.unwrap();
         remote
+    }
+
+    fn mic_log(desk: &Desk) -> Vec<&'static str> {
+        desk.mic.log.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn starting_a_mode_sends_the_mic_to_the_remote() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        assert_eq!(mic_log(&desk), ["start"]);
+    }
+
+    #[tokio::test]
+    async fn stopping_the_mode_brings_the_mic_home() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(mic_log(&desk), ["start", "stop"]);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_brings_the_mic_home() {
+        let desk = desk("DP-2");
+        let remote = started(&desk).await;
+        drop(remote);
+        until(|| mic_log(&desk) == ["start", "stop"]).await;
+    }
+
+    #[tokio::test]
+    async fn a_mic_that_cannot_start_leaves_the_mode_running() {
+        let mic = FakeMic {
+            refuse: true,
+            ..FakeMic::default()
+        };
+        let desk = desk_with("monitor = DP-2\n", mic);
+        let _remote = started(&desk).await;
+        assert_eq!(*desk.covered.lock().unwrap(), ["DP-2"]);
+        answer(ask(&desk, false).await).await.unwrap();
+        // It never went: there is nothing to bring home.
+        assert_eq!(mic_log(&desk), ["start"]);
+    }
+
+    #[tokio::test]
+    async fn the_mic_hotkey_is_bound_through_the_inhibitor_and_undone_on_stop() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        let binds = desk.hypr.binds();
+        assert_eq!(binds.len(), 1, "{binds:?}");
+        assert!(
+            binds[0].contains(r#"hl.bind("SUPER + CTRL + M""#),
+            "{binds:?}"
+        );
+        assert!(binds[0].contains("dont_inhibit = true"), "{binds:?}");
+        assert!(
+            binds[0].contains(r#"exec_cmd("'/opt/invented/navette' mic toggle")"#),
+            "{binds:?}"
+        );
+        answer(ask(&desk, false).await).await.unwrap();
+        let binds = desk.hypr.binds();
+        assert_eq!(binds.len(), 2, "{binds:?}");
+        assert!(binds[1].contains(":set_enabled(false)"), "{binds:?}");
+    }
+
+    #[tokio::test]
+    async fn the_mic_hotkey_comes_from_mode_conf() {
+        let desk = desk_with(
+            "monitor = DP-2\nmic_hotkey = SUPER + ALT + F9\n",
+            FakeMic::default(),
+        );
+        let _remote = started(&desk).await;
+        let binds = desk.hypr.binds();
+        assert!(
+            binds[0].contains(r#"hl.bind("SUPER + ALT + F9""#),
+            "{binds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_binds_the_mic_hotkey_again() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        desk.events.send(hypr::Event::ConfigReloaded).unwrap();
+        until(|| desk.hypr.binds().len() == 2).await;
+        let binds = desk.hypr.binds();
+        assert_eq!(binds[0], binds[1]);
     }
 
     #[tokio::test]

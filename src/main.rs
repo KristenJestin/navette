@@ -2,7 +2,8 @@
 //! the work laptop ("remote"), then `navette serve` at home and `navette agent` on the laptop
 //! keep an authenticated link between them. `navette mode start` gives one home monitor to the
 //! remote machine, `navette mode stop` gives it back; `navette serve --audio` brings the remote
-//! machine's sound home while the link is up.
+//! machine's sound home while the link is up, and sends the home mic there while a mode runs;
+//! `navette mic` switches it.
 
 use std::io::BufRead;
 use std::net::SocketAddr;
@@ -19,6 +20,7 @@ use navette::desk::Desk;
 use navette::display::{decode, remote};
 use navette::hypr::{self, Eval};
 use navette::link::{self, Backoff, Event, Heartbeat, Wire};
+use navette::mic::{self, Mic, NoSound, Routing};
 use navette::mode::{self, Home};
 use navette::pair::{self, Pin, Timeouts};
 use navette::store::Store;
@@ -64,7 +66,7 @@ enum Command {
         #[arg(long, value_name = "ADDR:PORT")]
         listen: Option<SocketAddr>,
         /// Play the remote machine's sound here, mixed with home sound, while the link is up
-        /// (until the modes take this over).
+        /// (until the modes take this over), and send it the home mic while a mode runs.
         #[arg(long)]
         audio: bool,
     },
@@ -77,6 +79,36 @@ enum Command {
     Mode {
         #[command(subcommand)]
         action: ModeAction,
+    },
+    /// Home: send the home mic to the remote machine or keep it home, while a mode runs.
+    ///
+    /// A mode sends it to the remote machine when it starts, and brings it home when it stops.
+    /// `navette serve --audio` must be running.
+    Mic {
+        #[command(subcommand)]
+        action: MicAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum MicAction {
+    /// Switch it to the other machine.
+    Toggle,
+    /// Send it to the remote machine.
+    Remote,
+    /// Keep it home.
+    Home,
+    /// Say where it goes: `remote`, `home`, or `off` with no mode running.
+    Status {
+        /// One line of JSON (`text`, `alt`, `class`, `tooltip`), for a bar.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Say where it goes, then again at every change, until stopped: for a bar.
+    Watch {
+        /// Lines of JSON (`text`, `alt`, `class`, `tooltip`).
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -155,15 +187,27 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
             let control = mode::listen(&mode::control_path()?)?;
+            let mic_control = mic::control_path()?;
+            let mic_control = mode::listen(&mic_control)?;
             let gpu = tokio::task::spawn_blocking(decode::open_gpu)
                 .await
                 .map_err(std::io::Error::other)?;
+            // Without `--audio`, home never reaches PipeWire.
+            let graph = audio.then(PipeWire::default);
+            let toggle = mic::toggle_command(&std::env::current_exe()?);
+            let mic = graph.clone().map(|graph| Arc::new(Mic::new(graph, toggle)));
+            let routing: Arc<dyn Routing> = match &mic {
+                Some(mic) => mic.clone(),
+                None => Arc::new(NoSound::default()),
+            };
+            let mic_control = tokio::spawn(mic::serve(mic_control, routing));
             let home = Home {
                 config_dir: store.dir().to_path_buf(),
                 hypr: Arc::new(hypr::Live),
                 screens: Arc::new(mode::LiveScreens),
                 gpu,
                 desk_record: Desk::<Eval>::default_record()?,
+                mic: mic.clone().map(|mic| mic as Arc<dyn mode::Mic>),
             };
             let (peers, peers_rx) = mpsc::unbounded_channel();
             let (orders, orders_rx) = mpsc::unbounded_channel();
@@ -171,8 +215,6 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             hypr::watch_events(hypr_events);
             let modes = tokio::spawn(mode::serve(home, peers_rx, orders_rx, hypr_events_rx));
             let control = tokio::spawn(mode::accept_orders(control, orders));
-            // Without `--audio`, home never reaches PipeWire.
-            let graph = audio.then(PipeWire::default);
             // Each service takes its part of the link; the clipboard bridge, not `Send`, runs on
             // this thread, in a local set.
             let attach = move |mut wire: Wire| {
@@ -181,9 +223,13 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 }
                 if let Some(graph) = &graph
                     && let Some(sound) = wire.audio.take()
-                    && let Err(e) = audio::home(graph.clone(), sound)
                 {
-                    eprintln!("navette: audio: {e}");
+                    if let Some(mic) = &mic {
+                        mic.attach(sound.to_peer.clone());
+                    }
+                    if let Err(e) = audio::home(graph.clone(), sound) {
+                        eprintln!("navette: audio: {e}");
+                    }
                 }
                 clipboard::attach(Side::Client, clipboard::hypr(Target::default()), wire)
             };
@@ -197,6 +243,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             control.abort();
             let _ = control.await;
             let _ = modes.await;
+            mic_control.abort();
+            let _ = mic_control.await;
             Ok(())
         }
         Command::Agent => {
@@ -263,6 +311,38 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 ModeAction::Stop => "stop",
             };
             println!("{}", mode::order(&mode::control_path()?, order).await?);
+            Ok(())
+        }
+        Command::Mic { action } => {
+            let path = mic::control_path()?;
+            let show = |status: mic::Status, json: bool| match json {
+                true => status.json(),
+                false => status.word().to_string(),
+            };
+            let order = match action {
+                MicAction::Toggle => mic::Order::Toggle,
+                MicAction::Remote => mic::Order::Remote,
+                MicAction::Home => mic::Order::Home,
+                MicAction::Status { json } => {
+                    // No `navette serve`: the mic is home.
+                    let status = mic::ask(&path, mic::Order::Status)
+                        .await
+                        .unwrap_or(mic::Status::Off);
+                    println!("{}", show(status, json));
+                    return Ok(());
+                }
+                MicAction::Watch { json } => {
+                    return mic::watch(&path, |status| {
+                        use std::io::Write;
+                        let mut out = std::io::stdout().lock();
+                        writeln!(out, "{}", show(status, json))?;
+                        // A bar reads it through a pipe: each line at once.
+                        out.flush()
+                    })
+                    .await;
+                }
+            };
+            println!("{}", mic::ask(&path, order).await?.word());
             Ok(())
         }
     }

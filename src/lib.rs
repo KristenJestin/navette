@@ -9,6 +9,7 @@ pub mod frame;
 pub mod hypr;
 pub mod identity;
 pub mod link;
+pub mod mic;
 pub mod mode;
 pub mod pair;
 pub mod store;
