@@ -80,7 +80,10 @@ peer only after checking the other's.
 - **Someone listening on the LAN** sees TLS 1.3 traffic, and during pairing only SPAKE2
   messages and certificate fingerprints, none of which is secret.
 - **Denial of service** stays possible from the LAN: a host can take the one pairing attempt
-  (pair again) or open connections that home drops after 10 s without a handshake.
+  (pair again). Home shakes hands with up to 8 connections at once and drops each one that
+  stays silent after 10 s, so a few silent connections do not keep the paired remote out; a
+  host that keeps all 8 slots busy permanently still can, and only a firewall rule limiting
+  the LAN sources to the remote's address stops that.
 - **What is not covered**: a compromised machine. Whoever can read a machine's
   `identity.key` can pose as it; the answer is a new identity and a new pairing. The address
   home listens on is the one it is given: Navette refuses a wildcard (`0.0.0.0`, `::`) but does

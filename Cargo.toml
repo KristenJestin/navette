@@ -12,11 +12,11 @@ path = "src/main.rs"
 [dependencies]
 bytes = "1"
 clap = { version = "4.6", features = ["derive", "env"] }
-gliff-proto = { git = "https://github.com/KristenJestin/navette-gliff", rev = "a2edd505f9868a0f3299eada3ddfbc342b0da0a7" }
-gliff-transport = { git = "https://github.com/KristenJestin/navette-gliff", rev = "a2edd505f9868a0f3299eada3ddfbc342b0da0a7" }
+gliff-proto = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
+gliff-transport = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
 hkdf = "0.12"
 hmac = "0.12"
-hypr-input = { git = "https://github.com/KristenJestin/navette-gliff", rev = "a2edd505f9868a0f3299eada3ddfbc342b0da0a7" }
+hypr-input = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
 minicbor = { version = "2", features = ["derive", "alloc"] }
 rand = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }

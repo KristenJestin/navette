@@ -344,6 +344,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::identity::Identity;
     use crate::pair::{self, Pin, Timeouts};
     use crate::transport::bind_lan;
 
@@ -547,5 +548,57 @@ mod tests {
             remote_dialer(&unpaired).err().unwrap().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn an_unpaired_host_cannot_evict_the_real_link() {
+        let desk = paired_desk().await;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (home_tx, mut home_events) = mpsc::unbounded_channel();
+                let (remote_tx, mut remote_events) = mpsc::unbounded_channel();
+                let acceptor = home_acceptor(&desk.home, None).await.unwrap();
+                let address = acceptor.local_addr().unwrap();
+                let home = tokio::task::spawn_local(serve(acceptor, fast(), home_tx, nothing));
+                let remote = tokio::task::spawn_local(agent(
+                    remote_dialer(&desk.remote).unwrap(),
+                    fast(),
+                    quick_backoff(),
+                    remote_tx,
+                    nothing,
+                ));
+                until_connected(&mut home_events).await;
+                until_connected(&mut remote_events).await;
+
+                // A stranger with its own certificate, and a silent connection: home refuses both.
+                let stranger = TlsDialer::new(
+                    &Identity::generate().unwrap(),
+                    desk.home.identity().unwrap().fingerprint(),
+                    address,
+                )
+                .unwrap();
+                let _ = stranger.dial().await;
+                let _silent = tokio::net::TcpStream::connect(address).await.unwrap();
+
+                // The real link outlives several heartbeat timeouts, and nothing dropped it.
+                let quiet = tokio::time::sleep(fast().timeout * 3);
+                tokio::pin!(quiet);
+                loop {
+                    tokio::select! {
+                        () = &mut quiet => break,
+                        event = home_events.recv() => assert!(
+                            !matches!(event, Some(Event::Disconnected(_))),
+                            "the real link was dropped: {event:?}",
+                        ),
+                        event = remote_events.recv() => assert!(
+                            !matches!(event, Some(Event::Disconnected(_))),
+                            "the real link was dropped: {event:?}",
+                        ),
+                    }
+                }
+                home.abort();
+                remote.abort();
+            })
+            .await;
     }
 }

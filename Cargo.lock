@@ -421,7 +421,7 @@ dependencies = [
 [[package]]
 name = "gliff-proto"
 version = "0.3.1"
-source = "git+https://github.com/KristenJestin/navette-gliff?rev=a2edd505f9868a0f3299eada3ddfbc342b0da0a7#a2edd505f9868a0f3299eada3ddfbc342b0da0a7"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#a2edd505f9868a0f3299eada3ddfbc342b0da0a7"
 dependencies = [
  "minicbor",
  "rayon",
@@ -431,7 +431,7 @@ dependencies = [
 [[package]]
 name = "gliff-transport"
 version = "0.3.1"
-source = "git+https://github.com/KristenJestin/navette-gliff?rev=a2edd505f9868a0f3299eada3ddfbc342b0da0a7#a2edd505f9868a0f3299eada3ddfbc342b0da0a7"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#a2edd505f9868a0f3299eada3ddfbc342b0da0a7"
 dependencies = [
  "bytes",
  "gliff-proto",
@@ -474,7 +474,7 @@ dependencies = [
 [[package]]
 name = "hypr-input"
 version = "0.3.1"
-source = "git+https://github.com/KristenJestin/navette-gliff?rev=a2edd505f9868a0f3299eada3ddfbc342b0da0a7#a2edd505f9868a0f3299eada3ddfbc342b0da0a7"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#a2edd505f9868a0f3299eada3ddfbc342b0da0a7"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
@@ -492,7 +492,7 @@ dependencies = [
 [[package]]
 name = "hypr-ipc"
 version = "0.3.1"
-source = "git+https://github.com/KristenJestin/navette-gliff?rev=a2edd505f9868a0f3299eada3ddfbc342b0da0a7#a2edd505f9868a0f3299eada3ddfbc342b0da0a7"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#a2edd505f9868a0f3299eada3ddfbc342b0da0a7"
 dependencies = [
  "serde",
  "serde_json",
@@ -503,7 +503,7 @@ dependencies = [
 [[package]]
 name = "hypr-wl"
 version = "0.3.1"
-source = "git+https://github.com/KristenJestin/navette-gliff?rev=a2edd505f9868a0f3299eada3ddfbc342b0da0a7#a2edd505f9868a0f3299eada3ddfbc342b0da0a7"
+source = "git+https://github.com/KristenJestin/navette-gliff?branch=navette#a2edd505f9868a0f3299eada3ddfbc342b0da0a7"
 dependencies = [
  "calloop",
  "calloop-wayland-source",
