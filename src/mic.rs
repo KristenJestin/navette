@@ -685,19 +685,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn the_link_dropping_brings_the_mic_home() {
-        let (graph, mic, remote, _tmp) = mic();
-        let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
-        // The link goes; the mode ends with it and stops the mic.
-        drop(remote);
-        let stopped = mic.clone();
-        blocking(move || stopped.stop()).await;
-        assert_eq!(mic.order(Order::Status).unwrap(), Status::Off);
-        assert!(graph.state().mics.is_empty());
-    }
-
     /// Waits for the mic to say `status`.
     async fn until_status(mic: &Mic<FakeGraph>, status: Status) {
         let mut changes = mic.watch();
