@@ -1,10 +1,11 @@
-//! `navette` : le mode télétravail. Depuis le bureau de la maison (Hyprland, plusieurs
-//! écrans), réserve des écrans pour le laptop pro et y affiche son bureau en plein écran,
-//! via gliff, avec bascule de l'audio. Rien n'est encore implémenté : voir les tickets.
+//! `navette`: the work-from-home mode. From the home desk (Hyprland, several monitors), it
+//! reserves monitors for the work laptop and shows its desktop on them fullscreen, with a mic
+//! toggle. `navette` runs at home; `navette agent` runs on the laptop. Nothing is implemented
+//! yet: see the issues.
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    eprintln!("navette : rien n'est encore implémenté (voir les tickets)");
+    eprintln!("navette: nothing is implemented yet (see the issues)");
     ExitCode::from(2)
 }
