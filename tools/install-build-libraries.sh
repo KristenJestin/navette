@@ -1,6 +1,6 @@
 #!/bin/sh
 # The system libraries Navette builds against, on an Ubuntu runner. The one list: the release and
-# beta workflows call it, and `verify` in ci.yml should too, so that a new dependency (video,
+# beta workflows call it, and `verify` in ci.yml, so that a new dependency (video,
 # audio, input...) is added here once and not forgotten in one of the three builds.
 #
 #   tools/install-build-libraries.sh
