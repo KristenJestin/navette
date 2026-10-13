@@ -156,7 +156,7 @@ pub fn lua_string(s: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
-            '\0' => out.push_str("\\0"),
+            '\0' => out.push_str("\\000"),
             c => out.push(c),
         }
     }
@@ -190,6 +190,8 @@ mod tests {
     fn lua_strings_are_quoted_and_escaped() {
         assert_eq!(lua_string("HOME-1"), r#""HOME-1""#);
         assert_eq!(lua_string("a\"b\\c\nd"), r#""a\"b\\c\nd""#);
+        // `\0` followed by a digit would read as another code: `\01` is byte 1.
+        assert_eq!(lua_string("\u{0}1"), r#""\0001""#);
     }
 
     /// A stand-in for Hyprland's command socket: answers each connection with `answer` and
