@@ -37,6 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The audio backend links against PipeWire, whose bindings bindgen generates with clang.
+      - run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
