@@ -12,8 +12,8 @@ use tokio::sync::oneshot;
 
 use super::output;
 use super::stream::{self, Source};
+use crate::display::wire::{Display, Incoming, Msg, Outbox, OutputCopy, Peer};
 use crate::hypr::{self, Hypr};
-use crate::wire::{Display, Incoming, Msg, Outbox, OutputCopy, Peer};
 
 /// How often a lost output is made again.
 const RETRY: Duration = Duration::from_secs(1);

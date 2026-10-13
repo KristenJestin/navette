@@ -1,5 +1,5 @@
 //! The link once paired: the remote's agent dials home and keeps an idle connection, home
-//! serves it. Both sides say hello (the link's version), then [`crate::wire`] carries the
+//! serves it. Both sides say hello (the link's version), then [`crate::display::wire`] carries the
 //! heartbeats, the display's orders and the video over the same authenticated stream.
 //!
 //! The agent reconnects with an exponential backoff whenever the link drops; home keeps the
@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::wire::{self, Peer};
+use crate::display::wire::{self, Peer};
 use tokio::task::JoinSet;
 
 use crate::frame::{read_frame, write_frame};

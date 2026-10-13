@@ -6,8 +6,8 @@
 use std::io;
 use std::time::Duration;
 
+use crate::display::wire::OutputCopy;
 use crate::hypr::{self, Hypr, Monitor};
-use crate::wire::OutputCopy;
 
 /// The remote output's name. One work monitor for now; several come with #10.
 pub const NAME: &str = "NAVETTE-1";

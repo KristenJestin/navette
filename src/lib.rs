@@ -9,4 +9,3 @@ pub mod link;
 pub mod pair;
 pub mod store;
 pub mod transport;
-pub mod wire;

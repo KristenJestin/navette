@@ -19,7 +19,7 @@ use hypr_capture::{CaptureConfig, CaptureEvent, CapturedFrame, Capturer};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use super::rate::{Ladder, LinkEstimator, RateController};
-use crate::wire::{Msg, Outbox};
+use crate::display::wire::{Msg, Outbox};
 
 /// The session-wide fps ceiling; ladder levels cap below it.
 const MAX_FPS: u32 = 60;
