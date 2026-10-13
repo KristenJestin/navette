@@ -57,8 +57,12 @@ other monitor they stay home.
   `dont_inhibit` (the mic toggle, say) still fires at home, everywhere; its key does not reach
   the remote machine.
 - **The release hotkey** gives the keyboard back to home without moving the pointer:
-  `Shift+Escape` by default (Escape alone still goes to the remote). Moving the pointer off
-  the monitor and back captures it again. Choose another chord (modifiers and one key), or
+  `Shift+Escape` by default (Escape alone still goes to the remote). Home's shortcuts work
+  at once; typed text goes to a home window once the pointer is over one, as Hyprland gives
+  the keyboard to the window under the pointer. A modifier counts as the key pressed, even
+  when a keyboard option makes it something else (Shift while Caps Lock is on, with
+  Omarchy's `shift:both_capslock_cancel`). Moving the pointer off the monitor and back
+  captures it again. Choose another chord (modifiers and one key), or
   none (`release = none`, or `release =` left empty), in `mode.conf`, where `#` starts a
   comment:
 
