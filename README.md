@@ -2,16 +2,23 @@
 
 The "work-from-home mode" for two Omarchy 4 (Hyprland, Wayland) machines on the same home LAN,
 written in Rust. From the home desk (several monitors, keyboard, mouse, mic, speakers), it drives
-a separate, employer-managed work laptop without unplugging anything: a preset reserves some of
-the home monitors, shows the laptop's output on them fullscreen as if they were its own monitors,
-lets focus follow the pointer between the two machines, switches audio by hand, and shares the
-clipboard both ways.
+a separate, employer-managed work laptop without unplugging anything: some of the home monitors
+show the laptop's output fullscreen, as if they were its own monitors, focus follows the pointer
+between the two machines, and the clipboard is shared both ways.
 
-Navette does not move the pixels itself: the video, input injection and the clipboard are
-[gliff](https://github.com/omacom/gliff)'s job (one gliff client window per reserved monitor).
-Navette is the orchestration on top — it applies the Hyprland preset, places the gliff windows,
-and owns the audio toggle and its indicator. It drives Hyprland over its IPC socket and gliff over
-its CLI or as a library.
+It is one program, `navette`, with two roles:
+
+- **At home**, `navette` takes the reserved monitors itself and draws the laptop's output on
+  them. Remote sound plays on the home speakers; the mic goes to one machine at a time, switched
+  by a hotkey or a bar indicator.
+- **On the laptop**, `navette agent` runs as a systemd user service, without root. It dials out to
+  the home machine: nothing listens on the laptop. Home listens on its LAN address only and
+  refuses any peer it has not been paired with (a one-time PIN, then mutual TLS).
+
+Navette is built on the library crates of [gliff](https://github.com/omacom/gliff) (capture,
+encode and decode, input, protocol, transport), pinned to an upstream commit and unchanged. What
+is specific to the work-from-home mode (pairing, modes, monitor mapping, mic routing) is Navette's
+own.
 
 Agents read `AGENTS.md`. Work in progress: see the issues.
 
