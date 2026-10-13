@@ -4,11 +4,13 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use super::jitter::Jitter;
-use super::{DefaultSink, Graph, OnSound};
+use super::{DefaultNode, Device, Graph, OnSound};
 
 #[derive(Default)]
 pub struct State {
-    pub default: Option<DefaultSink>,
+    /// The default sink.
+    pub default: Option<DefaultNode>,
+    pub default_source: Option<DefaultNode>,
     pub sinks: Vec<(String, Arc<Mutex<OnSound>>)>,
     pub playbacks: Vec<(String, Arc<Mutex<Jitter>>)>,
     /// What was done, in order.
@@ -27,7 +29,7 @@ pub struct FakeGraph(pub Arc<Mutex<State>>);
 impl FakeGraph {
     pub fn with_default(name: &str) -> Self {
         let graph = Self::default();
-        graph.state().default = Some(DefaultSink::named(name));
+        graph.state().default = Some(DefaultNode::named(name));
         graph
     }
 
@@ -67,11 +69,15 @@ impl Drop for FakeNode {
 impl Graph for FakeGraph {
     type Node = FakeNode;
 
-    fn default_sink(&self) -> io::Result<Option<DefaultSink>> {
-        Ok(self.state().default.clone())
+    fn default_node(&self, device: Device) -> io::Result<Option<DefaultNode>> {
+        let state = self.state();
+        Ok(match device {
+            Device::Sink => state.default.clone(),
+            Device::Source => state.default_source.clone(),
+        })
     }
 
-    fn set_default_sink(&self, sink: Option<&DefaultSink>) -> io::Result<()> {
+    fn set_default_node(&self, device: Device, node: Option<&DefaultNode>) -> io::Result<()> {
         let slow = self.state().slow_defaults;
         std::thread::sleep(slow);
         let mut state = self.state();
@@ -81,11 +87,16 @@ impl Graph for FakeGraph {
                 "PipeWire is gone",
             ));
         }
-        state.default = sink.cloned();
-        state.log.push(match sink {
-            Some(sink) => format!("default {}", sink.0),
-            None => "default cleared".to_owned(),
-        });
+        let (slot, what) = match device {
+            Device::Sink => (&mut state.default, "default"),
+            Device::Source => (&mut state.default_source, "default source"),
+        };
+        *slot = node.cloned();
+        let entry = match node {
+            Some(node) => format!("{what} {}", node.0),
+            None => format!("{what} cleared"),
+        };
+        state.log.push(entry);
         Ok(())
     }
 

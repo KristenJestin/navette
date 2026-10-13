@@ -107,12 +107,28 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The configured default sink, as PipeWire's `default` metadata holds it: kept as is, to be
-/// put back as it was.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DefaultSink(pub String);
+/// One of the machine's two defaults: its output, or its mic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Device {
+    Sink,
+    Source,
+}
 
-impl DefaultSink {
+impl Device {
+    fn saved_file(self) -> &'static str {
+        match self {
+            Device::Sink => "previous-default-sink",
+            Device::Source => "previous-default-source",
+        }
+    }
+}
+
+/// A configured default, as PipeWire's `default` metadata holds it: kept as is, to be put
+/// back as it was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefaultNode(pub String);
+
+impl DefaultNode {
     pub fn named(node: &str) -> Self {
         Self(format!("{{ \"name\": \"{node}\" }}"))
     }
@@ -139,14 +155,12 @@ impl DefaultSink {
     }
 }
 
-/// The file where the remote keeps the default it replaced until it is put back, so that an
-/// agent that died before putting it back finds it on its next start.
+/// The files where the remote keeps the defaults it replaced until they are put back, so
+/// that an agent that died before putting them back finds them on its next start.
 #[derive(Clone, Debug)]
 pub struct Saved {
     dir: PathBuf,
 }
-
-const SAVED_FILE: &str = "previous-default-sink";
 
 impl Saved {
     pub fn in_dir(dir: PathBuf) -> Self {
@@ -166,22 +180,22 @@ impl Saved {
 
     /// What was saved: nothing, or the default then (`None` when there was none, an empty
     /// file).
-    fn load(&self) -> io::Result<Option<Option<DefaultSink>>> {
-        match std::fs::read_to_string(self.dir.join(SAVED_FILE)) {
+    fn load(&self, device: Device) -> io::Result<Option<Option<DefaultNode>>> {
+        match std::fs::read_to_string(self.dir.join(device.saved_file())) {
             Ok(value) if value.is_empty() => Ok(Some(None)),
-            Ok(value) => Ok(Some(Some(DefaultSink(value)))),
+            Ok(value) => Ok(Some(Some(DefaultNode(value)))),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    fn save(&self, previous: Option<&DefaultSink>) -> io::Result<()> {
-        let value = previous.map_or("", |sink| sink.0.as_str());
-        crate::store::write_private(&self.dir, SAVED_FILE, value.as_bytes())
+    fn save(&self, device: Device, previous: Option<&DefaultNode>) -> io::Result<()> {
+        let value = previous.map_or("", |node| node.0.as_str());
+        crate::store::write_private(&self.dir, device.saved_file(), value.as_bytes())
     }
 
-    fn clear(&self) -> io::Result<()> {
-        match std::fs::remove_file(self.dir.join(SAVED_FILE)) {
+    fn clear(&self, device: Device) -> io::Result<()> {
+        match std::fs::remove_file(self.dir.join(device.saved_file())) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
@@ -198,10 +212,11 @@ pub type OnSound = Box<dyn FnMut(&[f32]) + Send>;
 pub trait Graph: Clone + Send + 'static {
     type Node: Send;
 
-    /// The default sink the user configured, if any.
-    fn default_sink(&self) -> io::Result<Option<DefaultSink>>;
-    /// Configures the default sink; `None` clears it, leaving the choice to the session manager.
-    fn set_default_sink(&self, sink: Option<&DefaultSink>) -> io::Result<()>;
+    /// The default sink or source the user configured, if any.
+    fn default_node(&self, device: Device) -> io::Result<Option<DefaultNode>>;
+    /// Configures the default sink or source; `None` clears it, leaving the choice to the
+    /// session manager.
+    fn set_default_node(&self, device: Device, node: Option<&DefaultNode>) -> io::Result<()>;
     /// A virtual sink: what the machine plays into it goes to `on_sound`.
     fn open_sink(&self, name: &str, description: &str, on_sound: OnSound)
     -> io::Result<Self::Node>;
@@ -216,61 +231,85 @@ pub trait Graph: Clone + Send + 'static {
     fn is_gone(&self, node: &Self::Node) -> bool;
 }
 
+/// A default switched to a node of ours. Dropping it puts the previous default back.
+struct Switch<G: Graph> {
+    graph: G,
+    saved: Saved,
+    device: Device,
+    ours: DefaultNode,
+    previous: Option<DefaultNode>,
+}
+
+impl<G: Graph> Switch<G> {
+    /// Saves the default that `ours` is to replace, before anything changes.
+    fn save(graph: G, saved: Saved, device: Device, ours: &str) -> io::Result<Self> {
+        let previous = match graph.default_node(device)? {
+            // Left on our own node by an agent that died: the user's choice is the one it saved.
+            Some(current) if current.name() == Some(ours) => saved.load(device)?.flatten(),
+            current => current,
+        };
+        // Saved before switching, so that a crash from here on still knows what to put back.
+        saved.save(device, previous.as_ref())?;
+        Ok(Self {
+            graph,
+            saved,
+            device,
+            ours: DefaultNode::named(ours),
+            previous,
+        })
+    }
+
+    /// Makes our node the default, again after PipeWire restarts; what goes back at the end
+    /// is still the default from before.
+    fn switch(&self) -> io::Result<()> {
+        self.graph.set_default_node(self.device, Some(&self.ours))
+    }
+}
+
+impl<G: Graph> Drop for Switch<G> {
+    fn drop(&mut self) {
+        // Kept saved when it fails, for the next start to put back.
+        match self
+            .graph
+            .set_default_node(self.device, self.previous.as_ref())
+        {
+            Ok(()) => {
+                if let Err(e) = self.saved.clear(self.device) {
+                    eprintln!("navette: audio: could not remove the saved default: {e}");
+                }
+            }
+            Err(e) => eprintln!("navette: audio: could not put the previous default back: {e}"),
+        }
+    }
+}
+
 /// The remote's sink while home asks for the sound. Dropping it puts the previous default
 /// back, then removes the sink.
 pub struct RemoteSink<G: Graph> {
-    graph: G,
-    saved: Saved,
-    previous: Option<DefaultSink>,
+    // Field order is drop order: the apps move straight to the previous default.
+    switch: Switch<G>,
     node: G::Node,
 }
 
 impl<G: Graph> RemoteSink<G> {
     pub fn start(graph: G, saved: Saved, on_sound: OnSound) -> io::Result<Self> {
-        let ours = DefaultSink::named(SINK);
-        let previous = match graph.default_sink()? {
-            // Left on our own sink by an agent that died: the user's choice is the one it saved.
-            Some(current) if current.name() == Some(SINK) => saved.load()?.flatten(),
-            current => current,
-        };
-        // Saved before switching, so that a crash from here on still knows what to put back.
-        saved.save(previous.as_ref())?;
-        let node = graph.open_sink(SINK, SINK_DESCRIPTION, on_sound)?;
-        let sink = Self {
-            graph,
-            saved,
-            previous,
-            node,
-        };
-        sink.graph.set_default_sink(Some(&ours))?;
-        Ok(sink)
+        let switch = Switch::save(graph, saved, Device::Sink, SINK)?;
+        let node = switch.graph.open_sink(SINK, SINK_DESCRIPTION, on_sound)?;
+        switch.switch()?;
+        Ok(Self { switch, node })
     }
 
     fn is_gone(&self) -> bool {
-        self.graph.is_gone(&self.node)
+        self.switch.graph.is_gone(&self.node)
     }
 
-    /// The sink again, once PipeWire has restarted, and the default again; what goes back at
-    /// the end is still the default from before the session.
+    /// The sink again, once PipeWire has restarted, and the default again.
     fn reopen(&mut self, on_sound: OnSound) -> io::Result<()> {
-        self.node = self.graph.open_sink(SINK, SINK_DESCRIPTION, on_sound)?;
-        self.graph.set_default_sink(Some(&DefaultSink::named(SINK)))
-    }
-}
-
-impl<G: Graph> Drop for RemoteSink<G> {
-    fn drop(&mut self) {
-        // Kept saved when it fails, for the next start to put back.
-        match self.graph.set_default_sink(self.previous.as_ref()) {
-            Ok(()) => {
-                if let Err(e) = self.saved.clear() {
-                    eprintln!("navette: audio: could not remove the saved default sink: {e}");
-                }
-            }
-            Err(e) => {
-                eprintln!("navette: audio: could not put the previous default sink back: {e}")
-            }
-        }
+        self.node = self
+            .switch
+            .graph
+            .open_sink(SINK, SINK_DESCRIPTION, on_sound)?;
+        self.switch.switch()
     }
 }
 
@@ -608,12 +647,12 @@ mod tests {
             r#"{ name = invented-speakers }"#,
         ] {
             assert_eq!(
-                DefaultSink(value.to_owned()).name(),
+                DefaultNode(value.to_owned()).name(),
                 Some("invented-speakers"),
                 "{value}"
             );
         }
-        assert_eq!(DefaultSink("{}".to_owned()).name(), None);
+        assert_eq!(DefaultNode("{}".to_owned()).name(), None);
     }
 
     #[test]
@@ -621,17 +660,17 @@ mod tests {
         let graph = FakeGraph::with_default("speakers");
         let (_tmp, saved) = saved();
         let sink = start(&graph, &saved);
-        assert_eq!(graph.state().default, Some(DefaultSink::named(SINK)));
+        assert_eq!(graph.state().default, Some(DefaultNode::named(SINK)));
         drop(sink);
         let state = graph.state();
-        assert_eq!(state.default, Some(DefaultSink::named("speakers")));
+        assert_eq!(state.default, Some(DefaultNode::named("speakers")));
         // Put back before the sink goes, so the apps move straight to the previous one.
         assert_eq!(
             state.log,
             [
                 format!("sink {SINK}"),
-                format!("default {}", DefaultSink::named(SINK).0),
-                format!("default {}", DefaultSink::named("speakers").0),
+                format!("default {}", DefaultNode::named(SINK).0),
+                format!("default {}", DefaultNode::named("speakers").0),
                 format!("remove {SINK}"),
             ]
         );
@@ -649,7 +688,7 @@ mod tests {
     fn a_default_left_on_the_navette_sink_with_nothing_saved_is_cleared() {
         // Written by the session manager in its own form, not ours.
         let graph = FakeGraph::default();
-        graph.state().default = Some(DefaultSink(format!(r#"{{"name":"{SINK}"}}"#)));
+        graph.state().default = Some(DefaultNode(format!(r#"{{"name":"{SINK}"}}"#)));
         let (_tmp, saved) = saved();
         drop(start(&graph, &saved));
         assert_eq!(graph.state().default, None);
@@ -662,12 +701,12 @@ mod tests {
         let graph = FakeGraph::with_default("speakers");
         let (_tmp, saved) = saved();
         let sink = start(&graph, &saved);
-        let file = saved.dir.join(SAVED_FILE);
+        let file = saved.dir.join(Device::Sink.saved_file());
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(
-            saved.load().unwrap(),
-            Some(Some(DefaultSink::named("speakers")))
+            saved.load(Device::Sink).unwrap(),
+            Some(Some(DefaultNode::named("speakers")))
         );
         drop(sink);
         assert!(!file.exists());
@@ -679,11 +718,11 @@ mod tests {
         let (_tmp, saved) = saved();
         // An agent that died while switched: the default is still ours.
         std::mem::forget(start(&graph, &saved));
-        assert_eq!(graph.state().default, Some(DefaultSink::named(SINK)));
+        assert_eq!(graph.state().default, Some(DefaultNode::named(SINK)));
 
         drop(start(&graph, &saved));
-        assert_eq!(graph.state().default, Some(DefaultSink::named("speakers")));
-        assert_eq!(saved.load().unwrap(), None);
+        assert_eq!(graph.state().default, Some(DefaultNode::named("speakers")));
+        assert_eq!(saved.load(Device::Sink).unwrap(), None);
     }
 
     #[test]
@@ -694,8 +733,8 @@ mod tests {
         graph.state().refuse_defaults = true;
         drop(sink);
         assert_eq!(
-            saved.load().unwrap(),
-            Some(Some(DefaultSink::named("speakers")))
+            saved.load(Device::Sink).unwrap(),
+            Some(Some(DefaultNode::named("speakers")))
         );
     }
 
@@ -709,11 +748,11 @@ mod tests {
         home(home_graph.clone(), home_peer).unwrap();
 
         until(&remote_graph, |s| !s.sinks.is_empty()).await;
-        assert_eq!(remote_graph.state().default, Some(DefaultSink::named(SINK)));
+        assert_eq!(remote_graph.state().default, Some(DefaultNode::named(SINK)));
         // Home's own default output is never touched.
         assert_eq!(
             home_graph.state().default,
-            Some(DefaultSink::named("home-speakers"))
+            Some(DefaultNode::named("home-speakers"))
         );
 
         let sink = remote_graph.state().sinks[0].1.clone();
@@ -761,7 +800,7 @@ mod tests {
         until(&remote_graph, |s| s.sinks.is_empty()).await;
         assert_eq!(
             remote_graph.state().default,
-            Some(DefaultSink::named("laptop-speakers"))
+            Some(DefaultNode::named("laptop-speakers"))
         );
         assert!(home_graph.state().playbacks.is_empty());
 
@@ -789,7 +828,7 @@ mod tests {
         assert!(remote_graph.state().sinks.is_empty());
         assert_eq!(
             remote_graph.state().default,
-            Some(DefaultSink::named("laptop-speakers"))
+            Some(DefaultNode::named("laptop-speakers"))
         );
     }
 
@@ -845,14 +884,14 @@ mod tests {
         // PipeWire restarts: the sink goes, and the session manager falls back to another
         // output.
         graph.restart();
-        graph.state().default = Some(DefaultSink::named("hdmi-out"));
+        graph.state().default = Some(DefaultNode::named("hdmi-out"));
         until(&graph, |s| {
-            !s.sinks.is_empty() && s.default == Some(DefaultSink::named(SINK))
+            !s.sinks.is_empty() && s.default == Some(DefaultNode::named(SINK))
         })
         .await;
         assert_eq!(
-            saved.load().unwrap(),
-            Some(Some(DefaultSink::named("laptop-speakers")))
+            saved.load(Device::Sink).unwrap(),
+            Some(Some(DefaultNode::named("laptop-speakers")))
         );
 
         // The user's choice from before the session comes back, not the fallback.
@@ -860,9 +899,9 @@ mod tests {
         blocking(move || audio.join().unwrap()).await;
         assert_eq!(
             graph.state().default,
-            Some(DefaultSink::named("laptop-speakers"))
+            Some(DefaultNode::named("laptop-speakers"))
         );
-        assert_eq!(saved.load().unwrap(), None);
+        assert_eq!(saved.load(Device::Sink).unwrap(), None);
     }
 
     #[test]
@@ -921,23 +960,23 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         until(&remote_graph, |s| {
-            s.default == Some(DefaultSink::named(SINK))
+            s.default == Some(DefaultNode::named(SINK))
         })
         .await;
         // Long enough for a late put-back of the first link to land, if it were still coming.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(remote_graph.state().default, Some(DefaultSink::named(SINK)));
+        assert_eq!(remote_graph.state().default, Some(DefaultNode::named(SINK)));
         // And the second link's save is not wiped by the first one's clean-up.
         assert_eq!(
-            saved.load().unwrap(),
-            Some(Some(DefaultSink::named("laptop-speakers")))
+            saved.load(Device::Sink).unwrap(),
+            Some(Some(DefaultNode::named("laptop-speakers")))
         );
 
         link.abort();
         blocking(move || second.join().unwrap()).await;
         assert_eq!(
             remote_graph.state().default,
-            Some(DefaultSink::named("laptop-speakers"))
+            Some(DefaultNode::named("laptop-speakers"))
         );
     }
 }

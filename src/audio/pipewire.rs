@@ -23,9 +23,10 @@ use pw::types::ObjectType;
 
 use super::codec::{CHANNELS, FRAME, RATE, SAMPLES_PER_CYCLE};
 use super::jitter::Jitter;
-use super::{DefaultSink, Graph, OnSound, lock};
+use super::{DefaultNode, Device, Graph, OnSound, lock};
 
 const CONFIGURED_SINK: &str = "default.configured.audio.sink";
+const CONFIGURED_SOURCE: &str = "default.configured.audio.source";
 /// Long enough for a busy PipeWire, short enough that a hung one does not hang the link.
 const ANSWER: Duration = Duration::from_secs(5);
 const BYTES_PER_FRAME: usize = CHANNELS * size_of::<f32>();
@@ -35,8 +36,8 @@ type Reply<T> = std_mpsc::Sender<io::Result<T>>;
 type Pending = Rc<RefCell<Vec<(spa::utils::result::AsyncSeq, Reply<()>)>>>;
 
 enum Command {
-    DefaultSink(Reply<Option<DefaultSink>>),
-    SetDefaultSink(Option<DefaultSink>, Reply<()>),
+    DefaultNode(Device, Reply<Option<DefaultNode>>),
+    SetDefaultNode(Device, Option<DefaultNode>, Reply<()>),
     OpenSink {
         name: String,
         description: String,
@@ -156,12 +157,12 @@ impl PipeWire {
 impl Graph for PipeWire {
     type Node = Node;
 
-    fn default_sink(&self) -> io::Result<Option<DefaultSink>> {
-        Ok(self.call(Command::DefaultSink)?.0)
+    fn default_node(&self, device: Device) -> io::Result<Option<DefaultNode>> {
+        Ok(self.call(|reply| Command::DefaultNode(device, reply))?.0)
     }
 
-    fn set_default_sink(&self, sink: Option<&DefaultSink>) -> io::Result<()> {
-        self.call(|reply| Command::SetDefaultSink(sink.cloned(), reply))
+    fn set_default_node(&self, device: Device, node: Option<&DefaultNode>) -> io::Result<()> {
+        self.call(|reply| Command::SetDefaultNode(device, node.cloned(), reply))
             .map(drop)
     }
 
@@ -254,7 +255,7 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
         .register();
 
     let metadata: Rc<RefCell<Option<(Metadata, MetadataListener)>>> = Rc::default();
-    let configured: Rc<RefCell<Option<String>>> = Rc::default();
+    let configured: Rc<RefCell<Configured>> = Rc::default();
     let _registry_listener = registry
         .add_listener_local()
         .global({
@@ -310,21 +311,22 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
     let quit = mainloop.clone();
     let next_id = Cell::new(0u64);
     let _commands = commands.attach(mainloop.loop_(), move |command| match command {
-        Command::DefaultSink(reply) => {
-            let _ = reply.send(Ok(configured.borrow().clone().map(DefaultSink)));
+        Command::DefaultNode(device, reply) => {
+            let value = configured.borrow_mut().of(device).clone();
+            let _ = reply.send(Ok(value.map(DefaultNode)));
         }
-        Command::SetDefaultSink(sink, reply) => {
+        Command::SetDefaultNode(device, node, reply) => {
             let result = match metadata.borrow().as_ref() {
                 Some((metadata, _)) => {
-                    let value = sink.map(|sink| sink.0);
+                    let value = node.map(|node| node.0);
                     metadata.set_property(
                         pw::core::PW_ID_CORE,
-                        CONFIGURED_SINK,
+                        key(device),
                         value.as_ref().map(|_| "Spa:String:JSON"),
                         value.as_deref(),
                     );
                     // The server echoes it back; until then, this is what it holds.
-                    *configured.borrow_mut() = value;
+                    *configured.borrow_mut().of(device) = value;
                     core.sync(0).map_err(pw_error)
                 }
                 None => Err(io::Error::new(
@@ -376,16 +378,40 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
     Ok(())
 }
 
-/// Follows the changes of the `default` metadata to the configured sink.
+/// The configured defaults, as the `default` metadata last said them.
+#[derive(Debug, Default, PartialEq)]
+struct Configured {
+    sink: Option<String>,
+    source: Option<String>,
+}
+
+impl Configured {
+    fn of(&mut self, device: Device) -> &mut Option<String> {
+        match device {
+            Device::Sink => &mut self.sink,
+            Device::Source => &mut self.source,
+        }
+    }
+}
+
+fn key(device: Device) -> &'static str {
+    match device {
+        Device::Sink => CONFIGURED_SINK,
+        Device::Source => CONFIGURED_SOURCE,
+    }
+}
+
+/// Follows the changes of the `default` metadata to the configured defaults.
 /// Only the core's keys hold the defaults; other subjects are nodes with metadata of their own.
-fn follow(configured: &mut Option<String>, subject: u32, key: Option<&str>, value: Option<&str>) {
+fn follow(configured: &mut Configured, subject: u32, key: Option<&str>, value: Option<&str>) {
     if subject != pw::core::PW_ID_CORE {
         return;
     }
     match key {
-        Some(CONFIGURED_SINK) => *configured = value.map(str::to_owned),
+        Some(CONFIGURED_SINK) => configured.sink = value.map(str::to_owned),
+        Some(CONFIGURED_SOURCE) => configured.source = value.map(str::to_owned),
         // Every key of the core cleared.
-        None => *configured = None,
+        None => *configured = Configured::default(),
         _ => {}
     }
 }
@@ -622,11 +648,11 @@ mod tests {
                 let mut next_id = 0;
                 for command in commands {
                     let entry = match command {
-                        Command::DefaultSink(reply) => {
+                        Command::DefaultNode(_, reply) => {
                             let _ = reply.send(Ok(None));
                             "default?".to_owned()
                         }
-                        Command::SetDefaultSink(sink, reply) => {
+                        Command::SetDefaultNode(_, sink, reply) => {
                             if !hung {
                                 let _ = reply.send(Ok(()));
                             }
@@ -709,7 +735,7 @@ mod tests {
         let old = sink(&pipewire).unwrap();
         loops.end(0);
         // The first call after the restart may fail; the one after it reaches a new loop.
-        let _ = pipewire.default_sink();
+        let _ = pipewire.default_node(Device::Sink);
         let new = sink(&pipewire).unwrap();
         drop(old);
         let log = loops.log();
@@ -733,10 +759,12 @@ mod tests {
     fn the_default_is_put_back_after_pipewire_restarts() {
         let loops = FakeLoops::default();
         let pipewire = loops.pipewire();
-        pipewire.default_sink().unwrap();
+        pipewire.default_node(Device::Sink).unwrap();
         loops.end(0);
-        let previous = DefaultSink::named("invented-speakers");
-        pipewire.set_default_sink(Some(&previous)).unwrap();
+        let previous = DefaultNode::named("invented-speakers");
+        pipewire
+            .set_default_node(Device::Sink, Some(&previous))
+            .unwrap();
         assert!(loops.log().contains(&format!("1: default {}", previous.0)));
     }
 
@@ -747,7 +775,7 @@ mod tests {
             ..FakeLoops::default()
         };
         let pipewire = loops.pipewire();
-        assert!(pipewire.set_default_sink(None).is_err());
+        assert!(pipewire.set_default_node(Device::Sink, None).is_err());
         assert!(loops.log().contains(&"0: quit".to_owned()));
     }
 
@@ -755,21 +783,39 @@ mod tests {
 
     #[test]
     fn the_configured_sink_follows_its_key_on_the_core() {
-        let mut configured = None;
+        let mut configured = Configured::default();
         follow(&mut configured, 0, Some(CONFIGURED_SINK), Some(SPEAKERS));
-        assert_eq!(configured.as_deref(), Some(SPEAKERS));
+        assert_eq!(configured.sink.as_deref(), Some(SPEAKERS));
         follow(&mut configured, 0, Some("default.audio.sink"), None);
-        assert_eq!(configured.as_deref(), Some(SPEAKERS));
+        assert_eq!(configured.sink.as_deref(), Some(SPEAKERS));
         follow(&mut configured, 0, None, None);
-        assert_eq!(configured, None);
+        assert_eq!(configured, Configured::default());
+    }
+
+    const MIC: &str = "{ \"name\": \"invented-mic\" }";
+
+    #[test]
+    fn the_configured_source_follows_its_own_key() {
+        let mut configured = Configured::default();
+        follow(&mut configured, 0, Some(CONFIGURED_SINK), Some(SPEAKERS));
+        follow(&mut configured, 0, Some(CONFIGURED_SOURCE), Some(MIC));
+        assert_eq!(configured.sink.as_deref(), Some(SPEAKERS));
+        assert_eq!(configured.source.as_deref(), Some(MIC));
+        follow(&mut configured, 0, Some(CONFIGURED_SOURCE), None);
+        assert_eq!(configured.sink.as_deref(), Some(SPEAKERS));
+        assert_eq!(configured.source, None);
     }
 
     #[test]
     fn a_clear_on_another_subject_keeps_the_default() {
-        let mut configured = Some(SPEAKERS.to_owned());
+        let mut configured = Configured {
+            sink: Some(SPEAKERS.to_owned()),
+            source: Some(MIC.to_owned()),
+        };
         // A node's own metadata cleared (its id as the subject), not the core's.
         follow(&mut configured, 42, None, None);
         follow(&mut configured, 42, Some(CONFIGURED_SINK), None);
-        assert_eq!(configured.as_deref(), Some(SPEAKERS));
+        assert_eq!(configured.sink.as_deref(), Some(SPEAKERS));
+        assert_eq!(configured.source.as_deref(), Some(MIC));
     }
 }
