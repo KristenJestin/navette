@@ -267,6 +267,9 @@ fn keysym(name: &str) -> Option<xkb::Keysym> {
 struct Keys {
     keymap: xkb::Keymap,
     state: xkb::State,
+    /// The keys held: a modifier key counts as typed even when xkb makes something else of it
+    /// (with `shift:both_capslock_cancel`, Shift while Caps Lock is on is a Caps Lock key).
+    held: BTreeSet<u32>,
 }
 
 impl Keys {
@@ -279,7 +282,11 @@ impl Keys {
             xkb::KEYMAP_COMPILE_NO_FLAGS,
         )?;
         let state = xkb::State::new(&keymap);
-        Some(Self { keymap, state })
+        Some(Self {
+            keymap,
+            state,
+            held: BTreeSet::new(),
+        })
     }
 
     fn update(&mut self, code: u32, pressed: bool) {
@@ -289,10 +296,12 @@ impl Keys {
             xkb::KeyDirection::Up
         };
         self.state.update_key(keycode(code), direction);
+        track(&mut self.held, code, pressed);
     }
 
     fn reset(&mut self) {
         self.state = xkb::State::new(&self.keymap);
+        self.held.clear();
     }
 
     /// Home's modifiers as the compositor reports them; `group` is the layout in effect.
@@ -309,23 +318,60 @@ impl Keys {
             .collect()
     }
 
-    /// The press of `code` with the modifiers held now is the hotkey. The key is read on its
-    /// first level, so `shift+q` is the Q key with Shift, whatever Shift makes of it.
-    fn is(&self, hotkey: &Hotkey, code: u32) -> bool {
+    /// What the press of `code` with the modifiers held now is to the hotkey. The key is read
+    /// on its first level, so `shift+q` is the Q key with Shift, whatever Shift makes of it.
+    fn chord(&self, hotkey: &Hotkey, code: u32) -> Chord {
+        if self.first_sym(code) != Some(hotkey.sym) {
+            return Chord::OtherKey;
+        }
         let active = |name| {
             self.state
                 .mod_name_is_active(name, xkb::STATE_MODS_EFFECTIVE)
         };
-        let mods = Mods {
+        let mut mods = Mods {
             shift: active(xkb::MOD_NAME_SHIFT),
             ctrl: active(xkb::MOD_NAME_CTRL),
             alt: active(xkb::MOD_NAME_ALT),
             logo: active(xkb::MOD_NAME_LOGO),
         };
+        for sym in self.held.iter().filter_map(|&held| self.first_sym(held)) {
+            use xkb::keysyms as k;
+            match sym.raw() {
+                k::KEY_Shift_L | k::KEY_Shift_R => mods.shift = true,
+                k::KEY_Control_L | k::KEY_Control_R => mods.ctrl = true,
+                k::KEY_Alt_L | k::KEY_Alt_R | k::KEY_Meta_L | k::KEY_Meta_R => mods.alt = true,
+                k::KEY_Super_L | k::KEY_Super_R => mods.logo = true,
+                _ => {}
+            }
+        }
+        if mods == hotkey.mods {
+            return Chord::Hotkey;
+        }
+        let held = (0..self.keymap.num_mods())
+            .filter(|&index| {
+                self.state
+                    .mod_index_is_active(index, xkb::STATE_MODS_EFFECTIVE)
+            })
+            .map(|index| self.keymap.mod_get_name(index).to_string())
+            .collect();
+        Chord::OtherMods(held)
+    }
+
+    fn first_sym(&self, code: u32) -> Option<xkb::Keysym> {
         let layout = self.state.key_get_layout(keycode(code));
         let syms = self.keymap.key_get_syms_by_level(keycode(code), layout, 0);
-        mods == hotkey.mods && syms.first() == Some(&hotkey.sym)
+        syms.first().copied()
     }
+}
+
+/// A key press, as the release hotkey sees it.
+#[derive(Debug, PartialEq, Eq)]
+enum Chord {
+    Hotkey,
+    /// The hotkey's key, with these modifiers (xkb names) instead of the hotkey's.
+    OtherMods(Vec<String>),
+    /// Any other key, never named: what is typed over the monitor may be a password.
+    OtherKey,
 }
 
 fn keycode(evdev: u32) -> xkb::Keycode {
@@ -353,6 +399,8 @@ pub struct Capture {
     released: bool,
     /// The locks last sent since the keyboard came; `None` sends them at the next modifiers.
     locks_sent: Option<Vec<String>>,
+    /// Hears each time the hotkey gives the keyboard back.
+    on_release: Option<crate::display::Released>,
 }
 
 impl Capture {
@@ -366,7 +414,14 @@ impl Capture {
             held_buttons: BTreeSet::new(),
             released: false,
             locks_sent: None,
+            on_release: None,
         }
+    }
+
+    /// `released` hears each time the hotkey gives the keyboard back.
+    pub fn on_release(mut self, released: crate::display::Released) -> Self {
+        self.on_release = Some(released);
+        self
     }
 
     pub fn keymap(&mut self, text: String) {
@@ -457,13 +512,24 @@ impl Capture {
         if self.released {
             return None;
         }
-        if pressed
-            && let (Some(hotkey), Some(keys)) = (&self.hotkey, &self.keys)
-            && keys.is(hotkey, code)
-        {
-            self.release();
-            self.released = true;
-            return Some(Focus::Give);
+        if pressed && let Some(hotkey) = &self.hotkey {
+            match self.keys.as_ref().map(|keys| keys.chord(hotkey, code)) {
+                Some(Chord::Hotkey) => {
+                    tracing::info!("the release hotkey: the keyboard goes home");
+                    self.release();
+                    self.released = true;
+                    if let Some(on_release) = &self.on_release {
+                        let _ = on_release.send(());
+                    }
+                    return Some(Focus::Give);
+                }
+                Some(Chord::OtherMods(held)) => tracing::debug!(
+                    ?held,
+                    "the release hotkey's key, not with the hotkey's modifiers"
+                ),
+                Some(Chord::OtherKey) => {}
+                None => tracing::debug!("no keymap from home: the release hotkey cannot be read"),
+            }
         }
         if let Some(keys) = &mut self.keys {
             keys.update(code, pressed);
@@ -797,6 +863,66 @@ mod tests {
         capture.modifiers(SHIFT, 0, 0, 0);
         assert_eq!(capture.key(KEY_ESC, true), Some(Focus::Give));
         assert_eq!(sent(&queue), [locked(&[]), Event::ReleaseAll]);
+    }
+
+    const KEY_RIGHTSHIFT: u32 = 54;
+    const KEY_LEFTCTRL: u32 = 29;
+
+    /// Home's keymap on the maintainer's desk: French, with Omarchy's keyboard options.
+    fn omarchy_fr() -> String {
+        hypr_input::keymap_from_names(&hypr_input::KeymapNames {
+            layout: "fr".into(),
+            options: Some("compose:caps,shift:both_capslock_cancel".into()),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    /// Over the surface with home's keymap on the maintainer's desk, and `locked` at home.
+    fn armed_on_the_desk(locked: u32) -> (Capture, Queue) {
+        let queue = Queue::default();
+        let mut capture = Capture::new(queue.clone(), Hotkey::parse(DEFAULT_HOTKEY).unwrap());
+        capture.keymap(omarchy_fr());
+        capture.enter(10.0, 10.0);
+        capture.keyboard_entered(&[]);
+        capture.modifiers(0, 0, locked, 0);
+        let _ = sent(&queue);
+        (capture, queue)
+    }
+
+    #[test]
+    fn shift_escape_releases_with_omarchy_s_keyboard_options() {
+        for shift in [KEY_LEFTSHIFT, KEY_RIGHTSHIFT] {
+            let (mut capture, queue) = armed_on_the_desk(0);
+            // As Hyprland sends them: the key, then the modifiers it changed.
+            assert_eq!(capture.key(shift, true), None);
+            capture.modifiers(SHIFT, 0, 0, 0);
+            assert_eq!(capture.key(KEY_ESC, true), Some(Focus::Give));
+            assert_eq!(sent(&queue), [key(shift, true), Event::ReleaseAll]);
+        }
+    }
+
+    #[test]
+    fn shift_escape_releases_with_omarchy_s_keyboard_options_and_caps_lock_on() {
+        let (mut capture, queue) = armed_on_the_desk(CAPS);
+        // With `shift:both_capslock_cancel`, Shift alone while Caps Lock is on is a Caps Lock
+        // key: Hyprland reports Lock held, not Shift.
+        assert_eq!(capture.key(KEY_LEFTSHIFT, true), None);
+        capture.modifiers(CAPS, 0, CAPS, 0);
+        assert_eq!(capture.key(KEY_ESC, true), Some(Focus::Give));
+        assert_eq!(sent(&queue), [key(KEY_LEFTSHIFT, true), Event::ReleaseAll]);
+    }
+
+    #[test]
+    fn a_chord_that_is_not_the_hotkey_names_the_modifiers_seen_and_never_another_key() {
+        let mut keys = Keys::new(&omarchy_fr()).unwrap();
+        let hotkey = Hotkey::parse(DEFAULT_HOTKEY).unwrap().unwrap();
+        keys.update(KEY_LEFTCTRL, true);
+        assert_eq!(
+            keys.chord(&hotkey, KEY_ESC),
+            Chord::OtherMods(vec!["Control".into()])
+        );
+        assert_eq!(keys.chord(&hotkey, KEY_T), Chord::OtherKey);
     }
 
     #[test]

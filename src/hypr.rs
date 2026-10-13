@@ -217,6 +217,57 @@ pub fn dispatch(hypr: &dyn Hypr, command: &str) -> io::Result<()> {
     }
 }
 
+/// Gives the keyboard to the home window that had it last, among those shown on a monitor other
+/// than `covered` (Hyprland's focus history), without moving the pointer: its address, or
+/// `None` when there is no such window.
+pub fn focus_last_window(hypr: &dyn Hypr, covered: &str) -> io::Result<Option<String>> {
+    let json = |request: &str| -> io::Result<serde_json::Value> {
+        serde_json::from_str(&hypr.request(request)?).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Hyprland's `{request}`: {e}"),
+            )
+        })
+    };
+    let monitors = json("j/monitors all")?;
+    let windows = json("j/clients")?;
+    // Shown: on the workspace its monitor shows now. A window on another workspace would make
+    // Hyprland switch to it.
+    let shown_at_home = |window: &serde_json::Value| {
+        monitors.as_array().into_iter().flatten().any(|m| {
+            m["id"] == window["monitor"]
+                && m["name"] != covered
+                && m["activeWorkspace"]["id"] == window["workspace"]["id"]
+        })
+    };
+    let last = windows
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| w["mapped"] == true && w["hidden"] == false && shown_at_home(w))
+        .filter_map(|w| Some((w["focusHistoryID"].as_i64()?, w["address"].as_str()?)))
+        .filter(|(history, _)| *history >= 0)
+        .min();
+    let Some((_, address)) = last else {
+        return Ok(None);
+    };
+    // Hyprland's focus warps the pointer onto the window; `no_warps` keeps it over the monitor
+    // for that one dispatch, in the same chunk, and is then put back as it was.
+    let no_warps = json("j/getoption cursor:no_warps")?;
+    let was = no_warps["int"].as_i64().map(|v| v != 0);
+    let was = was.or(no_warps["bool"].as_bool()).unwrap_or(false);
+    dispatch(
+        hypr,
+        &format!(
+            "eval hl.config({{ cursor = {{ no_warps = true }} }}) \
+             hl.dispatch(hl.dsp.focus({{ window = {} }})) \
+             hl.config({{ cursor = {{ no_warps = {was} }} }})",
+            lua_string(&format!("address:{address}"))
+        ),
+    )?;
+    Ok(Some(address.to_string()))
+}
+
 /// The running Hyprland: the one this process was started in while it answers, else the
 /// newest that does. `hypr_ipc::Instance::discover` keeps to the inherited signature, which
 /// names a dead instance once Hyprland has restarted.
@@ -337,6 +388,32 @@ pub mod fake {
         chosen_scale: Option<f32>,
         /// `cursor:invisible`, set at runtime; a reload or a restart sets it back.
         cursor_invisible: bool,
+        windows: Vec<FakeWindow>,
+        /// `cursor:no_warps`, as set now.
+        no_warps: bool,
+        /// The windows focused by a dispatch, and whether the pointer was warped onto each.
+        focused: Vec<(String, bool)>,
+    }
+
+    /// A window, on the active workspace of its monitor unless `hidden_workspace`.
+    #[derive(Clone, Debug)]
+    pub struct FakeWindow {
+        pub address: String,
+        pub monitor: String,
+        /// 0 for the window that had the keyboard last, then 1, 2…
+        pub focus_history: i64,
+        pub hidden_workspace: bool,
+    }
+
+    impl FakeWindow {
+        pub fn new(address: &str, monitor: &str, focus_history: i64) -> Self {
+            Self {
+                address: address.into(),
+                monitor: monitor.into(),
+                focus_history,
+                hidden_workspace: false,
+            }
+        }
     }
 
     #[derive(Default)]
@@ -369,6 +446,23 @@ pub mod fake {
 
         pub fn binds(&self) -> Vec<String> {
             self.state.lock().unwrap().binds.clone()
+        }
+
+        pub fn add_window(&self, window: FakeWindow) {
+            self.state.lock().unwrap().windows.push(window);
+        }
+
+        pub fn set_no_warps(&self, on: bool) {
+            self.state.lock().unwrap().no_warps = on;
+        }
+
+        pub fn no_warps(&self) -> bool {
+            self.state.lock().unwrap().no_warps
+        }
+
+        /// The windows focused by a dispatch, each with whether the pointer was warped.
+        pub fn focused(&self) -> Vec<(String, bool)> {
+            self.state.lock().unwrap().focused.clone()
         }
 
         pub fn cursor_invisible(&self) -> bool {
@@ -480,6 +574,47 @@ pub mod fake {
                     return Ok("error: hl.bind: invalid key".into());
                 }
                 state.binds.push(lua.to_string());
+                return Ok("ok".into());
+            }
+            if command == "j/clients" {
+                let monitors = &state.monitors;
+                let list: Vec<String> = state
+                    .windows
+                    .iter()
+                    .filter_map(|w| {
+                        let id = monitors.iter().position(|m| m.name == w.monitor)?;
+                        // A hidden workspace's id is past every monitor's active one.
+                        let workspace = if w.hidden_workspace { 100 } else { id + 1 };
+                        Some(format!(
+                            r#"{{"address":"{}","mapped":true,"hidden":false,"monitor":{id},"workspace":{{"id":{workspace},"name":"{workspace}"}},"focusHistoryID":{}}}"#,
+                            w.address, w.focus_history
+                        ))
+                    })
+                    .collect();
+                return Ok(format!("[{}]", list.join(",")));
+            }
+            if command == "j/getoption cursor:no_warps" {
+                return Ok(format!(
+                    r#"{{"option":"cursor:no_warps","int":{},"set":true}}"#,
+                    state.no_warps as u8
+                ));
+            }
+            if let Some(lua) = command.strip_prefix("eval ")
+                && let Some(at) = lua.find("hl.dsp.focus({ window = \"address:")
+            {
+                // The chunk runs in order: what it sets before the focus is in effect for it.
+                let set = |text: &str, now: bool| {
+                    text.rfind("no_warps = ")
+                        .map_or(now, |i| text[i..].starts_with("no_warps = true"))
+                };
+                let warped = !set(&lua[..at], state.no_warps);
+                state.no_warps = set(lua, state.no_warps);
+                let rest = &lua[at + "hl.dsp.focus({ window = \"address:".len()..];
+                let address = rest[..rest.find('"').unwrap()].to_string();
+                if !state.windows.iter().any(|w| w.address == address) {
+                    return Ok("error: hl.focus: window not found".into());
+                }
+                state.focused.push((address, warped));
                 return Ok("ok".into());
             }
             if let Some(lua) = command.strip_prefix("eval hl.config({ cursor = { invisible = ") {
@@ -689,6 +824,67 @@ mod port_tests {
             .map(|m| (m.name.as_str(), m.width, m.x))
             .collect();
         assert_eq!(names, [("DP-1", 1920, 0), ("DP-2", 2560, 1920)]);
+    }
+
+    use fake::FakeWindow;
+
+    fn home_with_windows(windows: &[FakeWindow]) -> FakeHypr {
+        let hypr = FakeHypr::with(vec![
+            FakeMonitor::new("DP-1", 1920, 1080, 0),
+            FakeMonitor::new("DP-2", 2560, 1440, 1920),
+            FakeMonitor::new("DP-3", 1920, 1080, 4480),
+        ]);
+        for window in windows {
+            hypr.add_window(window.clone());
+        }
+        hypr
+    }
+
+    #[test]
+    fn the_keyboard_goes_to_the_home_window_that_had_it_last_and_the_pointer_stays() {
+        let hypr = home_with_windows(&[
+            FakeWindow::new("0xa1", "DP-1", 1),
+            FakeWindow::new("0xb2", "DP-3", 0),
+            FakeWindow::new("0xc3", "DP-1", 2),
+        ]);
+        let focused = focus_last_window(&hypr, "DP-2").unwrap();
+        assert_eq!(focused.as_deref(), Some("0xb2"));
+        assert_eq!(hypr.focused(), [("0xb2".to_string(), false)]);
+        // Put back as it was.
+        assert!(!hypr.no_warps());
+    }
+
+    #[test]
+    fn a_window_under_the_covered_monitor_or_on_a_hidden_workspace_is_passed_over() {
+        let hidden = FakeWindow {
+            hidden_workspace: true,
+            ..FakeWindow::new("0xd4", "DP-1", 1)
+        };
+        let hypr = home_with_windows(&[
+            FakeWindow::new("0xe5", "DP-2", 0),
+            hidden,
+            FakeWindow::new("0xf6", "DP-3", 2),
+        ]);
+        assert_eq!(
+            focus_last_window(&hypr, "DP-2").unwrap().as_deref(),
+            Some("0xf6")
+        );
+    }
+
+    #[test]
+    fn with_no_home_window_shown_the_keyboard_is_left_as_it_is() {
+        let hypr = home_with_windows(&[FakeWindow::new("0xe5", "DP-2", 0)]);
+        assert_eq!(focus_last_window(&hypr, "DP-2").unwrap(), None);
+        assert_eq!(hypr.changes(), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn no_warps_set_by_the_user_stays_set() {
+        let hypr = home_with_windows(&[FakeWindow::new("0xa1", "DP-1", 0)]);
+        hypr.set_no_warps(true);
+        focus_last_window(&hypr, "DP-2").unwrap();
+        assert_eq!(hypr.focused(), [("0xa1".to_string(), false)]);
+        assert!(hypr.no_warps());
     }
 
     #[test]

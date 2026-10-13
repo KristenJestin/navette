@@ -57,14 +57,24 @@ other monitor they stay home.
   `dont_inhibit` (the mic toggle, say) still fires at home, everywhere; its key does not reach
   the remote machine.
 - **The release hotkey** gives the keyboard back to home without moving the pointer:
-  `Shift+Escape` by default (Escape alone still goes to the remote). Moving the pointer off
-  the monitor and back captures it again. Choose another chord (modifiers and one key), or
+  `Shift+Escape` by default (Escape alone still goes to the remote). Home's shortcuts work
+  at once, and typing goes to the home window that had the keyboard last, among those shown
+  on the other monitors (with none, to no window until the pointer is over one). The pointer
+  stays where it is: the focus is given with `cursor:no_warps` set for that moment, then put
+  back as it was. A modifier counts as the key pressed, even
+  when a keyboard option makes it something else (Shift while Caps Lock is on, with
+  Omarchy's `shift:both_capslock_cancel`). Moving the pointer off the monitor and back
+  captures it again. Choose another chord (modifiers and one key), or
   none (`release = none`, or `release =` left empty), in `mode.conf`, where `#` starts a
   comment:
 
   ```
   release = ctrl+alt+q     # or: release = none
   ```
+
+  With `RUST_LOG=navette=info`, `navette serve` says each time the hotkey gives the keyboard
+  back; with `RUST_LOG=navette=debug`, it also says when the hotkey's key came with other
+  modifiers, and which (no other key typed is ever logged).
 
 - **Keys held** when the pointer leaves the monitor, when the hotkey is typed, when the mode
   stops or when the link drops are all released on the remote machine: none stays down.
