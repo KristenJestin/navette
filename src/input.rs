@@ -267,6 +267,9 @@ fn keysym(name: &str) -> Option<xkb::Keysym> {
 struct Keys {
     keymap: xkb::Keymap,
     state: xkb::State,
+    /// The keys held: a modifier key counts as typed even when xkb makes something else of it
+    /// (with `shift:both_capslock_cancel`, Shift while Caps Lock is on is a Caps Lock key).
+    held: BTreeSet<u32>,
 }
 
 impl Keys {
@@ -279,7 +282,11 @@ impl Keys {
             xkb::KEYMAP_COMPILE_NO_FLAGS,
         )?;
         let state = xkb::State::new(&keymap);
-        Some(Self { keymap, state })
+        Some(Self {
+            keymap,
+            state,
+            held: BTreeSet::new(),
+        })
     }
 
     fn update(&mut self, code: u32, pressed: bool) {
@@ -289,10 +296,12 @@ impl Keys {
             xkb::KeyDirection::Up
         };
         self.state.update_key(keycode(code), direction);
+        track(&mut self.held, code, pressed);
     }
 
     fn reset(&mut self) {
         self.state = xkb::State::new(&self.keymap);
+        self.held.clear();
     }
 
     /// Home's modifiers as the compositor reports them; `group` is the layout in effect.
@@ -319,12 +328,22 @@ impl Keys {
             self.state
                 .mod_name_is_active(name, xkb::STATE_MODS_EFFECTIVE)
         };
-        let mods = Mods {
+        let mut mods = Mods {
             shift: active(xkb::MOD_NAME_SHIFT),
             ctrl: active(xkb::MOD_NAME_CTRL),
             alt: active(xkb::MOD_NAME_ALT),
             logo: active(xkb::MOD_NAME_LOGO),
         };
+        for sym in self.held.iter().filter_map(|&held| self.first_sym(held)) {
+            use xkb::keysyms as k;
+            match sym.raw() {
+                k::KEY_Shift_L | k::KEY_Shift_R => mods.shift = true,
+                k::KEY_Control_L | k::KEY_Control_R => mods.ctrl = true,
+                k::KEY_Alt_L | k::KEY_Alt_R | k::KEY_Meta_L | k::KEY_Meta_R => mods.alt = true,
+                k::KEY_Super_L | k::KEY_Super_R => mods.logo = true,
+                _ => {}
+            }
+        }
         if mods == hotkey.mods {
             return Chord::Hotkey;
         }
@@ -869,6 +888,17 @@ mod tests {
             assert_eq!(capture.key(KEY_ESC, true), Some(Focus::Give));
             assert_eq!(sent(&queue), [key(shift, true), Event::ReleaseAll]);
         }
+    }
+
+    #[test]
+    fn shift_escape_releases_with_omarchy_s_keyboard_options_and_caps_lock_on() {
+        let (mut capture, queue) = armed_on_the_desk(CAPS);
+        // With `shift:both_capslock_cancel`, Shift alone while Caps Lock is on is a Caps Lock
+        // key: Hyprland reports Lock held, not Shift.
+        assert_eq!(capture.key(KEY_LEFTSHIFT, true), None);
+        capture.modifiers(CAPS, 0, CAPS, 0);
+        assert_eq!(capture.key(KEY_ESC, true), Some(Focus::Give));
+        assert_eq!(sent(&queue), [key(KEY_LEFTSHIFT, true), Event::ReleaseAll]);
     }
 
     #[test]
