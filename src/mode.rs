@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use gliff_proto::ServerMsg;
 use gliff_vk::Gpu;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -25,8 +24,7 @@ use tokio::sync::oneshot;
 use crate::desk::{Change, Desk, DeskError};
 use crate::display::Ended;
 use crate::display::decode::{self, Decoding, Picture, Video};
-use crate::display::surface::Cursor;
-use crate::display::wire::{Display, Incoming, Msg, OutputCopy, Peer};
+use crate::display::wire::{Display, Incoming, Msg, OutputCopy, Peer, Pointer};
 use crate::hypr::{self, Eval, Hypr, lua_string};
 use crate::input::{self, Hotkey};
 
@@ -111,8 +109,8 @@ pub trait Screens: Send + Sync {
 
 pub trait Screen: Send {
     fn pictures(&self) -> Box<dyn FnMut(Picture) + Send>;
-    /// The remote cursor's image, shown at home's pointer over the cover.
-    fn cursor(&self, cursor: Cursor);
+    /// The remote pointer: its image, shown at home's pointer over the cover.
+    fn cursor(&self, pointer: Pointer);
     /// The GPU's pictures can be handed over as dmabufs, with no copy.
     fn takes_dmabuf(&self) -> bool;
 }
@@ -139,8 +137,8 @@ impl Screen for crate::display::surface::Surface {
         crate::display::surface::Surface::pictures(self)
     }
 
-    fn cursor(&self, cursor: Cursor) {
-        crate::display::surface::Surface::cursor(self, cursor)
+    fn cursor(&self, pointer: Pointer) {
+        crate::display::surface::Surface::cursor(self, pointer)
     }
 
     fn takes_dmabuf(&self) -> bool {
@@ -202,14 +200,14 @@ pub async fn serve(
                 }
                 None => break,
             },
-            msg = next(&mut peer) => match msg {
-                None => {
+            heard = next(&mut peer) => match heard {
+                Heard::Gone => {
                     peer = None;
                     if active.is_some() {
                         stop(&mut active, "the link to the remote machine dropped").await;
                     }
                 }
-                Some(Incoming::Display(Display::Started { output })) => {
+                Heard::Msg(Incoming::Display(Display::Started { output })) => {
                     if let Some(a) = &mut active
                         && let Some((reply, _)) = a.starting.take()
                     {
@@ -219,7 +217,7 @@ pub async fn serve(
                         )));
                     }
                 }
-                Some(Incoming::Display(Display::Failed { reason })) => {
+                Heard::Msg(Incoming::Display(Display::Failed { reason })) => {
                     if let Some(mut a) = active.take() {
                         match a.starting.take() {
                             Some((reply, _)) => {
@@ -236,25 +234,21 @@ pub async fn serve(
                         release(a).await;
                     }
                 }
-                Some(Incoming::NoInput(reason)) => eprintln!(
+                Heard::Msg(Incoming::NoInput(reason)) => eprintln!(
                     "navette: the remote machine shows its picture but cannot take home's \
                      keyboard and pointer: {reason}"
                 ),
-                Some(Incoming::Video {
-                    msg: ServerMsg::CursorShape { width, height, hot_x, hot_y, .. },
-                    main,
-                    ..
-                }) => {
+                Heard::Pointer(pointer) => {
                     if let Some(a) = &active {
-                        a.screen.cursor(Cursor { width, height, hot_x, hot_y, argb: main });
+                        a.screen.cursor(pointer);
                     }
                 }
-                Some(Incoming::Video { msg, main, aux }) => {
+                Heard::Msg(Incoming::Video { msg, main, aux }) => {
                     if let Some(a) = &active {
                         a.decoding.video(Video { msg, main, aux });
                     }
                 }
-                Some(_) => {}
+                Heard::Msg(_) => {}
             },
             order = orders.recv() => match order {
                 Some(Order::Start(reply)) => {
@@ -329,10 +323,21 @@ async fn ended(active: &mut Option<Active>) -> Option<String> {
     }
 }
 
-async fn next(peer: &mut Option<Peer>) -> Option<Incoming> {
-    match peer {
-        Some(peer) => peer.inbox.recv().await,
-        None => std::future::pending().await,
+/// What the link brings: a message, the remote pointer as it changed, or its end.
+enum Heard {
+    Msg(Incoming),
+    Pointer(Pointer),
+    Gone,
+}
+
+async fn next(peer: &mut Option<Peer>) -> Heard {
+    let Some(peer) = peer else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        msg = peer.inbox.recv() => msg.map_or(Heard::Gone, Heard::Msg),
+        // Its sender goes with the inbox's.
+        Ok(()) = peer.pointer.changed() => Heard::Pointer(peer.pointer.borrow_and_update().clone()),
     }
 }
 
@@ -583,10 +588,10 @@ async fn send_order(path: &Path, order: &str) -> io::Result<String> {
 mod tests {
     use std::sync::Mutex;
 
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
 
     use super::*;
-    use crate::display::wire::Outbox;
+    use crate::display::wire::{Cursor, Outbox};
     use crate::hypr::fake::{FakeHypr, FakeMonitor};
 
     #[derive(Default)]
@@ -598,13 +603,13 @@ mod tests {
         /// The release hotkey each screen was given.
         hotkeys: Arc<Mutex<Vec<Option<Hotkey>>>>,
         /// The cursors the screens were given.
-        cursors: Arc<Mutex<Vec<Cursor>>>,
+        cursors: Arc<Mutex<Vec<Pointer>>>,
     }
 
     struct FakeScreen {
         monitor: String,
         covered: Arc<Mutex<Vec<String>>>,
-        cursors: Arc<Mutex<Vec<Cursor>>>,
+        cursors: Arc<Mutex<Vec<Pointer>>>,
     }
 
     impl Screens for FakeScreens {
@@ -635,8 +640,8 @@ mod tests {
             false
         }
 
-        fn cursor(&self, cursor: Cursor) {
-            self.cursors.lock().unwrap().push(cursor);
+        fn cursor(&self, pointer: Pointer) {
+            self.cursors.lock().unwrap().push(pointer);
         }
     }
 
@@ -652,7 +657,7 @@ mod tests {
         covered: Arc<Mutex<Vec<String>>>,
         ends: Arc<Mutex<Vec<Ended>>>,
         hotkeys: Arc<Mutex<Vec<Option<Hotkey>>>>,
-        cursors: Arc<Mutex<Vec<Cursor>>>,
+        cursors: Arc<Mutex<Vec<Pointer>>>,
         peers: UnboundedSender<Peer>,
         orders: UnboundedSender<Order>,
         events: UnboundedSender<hypr::Event>,
@@ -702,19 +707,26 @@ mod tests {
     struct Remote {
         outbox: Outbox,
         to_home: mpsc::Sender<Incoming>,
+        pointer: watch::Sender<Pointer>,
     }
 
     fn connect(desk: &Desk) -> Remote {
         let outbox = Outbox::default();
         let (to_home, inbox) = mpsc::channel(64);
+        let (pointer, pointer_rx) = watch::channel(Pointer::default());
         desk.peers
             .send(Peer {
                 outbox: outbox.clone(),
                 inbox,
+                pointer: pointer_rx,
                 input: Default::default(),
             })
             .unwrap();
-        Remote { outbox, to_home }
+        Remote {
+            outbox,
+            to_home,
+            pointer,
+        }
     }
 
     async fn ask(desk: &Desk, start: bool) -> oneshot::Receiver<io::Result<String>> {
@@ -866,24 +878,18 @@ mod tests {
     async fn the_remote_cursor_is_drawn_on_the_cover() {
         let desk = desk("DP-2");
         let remote = started(&desk).await;
-        let shape = ServerMsg::CursorShape {
-            id: 1,
+        let cursor = Cursor {
             width: 1,
             height: 1,
             hot_x: 0,
             hot_y: 0,
-            argb_len: 4,
+            argb: bytes::Bytes::from_static(&[1, 2, 3, 255]),
         };
         remote
-            .to_home
-            .try_send(Incoming::Video {
-                msg: shape,
-                main: bytes::Bytes::from_static(&[1, 2, 3, 255]),
-                aux: bytes::Bytes::new(),
-            })
-            .unwrap();
+            .pointer
+            .send_modify(|pointer| pointer.shape = Some(cursor.clone()));
         until(|| !desk.cursors.lock().unwrap().is_empty()).await;
-        assert_eq!(&desk.cursors.lock().unwrap()[0].argb[..], &[1, 2, 3, 255]);
+        assert_eq!(desk.cursors.lock().unwrap()[0].shape, Some(cursor));
     }
 
     #[test]

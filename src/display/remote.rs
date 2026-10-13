@@ -602,6 +602,7 @@ mod tests {
         let peer = Peer {
             outbox: outbox.clone(),
             inbox: inbox_rx,
+            pointer: tokio::sync::watch::channel(Default::default()).1,
             input: wire.clone(),
         };
         let ports = Ports {

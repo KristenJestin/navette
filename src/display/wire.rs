@@ -14,12 +14,41 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use gliff_proto::{ClientCaps, ClientMsg, ServerMsg};
 use minicbor::{Decode, Encode};
-use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{Notify, watch};
 
 /// The largest cursor taken, as gliff's client, in pixels a side: a cursor image declaring
 /// more ends the link.
 pub const MAX_CURSOR: u32 = 1024;
+
+/// The remote cursor's image: little-endian ARGB8888 in the output's pixels, its hotspot in
+/// them too.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Cursor {
+    pub width: u32,
+    pub height: u32,
+    pub hot_x: i32,
+    pub hot_y: i32,
+    pub argb: Bytes,
+}
+
+/// The remote pointer as last heard. Only the newest counts, so it never waits behind the
+/// pictures, nor is it dropped with them when the display falls behind.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pointer {
+    /// `None` until the remote sends an image.
+    pub shape: Option<Cursor>,
+    pub visible: bool,
+}
+
+impl Default for Pointer {
+    fn default() -> Self {
+        Self {
+            shape: None,
+            visible: true,
+        }
+    }
+}
 
 /// What the display sends.
 #[derive(Clone, Debug, PartialEq)]
@@ -98,6 +127,8 @@ pub enum Incoming {
 pub struct Peer {
     pub outbox: Outbox,
     pub inbox: mpsc::Receiver<Incoming>,
+    /// Remote to home; it ends with the inbox.
+    pub pointer: watch::Receiver<Pointer>,
     pub input: crate::input::Wire,
 }
 

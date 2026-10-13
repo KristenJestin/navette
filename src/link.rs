@@ -23,10 +23,11 @@ use gliff_transport::Framed;
 use gliff_transport::clipboard::{Outbound, outbound_channel};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::audio::{self, codec::MAX_PACKET};
-use crate::display::wire::{Incoming, MAX_CURSOR, Outbox, Peer};
+use crate::display::wire::{Cursor, Incoming, MAX_CURSOR, Outbox, Peer, Pointer};
 use crate::frame::{read_frame, write_frame};
 use crate::input;
 use crate::store::{Role, Store};
@@ -161,10 +162,12 @@ where
     let (to_peer, outbound_rx) = outbound_channel();
     let outbox = Outbox::default();
     let (display_tx, display_rx) = mpsc::channel(DISPLAY_INBOUND);
+    let (pointer_tx, pointer) = watch::channel(Pointer::default());
     let input = input::Wire::default();
     let display = Peer {
         outbox: outbox.clone(),
         inbox: display_rx,
+        pointer,
         input: input.clone(),
     };
     let (sound, sound_end) = audio::wire();
@@ -192,7 +195,7 @@ where
             heartbeat.timeout,
             inbound_tx,
             sound_end.to_audio,
-            display_tx,
+            (display_tx, pointer_tx),
             &outbox,
             &input.from_peer,
         ) => result,
@@ -273,7 +276,7 @@ async fn receive<R: AsyncRead + Unpin>(
     timeout: Duration,
     inbound: mpsc::Sender<Clip>,
     sound: SyncSender<audio::Message>,
-    display: mpsc::Sender<Incoming>,
+    (display, pointer): (mpsc::Sender<Incoming>, watch::Sender<Pointer>),
     outbox: &Outbox,
     input: &input::Queue,
 ) -> io::Result<Infallible> {
@@ -327,6 +330,24 @@ async fn receive<R: AsyncRead + Unpin>(
                 .await
                 .map_err(|_| silent())?
                 .map_err(io_error)?;
+                if let ServerMsg::CursorShape {
+                    width,
+                    height,
+                    hot_x,
+                    hot_y,
+                    ..
+                } = msg
+                {
+                    let shape = Cursor {
+                        width,
+                        height,
+                        hot_x,
+                        hot_y,
+                        argb: main,
+                    };
+                    pointer.send_modify(|pointer| pointer.shape = Some(shape));
+                    continue;
+                }
                 let video = Incoming::Video { msg, main, aux };
                 if let Err(mpsc::error::TrySendError::Full(Incoming::Video { msg, .. })) =
                     display.try_send(video)
@@ -1106,14 +1127,58 @@ pub(crate) mod tests {
         };
         ends.remote
             .outbox
-            .send(DisplayMsg::Video(shape.clone()), vec![vec![5; 8]]);
-        match incoming(&mut ends.home).await {
-            Incoming::Video { msg, main, .. } => {
-                assert_eq!(msg, shape);
-                assert_eq!(&main[..], &[5; 8]);
-            }
-            other => panic!("expected the cursor, got {other:?}"),
+            .send(DisplayMsg::Video(shape), vec![vec![5; 8]]);
+        let cursor = newest_cursor(&mut ends.home).await;
+        assert_eq!((cursor.width, cursor.height), (2, 1));
+        assert_eq!(&cursor.argb[..], &[5; 8]);
+    }
+
+    /// The remote pointer's image, once one has come.
+    async fn newest_cursor(peer: &mut Peer) -> Cursor {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            peer.pointer.wait_for(|pointer| pointer.shape.is_some()),
+        )
+        .await
+        .expect("a cursor in time")
+        .expect("the link is up")
+        .shape
+        .clone()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_remote_cursor_is_never_lost_behind_a_full_display_queue() {
+        let mut ends = display_link(1 << 20).await;
+        // Home's display reads nothing: its queue fills.
+        for id in 0..DISPLAY_INBOUND as u64 + 20 {
+            let (msg, payloads) = video_frame(id, 16);
+            ends.remote.outbox.send(msg, payloads);
         }
+        let shape = |id| ServerMsg::CursorShape {
+            id,
+            width: 1,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            argb_len: 4,
+        };
+        ends.remote
+            .outbox
+            .send(DisplayMsg::Video(shape(1)), vec![vec![1; 4]]);
+        assert_eq!(&newest_cursor(&mut ends.home).await.argb[..], &[1; 4]);
+        ends.remote
+            .outbox
+            .send(DisplayMsg::Video(shape(2)), vec![vec![2; 4]]);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ends.home
+                .pointer
+                .wait_for(|pointer| pointer.shape.as_ref().is_some_and(|c| c.argb[..] == [2; 4])),
+        )
+        .await
+        .expect("the newer cursor in time")
+        .unwrap();
     }
 
     #[tokio::test]

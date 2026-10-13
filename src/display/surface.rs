@@ -28,6 +28,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
@@ -69,7 +70,7 @@ use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 use super::Ended;
 use super::decode::Picture;
-use super::wire::MAX_CURSOR;
+use super::wire::{Cursor, MAX_CURSOR, Pointer};
 use crate::input::{self, Capture, Grab, Hotkey, Seat};
 
 /// How long the compositor has to place the surface.
@@ -107,17 +108,6 @@ fn same_gpu(main_device: u64, render_node: &Path) -> bool {
     hardware(main_device).is_some_and(|main| hardware(node.rdev()) == Some(main))
 }
 
-/// The remote cursor's image: little-endian ARGB8888 in the output's pixels, its hotspot in
-/// them too.
-#[derive(Debug)]
-pub struct Cursor {
-    pub width: u32,
-    pub height: u32,
-    pub hot_x: i32,
-    pub hot_y: i32,
-    pub argb: bytes::Bytes,
-}
-
 impl Cursor {
     /// Whether it can be shown: a sane size, its pixels all there, and a visible shape (not
     /// fully transparent, nor one flat colour as Hyprland sends when it has no image to share).
@@ -144,7 +134,35 @@ impl Cursor {
 /// What the surface is given to show.
 enum Show {
     Picture(Picture),
-    Cursor(Cursor),
+    /// The remote pointer changed: the newest waits in [`Newest`].
+    Pointer,
+}
+
+/// The newest value only: a writer replaces what the reader has not taken yet, so remote
+/// cursors never pile up in the channel.
+struct Newest<T>(Arc<Mutex<Option<T>>>);
+
+impl<T> Clone for Newest<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> Default for Newest<T> {
+    fn default() -> Self {
+        Self(Arc::default())
+    }
+}
+
+impl<T> Newest<T> {
+    /// True when nothing was waiting: the reader has to be woken.
+    fn put(&self, value: T) -> bool {
+        self.0.lock().unwrap().replace(value).is_none()
+    }
+
+    fn take(&self) -> Option<T> {
+        self.0.lock().unwrap().take()
+    }
 }
 
 /// The surface, on its own thread. Dropping it removes the surface.
@@ -152,6 +170,7 @@ pub struct Surface {
     /// The compositor takes the decoder's linear XRGB8888 dmabuf.
     linear_dmabuf: bool,
     pictures: Option<channel::Sender<Show>>,
+    pointer: Newest<Pointer>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -179,13 +198,15 @@ impl Surface {
         let shutdown = socket.try_clone()?;
         let conn = Connection::from_socket(socket).map_err(wayland)?;
         let (pictures, channel) = channel::channel();
+        let pointer = Newest::default();
         let (ready_tx, ready) = std::sync::mpsc::channel();
         let output = output.to_string();
+        let newest = pointer.clone();
         let thread = std::thread::Builder::new()
             .name("navette-surface".into())
             .spawn(move || {
                 let capture = Capture::new(input, hotkey);
-                let why = match run(conn, &output, channel, capture, &ready_tx) {
+                let why = match run(conn, &output, (channel, newest), capture, &ready_tx) {
                     Ok(None) => return,
                     Ok(Some(why)) => why,
                     Err(e) => {
@@ -199,6 +220,7 @@ impl Surface {
         let mut surface = Self {
             linear_dmabuf: false,
             pictures: Some(pictures),
+            pointer,
             thread: Some(thread),
         };
         match ready.recv_timeout(wait) {
@@ -238,10 +260,12 @@ impl Surface {
         })
     }
 
-    /// The remote cursor's new image.
-    pub fn cursor(&self, cursor: Cursor) {
-        if let Some(pictures) = &self.pictures {
-            let _ = pictures.send(Show::Cursor(cursor));
+    /// The remote pointer as it changed.
+    pub fn cursor(&self, pointer: Pointer) {
+        if self.pointer.put(pointer)
+            && let Some(pictures) = &self.pictures
+        {
+            let _ = pictures.send(Show::Pointer);
         }
     }
 }
@@ -287,7 +311,7 @@ fn wayland(e: impl std::fmt::Display) -> io::Error {
 fn run(
     conn: Connection,
     output_name: &str,
-    pictures: Channel<Show>,
+    (pictures, pointer): (Channel<Show>, Newest<Pointer>),
     capture: Capture,
     ready: &std::sync::mpsc::Sender<Ready>,
 ) -> io::Result<Option<String>> {
@@ -428,7 +452,11 @@ fn run(
                 state.pending = Some(picture);
                 state.present();
             }
-            ChannelEvent::Msg(Show::Cursor(cursor)) => state.remote_cursor(cursor),
+            ChannelEvent::Msg(Show::Pointer) => {
+                if let Some(pointer) = pointer.take() {
+                    state.remote_cursor(pointer);
+                }
+            }
             ChannelEvent::Closed => state.exit = Some(None),
         })
         .map_err(|e| wayland(e.error))?;
@@ -563,7 +591,12 @@ impl State {
     }
 
     /// Draws the remote cursor's new image, and shows it if the pointer is over the surface.
-    fn remote_cursor(&mut self, cursor: Cursor) {
+    fn remote_cursor(&mut self, pointer: Pointer) {
+        let Some(cursor) = pointer.shape else {
+            self.hotspot = None;
+            self.set_cursor();
+            return;
+        };
         tracing::debug!(
             width = cursor.width,
             height = cursor.height,
@@ -1073,6 +1106,17 @@ mod tests {
             hot_y: 0,
             argb: argb.into(),
         }
+    }
+
+    #[test]
+    fn only_the_newest_remote_pointer_waits() {
+        let newest = Newest::default();
+        assert!(newest.put(1));
+        // The reader, already woken, takes the newer one.
+        assert!(!newest.put(2));
+        assert_eq!(newest.take(), Some(2));
+        assert_eq!(newest.take(), None);
+        assert!(newest.put(3));
     }
 
     #[test]
