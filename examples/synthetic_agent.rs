@@ -25,10 +25,9 @@ const FPS: u64 = 60;
 
 struct Synthetic;
 
-/// Stops the pattern thread when dropped; holds `ended`, which this stream never sends.
+/// Stops the pattern thread when dropped.
 struct Running {
     stop: Arc<std::sync::atomic::AtomicBool>,
-    _ended: oneshot::Sender<io::Error>,
 }
 
 impl Drop for Running {
@@ -63,7 +62,9 @@ impl Streams for Synthetic {
         .map_err(io::Error::other)?;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopped = stop.clone();
+        let output = source.output.clone();
         std::thread::spawn(move || {
+            let mut checked = Instant::now();
             outbox.send(
                 Msg::Video(ServerMsg::StreamConfig {
                     codec: Codec::H264,
@@ -93,6 +94,16 @@ impl Streams for Synthetic {
                             }),
                             Vec::new(),
                         );
+                    }
+                }
+                // A real capture stops with its output (a Hyprland restart): so does the pattern.
+                if checked.elapsed() >= Duration::from_secs(1) {
+                    checked = Instant::now();
+                    let there = hypr::monitors(&hypr::Live)
+                        .is_ok_and(|list| list.iter().any(|m| m.name == output));
+                    if !there {
+                        let _ = ended.send(io::Error::other("the output is gone"));
+                        return;
                     }
                 }
                 let due = start + Duration::from_micros(frame_id * 1_000_000 / FPS);
@@ -126,10 +137,7 @@ impl Streams for Synthetic {
             }
             eprintln!("synthetic agent: the pattern stopped after {frame_id} frames");
         });
-        Ok(Box::new(Running {
-            stop,
-            _ended: ended,
-        }))
+        Ok(Box::new(Running { stop }))
     }
 }
 
