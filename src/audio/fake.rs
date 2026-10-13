@@ -17,6 +17,8 @@ pub struct State {
     pub refuse_defaults: bool,
     /// How long a change of the default takes.
     pub slow_defaults: std::time::Duration,
+    /// How many times PipeWire restarted: a node opened before the last restart is gone.
+    pub restarts: u32,
 }
 
 #[derive(Clone, Default)]
@@ -32,16 +34,30 @@ impl FakeGraph {
     pub fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.0.lock().unwrap()
     }
+
+    /// PipeWire restarts: every node goes with it.
+    pub fn restart(&self) {
+        let mut state = self.state();
+        state.restarts += 1;
+        state.sinks.clear();
+        state.playbacks.clear();
+        state.log.push("restart".to_owned());
+    }
 }
 
 pub struct FakeNode {
     graph: FakeGraph,
     name: String,
+    restarts: u32,
 }
 
 impl Drop for FakeNode {
     fn drop(&mut self) {
         let mut state = self.graph.state();
+        // A node of an earlier PipeWire went with it: its name may be a new node's now.
+        if state.restarts != self.restarts {
+            return;
+        }
         state.sinks.retain(|(name, _)| *name != self.name);
         state.playbacks.retain(|(name, _)| *name != self.name);
         state.log.push(format!("remove {}", self.name));
@@ -82,6 +98,7 @@ impl Graph for FakeGraph {
         Ok(FakeNode {
             graph: self.clone(),
             name: name.to_owned(),
+            restarts: state.restarts,
         })
     }
 
@@ -97,6 +114,11 @@ impl Graph for FakeGraph {
         Ok(FakeNode {
             graph: self.clone(),
             name: name.to_owned(),
+            restarts: state.restarts,
         })
+    }
+
+    fn is_gone(&self, node: &FakeNode) -> bool {
+        self.state().restarts != node.restarts
     }
 }

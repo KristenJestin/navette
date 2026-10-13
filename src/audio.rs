@@ -25,9 +25,11 @@ pub mod pipewire;
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -46,6 +48,9 @@ const PLAYBACK_DESCRIPTION: &str = "Remote machine (Navette)";
 /// Home starts playing once 30 ms are buffered, and keeps at most 120 ms.
 const JITTER_TARGET: usize = 3 * FRAME_SAMPLES;
 const JITTER_MAX: usize = 12 * FRAME_SAMPLES;
+
+/// How often the remote checks that its sink is still there: PipeWire may restart under it.
+const CHECK: Duration = Duration::from_millis(250);
 
 /// The audio messages; on the link, they are top-level variants of
 /// [`LinkMsg`](crate::wire::LinkMsg).
@@ -207,6 +212,8 @@ pub trait Graph: Clone + Send + 'static {
         description: &str,
         jitter: Arc<Mutex<Jitter>>,
     ) -> io::Result<Self::Node>;
+    /// Whether `node` went with the PipeWire it was opened on (restarted, say).
+    fn is_gone(&self, node: &Self::Node) -> bool;
 }
 
 /// The remote's sink while home asks for the sound. Dropping it puts the previous default
@@ -215,7 +222,7 @@ pub struct RemoteSink<G: Graph> {
     graph: G,
     saved: Saved,
     previous: Option<DefaultSink>,
-    _node: G::Node,
+    node: G::Node,
 }
 
 impl<G: Graph> RemoteSink<G> {
@@ -233,10 +240,21 @@ impl<G: Graph> RemoteSink<G> {
             graph,
             saved,
             previous,
-            _node: node,
+            node,
         };
         sink.graph.set_default_sink(Some(&ours))?;
         Ok(sink)
+    }
+
+    fn is_gone(&self) -> bool {
+        self.graph.is_gone(&self.node)
+    }
+
+    /// The sink again, once PipeWire has restarted, and the default again; what goes back at
+    /// the end is still the default from before the session.
+    fn reopen(&mut self, on_sound: OnSound) -> io::Result<()> {
+        self.node = self.graph.open_sink(SINK, SINK_DESCRIPTION, on_sound)?;
+        self.graph.set_default_sink(Some(&DefaultSink::named(SINK)))
     }
 }
 
@@ -264,10 +282,10 @@ const ARENA: usize = 64 * 1024;
 fn sender(
     home: mpsc::Sender<Message>,
     session: u32,
+    seq: Arc<AtomicU32>,
     failures: Arc<AtomicU64>,
 ) -> io::Result<OnSound> {
     let mut encoder = Encoder::new()?;
-    let mut seq = 0u32;
     // The packets are cut from one block, so a frame costs no allocation of its own.
     let mut arena = BytesMut::with_capacity(ARENA);
     Ok(Box::new(move |pcm| {
@@ -278,13 +296,12 @@ fn sender(
             arena.extend_from_slice(packet);
             let frame = Message::Frame {
                 session,
-                seq,
+                seq: seq.fetch_add(1, Ordering::Relaxed),
                 packet: arena.split().freeze(),
             };
             // Late sound is worse than lost sound: a full link drops the frame, and home fills
             // the gap.
             let _ = home.try_send(frame);
-            seq = seq.wrapping_add(1);
         });
         if sent.is_err() {
             failures.fetch_add(1, Ordering::Relaxed);
@@ -294,7 +311,12 @@ fn sender(
 
 /// The sink while it runs, and the cycles it could not encode.
 struct Capture<G: Graph> {
-    _sink: RemoteSink<G>,
+    sink: RemoteSink<G>,
+    home: mpsc::Sender<Message>,
+    session: u32,
+    /// Shared with the sink's sender, and with the next one after a restart: home would take
+    /// frames numbered from 0 again as late.
+    seq: Arc<AtomicU32>,
     failures: Arc<AtomicU64>,
 }
 
@@ -305,12 +327,30 @@ impl<G: Graph> Capture<G> {
         home: mpsc::Sender<Message>,
         session: u32,
     ) -> io::Result<Self> {
+        let seq = Arc::new(AtomicU32::new(0));
         let failures = Arc::new(AtomicU64::new(0));
-        let on_sound = sender(home, session, failures.clone())?;
+        let on_sound = sender(home.clone(), session, seq.clone(), failures.clone())?;
         Ok(Self {
-            _sink: RemoteSink::start(graph, saved, on_sound)?,
+            sink: RemoteSink::start(graph, saved, on_sound)?,
+            home,
+            session,
+            seq,
             failures,
         })
+    }
+
+    /// Opens the sink again if PipeWire restarted under it.
+    fn recover(&mut self) -> io::Result<()> {
+        if !self.sink.is_gone() {
+            return Ok(());
+        }
+        let on_sound = sender(
+            self.home.clone(),
+            self.session,
+            self.seq.clone(),
+            self.failures.clone(),
+        )?;
+        self.sink.reopen(on_sound)
     }
 }
 
@@ -340,9 +380,11 @@ pub fn remote<G: Graph>(
                 let _ = previous.join();
             }
             let mut sink = None;
-            while let Ok(message) = wire.from_peer.recv() {
-                match message {
-                    Message::Start { session } => {
+            // Told once per outage, not at each check while PipeWire is still away.
+            let mut lost = false;
+            loop {
+                match wire.from_peer.recv_timeout(CHECK) {
+                    Ok(Message::Start { session }) => {
                         // A new session replaces the one running, if any.
                         drop(sink.take());
                         match Capture::start(
@@ -355,8 +397,19 @@ pub fn remote<G: Graph>(
                             Err(e) => eprintln!("navette: audio: could not start the sink: {e}"),
                         }
                     }
-                    Message::Stop => drop(sink.take()),
-                    Message::Frame { .. } => {}
+                    Ok(Message::Stop) => drop(sink.take()),
+                    Ok(Message::Frame { .. }) | Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+                if let Some(capture) = &mut sink {
+                    match capture.recover() {
+                        Ok(()) => lost = false,
+                        Err(e) if !lost => {
+                            eprintln!("navette: audio: could not open the sink again: {e}");
+                            lost = true;
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
         })
@@ -778,6 +831,62 @@ mod tests {
             out.iter().any(|s| s.abs() > 0.1),
             "the new session was not played"
         );
+    }
+
+    #[tokio::test]
+    async fn the_sink_comes_back_after_pipewire_restarts() {
+        let graph = FakeGraph::with_default("laptop-speakers");
+        let (_tmp, saved) = saved();
+        let (wire, link) = super::wire();
+        let audio = remote(graph.clone(), saved.clone(), wire, None).unwrap();
+        link.to_audio.send(Message::Start { session: 1 }).unwrap();
+        until(&graph, |s| !s.sinks.is_empty()).await;
+
+        // PipeWire restarts: the sink goes, and the session manager falls back to another
+        // output.
+        graph.restart();
+        graph.state().default = Some(DefaultSink::named("hdmi-out"));
+        until(&graph, |s| {
+            !s.sinks.is_empty() && s.default == Some(DefaultSink::named(SINK))
+        })
+        .await;
+        assert_eq!(
+            saved.load().unwrap(),
+            Some(Some(DefaultSink::named("laptop-speakers")))
+        );
+
+        // The user's choice from before the session comes back, not the fallback.
+        drop(link);
+        blocking(move || audio.join().unwrap()).await;
+        assert_eq!(
+            graph.state().default,
+            Some(DefaultSink::named("laptop-speakers"))
+        );
+        assert_eq!(saved.load().unwrap(), None);
+    }
+
+    #[test]
+    fn the_frames_keep_their_numbers_after_pipewire_restarts() {
+        let graph = FakeGraph::with_default("laptop-speakers");
+        let (_tmp, saved) = saved();
+        let (to_home, mut frames) = mpsc::channel(QUEUE);
+        let mut capture = Capture::start(graph.clone(), saved, to_home, 1).unwrap();
+        let play = |graph: &FakeGraph| {
+            let sink = graph.state().sinks[0].1.clone();
+            (sink.lock().unwrap())(&tone(2));
+        };
+        play(&graph);
+        graph.restart();
+        capture.recover().unwrap();
+        play(&graph);
+
+        let seqs: Vec<u32> = std::iter::from_fn(|| frames.try_recv().ok())
+            .map(|message| match message {
+                Message::Frame { seq, .. } => seq,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(seqs, (0..4).collect::<Vec<_>>());
     }
 
     #[tokio::test]

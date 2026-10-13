@@ -189,6 +189,10 @@ impl Graph for PipeWire {
         })?;
         Ok(self.node(id.0, id.1))
     }
+
+    fn is_gone(&self, node: &Node) -> bool {
+        !node.on.running.load(Ordering::Acquire)
+    }
 }
 
 fn pw_error(e: pw::Error) -> io::Error {
@@ -713,6 +717,16 @@ mod tests {
         assert!(!log.contains(&"1: close 0".to_owned()), "{log:?}");
         drop(new);
         assert!(loops.log().contains(&"1: close 0".to_owned()));
+    }
+
+    #[test]
+    fn a_node_on_an_ended_loop_is_gone() {
+        let loops = FakeLoops::default();
+        let pipewire = loops.pipewire();
+        let node = sink(&pipewire).unwrap();
+        assert!(!pipewire.is_gone(&node));
+        loops.end(0);
+        assert!(pipewire.is_gone(&node));
     }
 
     #[test]
