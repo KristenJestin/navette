@@ -21,8 +21,9 @@
 //!
 //! The home machine is gliff's client side of the engine (odd request ids) and the remote
 //! machine its server side (even ones), so two transfers in opposite directions never share an
-//! id. Everything here runs on the link's thread, in a `LocalSet`; the compositor calls that
-//! block run on other threads, so they never hold up the link's heartbeats.
+//! id. Everything here runs on the link's thread, in a `LocalSet` of the bridge's own, so the
+//! end of the bridge ends every transfer and paste it started; the compositor calls that block
+//! run on other threads, so they never hold up the link's heartbeats.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -49,6 +50,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::unix::pipe;
 use tokio::sync::OnceCell;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::task::LocalSet;
 
 use crate::link::Wire;
 
@@ -382,7 +384,8 @@ async fn local_files_from_pipe(mut rx: pipe::Receiver) -> LocalFiles {
 
 /// Runs one link's bridge until the link's clipboard channel closes (`true`) or the compositor
 /// side does (`false`). Takes the wire by reference so a new compositor connection can pick
-/// the same link up again; `serials` is the link's.
+/// the same link up again; `serials` is the link's. Whatever the bridge started (pastes,
+/// transfers, spools kept for their grace) ends with it, even when this future is dropped.
 pub async fn run<C: Compositor>(
     side: Side,
     wire: &mut Wire,
@@ -391,25 +394,31 @@ pub async fn run<C: Compositor>(
     spool_base: Option<PathBuf>,
     serials: Rc<Cell<u64>>,
 ) -> bool {
-    let bridge = Bridge::new(
-        Transfers::new(wire.to_peer.clone(), side),
-        Jobs::new(report),
-        compositor,
-        spool_base,
-        serials,
-    );
-    loop {
-        tokio::select! {
-            clip = wire.from_peer.recv() => match clip {
-                Some((msg, payload)) => bridge.on_peer_msg(msg, payload),
-                None => return true,
-            },
-            event = events.recv() => match event {
-                Some(event) => bridge.on_compositor_event(event),
-                None => return false,
-            },
-        }
-    }
+    // Every task the bridge and gliff's engine spawn lands in this set, and dies with it.
+    let tasks = LocalSet::new();
+    tasks
+        .run_until(async {
+            let bridge = Bridge::new(
+                Transfers::new(wire.to_peer.clone(), side),
+                Jobs::new(report),
+                compositor,
+                spool_base,
+                serials,
+            );
+            loop {
+                tokio::select! {
+                    clip = wire.from_peer.recv() => match clip {
+                        Some((msg, payload)) => bridge.on_peer_msg(msg, payload),
+                        None => return true,
+                    },
+                    event = events.recv() => match event {
+                        Some(event) => bridge.on_compositor_event(event),
+                        None => return false,
+                    },
+                }
+            }
+        })
+        .await
 }
 
 /// Only what the user must know: a paste that failed. It names no file or content.
@@ -546,6 +555,7 @@ mod tests {
     use std::sync::Mutex;
 
     use gliff_proto::ClipboardMsg;
+    use gliff_proto::clipboard::CHUNK;
     use gliff_transport::clipboard::outbound_channel;
     use tokio::net::unix::pipe;
     use tokio::sync::mpsc;
@@ -578,6 +588,9 @@ mod tests {
         offered: Mutex<Vec<Vec<String>>>,
         /// How long `receive` blocks its caller, like a compositor that answers late.
         slow: Mutex<Duration>,
+        /// When set, the application that owns the selection writes it and never closes its
+        /// end, which is handed over here: a transfer that stays in flight.
+        stalled: Mutex<Option<std::sync::mpsc::Sender<std::io::PipeWriter>>>,
     }
 
     impl Compositor for Fake {
@@ -595,9 +608,13 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not selected"))?;
             let (reader, mut writer) = std::io::pipe()?;
+            let stalled = self.stalled.lock().unwrap().clone();
             // A pipe holds 64 KiB: the application writing into it is another thread.
             std::thread::spawn(move || {
                 let _ = writer.write_all(&data);
+                if let Some(stalled) = stalled {
+                    let _ = stalled.send(writer);
+                }
             });
             Ok(reader.into())
         }
@@ -617,6 +634,8 @@ mod tests {
     struct Machine {
         clipboard: Arc<Fake>,
         events: mpsc::UnboundedSender<Selected>,
+        /// Its end of the link: aborting it drops the link.
+        link: tokio::task::JoinHandle<()>,
     }
 
     impl Machine {
@@ -670,14 +689,18 @@ mod tests {
         let clipboard = Arc::new(Fake::default());
         let (events, selected) = mpsc::unbounded_channel();
         let bridge = clipboard.clone();
-        tokio::task::spawn_local(async move {
+        let link = tokio::task::spawn_local(async move {
             let service = |mut wire| async move {
                 let serials = Rc::default();
                 super::run(side, &mut wire, bridge, selected, Some(spool), serials).await;
             };
             link::run(stream, heartbeat(), service).await;
         });
-        Machine { clipboard, events }
+        Machine {
+            clipboard,
+            events,
+            link,
+        }
     }
 
     async fn text_crosses(copy_at_home: bool) {
@@ -1089,6 +1112,79 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(2), refused)
                     .await
                     .expect("the request refused at once, not left to time out");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_paste_in_flight_ends_when_the_link_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                let (stalled, source) = std::sync::mpsc::channel();
+                *home.clipboard.stalled.lock().unwrap() = Some(stalled);
+                // One whole chunk, so it crosses before the source stalls.
+                home.copy(&[(TEXT, &vec![b'a'; CHUNK])]);
+                remote.offered(1).await;
+                let (reader, writer) = std::io::pipe().unwrap();
+                remote
+                    .events
+                    .send(Selected::Paste {
+                        mime_type: TEXT.into(),
+                        fd: writer.into(),
+                    })
+                    .unwrap();
+                let mut reader = pipe::Receiver::from_owned_fd(reader.into()).unwrap();
+                let mut first = vec![0u8; CHUNK];
+                within("the first chunk", reader.read_exact(&mut first))
+                    .await
+                    .unwrap();
+
+                home.link.abort();
+                // The application that pastes gets its end of file at once, not after gliff's
+                // idle timeout, and the one that copied sees nobody reads it any more.
+                let mut rest = Vec::new();
+                tokio::time::timeout(Duration::from_secs(2), reader.read_to_end(&mut rest))
+                    .await
+                    .expect("the paste ends with the link")
+                    .unwrap();
+                let mut source = source.recv().unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(
+                    source.write_all(b"more").unwrap_err().kind(),
+                    io::ErrorKind::BrokenPipe,
+                    "the copied side is still read",
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_pasted_files_are_removed_when_the_link_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                for (n, name) in ["first.txt", "second.txt"].into_iter().enumerate() {
+                    std::fs::write(copied.join(name), name).unwrap();
+                    let list = format!("file://{}\r\n", copied.join(name).display());
+                    home.copy(&[(URI_LIST, list.as_bytes())]);
+                    remote.offered(n + 1).await;
+                    remote.paste(URI_LIST).await;
+                }
+                let spooled = tmp.path().join("remote");
+                assert_eq!(std::fs::read_dir(&spooled).unwrap().count(), 2);
+
+                home.link.abort();
+                within("the spools removed", async {
+                    while std::fs::read_dir(&spooled).unwrap().count() > 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
             })
             .await;
     }
