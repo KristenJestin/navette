@@ -129,6 +129,8 @@ struct Running<G: Graph> {
 
 /// How often the mic looks for a PipeWire that restarted under it.
 const CHECK: Duration = Duration::from_millis(250);
+/// How long an order to the remote waits for room on the link.
+const STALLED: Duration = Duration::from_secs(2);
 
 impl<G: Graph + Sync> Mic<G> {
     /// `toggle_command` is what the hotkey runs ([`toggle_command`]).
@@ -255,28 +257,48 @@ impl<G: Graph> Shared<G> {
     }
 }
 
-/// Waits for room on the link: an order must not be lost, as a frame may be.
-fn send(link: &mpsc::Sender<Message>, message: Message) -> io::Result<()> {
-    link.blocking_send(message)
-        .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "the link is down"))
+/// Waits for room on the link, an order must not be lost as a frame may be, but not for ever:
+/// the mic's lock is held meanwhile.
+fn send(link: &mpsc::Sender<Message>, mut message: Message) -> io::Result<()> {
+    let since = std::time::Instant::now();
+    loop {
+        match link.try_send(message) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) if since.elapsed() >= STALLED => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the link is stalled",
+                ));
+            }
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                message = returned;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "the link is down",
+                ));
+            }
+        }
+    }
 }
 
 impl<G: Graph + Sync> Routing for Mic<G> {
     fn order(&self, order: Order) -> io::Result<Status> {
         let shared = &self.shared;
+        // Read without the lock, which a start or a stop holds while it waits.
+        if order == Order::Status {
+            return Ok(*shared.status.borrow());
+        }
         let mut state = lock(&shared.state);
         let current = *shared.status.borrow();
         let Some(running) = &mut state.running else {
-            return match order {
-                Order::Status => Ok(current),
-                _ => Err(io::Error::other(
-                    "no mode is running: the mic is home until one starts",
-                )),
-            };
+            return Err(io::Error::other(
+                "no mode is running: the mic is home until one starts",
+            ));
         };
-        if let Some(failure) = &running.failure
-            && order != Order::Status
-        {
+        if let Some(failure) = &running.failure {
             return Err(io::Error::other(failure.clone()));
         }
         let to = match (order, current) {
@@ -676,6 +698,39 @@ mod tests {
         graph.state().refuse_mics = false;
         until_status(&mic, Status::Remote).await;
         assert_eq!(mic.order(Order::Toggle).unwrap(), Status::Home);
+    }
+
+    /// Fills the link as a stalled one is: nothing more goes in.
+    fn stall(remote: &mpsc::Receiver<Message>, mic: &Mic<FakeGraph>) {
+        let link = lock(&mic.shared.state).link.clone().unwrap();
+        while link.try_send(Message::MicStop).is_ok() {}
+        assert_eq!(remote.len(), crate::audio::QUEUE);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_link_does_not_hold_the_mic_for_ever() {
+        let (_graph, mic, remote, _tmp) = mic();
+        stall(&remote, &mic);
+        let started = mic.clone();
+        let start =
+            tokio::time::timeout(Duration::from_secs(10), blocking(move || started.start()));
+        let error = start.await.expect("an answer in time").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn the_status_answers_while_a_start_waits_for_the_link() {
+        let (_graph, mic, remote, _tmp) = mic();
+        stall(&remote, &mic);
+        let started = mic.clone();
+        let start = tokio::task::spawn_blocking(move || started.start());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let asked = mic.clone();
+        let status = blocking(move || asked.order(Order::Status));
+        let status = tokio::time::timeout(Duration::from_millis(500), status).await;
+        assert_eq!(status.expect("an answer in time").unwrap(), Status::Off);
+        drop(remote);
+        let _ = start.await;
     }
 
     #[tokio::test]
