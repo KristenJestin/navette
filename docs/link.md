@@ -29,6 +29,30 @@ identity) and `paired.conf` (the peer's certificate fingerprint, its role and th
 all 0600 in a 0700 directory. Pairing again replaces `paired.conf`; to change a machine's
 identity, remove its `identity.*` files and pair both machines again.
 
+## The clipboard
+
+Once the link is up, `navette serve` and `navette agent` each run one clipboard bridge for it,
+whatever the modes will later be: copy on one machine, paste on the other, text and files,
+both ways. It rides the link after the hello, in gliff's framing; the transfer is gliff's
+engine, which is lazy (nothing moves until an application pastes), typed, chunked, and
+refuses a request against an offer that a newer copy has replaced.
+
+- **One bridge per link, never per monitor.** Two bridges on one machine's clipboard replace
+  each other's offers, and every paste then fails with "the peer aborted the transfer"; the
+  link has exactly one. When home accepts a new connection from the remote, it ends the older
+  one, and its bridge, before it starts the new one's.
+- **Both machines use `ext-data-control`** (Hyprland has it), through gliff's `hypr-input`.
+  The display is `$WAYLAND_DISPLAY`, else the running Hyprland session. If it is not there
+  yet (the agent starting before the session) the link stays up, and the bridge looks again
+  every 5 s.
+- **Limits** are gliff's: 32 MiB for a pasted item that is not a file, 4 GiB and 10,000
+  entries for a set of files.
+- **Pasted files** are spooled under `$XDG_CACHE_HOME/navette/clipboard` (else
+  `~/.cache/navette/clipboard`), in a 0700 folder per offer, removed when the offer is
+  replaced (after five minutes' grace for the application that was just handed the paths) or
+  the link ends. A paste that fails is written to the journal ("a paste failed: ..."), with no
+  file name or content; there is no desktop notification yet.
+
 ## The home firewall
 
 Pairing and the link use the same port, so home needs one rule. With Omarchy's `ufw`:
