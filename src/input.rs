@@ -12,8 +12,9 @@
 //! ever staying down: a motion replaces a motion queued right before it; and when the queue is
 //! full (the link stalled for [`QUEUE`] events), what waits is dropped and replaced by a
 //! `ReleaseAll`, keeping only the latest keymap and area. A release is so never lost: it is
-//! queued, or everything held is released. A keymap replaces one still queued, so the queue
-//! holds one at most, and its memory stays bounded.
+//! queued, or everything held is released. After such a cut, a key still held at home is up on
+//! the remote until it is pressed again. A keymap replaces one still queued, so the queue holds
+//! one at most, and its memory stays bounded.
 //!
 //! The release hotkey and the held-key bookkeeping are adapted from gliff's client
 //! (`crates/gliff/src/main.rs`; gliff, MIT, see `LICENSES/gliff-MIT.txt`).
@@ -118,9 +119,11 @@ impl Queue {
         match events.back_mut() {
             Some(last) if follows_a_motion => *last = event,
             _ if full => {
+                // A keymap coming now replaces the one queued.
                 let keymap = events
                     .iter()
                     .rfind(|e| matches!(e, Event::Keymap(_)))
+                    .filter(|_| !matches!(event, Event::Keymap(_)))
                     .cloned();
                 let area = events
                     .iter()
@@ -216,7 +219,8 @@ pub struct Hotkey {
 pub const DEFAULT_HOTKEY: &str = "shift+escape";
 
 impl Hotkey {
-    /// `shift+escape`, `ctrl+alt+q`, `super+f12`…; `none` (or nothing) for no hotkey.
+    /// `shift+escape`, `ctrl+alt+q`, `super+f12`…: modifiers and one key. `none`, or nothing
+    /// (`release =` left empty), for no hotkey.
     pub fn parse(spec: &str) -> Result<Option<Self>, String> {
         let spec = spec.trim();
         if spec.is_empty() || spec.eq_ignore_ascii_case("none") {
@@ -231,7 +235,12 @@ impl Hotkey {
                 "ctrl" | "control" => mods.ctrl = true,
                 "alt" => mods.alt = true,
                 "super" | "logo" | "win" | "meta" => mods.logo = true,
-                name => sym = Some(keysym(name).ok_or_else(|| format!("unknown key '{name}'"))?),
+                name => {
+                    if sym.is_some() {
+                        return Err(format!("two keys in the release hotkey '{spec}'"));
+                    }
+                    sym = Some(keysym(name).ok_or_else(|| format!("unknown key '{name}'"))?);
+                }
             }
         }
         match sym {
@@ -649,6 +658,8 @@ mod tests {
         assert!(Hotkey::parse("Shift+Esc").unwrap().is_some());
         assert!(Hotkey::parse("shift+nokey").unwrap_err().contains("nokey"));
         assert!(Hotkey::parse("shift").unwrap_err().contains("no key"));
+        assert!(Hotkey::parse("shift+a+b").unwrap_err().contains("two keys"));
+        assert_eq!(Hotkey::parse(""), Ok(None));
     }
 
     #[test]
@@ -714,6 +725,8 @@ mod tests {
         queue.push(key(KEY_LEFTSHIFT, false));
         let queued = queue.queued();
         assert!(queued.len() <= QUEUE + 1, "{}", queued.len());
+        // The release pushed after the cut is there, after the ReleaseAll.
+        assert_eq!(queued.last(), Some(&key(KEY_LEFTSHIFT, false)));
         assert!(queued.contains(&Event::Keymap("km".into())));
         let release_all = queued.iter().position(|e| *e == Event::ReleaseAll).unwrap();
         // Everything after the cut is pressed again from nothing held: Shift is not down.
@@ -721,6 +734,23 @@ mod tests {
             !queued[release_all..].contains(&key(KEY_LEFTSHIFT, true)),
             "{queued:?}"
         );
+    }
+
+    #[test]
+    fn a_keymap_that_comes_to_a_full_queue_is_the_only_one_kept() {
+        let queue = Queue::default();
+        queue.push(Event::Keymap("old".into()));
+        // Full to the last place: the new keymap is what cuts it.
+        for n in 0..QUEUE - 1 {
+            queue.push(key(KEY_T, n % 2 == 0));
+        }
+        queue.push(Event::Keymap("new".into()));
+        let keymaps: Vec<Event> = queue
+            .queued()
+            .into_iter()
+            .filter(|e| matches!(e, Event::Keymap(_)))
+            .collect();
+        assert_eq!(keymaps, [Event::Keymap("new".into())]);
     }
 
     #[tokio::test]
