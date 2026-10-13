@@ -22,3 +22,7 @@ pub const REMOTE_CURSOR: bool = false;
 /// Where a part of a running mode says why it cannot go on (the surface went away, home cannot
 /// decode): the mode then ends.
 pub type Ended = tokio::sync::mpsc::UnboundedSender<String>;
+
+/// Where the surface says the release hotkey gave the keyboard back: home then gives it to the
+/// home window that had it last.
+pub type Released = tokio::sync::mpsc::UnboundedSender<()>;

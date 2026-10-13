@@ -24,9 +24,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use crate::desk::{Change, Desk, DeskError};
-use crate::display::Ended;
 use crate::display::decode::{self, Decoding, Picture, Video};
 use crate::display::wire::{Display, Incoming, MAX_OUTPUTS, Msg, OutputCopy, Peer, Pointer};
+use crate::display::{Ended, Released};
 use crate::hypr::{self, Eval, Hypr, lua_string};
 use crate::input::{self, Hotkey};
 
@@ -165,12 +165,13 @@ impl Drop for MicSent {
 /// Covers a home monitor (the port behind which tests put a fake).
 pub trait Screens: Send + Sync {
     /// Covers `monitor`; the guard takes the cover away when dropped. Home's input over it goes
-    /// to `input`, until `hotkey`. `ended` hears it if the cover goes away on its own.
+    /// to `input`, until `hotkey`, which `released` then hears. `ended` hears it if the cover
+    /// goes away on its own.
     fn open(
         &self,
         monitor: &str,
         input: input::Queue,
-        hotkey: Option<Hotkey>,
+        hotkey: (Option<Hotkey>, Released),
         ended: Ended,
     ) -> io::Result<Box<dyn Screen>>;
 }
@@ -191,7 +192,7 @@ impl Screens for LiveScreens {
         &self,
         monitor: &str,
         input: input::Queue,
-        hotkey: Option<Hotkey>,
+        hotkey: (Option<Hotkey>, Released),
         ended: Ended,
     ) -> io::Result<Box<dyn Screen>> {
         Ok(Box::new(crate::display::surface::Surface::open(
@@ -242,6 +243,8 @@ struct Active {
     desk: Arc<Mutex<Desk<Eval>>>,
     /// Why a surface or a decoder cannot go on.
     ended: UnboundedReceiver<String>,
+    /// Each time the release hotkey gave the keyboard back.
+    released: UnboundedReceiver<()>,
     /// The `navette mode start` waiting for the remote's answer.
     starting: Option<(oneshot::Sender<io::Result<String>>, tokio::time::Instant)>,
 }
@@ -402,12 +405,29 @@ pub async fn serve(
                     }
                 }
             }
-            Some(why) = ended(&mut active) => {
-                if let Some(peer) = &peer {
-                    peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
+            Some(said) = said(&mut active) => match said {
+                Said::Released => {
+                    if let Some(a) = &active {
+                        let (hypr, monitor) = (home.hypr.clone(), a.monitors[0].clone());
+                        let focus = move || hypr::focus_last_window(&*hypr, &monitor);
+                        match blocking(focus).await {
+                            Ok(Some(window)) => {
+                                tracing::info!(window, "the keyboard went to a home window")
+                            }
+                            Ok(None) => tracing::info!("no home window shown to take the keyboard"),
+                            Err(e) => eprintln!(
+                                "navette: the keyboard came home but no window took it: {e}"
+                            ),
+                        }
+                    }
                 }
-                stop(&mut active, &why).await;
-            }
+                Said::Ended(why) => {
+                    if let Some(peer) = &peer {
+                        peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
+                    }
+                    stop(&mut active, &why).await;
+                }
+            },
             _ = sleep_until(deadline) => {
                 if let Some(peer) = &peer {
                     peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
@@ -427,11 +447,23 @@ pub async fn serve(
     stop(&mut active, "navette is stopping").await;
 }
 
-/// Why one of the running mode's surfaces or decoders gave up; pending forever with no mode.
-async fn ended(active: &mut Option<Active>) -> Option<String> {
-    match active {
-        Some(a) => a.ended.recv().await,
-        None => std::future::pending().await,
+/// What the running mode's surface and decoder say.
+enum Said {
+    /// The release hotkey gave the keyboard back.
+    Released,
+    /// Why they gave up.
+    Ended(String),
+}
+
+/// What the running mode's surface or decoder say next; pending forever with no mode.
+async fn said(active: &mut Option<Active>) -> Option<Said> {
+    let Some(a) = active else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        Some(why) = a.ended.recv() => Some(Said::Ended(why)),
+        Some(()) = a.released.recv() => Some(Said::Released),
+        else => None,
     }
 }
 
@@ -508,6 +540,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
     let desk = open_desk(home, &names, &monitors).await?;
     // Off the executor, and so is the undo when one fails: the desk drops with the closure.
     let (ended_tx, ended) = tokio::sync::mpsc::unbounded_channel();
+    let (released_tx, released) = tokio::sync::mpsc::unbounded_channel();
     let (screens, gpu, outbox, input, mic) = (
         home.screens.clone(),
         home.gpu.clone(),
@@ -521,7 +554,12 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
         let mut shown = Vec::new();
         for ((index, name), gpu) in covered.iter().enumerate().zip(gpus) {
             let output = index as u8;
-            let screen = screens.open(name, input.on(output), hotkey, ended_tx.clone())?;
+            let screen = screens.open(
+                name,
+                input.on(output),
+                (hotkey, released_tx.clone()),
+                ended_tx.clone(),
+            )?;
             let decoding = Decoding::start(
                 gpu,
                 screen.takes_dmabuf(),
@@ -559,6 +597,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
         shown,
         desk: Arc::new(Mutex::new(desk)),
         ended,
+        released,
         starting: None,
     });
     Ok(())
@@ -773,7 +812,7 @@ mod tests {
 
     use super::*;
     use crate::display::wire::{Cursor, Outbox};
-    use crate::hypr::fake::{FakeHypr, FakeMonitor};
+    use crate::hypr::fake::{FakeHypr, FakeMonitor, FakeWindow};
 
     #[derive(Default)]
     struct FakeScreens {
@@ -787,6 +826,8 @@ mod tests {
         cursors: Arc<Mutex<Vec<(String, Pointer)>>>,
         /// Where each screen sends home's input, with its monitor.
         inputs: Arc<Mutex<Vec<(String, input::Queue)>>>,
+        /// Where each screen says its hotkey gave the keyboard back.
+        releases: Arc<Mutex<Vec<Released>>>,
     }
 
     struct FakeScreen {
@@ -800,7 +841,7 @@ mod tests {
             &self,
             monitor: &str,
             input: input::Queue,
-            hotkey: Option<Hotkey>,
+            (hotkey, released): (Option<Hotkey>, Released),
             ended: Ended,
         ) -> io::Result<Box<dyn Screen>> {
             self.inputs
@@ -808,6 +849,7 @@ mod tests {
                 .unwrap()
                 .push((monitor.to_string(), input));
             self.hotkeys.lock().unwrap().push(hotkey);
+            self.releases.lock().unwrap().push(released);
             self.covered.lock().unwrap().push(monitor.to_string());
             self.ends.lock().unwrap().push(ended);
             Ok(Box::new(FakeScreen {
@@ -875,6 +917,7 @@ mod tests {
         hotkeys: Arc<Mutex<Vec<Option<Hotkey>>>>,
         cursors: Arc<Mutex<Vec<(String, Pointer)>>>,
         inputs: Arc<Mutex<Vec<(String, input::Queue)>>>,
+        releases: Arc<Mutex<Vec<Released>>>,
         peers: UnboundedSender<Peer>,
         orders: UnboundedSender<Order>,
         events: UnboundedSender<hypr::Event>,
@@ -905,6 +948,7 @@ mod tests {
         let covered = screens.covered.clone();
         let ends = screens.ends.clone();
         let hotkeys = screens.hotkeys.clone();
+        let releases = screens.releases.clone();
         let cursors = screens.cursors.clone();
         let inputs = screens.inputs.clone();
         let (peers, peers_rx) = mpsc::unbounded_channel();
@@ -926,6 +970,7 @@ mod tests {
             covered,
             ends,
             hotkeys,
+            releases,
             cursors,
             inputs,
             peers,
@@ -1036,6 +1081,31 @@ mod tests {
             rules[0].contains(r#"match = { workspace = "m[DP-2]" }, monitor = "DP-1""#),
             "{rules:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_release_hotkey_gives_typing_to_the_home_window_that_had_it_last() {
+        let desk = desk("DP-2");
+        desk.hypr.add_window(FakeWindow::new("0xa1", "DP-1", 1));
+        desk.hypr.add_window(FakeWindow::new("0xb2", "DP-1", 0));
+        let _remote = started(&desk).await;
+        assert_eq!(desk.hypr.focused(), []);
+        let released = desk.releases.lock().unwrap()[0].clone();
+        released.send(()).unwrap();
+        // Focused with the pointer left where it is, over the covered monitor.
+        until(|| desk.hypr.focused() == [("0xb2".to_string(), false)]).await;
+    }
+
+    #[tokio::test]
+    async fn with_no_home_window_the_release_hotkey_changes_no_focus() {
+        let desk = desk("DP-2");
+        desk.hypr.add_window(FakeWindow::new("0xc3", "DP-2", 0));
+        let _remote = started(&desk).await;
+        let released = desk.releases.lock().unwrap()[0].clone();
+        released.send(()).unwrap();
+        // The mode goes on, and a stop still answers once the release was handled.
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(desk.hypr.focused(), []);
     }
 
     async fn started(desk: &Desk) -> Remote {

@@ -69,10 +69,10 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
-use super::Ended;
 use super::REMOTE_CURSOR;
 use super::decode::Picture;
 use super::wire::{Cursor, MAX_CURSOR, Pointer};
+use super::{Ended, Released};
 use crate::input::{self, Capture, Grab, Hotkey, Seat};
 
 /// How long the compositor has to place the surface.
@@ -193,17 +193,17 @@ impl Surface {
     pub fn open(
         output: &str,
         input: input::Queue,
-        hotkey: Option<Hotkey>,
+        (hotkey, released): (Option<Hotkey>, Released),
         ended: Ended,
     ) -> io::Result<Self> {
-        let capture = (input, hotkey);
+        let capture = (input, hotkey, Some(released));
         Self::open_on(compositor()?, output, capture, PLACE_TIMEOUT, ended)
     }
 
     fn open_on(
         socket: UnixStream,
         output: &str,
-        (input, hotkey): (input::Queue, Option<Hotkey>),
+        (input, hotkey, released): (input::Queue, Option<Hotkey>, Option<Released>),
         wait: Duration,
         ended: Ended,
     ) -> io::Result<Self> {
@@ -218,6 +218,10 @@ impl Surface {
             .name("navette-surface".into())
             .spawn(move || {
                 let capture = Capture::new(input, hotkey);
+                let capture = match released {
+                    Some(released) => capture.on_release(released),
+                    None => capture,
+                };
                 let why = match run(conn, &output, (channel, newest), capture, &ready_tx) {
                     Ok(None) => return,
                     Ok(Some(why)) => why,
