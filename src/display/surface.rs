@@ -2,16 +2,20 @@
 //! overlay layer, bound to that output, anchored on every edge, above the bar. A GPU picture is
 //! a dmabuf handed to the compositor as is (linux-dmabuf), with no copy; a CPU picture goes
 //! through shared memory, as does a GPU picture when the compositor does not take the decoder's
-//! linear dmabufs (Hyprland on an NVIDIA GPU lists only tiled ones). The newest picture wins: one is shown per frame callback, and an
+//! linear dmabufs (Hyprland on an NVIDIA GPU lists only tiled ones), or when the decoder's GPU
+//! is not the compositor's. The newest picture wins: one is shown per frame callback, and an
 //! older one still waiting is dropped, which gives its image back to the decoder.
 //!
-//! The keyboard (focus, the shortcuts inhibitor) comes with the input issue (#7); the surface
-//! already takes it on demand, as #2 measured.
+//! The keyboard (focus, the shortcuts inhibitor) comes with the input issue (#7): until then the
+//! surface takes none, so home's keyboard stays where it was.
 
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::AsFd;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
@@ -40,7 +44,11 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
+use super::Ended;
 use super::decode::Picture;
+
+/// How long the compositor has to place the surface.
+const PLACE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const XRGB8888: u32 = drm_fourcc::DrmFourcc::Xrgb8888 as u32;
 const LINEAR: u64 = 0;
@@ -53,40 +61,88 @@ fn takes_linear_xrgb(formats: impl IntoIterator<Item = (u32, u64)>) -> bool {
 /// The layer surface's namespace, for layer rules.
 pub const NAMESPACE: &str = "navette";
 
+/// The `major:minor` of a device number, as `/sys/dev/char` names it.
+fn char_device(dev: u64) -> String {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    format!("{major}:{minor}")
+}
+
+/// The hardware behind a DRM node: a card and its render node lead to the same one.
+fn hardware(dev: u64) -> Option<PathBuf> {
+    std::fs::canonicalize(format!("/sys/dev/char/{}/device", char_device(dev))).ok()
+}
+
+/// Whether the decoder's render node is on the compositor's main device, so its buffers import.
+fn same_gpu(main_device: u64, render_node: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(node) = std::fs::metadata(render_node) else {
+        return false;
+    };
+    hardware(main_device).is_some_and(|main| hardware(node.rdev()) == Some(main))
+}
+
 /// The surface, on its own thread. Dropping it removes the surface.
 pub struct Surface {
-    /// The compositor takes a linear XRGB8888 dmabuf, the decoder's output.
+    /// The compositor takes the decoder's linear XRGB8888 dmabuf.
     linear_dmabuf: bool,
     pictures: Option<channel::Sender<Picture>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Surface {
-    /// Puts the surface on `output` and waits until the compositor has placed it.
-    pub fn open(output: &str) -> io::Result<Self> {
+    /// Puts the surface on `output` and waits until the compositor has placed it. `ended` hears
+    /// it if the surface goes away on its own: the monitor unplugged, the compositor gone.
+    pub fn open(output: &str, ended: Ended) -> io::Result<Self> {
+        Self::open_on(compositor()?, output, PLACE_TIMEOUT, ended)
+    }
+
+    fn open_on(socket: UnixStream, output: &str, wait: Duration, ended: Ended) -> io::Result<Self> {
+        let shutdown = socket.try_clone()?;
+        let conn = Connection::from_socket(socket).map_err(wayland)?;
         let (pictures, channel) = channel::channel();
         let (ready_tx, ready) = std::sync::mpsc::channel();
         let output = output.to_string();
         let thread = std::thread::Builder::new()
             .name("navette-surface".into())
             .spawn(move || {
-                if let Err(e) = run(&output, channel, &ready_tx) {
-                    let _ = ready_tx.send(Err(e));
-                }
+                let why = match run(conn, &output, channel, &ready_tx) {
+                    Ok(None) => return,
+                    Ok(Some(why)) => why,
+                    Err(e) => {
+                        let why = format!("the surface on {output} ended: {e}");
+                        let _ = ready_tx.send(Err(e));
+                        why
+                    }
+                };
+                let _ = ended.send(why);
             })?;
         let mut surface = Self {
             linear_dmabuf: false,
             pictures: Some(pictures),
             thread: Some(thread),
         };
-        match ready.recv() {
+        match ready.recv_timeout(wait) {
             Ok(Ok((size, linear_dmabuf))) => {
                 tracing::debug!(?size, linear_dmabuf, "surface placed");
                 surface.linear_dmabuf = linear_dmabuf;
                 Ok(surface)
             }
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(io::Error::other("the surface thread ended")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // The thread may wait on the compositor for good: cut it off, so it ends.
+                let _ = shutdown.shutdown(std::net::Shutdown::Both);
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "the compositor did not place the surface within {} s",
+                        wait.as_secs_f32()
+                    ),
+                ))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(io::Error::other("the surface thread ended"))
+            }
         }
     }
 
@@ -113,6 +169,27 @@ impl Drop for Surface {
     }
 }
 
+/// The compositor's socket: `WAYLAND_DISPLAY`, else the running Hyprland's, as after a
+/// restart of Hyprland the inherited name may be gone.
+fn compositor() -> io::Result<UnixStream> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is not set"))?;
+    let inherited = std::env::var("WAYLAND_DISPLAY")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .and_then(|d| UnixStream::connect(runtime.join(d)).ok());
+    match inherited {
+        Some(socket) => Ok(socket),
+        None => {
+            let display = crate::hypr::instance()?
+                .wayland_display()
+                .map_err(wayland)?;
+            UnixStream::connect(runtime.join(display))
+        }
+    }
+}
+
 /// The surface's size once placed, and whether the compositor takes linear dmabufs.
 type Ready = io::Result<((u32, u32), bool)>;
 
@@ -120,12 +197,13 @@ fn wayland(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("wayland: {e}"))
 }
 
+/// Runs the surface until it is dropped (`None`) or goes away on its own (why).
 fn run(
+    conn: Connection,
     output_name: &str,
     pictures: Channel<Picture>,
     ready: &std::sync::mpsc::Sender<Ready>,
-) -> io::Result<()> {
-    let conn = Connection::connect_to_env().map_err(wayland)?;
+) -> io::Result<Option<String>> {
     let (globals, queue) = registry_queue_init::<State>(&conn).map_err(wayland)?;
     let qh = queue.handle();
     let compositor = CompositorState::bind(&globals, &qh).map_err(wayland)?;
@@ -146,11 +224,12 @@ fn run(
         size: None,
         ready: Some(ready.clone()),
         linear_dmabuf: None,
+        render_node: hypr_capture::render_node(None),
         pending: None,
         waiting_frame: false,
         shown_shm: None,
         shown_dmabuf: HashMap::new(),
-        exit: false,
+        exit: None,
         qh: qh.clone(),
     };
 
@@ -162,11 +241,19 @@ fn run(
         .insert(event_loop.handle())
         .map_err(|e| wayland(e.error))?;
     // The output list arrives with the first round trips.
-    event_loop.dispatch(Some(std::time::Duration::from_millis(100)), &mut state)?;
+    event_loop.dispatch(Some(Duration::from_millis(100)), &mut state)?;
     conn.roundtrip().map_err(wayland)?;
-    event_loop.dispatch(Some(std::time::Duration::from_millis(100)), &mut state)?;
+    event_loop.dispatch(Some(Duration::from_millis(100)), &mut state)?;
+    // Version 4's feedback comes once complete: no guess before its `done`.
+    for _ in 0..10 {
+        if state.linear_dmabuf.is_some() || state.dmabuf.version().is_none_or(|v| v < 4) {
+            break;
+        }
+        conn.roundtrip().map_err(wayland)?;
+        event_loop.dispatch(Some(Duration::from_millis(50)), &mut state)?;
+    }
 
-    // Before version 4, the formats came as a list.
+    // Before version 4, the formats came as a list, with no main device.
     if state.linear_dmabuf.is_none() {
         let linear = takes_linear_xrgb(
             state
@@ -200,7 +287,8 @@ fn run(
     layer.set_anchor(Anchor::all());
     layer.set_size(0, 0);
     layer.set_exclusive_zone(-1);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    // No keyboard until the input issue (#7).
+    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.commit();
     state.viewport = Some(viewporter.get_viewport(&surface, &qh, ()));
     state.layer = Some(layer);
@@ -213,14 +301,16 @@ fn run(
                 state.pending = Some(picture);
                 state.present();
             }
-            ChannelEvent::Closed => state.exit = true,
+            ChannelEvent::Closed => state.exit = Some(None),
         })
         .map_err(|e| wayland(e.error))?;
 
-    while !state.exit {
+    loop {
+        if let Some(why) = state.exit.take() {
+            return Ok(why);
+        }
         event_loop.dispatch(None, &mut state)?;
     }
-    Ok(())
 }
 
 struct State {
@@ -238,13 +328,16 @@ struct State {
     ready: Option<std::sync::mpsc::Sender<Ready>>,
     /// From the compositor's dmabuf feedback (version 4 and up).
     linear_dmabuf: Option<bool>,
+    /// The decoder's GPU, compared with the compositor's main device.
+    render_node: PathBuf,
     pending: Option<Picture>,
     /// A picture was committed and its frame callback has not come yet.
     waiting_frame: bool,
     shown_shm: Option<Buffer>,
     /// Dmabuf pictures the compositor still holds, by buffer.
     shown_dmabuf: HashMap<ObjectId, (wl_buffer::WlBuffer, Picture)>,
-    exit: bool,
+    /// Set to stop: `None` when dropped, else why the surface went away.
+    exit: Option<Option<String>>,
     qh: QueueHandle<State>,
 }
 
@@ -267,10 +360,6 @@ impl State {
         let qh = self.qh.clone();
         let Some(surface) = self.surface().cloned() else {
             return;
-        };
-        let (buffer_w, buffer_h) = match &picture {
-            Picture::Dmabuf(f) => (f.width, f.height),
-            Picture::Bgra(f) => (f.width, f.height),
         };
         match picture {
             Picture::Dmabuf(frame) => {
@@ -305,13 +394,9 @@ impl State {
                 self.shown_shm = Some(buffer);
             }
         }
-        // A picture of the unrotated mode on a turned monitor is turned by the compositor.
-        let turned = (buffer_w > buffer_h) != (width > height);
-        surface.set_buffer_transform(if turned {
-            self.transform
-        } else {
-            wl_output::Transform::Normal
-        });
+        // The picture is in the monitor's mode, unturned, like the screen it was captured from:
+        // the compositor applies the monitor's transform, flips and half turns included.
+        surface.set_buffer_transform(self.transform);
         if let Some(viewport) = &self.viewport {
             viewport.set_destination(width as i32, height as i32);
         }
@@ -390,8 +475,7 @@ impl CompositorHandler for State {
 
 impl LayerShellHandler for State {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        // The monitor went away.
-        self.exit = true;
+        self.exit = Some(Some("the monitor went away".into()));
     }
 
     fn configure(
@@ -447,7 +531,7 @@ impl DmabufHandler for State {
                 .filter_map(|&i| table.get(i as usize))
                 .map(|f| (f.format, f.modifier))
         }));
-        self.linear_dmabuf = Some(linear);
+        self.linear_dmabuf = Some(linear && same_gpu(feedback.main_device(), &self.render_node));
     }
 
     fn created(
@@ -514,6 +598,30 @@ mod tests {
     use super::*;
 
     const BLOCK_LINEAR: u64 = 0x0300_0000_0060_6015;
+
+    #[test]
+    fn a_compositor_that_never_places_the_surface_does_not_hold_the_start() {
+        let (ours, _silent) = UnixStream::pair().unwrap();
+        let begin = std::time::Instant::now();
+        let error = Surface::open_on(
+            ours,
+            "DP-1",
+            std::time::Duration::from_millis(300),
+            tokio::sync::mpsc::unbounded_channel().0,
+        )
+        .err()
+        .expect("no surface");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(begin.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_device_number_is_read_as_sysfs_names_it() {
+        // makedev(226, 128): the first render node.
+        assert_eq!(char_device((226 << 8) | 128), "226:128");
+        // makedev(226, 300): the minor's high bits sit above the major.
+        assert_eq!(char_device((256 << 12) | (226 << 8) | 44), "226:300");
+    }
 
     #[test]
     fn a_compositor_with_only_tiled_dmabufs_gets_a_copy() {
