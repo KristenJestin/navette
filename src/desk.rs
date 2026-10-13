@@ -31,7 +31,8 @@ pub struct Change {
 
 impl Change {
     /// A named window rule. `fields` is the rest of the Lua table, e.g.
-    /// `match = { workspace = "2" }, monitor = "HOME-1"`.
+    /// `match = { workspace = "2" }, monitor = "HOME-1"`; every string in it must go through
+    /// [`lua_string`].
     pub fn window_rule(name: &str, fields: &str) -> Self {
         Self::named_rule("hl.window_rule", name, fields)
     }
@@ -56,6 +57,8 @@ pub enum DeskError {
     Hypr(HyprError),
     /// The record under `$XDG_RUNTIME_DIR` could not be read or written.
     Record(io::Error),
+    /// Another Navette holds the desk.
+    Busy,
 }
 
 impl fmt::Display for DeskError {
@@ -63,6 +66,7 @@ impl fmt::Display for DeskError {
         match self {
             DeskError::Hypr(e) => e.fmt(f),
             DeskError::Record(e) => write!(f, "the desk record: {e}"),
+            DeskError::Busy => write!(f, "another Navette is already changing this desk"),
         }
     }
 }
@@ -81,6 +85,8 @@ pub struct Desk<H: Hyprland> {
     record: PathBuf,
     run: String,
     changes: Vec<Change>,
+    /// Held while this desk lives, so a second Navette cannot take its rules for leftovers.
+    _lock: Option<fs::File>,
 }
 
 impl<H: Hyprland> Desk<H> {
@@ -92,16 +98,20 @@ impl<H: Hyprland> Desk<H> {
             .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is not set"))
     }
 
-    /// Opens the desk, first undoing whatever a previous run left in `record`.
+    /// Opens the desk, first undoing whatever a previous run left in `record`. Fails with
+    /// [`DeskError::Busy`] while another Navette holds it.
     pub fn start(hypr: H, record: impl Into<PathBuf>) -> Result<Self, DeskError> {
+        let record = record.into();
+        let lock = lock(&record)?;
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let mut desk = Self {
             hypr,
-            record: record.into(),
+            record,
             run: format!("{nanos:x}"),
             changes: Vec::new(),
+            _lock: Some(lock),
         };
         let leftovers = read_record(&desk.record).map_err(DeskError::Record)?;
         let remaining = desk.undo_all(leftovers);
@@ -118,7 +128,10 @@ impl<H: Hyprland> Desk<H> {
     /// it, it is undone and forgotten.
     pub fn apply(&mut self, change: Change) -> Result<(), DeskError> {
         self.changes.push(change);
-        self.save()?;
+        if let Err(e) = self.save() {
+            self.changes.pop();
+            return Err(e);
+        }
         let change = self.changes.last().expect("just pushed");
         if let Err(e) = self.hypr.eval(&change.apply) {
             let change = self.changes.pop().expect("just pushed");
@@ -153,23 +166,30 @@ impl<H: Hyprland> Desk<H> {
         }
     }
 
-    /// Undoes every change, the last one first. What Hyprland refuses to undo stays recorded,
-    /// for the next start to try again.
+    /// Undoes every change, the last one first. What could not reach Hyprland stays recorded,
+    /// for the next start to try again; what Hyprland refuses is dropped.
     pub fn stop(&mut self) -> Result<(), DeskError> {
         let undos = self.changes.drain(..).map(|c| c.undo).collect();
         let remaining = self.undo_all(undos);
         self.finish_undo(remaining)
     }
 
-    /// Runs `undos` last first; returns the ones that failed, in record order, with the first
-    /// error.
+    /// Runs `undos` last first; returns the ones that could not reach Hyprland, in record order,
+    /// with the first such error. A refused undo is logged and dropped: Hyprland will not take
+    /// it later either (a garbled line), and keeping it would fail every start.
     fn undo_all(&mut self, undos: Vec<String>) -> (Vec<String>, Option<HyprError>) {
         let mut remaining = Vec::new();
         let mut first_error = None;
         for undo in undos.into_iter().rev() {
-            if let Err(e) = self.hypr.eval(&undo) {
-                first_error.get_or_insert(e);
-                remaining.push(undo);
+            match self.hypr.eval(&undo) {
+                Ok(()) => {}
+                Err(HyprError::Refused(answer)) => {
+                    eprintln!("navette: dropping an undo Hyprland refused ({answer}): {undo}");
+                }
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                    remaining.push(undo);
+                }
             }
         }
         remaining.reverse();
@@ -187,6 +207,41 @@ impl<H: Hyprland> Desk<H> {
     fn save(&self) -> Result<(), DeskError> {
         let undos: Vec<String> = self.changes.iter().map(|c| c.undo.clone()).collect();
         write_record(&self.record, &undos).map_err(DeskError::Record)
+    }
+}
+
+impl<H: Hyprland> Drop for Desk<H> {
+    /// Best effort, for the exits that do not call [`Desk::stop`]: an error, a panic.
+    fn drop(&mut self) {
+        if !self.changes.is_empty()
+            && let Err(e) = self.stop()
+        {
+            eprintln!("navette: could not restore the desk: {e}");
+        }
+    }
+}
+
+/// Takes `<record>.lock`; the kernel releases it when the process ends, crash included.
+fn lock(record: &Path) -> Result<fs::File, DeskError> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let dir = record.parent().unwrap_or(Path::new("."));
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(DeskError::Record)?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(record.with_extension("lock"))
+        .map_err(DeskError::Record)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(DeskError::Busy),
+        Err(fs::TryLockError::Error(e)) => Err(DeskError::Record(e)),
     }
 }
 
@@ -215,7 +270,7 @@ fn write_record(path: &Path, undos: &[String]) -> io::Result<()> {
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
-    let tmp = path.with_extension("tmp");
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -230,7 +285,10 @@ fn write_record(path: &Path, undos: &[String]) -> io::Result<()> {
 }
 
 fn escape(chunk: &str) -> String {
-    chunk.replace('\\', "\\\\").replace('\n', "\\n")
+    chunk
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn unescape(line: &str) -> String {
@@ -240,6 +298,10 @@ fn unescape(line: &str) -> String {
         match (c, chars.clone().next()) {
             ('\\', Some('n')) => {
                 out.push('\n');
+                chars.next();
+            }
+            ('\\', Some('r')) => {
+                out.push('\r');
                 chars.next();
             }
             ('\\', Some('\\')) => {
@@ -315,11 +377,13 @@ mod tests {
             if !undo && state.refuse.as_deref().is_some_and(|p| lua.contains(p)) {
                 return Err(HyprError::Refused("error: refused".into()));
             }
-            let name = lua
+            let Some(name) = lua
                 .split_once("name = \"")
                 .and_then(|(_, rest)| rest.split_once('"'))
                 .map(|(name, _)| name.to_owned())
-                .expect("a named rule");
+            else {
+                return Err(HyprError::Refused("error: not a rule".into()));
+            };
             state.rules.insert(name, !undo);
             Ok(())
         }
@@ -330,6 +394,12 @@ mod tests {
             &desk.rule_name(base),
             r#"match = { workspace = "2" }, monitor = "HOME-1""#,
         )
+    }
+
+    /// What a crash leaves: no stop, no Drop; the kernel releases the lock.
+    fn crash(desk: Desk<FakeHyprland>) {
+        let mut desk = std::mem::ManuallyDrop::new(desk);
+        desk._lock.take();
     }
 
     fn record_in(dir: &tempfile::TempDir) -> PathBuf {
@@ -409,7 +479,7 @@ mod tests {
             let mut crashed = Desk::start(fake.clone(), record_in(&dir)).unwrap();
             crashed.apply(keep_home_off(&crashed, "windows")).unwrap();
             crashed.apply(keep_home_off(&crashed, "layers")).unwrap();
-            // Dropped without stop(), as a crash would.
+            crash(crashed);
         }
         assert_ne!(fake.enabled_rules(), before);
 
@@ -445,6 +515,7 @@ mod tests {
         assert!(desk.stop().is_err());
         assert!(record_in(&dir).exists());
         fake.set_unreachable(false);
+        drop(desk);
 
         Desk::start(fake.clone(), record_in(&dir)).unwrap();
         assert_eq!(fake.enabled_rules(), before);
@@ -454,9 +525,10 @@ mod tests {
     #[test]
     fn each_run_names_its_rules_afresh() {
         let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
         let first = Desk::start(FakeHyprland::default(), record_in(&dir)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1));
-        let second = Desk::start(FakeHyprland::default(), record_in(&dir)).unwrap();
+        let second = Desk::start(FakeHyprland::default(), record_in(&other)).unwrap();
         assert!(first.rule_name("windows").starts_with("navette-windows-"));
         assert_ne!(first.rule_name("windows"), second.rule_name("windows"));
     }
@@ -490,9 +562,98 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupt_record_does_not_block_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeHyprland::with_user_rule();
+        let before = fake.enabled_rules();
+        fs::create_dir_all(record_in(&dir).parent().unwrap()).unwrap();
+        fs::write(record_in(&dir), "garbled \\x line\n").unwrap();
+
+        let mut desk = Desk::start(fake.clone(), record_in(&dir)).unwrap();
+
+        assert_eq!(fake.enabled_rules(), before);
+        assert!(!record_in(&dir).exists());
+        desk.apply(keep_home_off(&desk, "windows")).unwrap();
+    }
+
+    #[test]
+    fn a_record_from_before_a_hyprland_restart_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = FakeHyprland::with_user_rule();
+        let mut crashed = Desk::start(old.clone(), record_in(&dir)).unwrap();
+        crashed.apply(keep_home_off(&crashed, "windows")).unwrap();
+        crash(crashed);
+
+        // Hyprland restarted: a new instance, with only the user's config.
+        let restarted = FakeHyprland::with_user_rule();
+        let before = restarted.enabled_rules();
+        Desk::start(restarted.clone(), record_in(&dir)).unwrap();
+
+        assert_eq!(restarted.enabled_rules(), before);
+        assert!(!record_in(&dir).exists());
+    }
+
+    #[test]
+    fn a_change_that_cannot_be_recorded_is_not_applied_nor_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeHyprland::with_user_rule();
+        let before = fake.enabled_rules();
+        let mut desk = Desk::start(fake.clone(), record_in(&dir)).unwrap();
+        let parent = record_in(&dir).parent().unwrap().to_owned();
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = desk.apply(keep_home_off(&desk, "windows"));
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(result, Err(DeskError::Record(_))));
+        assert!(desk.changes.is_empty());
+        assert_eq!(fake.enabled_rules(), before);
+    }
+
+    #[test]
+    fn dropping_the_desk_undoes_its_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeHyprland::with_user_rule();
+        let before = fake.enabled_rules();
+        {
+            let mut desk = Desk::start(fake.clone(), record_in(&dir)).unwrap();
+            desk.apply(keep_home_off(&desk, "windows")).unwrap();
+        }
+        assert_eq!(fake.enabled_rules(), before);
+        assert!(!record_in(&dir).exists());
+    }
+
+    #[test]
+    fn a_second_navette_does_not_undo_the_first_ones_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeHyprland::with_user_rule();
+        let mut first = Desk::start(fake.clone(), record_in(&dir)).unwrap();
+        first.apply(keep_home_off(&first, "windows")).unwrap();
+        let applied = fake.enabled_rules();
+
+        let second = Desk::start(fake.clone(), record_in(&dir));
+
+        assert!(second.is_err());
+        assert_eq!(fake.enabled_rules(), applied);
+        assert!(record_in(&dir).exists());
+        drop(first);
+        Desk::start(fake.clone(), record_in(&dir)).unwrap();
+    }
+
+    #[test]
     fn multi_line_chunks_survive_the_record() {
-        for chunk in ["a\nb", "back\\slash", "\\n literally", ""] {
+        for chunk in [
+            "a\nb",
+            "cr\r\nlf",
+            "back\\slash",
+            "\\n literally",
+            "\\r too",
+            "",
+        ] {
             assert_eq!(unescape(&escape(chunk)), chunk);
+            assert!(!escape(chunk).contains(['\n', '\r']));
         }
     }
 }
