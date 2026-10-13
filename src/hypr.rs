@@ -330,6 +330,8 @@ pub mod fake {
         requests: Vec<String>,
         /// `hl.window_rule` tables, as sent.
         window_rules: Vec<String>,
+        /// The Lua chunks that bind keys or disable a bind, as sent.
+        binds: Vec<String>,
         down: bool,
         /// The scale Hyprland gives a monitor whatever its rule asks (it rounds fractional ones).
         chosen_scale: Option<f32>,
@@ -361,6 +363,10 @@ pub mod fake {
         /// The window rules sent, in order, `enabled = false` ones included.
         pub fn window_rules(&self) -> Vec<String> {
             self.state.lock().unwrap().window_rules.clone()
+        }
+
+        pub fn binds(&self) -> Vec<String> {
+            self.state.lock().unwrap().binds.clone()
         }
 
         pub fn monitor(&self, name: &str) -> Option<FakeMonitor> {
@@ -456,6 +462,16 @@ pub mod fake {
                 state
                     .window_rules
                     .push(rule.trim_end_matches(')').to_string());
+                return Ok("ok".into());
+            }
+            if let Some(lua) = command.strip_prefix("eval ")
+                && (lua.contains("hl.bind(") || lua.contains(":set_enabled(false)"))
+            {
+                // Keys Hyprland cannot read: invented, as its answer.
+                if lua.contains("hl.bind(\"NOT A KEY") {
+                    return Ok("error: hl.bind: invalid key".into());
+                }
+                state.binds.push(lua.to_string());
                 return Ok("ok".into());
             }
             if let Some(lua) = command.strip_prefix("eval ") {

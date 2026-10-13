@@ -13,7 +13,6 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -240,7 +239,8 @@ async fn send<W: AsyncWrite + Unpin>(
             msg = sound.recv(), if sound_open => match msg {
                 Some(msg) => {
                     let packet = match &msg {
-                        audio::Message::Frame { packet, .. } => &packet[..],
+                        audio::Message::Frame { packet, .. }
+                        | audio::Message::MicFrame { packet, .. } => &packet[..],
                         _ => &[],
                     };
                     writer
@@ -275,7 +275,7 @@ async fn receive<R: AsyncRead + Unpin>(
     mut reader: Framed<R>,
     timeout: Duration,
     inbound: mpsc::Sender<Clip>,
-    sound: SyncSender<audio::Message>,
+    sound: audio::ToAudio,
     (display, pointer): (mpsc::Sender<Incoming>, watch::Sender<Pointer>),
     outbox: &Outbox,
     input: &input::Queue,
@@ -287,10 +287,16 @@ async fn receive<R: AsyncRead + Unpin>(
             .map_err(|_| silent())?
             .map_err(io_error)?;
         let clip = match msg {
-            LinkMsg::AudioStart { .. } | LinkMsg::AudioStop | LinkMsg::AudioFrame { .. } => {
+            LinkMsg::AudioStart { .. }
+            | LinkMsg::AudioStop
+            | LinkMsg::AudioFrame { .. }
+            | LinkMsg::MicStart { .. }
+            | LinkMsg::MicStop
+            | LinkMsg::MicFrame { .. } => {
                 let sound_msg = audio_received(&mut reader, timeout, msg).await?;
-                // Like the clipboard's, a sound the audio thread is not ready for is dropped.
-                let _ = sound.try_send(sound_msg);
+                // Like the clipboard's, a frame the audio thread is not ready for is dropped; an
+                // order is not.
+                let _ = sound.send(sound_msg);
                 continue;
             }
             LinkMsg::Display(order) => {
@@ -427,12 +433,26 @@ async fn audio_received<R: AsyncRead + Unpin>(
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the peer went silent"))?
                 .map_err(io_error)?,
         },
-        LinkMsg::AudioFrame { .. } => {
+        LinkMsg::MicStart { session } => audio::Message::MicStart { session },
+        LinkMsg::MicFrame {
+            session,
+            seq,
+            data_len,
+        } if data_len as usize <= MAX_PACKET => audio::Message::MicFrame {
+            session,
+            seq,
+            packet: tokio::time::timeout(timeout, reader.read_payload(data_len))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the peer went silent"))?
+                .map_err(io_error)?,
+        },
+        LinkMsg::AudioFrame { .. } | LinkMsg::MicFrame { .. } => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "an audio packet larger than Opus makes",
             ));
         }
+        LinkMsg::MicStop => audio::Message::MicStop,
         _ => audio::Message::Stop,
     })
 }
@@ -742,6 +762,27 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_mic_packet_larger_than_opus_makes_ends_the_link() {
+        let (a, b) = tokio::io::duplex(2 * MAX_PACKET);
+        let mut peer = Framed::new(b);
+        let data = vec![0u8; MAX_PACKET + 1];
+        peer.write_msg_with_payloads(
+            &LinkMsg::MicFrame {
+                session: 1,
+                seq: 0,
+                data_len: data.len() as u32,
+            },
+            &[&data],
+        )
+        .await
+        .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), nothing))
+            .await
+            .expect("the link must give up on an oversized packet");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
     async fn a_sound_that_never_reads_does_not_stop_the_reader() {
         let (a, b) = tokio::io::duplex(64 * 1024);
         let mut peer = Framed::new(b);
@@ -766,6 +807,49 @@ pub(crate) mod tests {
             .await
             .expect("the reader must keep reading past a sound that does not");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn an_order_after_a_flood_of_frames_still_reaches_the_audio_thread() {
+        let (a, b) = tokio::io::duplex(1024 * 1024);
+        let mut peer = Framed::new(b);
+        // The audio thread stalls (PipeWire slow to answer) while the mic keeps sending.
+        for seq in 0..(4 * audio::QUEUE as u32) {
+            peer.write_msg_with_payloads(
+                &LinkMsg::MicFrame {
+                    session: 1,
+                    seq,
+                    data_len: 3,
+                },
+                &[&[1, 2, 3]],
+            )
+            .await
+            .unwrap();
+        }
+        peer.write_msg(&LinkMsg::MicStop).await.unwrap();
+        peer.write_msg(&LinkMsg::AudioStop).await.unwrap();
+        let (taken, sound) = tokio::sync::oneshot::channel();
+        let stalled = |mut wire: Wire| async move {
+            let _ = taken.send(wire.audio.take().unwrap());
+            std::future::pending::<()>().await
+        };
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), stalled))
+            .await
+            .expect("the link ends once the peer goes silent");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let sound = sound.await.unwrap();
+        let got: Vec<audio::Message> =
+            std::iter::from_fn(|| sound.from_peer.try_recv().ok()).collect();
+        let frames = got
+            .iter()
+            .filter(|m| matches!(m, audio::Message::MicFrame { .. }))
+            .count();
+        assert!(frames <= audio::QUEUE, "{frames} frames queued");
+        assert_eq!(
+            got[frames..],
+            [audio::Message::MicStop, audio::Message::Stop],
+            "the orders were dropped"
+        );
     }
 
     /// What the service gets when the peer sends `offer`.

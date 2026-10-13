@@ -14,6 +14,10 @@
 //! - `AudioStop` (home → remote): put the previous default back and stop sending.
 //! - `AudioFrame` (remote → home), with the session and a sequence number: one Opus packet
 //!   follows it.
+//!
+//! Home's mic goes the other way ([`mic`]): `MicStart` and `MicStop` (home → remote) open and
+//! close the remote's virtual source, the default mic while a mode runs, and `MicFrame` (home
+//! → remote) carries what the home mic hears while it goes to the remote machine.
 
 #[cfg(test)]
 pub(crate) mod allocations;
@@ -21,11 +25,12 @@ pub mod codec;
 #[cfg(test)]
 pub mod fake;
 pub mod jitter;
+pub mod mic;
 pub mod pipewire;
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -67,33 +72,105 @@ pub enum Message {
         seq: u32,
         packet: Bytes,
     },
+    /// Home's mic, the other way (`mic`): the remote's source becomes the default mic for
+    /// the session.
+    MicStart {
+        session: u32,
+    },
+    MicStop,
+    /// Home → remote: one Opus packet of what the home mic hears.
+    MicFrame {
+        session: u32,
+        seq: u32,
+        packet: Bytes,
+    },
 }
 
-/// Audio messages waiting between the link and the audio thread, each way: 64 frames are
-/// 640 ms of sound. The link's reader never waits on the audio thread, nor the sink's callback
-/// on the link: past this many, a message is dropped, and home fills the gap.
+/// Audio frames waiting between the link and the audio thread, each way: 64 frames are 640 ms
+/// of sound. The link's reader never waits on the audio thread, nor the sink's callback on the
+/// link: past this many, a frame is dropped, and the other side fills the gap. Orders (start,
+/// stop) are few, and never dropped: a lost stop would leave the remote's default on Navette.
 pub const QUEUE: usize = 64;
+
+impl Message {
+    fn is_frame(&self) -> bool {
+        matches!(self, Message::Frame { .. } | Message::MicFrame { .. })
+    }
+}
 
 /// What the audio thread of one link gets: the peer's audio messages, and where to put its own.
 /// The first ends when the link drops.
 pub struct Wire {
-    pub from_peer: std::sync::mpsc::Receiver<Message>,
+    pub from_peer: Inbox,
     pub to_peer: mpsc::Sender<Message>,
+}
+
+/// The peer's audio messages, in the order they came, for the audio thread.
+pub struct Inbox {
+    messages: std::sync::mpsc::Receiver<Message>,
+    /// Frames sent and not yet taken.
+    frames: Arc<AtomicUsize>,
+}
+
+impl Inbox {
+    pub fn recv(&self) -> Result<Message, std::sync::mpsc::RecvError> {
+        self.messages.recv().map(|m| self.taken(m))
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Message, RecvTimeoutError> {
+        self.messages.recv_timeout(timeout).map(|m| self.taken(m))
+    }
+
+    pub fn try_recv(&self) -> Result<Message, std::sync::mpsc::TryRecvError> {
+        self.messages.try_recv().map(|m| self.taken(m))
+    }
+
+    fn taken(&self, message: Message) -> Message {
+        if message.is_frame() {
+            self.frames.fetch_sub(1, Ordering::Relaxed);
+        }
+        message
+    }
+}
+
+/// The link's way into an [`Inbox`]: an order always goes in, a frame only while fewer than
+/// [`QUEUE`] wait.
+pub struct ToAudio {
+    messages: std::sync::mpsc::Sender<Message>,
+    frames: Arc<AtomicUsize>,
+}
+
+impl ToAudio {
+    /// Fails once the audio thread is gone; a frame dropped for a full queue is no failure.
+    pub fn send(&self, message: Message) -> Result<(), std::sync::mpsc::SendError<Message>> {
+        if message.is_frame() && self.frames.fetch_add(1, Ordering::Relaxed) >= QUEUE {
+            self.frames.fetch_sub(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        self.messages.send(message)
+    }
 }
 
 /// The link's end of a [`Wire`].
 pub struct LinkEnd {
-    pub to_audio: std::sync::mpsc::SyncSender<Message>,
+    pub to_audio: ToAudio,
     pub from_audio: mpsc::Receiver<Message>,
 }
 
 pub fn wire() -> (Wire, LinkEnd) {
-    let (to_audio, from_peer) = std::sync::mpsc::sync_channel(QUEUE);
+    let (messages, received) = std::sync::mpsc::channel();
+    let frames = Arc::new(AtomicUsize::new(0));
     let (to_peer, from_audio) = mpsc::channel(QUEUE);
     (
-        Wire { from_peer, to_peer },
+        Wire {
+            from_peer: Inbox {
+                messages: received,
+                frames: frames.clone(),
+            },
+            to_peer,
+        },
         LinkEnd {
-            to_audio,
+            to_audio: ToAudio { messages, frames },
             from_audio,
         },
     )
@@ -107,12 +184,28 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The configured default sink, as PipeWire's `default` metadata holds it: kept as is, to be
-/// put back as it was.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DefaultSink(pub String);
+/// One of the machine's two defaults: its output, or its mic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Device {
+    Sink,
+    Source,
+}
 
-impl DefaultSink {
+impl Device {
+    fn saved_file(self) -> &'static str {
+        match self {
+            Device::Sink => "previous-default-sink",
+            Device::Source => "previous-default-source",
+        }
+    }
+}
+
+/// A configured default, as PipeWire's `default` metadata holds it: kept as is, to be put
+/// back as it was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefaultNode(pub String);
+
+impl DefaultNode {
     pub fn named(node: &str) -> Self {
         Self(format!("{{ \"name\": \"{node}\" }}"))
     }
@@ -139,14 +232,12 @@ impl DefaultSink {
     }
 }
 
-/// The file where the remote keeps the default it replaced until it is put back, so that an
-/// agent that died before putting it back finds it on its next start.
+/// The files where the remote keeps the defaults it replaced until they are put back, so
+/// that an agent that died before putting them back finds them on its next start.
 #[derive(Clone, Debug)]
 pub struct Saved {
     dir: PathBuf,
 }
-
-const SAVED_FILE: &str = "previous-default-sink";
 
 impl Saved {
     pub fn in_dir(dir: PathBuf) -> Self {
@@ -166,22 +257,22 @@ impl Saved {
 
     /// What was saved: nothing, or the default then (`None` when there was none, an empty
     /// file).
-    fn load(&self) -> io::Result<Option<Option<DefaultSink>>> {
-        match std::fs::read_to_string(self.dir.join(SAVED_FILE)) {
+    fn load(&self, device: Device) -> io::Result<Option<Option<DefaultNode>>> {
+        match std::fs::read_to_string(self.dir.join(device.saved_file())) {
             Ok(value) if value.is_empty() => Ok(Some(None)),
-            Ok(value) => Ok(Some(Some(DefaultSink(value)))),
+            Ok(value) => Ok(Some(Some(DefaultNode(value)))),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    fn save(&self, previous: Option<&DefaultSink>) -> io::Result<()> {
-        let value = previous.map_or("", |sink| sink.0.as_str());
-        crate::store::write_private(&self.dir, SAVED_FILE, value.as_bytes())
+    fn save(&self, device: Device, previous: Option<&DefaultNode>) -> io::Result<()> {
+        let value = previous.map_or("", |node| node.0.as_str());
+        crate::store::write_private(&self.dir, device.saved_file(), value.as_bytes())
     }
 
-    fn clear(&self) -> io::Result<()> {
-        match std::fs::remove_file(self.dir.join(SAVED_FILE)) {
+    fn clear(&self, device: Device) -> io::Result<()> {
+        match std::fs::remove_file(self.dir.join(device.saved_file())) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
@@ -198,10 +289,11 @@ pub type OnSound = Box<dyn FnMut(&[f32]) + Send>;
 pub trait Graph: Clone + Send + 'static {
     type Node: Send;
 
-    /// The default sink the user configured, if any.
-    fn default_sink(&self) -> io::Result<Option<DefaultSink>>;
-    /// Configures the default sink; `None` clears it, leaving the choice to the session manager.
-    fn set_default_sink(&self, sink: Option<&DefaultSink>) -> io::Result<()>;
+    /// The default sink or source the user configured, if any.
+    fn default_node(&self, device: Device) -> io::Result<Option<DefaultNode>>;
+    /// Configures the default sink or source; `None` clears it, leaving the choice to the
+    /// session manager.
+    fn set_default_node(&self, device: Device, node: Option<&DefaultNode>) -> io::Result<()>;
     /// A virtual sink: what the machine plays into it goes to `on_sound`.
     fn open_sink(&self, name: &str, description: &str, on_sound: OnSound)
     -> io::Result<Self::Node>;
@@ -212,65 +304,139 @@ pub trait Graph: Clone + Send + 'static {
         description: &str,
         jitter: Arc<Mutex<Jitter>>,
     ) -> io::Result<Self::Node>;
+    /// A virtual source, which the machine's apps record from as from a mic: it plays what
+    /// `jitter` holds.
+    fn open_source(
+        &self,
+        name: &str,
+        description: &str,
+        jitter: Arc<Mutex<Jitter>>,
+    ) -> io::Result<Self::Node>;
+    /// The mic the session manager gives the apps now: the configured default, or its own
+    /// pick when there is none.
+    fn mic_in_use(&self) -> io::Result<Option<String>>;
+    /// The mic named `mic`, with the echo of what the speakers play cancelled: what it hears
+    /// goes to `on_sound`. The echo canceller goes with the node.
+    fn open_mic(
+        &self,
+        name: &str,
+        description: &str,
+        mic: &str,
+        on_sound: OnSound,
+    ) -> io::Result<Self::Node>;
     /// Whether `node` went with the PipeWire it was opened on (restarted, say).
     fn is_gone(&self, node: &Self::Node) -> bool;
+}
+
+/// A default switched to a node of ours. Dropping it puts the previous default back.
+struct Switch<G: Graph> {
+    graph: G,
+    saved: Saved,
+    device: Device,
+    ours: DefaultNode,
+    previous: Option<DefaultNode>,
+}
+
+impl<G: Graph> Switch<G> {
+    /// Saves the default that `ours` is to replace, before anything changes.
+    fn save(graph: G, saved: Saved, device: Device, ours: &str) -> io::Result<Self> {
+        let previous = match graph.default_node(device)? {
+            // Left on our own node by an agent that died: the user's choice is the one it saved.
+            Some(current) if current.name() == Some(ours) => saved.load(device)?.flatten(),
+            current => current,
+        };
+        // Saved before switching, so that a crash from here on still knows what to put back.
+        saved.save(device, previous.as_ref())?;
+        Ok(Self {
+            graph,
+            saved,
+            device,
+            ours: DefaultNode::named(ours),
+            previous,
+        })
+    }
+
+    /// Makes our node the default, again after PipeWire restarts; what goes back at the end
+    /// is still the default from before.
+    fn switch(&self) -> io::Result<()> {
+        self.graph.set_default_node(self.device, Some(&self.ours))
+    }
+}
+
+impl<G: Graph> Drop for Switch<G> {
+    fn drop(&mut self) {
+        // Kept saved when it fails, for the next start to put back.
+        match self
+            .graph
+            .set_default_node(self.device, self.previous.as_ref())
+        {
+            Ok(()) => {
+                if let Err(e) = self.saved.clear(self.device) {
+                    eprintln!("navette: audio: could not remove the saved default: {e}");
+                }
+            }
+            Err(e) => eprintln!("navette: audio: could not put the previous default back: {e}"),
+        }
+    }
+}
+
+/// Puts back the defaults an agent that died left on Navette's nodes, as soon as audio starts
+/// again rather than at the next session; a default the user changed since stays.
+pub(crate) fn repair<G: Graph>(graph: &G, saved: &Saved) {
+    for (device, ours) in [(Device::Sink, SINK), (Device::Source, mic::SOURCE)] {
+        if let Err(e) = repair_one(graph, saved, device, ours) {
+            eprintln!("navette: audio: could not put back a default a previous run left: {e}");
+        }
+    }
+}
+
+pub(super) fn repair_one<G: Graph>(
+    graph: &G,
+    saved: &Saved,
+    device: Device,
+    ours: &str,
+) -> io::Result<()> {
+    let Some(previous) = saved.load(device)? else {
+        return Ok(());
+    };
+    if graph
+        .default_node(device)?
+        .and_then(|c| c.name().map(str::to_owned))
+        .as_deref()
+        == Some(ours)
+    {
+        graph.set_default_node(device, previous.as_ref())?;
+    }
+    saved.clear(device)
 }
 
 /// The remote's sink while home asks for the sound. Dropping it puts the previous default
 /// back, then removes the sink.
 pub struct RemoteSink<G: Graph> {
-    graph: G,
-    saved: Saved,
-    previous: Option<DefaultSink>,
+    // Field order is drop order: the apps move straight to the previous default.
+    switch: Switch<G>,
     node: G::Node,
 }
 
 impl<G: Graph> RemoteSink<G> {
     pub fn start(graph: G, saved: Saved, on_sound: OnSound) -> io::Result<Self> {
-        let ours = DefaultSink::named(SINK);
-        let previous = match graph.default_sink()? {
-            // Left on our own sink by an agent that died: the user's choice is the one it saved.
-            Some(current) if current.name() == Some(SINK) => saved.load()?.flatten(),
-            current => current,
-        };
-        // Saved before switching, so that a crash from here on still knows what to put back.
-        saved.save(previous.as_ref())?;
-        let node = graph.open_sink(SINK, SINK_DESCRIPTION, on_sound)?;
-        let sink = Self {
-            graph,
-            saved,
-            previous,
-            node,
-        };
-        sink.graph.set_default_sink(Some(&ours))?;
-        Ok(sink)
+        let switch = Switch::save(graph, saved, Device::Sink, SINK)?;
+        let node = switch.graph.open_sink(SINK, SINK_DESCRIPTION, on_sound)?;
+        switch.switch()?;
+        Ok(Self { switch, node })
     }
 
     fn is_gone(&self) -> bool {
-        self.graph.is_gone(&self.node)
+        self.switch.graph.is_gone(&self.node)
     }
 
-    /// The sink again, once PipeWire has restarted, and the default again; what goes back at
-    /// the end is still the default from before the session.
+    /// The sink again, once PipeWire has restarted, and the default again.
     fn reopen(&mut self, on_sound: OnSound) -> io::Result<()> {
-        self.node = self.graph.open_sink(SINK, SINK_DESCRIPTION, on_sound)?;
-        self.graph.set_default_sink(Some(&DefaultSink::named(SINK)))
-    }
-}
-
-impl<G: Graph> Drop for RemoteSink<G> {
-    fn drop(&mut self) {
-        // Kept saved when it fails, for the next start to put back.
-        match self.graph.set_default_sink(self.previous.as_ref()) {
-            Ok(()) => {
-                if let Err(e) = self.saved.clear() {
-                    eprintln!("navette: audio: could not remove the saved default sink: {e}");
-                }
-            }
-            Err(e) => {
-                eprintln!("navette: audio: could not put the previous default sink back: {e}")
-            }
-        }
+        self.node = self
+            .switch
+            .graph
+            .open_sink(SINK, SINK_DESCRIPTION, on_sound)?;
+        self.switch.switch()
     }
 }
 
@@ -285,6 +451,23 @@ fn sender(
     seq: Arc<AtomicU32>,
     failures: Arc<AtomicU64>,
 ) -> io::Result<OnSound> {
+    encoding(home, session, seq, failures, |session, seq, packet| {
+        Message::Frame {
+            session,
+            seq,
+            packet,
+        }
+    })
+}
+
+/// Encodes what a node hears and sends each frame as `frame` makes it, on PipeWire's thread.
+fn encoding(
+    to: mpsc::Sender<Message>,
+    session: u32,
+    seq: Arc<AtomicU32>,
+    failures: Arc<AtomicU64>,
+    frame: fn(u32, u32, Bytes) -> Message,
+) -> io::Result<OnSound> {
     let mut encoder = Encoder::new()?;
     // The packets are cut from one block, so a frame costs no allocation of its own.
     let mut arena = BytesMut::with_capacity(ARENA);
@@ -294,14 +477,14 @@ fn sender(
                 arena.reserve(ARENA);
             }
             arena.extend_from_slice(packet);
-            let frame = Message::Frame {
+            let frame = frame(
                 session,
-                seq: seq.fetch_add(1, Ordering::Relaxed),
-                packet: arena.split().freeze(),
-            };
-            // Late sound is worse than lost sound: a full link drops the frame, and home fills
-            // the gap.
-            let _ = home.try_send(frame);
+                seq.fetch_add(1, Ordering::Relaxed),
+                arena.split().freeze(),
+            );
+            // Late sound is worse than lost sound: a full link drops the frame, and the other
+            // side fills the gap.
+            let _ = to.try_send(frame);
         });
         if sent.is_err() {
             failures.fetch_add(1, Ordering::Relaxed);
@@ -379,9 +562,12 @@ pub fn remote<G: Graph>(
             if let Some(previous) = after {
                 let _ = previous.join();
             }
+            repair(&graph, &saved);
             let mut sink = None;
+            let mut voice: Option<mic::Voice<G>> = None;
             // Told once per outage, not at each check while PipeWire is still away.
             let mut lost = false;
+            let mut voice_lost = false;
             loop {
                 match wire.from_peer.recv_timeout(CHECK) {
                     Ok(Message::Start { session }) => {
@@ -398,8 +584,41 @@ pub fn remote<G: Graph>(
                         }
                     }
                     Ok(Message::Stop) => drop(sink.take()),
+                    Ok(Message::MicStart { session }) => {
+                        let started = match voice.take() {
+                            // No flip of the default away and back.
+                            Some(mut running) => running.restart(session).map(|()| running),
+                            None => mic::Voice::start(graph.clone(), saved.clone(), session),
+                        };
+                        match started {
+                            Ok(started) => voice = Some(started),
+                            Err(e) => eprintln!("navette: mic: could not start the source: {e}"),
+                        }
+                    }
+                    Ok(Message::MicStop) => drop(voice.take()),
+                    Ok(Message::MicFrame {
+                        session,
+                        seq,
+                        packet,
+                    }) => {
+                        if let Some(voice) = &mut voice
+                            && let Err(e) = voice.received(session, seq, &packet)
+                        {
+                            eprintln!("navette: mic: {e}");
+                        }
+                    }
                     Ok(Message::Frame { .. }) | Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
+                }
+                if let Some(voice) = &mut voice {
+                    match voice.recover() {
+                        Ok(()) => voice_lost = false,
+                        Err(e) if !voice_lost => {
+                            eprintln!("navette: mic: could not open the source again: {e}");
+                            voice_lost = true;
+                        }
+                        Err(_) => {}
+                    }
                 }
                 if let Some(capture) = &mut sink {
                     match capture.recover() {
@@ -420,6 +639,33 @@ struct Playback<G: Graph> {
     session: u32,
     jitter: Arc<Mutex<Jitter>>,
     decoder: Decoder,
+    undecoded: Undecoded,
+}
+
+/// The packets of a session that could not be decoded: the first is told, the rest counted and
+/// told once the session ends, as a broken stream would otherwise fill the log a line a frame.
+struct Undecoded(u64, &'static str);
+
+impl Undecoded {
+    fn new(what: &'static str) -> Self {
+        Self(0, what)
+    }
+
+    fn failed(&mut self, e: io::Error) -> io::Result<()> {
+        self.0 += 1;
+        if self.0 == 1 { Err(e) } else { Ok(()) }
+    }
+}
+
+impl Drop for Undecoded {
+    fn drop(&mut self) {
+        if self.0 > 1 {
+            eprintln!(
+                "navette: {}: {} packets could not be decoded",
+                self.1, self.0
+            );
+        }
+    }
 }
 
 /// Home's side: asks the remote for its sound and plays it. Its calls wait for PipeWire and
@@ -456,6 +702,7 @@ impl<G: Graph> Home<G> {
             session,
             jitter,
             decoder: Decoder::new()?,
+            undecoded: Undecoded::new("audio"),
         });
         self.order(Message::Start { session })
     }
@@ -483,8 +730,10 @@ impl<G: Graph> Home<G> {
             // Sent before home stopped: its numbering is not the new session's.
             && session == playback.session
         {
-            let pcm = playback.decoder.decode(seq, &packet)?;
-            lock(&playback.jitter).push(&pcm);
+            match playback.decoder.decode(seq, &packet) {
+                Ok(pcm) => lock(&playback.jitter).push(&pcm),
+                Err(e) => return playback.undecoded.failed(e),
+            }
         }
         Ok(())
     }
@@ -516,11 +765,11 @@ mod tests {
     use super::*;
     use crate::link;
 
-    const WAIT: Duration = Duration::from_secs(10);
+    pub(super) const WAIT: Duration = Duration::from_secs(10);
 
     /// The audio wires of the two ends of a link in memory, and home's end of the link, to
     /// drop it.
-    async fn linked() -> (Wire, Wire, tokio::task::JoinHandle<io::Error>) {
+    pub(super) async fn linked() -> (Wire, Wire, tokio::task::JoinHandle<io::Error>) {
         let (home_stream, remote_stream) = tokio::io::duplex(64 * 1024);
         let heartbeat = link::Heartbeat::default();
         let end = |stream| {
@@ -537,7 +786,7 @@ mod tests {
         (home.await.unwrap(), remote.await.unwrap(), home_end)
     }
 
-    async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    pub(super) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
         tokio::time::timeout(WAIT, tokio::task::spawn_blocking(f))
             .await
             .expect("in time")
@@ -545,7 +794,7 @@ mod tests {
     }
 
     /// Polls `check` on the fake graph until it holds.
-    async fn until(graph: &FakeGraph, check: impl Fn(&fake::State) -> bool) {
+    pub(super) async fn until(graph: &FakeGraph, check: impl Fn(&fake::State) -> bool) {
         tokio::time::timeout(WAIT, async {
             while !check(&graph.state()) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -555,7 +804,7 @@ mod tests {
         .expect("the graph reached the expected state in time");
     }
 
-    fn tone(frames: usize) -> Vec<f32> {
+    pub(super) fn tone(frames: usize) -> Vec<f32> {
         (0..frames * codec::FRAME)
             .flat_map(|i| {
                 let v = 0.5 * (i as f32 * 440.0 * std::f32::consts::TAU / codec::RATE as f32).sin();
@@ -575,12 +824,19 @@ mod tests {
                 packet: Bytes::from_static(&[9, 8, 7]),
             },
             Message::Stop,
+            Message::MicStart { session: 8 },
+            Message::MicFrame {
+                session: 8,
+                seq: 0x0506_0708,
+                packet: Bytes::from_static(&[6, 5]),
+            },
+            Message::MicStop,
         ];
         for message in &messages {
             home.to_peer.send(message.clone()).await.unwrap();
         }
         let received = blocking(move || {
-            (0..3)
+            (0..6)
                 .map(|_| remote.from_peer.recv_timeout(WAIT).unwrap())
                 .collect::<Vec<_>>()
         })
@@ -589,7 +845,7 @@ mod tests {
     }
 
     /// A saved-default file of its own, in a temporary directory.
-    fn saved() -> (tempfile::TempDir, Saved) {
+    pub(super) fn saved() -> (tempfile::TempDir, Saved) {
         let tmp = tempfile::tempdir().unwrap();
         let saved = Saved::in_dir(tmp.path().join("state"));
         (tmp, saved)
@@ -608,12 +864,12 @@ mod tests {
             r#"{ name = invented-speakers }"#,
         ] {
             assert_eq!(
-                DefaultSink(value.to_owned()).name(),
+                DefaultNode(value.to_owned()).name(),
                 Some("invented-speakers"),
                 "{value}"
             );
         }
-        assert_eq!(DefaultSink("{}".to_owned()).name(), None);
+        assert_eq!(DefaultNode("{}".to_owned()).name(), None);
     }
 
     #[test]
@@ -621,17 +877,17 @@ mod tests {
         let graph = FakeGraph::with_default("speakers");
         let (_tmp, saved) = saved();
         let sink = start(&graph, &saved);
-        assert_eq!(graph.state().default, Some(DefaultSink::named(SINK)));
+        assert_eq!(graph.state().default, Some(DefaultNode::named(SINK)));
         drop(sink);
         let state = graph.state();
-        assert_eq!(state.default, Some(DefaultSink::named("speakers")));
+        assert_eq!(state.default, Some(DefaultNode::named("speakers")));
         // Put back before the sink goes, so the apps move straight to the previous one.
         assert_eq!(
             state.log,
             [
                 format!("sink {SINK}"),
-                format!("default {}", DefaultSink::named(SINK).0),
-                format!("default {}", DefaultSink::named("speakers").0),
+                format!("default {}", DefaultNode::named(SINK).0),
+                format!("default {}", DefaultNode::named("speakers").0),
                 format!("remove {SINK}"),
             ]
         );
@@ -649,7 +905,7 @@ mod tests {
     fn a_default_left_on_the_navette_sink_with_nothing_saved_is_cleared() {
         // Written by the session manager in its own form, not ours.
         let graph = FakeGraph::default();
-        graph.state().default = Some(DefaultSink(format!(r#"{{"name":"{SINK}"}}"#)));
+        graph.state().default = Some(DefaultNode(format!(r#"{{"name":"{SINK}"}}"#)));
         let (_tmp, saved) = saved();
         drop(start(&graph, &saved));
         assert_eq!(graph.state().default, None);
@@ -662,12 +918,12 @@ mod tests {
         let graph = FakeGraph::with_default("speakers");
         let (_tmp, saved) = saved();
         let sink = start(&graph, &saved);
-        let file = saved.dir.join(SAVED_FILE);
+        let file = saved.dir.join(Device::Sink.saved_file());
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(
-            saved.load().unwrap(),
-            Some(Some(DefaultSink::named("speakers")))
+            saved.load(Device::Sink).unwrap(),
+            Some(Some(DefaultNode::named("speakers")))
         );
         drop(sink);
         assert!(!file.exists());
@@ -679,11 +935,11 @@ mod tests {
         let (_tmp, saved) = saved();
         // An agent that died while switched: the default is still ours.
         std::mem::forget(start(&graph, &saved));
-        assert_eq!(graph.state().default, Some(DefaultSink::named(SINK)));
+        assert_eq!(graph.state().default, Some(DefaultNode::named(SINK)));
 
         drop(start(&graph, &saved));
-        assert_eq!(graph.state().default, Some(DefaultSink::named("speakers")));
-        assert_eq!(saved.load().unwrap(), None);
+        assert_eq!(graph.state().default, Some(DefaultNode::named("speakers")));
+        assert_eq!(saved.load(Device::Sink).unwrap(), None);
     }
 
     #[test]
@@ -694,8 +950,8 @@ mod tests {
         graph.state().refuse_defaults = true;
         drop(sink);
         assert_eq!(
-            saved.load().unwrap(),
-            Some(Some(DefaultSink::named("speakers")))
+            saved.load(Device::Sink).unwrap(),
+            Some(Some(DefaultNode::named("speakers")))
         );
     }
 
@@ -709,11 +965,11 @@ mod tests {
         home(home_graph.clone(), home_peer).unwrap();
 
         until(&remote_graph, |s| !s.sinks.is_empty()).await;
-        assert_eq!(remote_graph.state().default, Some(DefaultSink::named(SINK)));
+        assert_eq!(remote_graph.state().default, Some(DefaultNode::named(SINK)));
         // Home's own default output is never touched.
         assert_eq!(
             home_graph.state().default,
-            Some(DefaultSink::named("home-speakers"))
+            Some(DefaultNode::named("home-speakers"))
         );
 
         let sink = remote_graph.state().sinks[0].1.clone();
@@ -761,7 +1017,7 @@ mod tests {
         until(&remote_graph, |s| s.sinks.is_empty()).await;
         assert_eq!(
             remote_graph.state().default,
-            Some(DefaultSink::named("laptop-speakers"))
+            Some(DefaultNode::named("laptop-speakers"))
         );
         assert!(home_graph.state().playbacks.is_empty());
 
@@ -789,7 +1045,7 @@ mod tests {
         assert!(remote_graph.state().sinks.is_empty());
         assert_eq!(
             remote_graph.state().default,
-            Some(DefaultSink::named("laptop-speakers"))
+            Some(DefaultNode::named("laptop-speakers"))
         );
     }
 
@@ -833,6 +1089,25 @@ mod tests {
         );
     }
 
+    /// No Opus packet: its header asks for more frames than a packet holds.
+    pub(super) const BROKEN: [u8; 3] = [0xff, 0xff, 0xff];
+
+    #[test]
+    fn a_run_of_broken_packets_is_told_once() {
+        let (to_remote, _orders) = mpsc::channel(8);
+        let mut home = Home::new(FakeGraph::default(), to_remote);
+        home.start().unwrap();
+        let frame = |seq| Message::Frame {
+            session: 1,
+            seq,
+            packet: Bytes::from_static(&BROKEN),
+        };
+        assert!(home.received(frame(0)).is_err());
+        assert!(home.received(frame(1)).is_ok());
+        assert!(home.received(frame(2)).is_ok());
+        assert_eq!(home.playback.as_ref().unwrap().undecoded.0, 3);
+    }
+
     #[tokio::test]
     async fn the_sink_comes_back_after_pipewire_restarts() {
         let graph = FakeGraph::with_default("laptop-speakers");
@@ -845,14 +1120,14 @@ mod tests {
         // PipeWire restarts: the sink goes, and the session manager falls back to another
         // output.
         graph.restart();
-        graph.state().default = Some(DefaultSink::named("hdmi-out"));
+        graph.state().default = Some(DefaultNode::named("hdmi-out"));
         until(&graph, |s| {
-            !s.sinks.is_empty() && s.default == Some(DefaultSink::named(SINK))
+            !s.sinks.is_empty() && s.default == Some(DefaultNode::named(SINK))
         })
         .await;
         assert_eq!(
-            saved.load().unwrap(),
-            Some(Some(DefaultSink::named("laptop-speakers")))
+            saved.load(Device::Sink).unwrap(),
+            Some(Some(DefaultNode::named("laptop-speakers")))
         );
 
         // The user's choice from before the session comes back, not the fallback.
@@ -860,9 +1135,9 @@ mod tests {
         blocking(move || audio.join().unwrap()).await;
         assert_eq!(
             graph.state().default,
-            Some(DefaultSink::named("laptop-speakers"))
+            Some(DefaultNode::named("laptop-speakers"))
         );
-        assert_eq!(saved.load().unwrap(), None);
+        assert_eq!(saved.load(Device::Sink).unwrap(), None);
     }
 
     #[test]
@@ -921,23 +1196,23 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         until(&remote_graph, |s| {
-            s.default == Some(DefaultSink::named(SINK))
+            s.default == Some(DefaultNode::named(SINK))
         })
         .await;
         // Long enough for a late put-back of the first link to land, if it were still coming.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(remote_graph.state().default, Some(DefaultSink::named(SINK)));
+        assert_eq!(remote_graph.state().default, Some(DefaultNode::named(SINK)));
         // And the second link's save is not wiped by the first one's clean-up.
         assert_eq!(
-            saved.load().unwrap(),
-            Some(Some(DefaultSink::named("laptop-speakers")))
+            saved.load(Device::Sink).unwrap(),
+            Some(Some(DefaultNode::named("laptop-speakers")))
         );
 
         link.abort();
         blocking(move || second.join().unwrap()).await;
         assert_eq!(
             remote_graph.state().default,
-            Some(DefaultSink::named("laptop-speakers"))
+            Some(DefaultNode::named("laptop-speakers"))
         );
     }
 }
