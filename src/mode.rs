@@ -506,12 +506,13 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
     );
     let covered = names.clone();
     let (shown, desk, mic) = blocking(move || {
+        let gpus = decoding_gpus(gpu, covered.len(), decode::open_gpu);
         let mut shown = Vec::new();
-        for (index, name) in covered.iter().enumerate() {
+        for ((index, name), gpu) in covered.iter().enumerate().zip(gpus) {
             let output = index as u8;
             let screen = screens.open(name, input.on(output), hotkey, ended_tx.clone())?;
             let decoding = Decoding::start(
-                gpu.clone(),
+                gpu,
                 screen.takes_dmabuf(),
                 outbox.on(output),
                 screen.pictures(),
@@ -550,6 +551,21 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
         starting: None,
     });
     Ok(())
+}
+
+/// One decoding GPU per output, none shared: a `Gpu` is not thread-safe (one Vulkan queue,
+/// one VA-API display), and two decoders submitting on one at once lost the device on an
+/// NVIDIA GPU. The first output takes home's; each other one opens its own, and decodes on the
+/// CPU when it cannot. Without a GPU at home, every output decodes on the CPU.
+fn decoding_gpus<T>(
+    first: Option<T>,
+    count: usize,
+    mut open: impl FnMut() -> Option<T>,
+) -> Vec<Option<T>> {
+    let on_gpu = first.is_some();
+    let mut gpus = vec![first];
+    gpus.extend((1..count).map(|_| if on_gpu { open() } else { None }));
+    gpus
 }
 
 /// Opens the desk (undoing what a previous run left) and keeps home windows off the `given`
@@ -1629,5 +1645,26 @@ mod tests {
         assert!(error.contains("DP-3 twice"), "{error}");
         std::fs::write(&path, "monitor = ,\n").unwrap();
         assert!(monitors(config.path()).is_err());
+    }
+
+    #[test]
+    fn no_two_outputs_decode_on_the_same_gpu() {
+        let opened = std::cell::Cell::new(0);
+        let open = || {
+            opened.set(opened.get() + 1);
+            Some(Arc::new(opened.get()))
+        };
+        let home = Arc::new(0);
+        let gpus = decoding_gpus(Some(home.clone()), 3, open);
+        assert!(Arc::ptr_eq(gpus[0].as_ref().unwrap(), &home));
+        let distinct: std::collections::HashSet<_> = gpus
+            .iter()
+            .map(|g| Arc::as_ptr(g.as_ref().unwrap()))
+            .collect();
+        assert_eq!(distinct.len(), 3);
+        // On the CPU at home, no GPU is opened for the others.
+        let gpus = decoding_gpus(None, 2, open);
+        assert_eq!(gpus, [None, None]);
+        assert_eq!(opened.get(), 2);
     }
 }
