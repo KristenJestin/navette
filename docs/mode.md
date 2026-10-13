@@ -72,6 +72,45 @@ While the mode runs:
 - **The home mic**, with `navette serve --audio`, goes to the remote machine while the mode runs,
   and the hotkey switches it either way ([the mic](mic.md)).
 
+## Closing the remote laptop
+
+The remote laptop can be closed while a mode runs, and opened again, if home's `mode.conf`
+says so (it is off by default):
+
+```
+closed_lid = on     # or off
+```
+
+- **Closed**, the laptop's own screen (the output named `eDP-…`, `LVDS-…` or `DSI-…`; both,
+  on a laptop with two) is disabled within a second, and Hyprland moves its workspaces to
+  Navette's outputs. The laptop does not suspend: the agent holds logind's
+  `handle-lid-switch` inhibitor lock, which needs no root, for as long as the mode runs. The
+  agent reads logind's `LidClosed` once a second, on a thread of its own, so neither logind
+  nor Hyprland ever holds home's keyboard and pointer; the mode starts at once, and the lid
+  is watched once logind has given the lock.
+- **Opened**, the screen comes back with the mode, place, scale and orientation it had, beside
+  Navette's outputs, and Hyprland gives it back the workspaces it had.
+- **A config reload** or a script on the lid that turns the screen on while the lid is closed
+  is undone at once; after a Hyprland restart, the screen is disabled again once Navette's
+  outputs are back.
+- **Undone** when the mode stops, when the link drops and when the agent stops: the screen
+  comes back first, then the lock is released, and logind handles the lid as it always does.
+  The rule that brings the screen back is kept in `$XDG_RUNTIME_DIR/navette/lid` until it is
+  back: when Hyprland could not be reached to take it, the agent tries again at Hyprland's
+  next event, at the next mode, and when it starts again after a crash (its lock went with
+  it). If the agent's loop fails, the agent ends and systemd starts it again.
+- **When the lid cannot be watched**, the mode runs without the option, the lid does what it
+  always does, and `navette serve` says why at home, as the agent does in its journal
+  (`journalctl --user -u navette-agent`). Nothing else is tried. That is when logind or the
+  laptop's policy refuses the lock, when `LidClosed` cannot be read (then no lock is taken;
+  if it stops being readable for five seconds, the screen comes back and the lock is let
+  go), and without `XDG_RUNTIME_DIR`. An agent too old to know `closed_lid` is named in
+  `navette mode start`'s answer.
+
+Nothing else on the laptop changes: its idle lock works as usual, and so does a lock on
+closing the lid (Omarchy's lid bind locks the session when no physical monitor is plugged in;
+Navette's outputs do not count as one). It is unlocked from the home monitors.
+
 ## Keyboard and pointer
 
 Focus follows the pointer, with nothing to click. Over a reserved monitor, the keyboard,

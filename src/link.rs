@@ -420,6 +420,10 @@ async fn receive<R: AsyncRead + Unpin>(
                 let _ = display.try_send(Incoming::NoInput(reason));
                 continue;
             }
+            LinkMsg::NoLid { reason } => {
+                let _ = display.try_send(Incoming::NoLid(reason));
+                continue;
+            }
             msg => msg,
         };
         let Some(clip) = clip.into_clipboard().map(checked) else {
@@ -1411,6 +1415,18 @@ pub(crate) mod tests {
         );
         match incoming(&mut ends.home).await {
             Incoming::NoInput(reason) => assert_eq!(reason, "no virtual keyboard"),
+            other => panic!("expected the notice, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_remote_s_no_lid_notice_crosses_the_link() {
+        let mut ends = display_link(64 * 1024).await;
+        ends.remote
+            .outbox
+            .send(DisplayMsg::NoLid("Access denied".into()), Vec::new());
+        match incoming(&mut ends.home).await {
+            Incoming::NoLid(reason) => assert_eq!(reason, "Access denied"),
             other => panic!("expected the notice, got {other:?}"),
         }
     }

@@ -20,6 +20,7 @@ use navette::desk::Desk;
 use navette::display::{decode, remote};
 use navette::hypr::{self, Eval};
 use navette::input;
+use navette::lid;
 use navette::link::{self, Backoff, Event, Heartbeat, Wire};
 use navette::mic::{self, Mic, NoSound, Routing};
 use navette::mode::{self, Home};
@@ -267,13 +268,15 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let (peers, peers_rx) = mpsc::unbounded_channel();
             let (hypr_events, hypr_events_rx) = mpsc::unbounded_channel();
             hypr::watch_events(hypr_events);
-            let display = tokio::spawn(remote::serve(
-                peers_rx,
-                Arc::new(hypr::Live),
-                Arc::new(remote::LiveStreams),
-                Arc::new(input::LiveInjectors),
-                hypr_events_rx,
-            ));
+            let ports = remote::Ports {
+                hypr: Arc::new(hypr::Live),
+                streams: Arc::new(remote::LiveStreams),
+                injectors: Arc::new(input::LiveInjectors),
+                logind: Arc::new(lid::LiveLogind),
+                lid_record: lid::record_path(),
+                lid_poll: lid::POLL,
+            };
+            let mut display = tokio::spawn(remote::serve(peers_rx, ports, hypr_events_rx));
             let graph = PipeWire::default();
             let saved = audio::Saved::in_dir(audio::Saved::default_dir()?);
             // The latest link's audio thread; each one joins the one before it.
@@ -305,6 +308,15 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             tokio::select! {
                 () = local.run_until(agent) => {}
                 result = stopped() => result?,
+                // It serves until the link's end; ended before, it panicked. Its watch put the
+                // laptop's screen back; the agent ends, and systemd starts it again, which
+                // removes what is left.
+                ended = &mut display => {
+                    return Err(std::io::Error::other(format!(
+                        "the display stopped: {}",
+                        ended.err().map_or_else(|| "no reason".into(), |e| e.to_string())
+                    )));
+                }
             }
             // The link is dropped: the display removes its output, and the audio thread removes
             // its sink and puts the previous default output back; the process waits for both.

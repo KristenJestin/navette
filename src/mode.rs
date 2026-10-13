@@ -135,6 +135,24 @@ pub fn release_hotkey(config_dir: &Path) -> io::Result<Option<Hotkey>> {
     })
 }
 
+/// Whether the remote laptop may be closed while the mode runs: `closed_lid = on` in the
+/// mode's config; off when it says nothing.
+pub fn closed_lid(config_dir: &Path) -> io::Result<bool> {
+    let path = config_dir.join(CONFIG_FILE);
+    let text = std::fs::read_to_string(&path)?;
+    match setting(&text, "closed_lid") {
+        None | Some("off") => Ok(false),
+        Some("on") => Ok(true),
+        Some(other) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{}: `closed_lid = {other}`: on or off; nothing was changed",
+                path.display()
+            ),
+        )),
+    }
+}
+
 /// The keys that switch the mic: `mic_hotkey` in `mode.conf`, or [`MIC_HOTKEY`].
 fn mic_hotkey(config_dir: &Path) -> String {
     let text = std::fs::read_to_string(config_dir.join(CONFIG_FILE)).unwrap_or_default();
@@ -256,6 +274,8 @@ struct Active {
     released: UnboundedReceiver<()>,
     /// The `navette mode start` waiting for the remote's answer.
     starting: Option<(oneshot::Sender<io::Result<String>>, tokio::time::Instant)>,
+    /// `closed_lid = on` was asked of the remote.
+    closed_lid: bool,
 }
 
 /// One monitor's cover and the decoder of its output's stream.
@@ -304,7 +324,7 @@ pub async fn serve(
                         stop(&mut active, "the link to the remote machine dropped").await;
                     }
                 }
-                Heard::Msg(Incoming::Display(Display::Started { output, others })) => {
+                Heard::Msg(Incoming::Display(Display::Started { output, others, closed_lid })) => {
                     let mut outputs = vec![output];
                     outputs.extend(others.unwrap_or_default());
                     let short = active
@@ -326,11 +346,18 @@ pub async fn serve(
                         && let Some((reply, _)) = a.starting.take()
                     {
                         let verb = if a.monitors.len() > 1 { "show" } else { "shows" };
-                        let _ = reply.send(Ok(format!(
+                        let mut text = format!(
                             "{} {verb} the remote machine's {}",
                             a.label(),
                             outputs.join(", ")
-                        )));
+                        );
+                        if a.closed_lid && closed_lid.is_none() {
+                            text.push_str(
+                                "; the remote machine's agent does not know closed_lid, its lid \
+                                 does what it always does: update navette there",
+                            );
+                        }
+                        let _ = reply.send(Ok(text));
                     }
                 }
                 Heard::Msg(Incoming::Display(Display::Failed { reason })) => {
@@ -353,6 +380,10 @@ pub async fn serve(
                 Heard::Msg(Incoming::NoInput(reason)) => eprintln!(
                     "navette: the remote machine shows its picture but cannot take home's \
                      keyboard and pointer: {reason}"
+                ),
+                Heard::Msg(Incoming::NoLid(reason)) => eprintln!(
+                    "navette: closed_lid: the remote machine's lid does what it always does: \
+                     {reason}"
                 ),
                 Heard::Pointer(pointers) => {
                     if let Some(a) = &active {
@@ -517,6 +548,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
     }
     let names = self::monitors(&home.config_dir)?;
     let hotkey = release_hotkey(&home.config_dir)?;
+    let closed_lid = closed_lid(&home.config_dir)?;
     let hypr = home.hypr.clone();
     let monitors = blocking(move || hypr::monitors(&*hypr)).await?;
     let mut given = Vec::new();
@@ -608,6 +640,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
             output: first,
             caps,
             others: (!others.is_empty()).then_some(others),
+            closed_lid: Some(closed_lid),
         }),
         Vec::new(),
     );
@@ -623,6 +656,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
         ended,
         released,
         starting: None,
+        closed_lid,
     });
     // What was already under the monitors comes out from under the covers.
     send_home(home, sending).await;
@@ -1107,6 +1141,7 @@ mod tests {
             .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
                 others: None,
+                closed_lid: None,
             }))
             .unwrap();
         let text = answer(pending).await.unwrap();
@@ -1157,6 +1192,7 @@ mod tests {
             .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
                 others: None,
+                closed_lid: None,
             }))
             .unwrap();
         answer(pending).await.unwrap();
@@ -1290,6 +1326,7 @@ mod tests {
             .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
                 others: None,
+                closed_lid: None,
             }))
             .unwrap();
         answer(pending).await.unwrap();
@@ -1356,6 +1393,7 @@ mod tests {
             .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
                 others: Some(vec!["NAVETTE-2".into()]),
+                closed_lid: None,
             }))
             .unwrap();
         answer(pending).await.unwrap();
@@ -1471,6 +1509,75 @@ mod tests {
         assert_eq!(*desk.hotkeys.lock().unwrap(), [chosen]);
     }
 
+    fn closed_lid_sent(remote: &Remote) -> Vec<Option<bool>> {
+        remote
+            .outbox
+            .queued()
+            .into_iter()
+            .filter_map(|m| match m {
+                Msg::Display(Display::Start { closed_lid, .. }) => Some(closed_lid),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn closed_lid_on_is_sent_with_the_mode() {
+        let desk = desk_with("monitor = DP-2\nclosed_lid = on   # the laptop stays shut\n");
+        let remote = connect(&desk);
+        let _pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        assert_eq!(closed_lid_sent(&remote), [Some(true)]);
+    }
+
+    #[tokio::test]
+    async fn closed_lid_is_off_by_default() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        let _pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        assert_eq!(closed_lid_sent(&remote), [Some(false)]);
+    }
+
+    /// A mode with `closed_lid = on` the remote says started, `said` back: `mode start`'s answer.
+    async fn started_with_the_lid(said: Option<bool>) -> String {
+        let desk = desk_with("monitor = DP-2\nclosed_lid = on\n");
+        let remote = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        remote
+            .to_home
+            .try_send(Incoming::Display(Display::Started {
+                output: "NAVETTE-1".into(),
+                others: None,
+                closed_lid: said,
+            }))
+            .unwrap();
+        answer(pending).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_does_not_know_closed_lid_is_said_at_start() {
+        let text = started_with_the_lid(None).await;
+        assert!(
+            text.contains("closed_lid") && text.contains("update"),
+            "{text}"
+        );
+        let text = started_with_the_lid(Some(true)).await;
+        assert!(!text.contains("closed_lid"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_closed_lid_value_other_than_on_or_off_fails_clearly_and_changes_nothing() {
+        let desk = desk_with("monitor = DP-2\nclosed_lid = yes please\n");
+        let remote = connect(&desk);
+        let error = answer(ask(&desk, true).await).await.unwrap_err();
+        assert!(error.to_string().contains("closed_lid"), "{error}");
+        assert!(desk.covered.lock().unwrap().is_empty());
+        assert!(remote.outbox.queued().is_empty());
+        assert!(desk.hypr.changes().is_empty());
+    }
+
     #[tokio::test]
     async fn a_release_hotkey_with_no_known_key_fails_clearly_and_changes_nothing() {
         let desk = desk_with("monitor = DP-2\nrelease = shift+nokey\n");
@@ -1529,6 +1636,7 @@ mod tests {
             .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
                 others: None,
+                closed_lid: None,
             }))
             .unwrap();
         answer(pending).await.unwrap();
@@ -1569,6 +1677,7 @@ mod tests {
             .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
                 others: None,
+                closed_lid: None,
             }))
             .unwrap();
         answer(pending).await.unwrap();
@@ -1742,6 +1851,7 @@ mod tests {
             .try_send(Incoming::Display(Display::Started {
                 output: outputs[0].into(),
                 others: (!others.is_empty()).then_some(others),
+                closed_lid: None,
             }))
             .unwrap();
         let text = answer(pending).await;

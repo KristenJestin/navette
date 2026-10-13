@@ -459,6 +459,8 @@ pub mod fake {
         pub y: i32,
         pub scale: f32,
         pub transform: i32,
+        /// Disabled by a rule: listed by `monitors all`, its mode and place kept.
+        pub disabled: bool,
     }
 
     impl FakeMonitor {
@@ -472,6 +474,7 @@ pub mod fake {
                 y: 0,
                 scale: 1.0,
                 transform: 0,
+                disabled: false,
             }
         }
     }
@@ -664,7 +667,8 @@ pub mod fake {
             self.state.lock().unwrap().chosen_scale = Some(scale);
         }
 
-        /// `hyprctl reload`: the runtime rules are gone, the outputs stay, at scale 2.
+        /// `hyprctl reload`: the runtime rules are gone, the outputs stay, at scale 2, and an
+        /// output disabled at runtime is on again.
         pub fn reload(&self) {
             let mut state = self.state.lock().unwrap();
             state.rules.clear();
@@ -673,12 +677,16 @@ pub mod fake {
                 if m.name.starts_with("NAVETTE") {
                     m.scale = 2.0;
                 }
+                m.disabled = false;
             }
         }
 
-        fn apply_rule(state: &mut State, mut rule: FakeMonitor) {
+        /// A rule merges into the output's: one that does not say `disabled = false` leaves a
+        /// disabled output disabled (measured in #36).
+        fn apply_rule(state: &mut State, mut rule: FakeMonitor, enables: bool) {
             rule.scale = state.chosen_scale.unwrap_or(rule.scale);
             if let Some(m) = state.monitors.iter_mut().find(|m| m.name == rule.name) {
+                rule.disabled = m.disabled && !enables;
                 *m = rule.clone();
             }
             state.rules.retain(|(name, _)| *name != rule.name);
@@ -716,6 +724,7 @@ pub mod fake {
             y: y.parse().ok()?,
             scale: field("scale")?.parse().ok()?,
             transform: field("transform")?.parse().ok()?,
+            disabled: false,
         })
     }
 
@@ -736,9 +745,9 @@ pub mod fake {
                     .enumerate()
                     .map(|(id, m)| {
                         format!(
-                            r#"{{"id":{id},"name":"{}","width":{},"height":{},"refreshRate":{},"x":{},"y":{},"scale":{},"transform":{},"focused":false,"disabled":false,"activeWorkspace":{{"id":{},"name":"{}"}}}}"#,
+                            r#"{{"id":{id},"name":"{}","width":{},"height":{},"refreshRate":{},"x":{},"y":{},"scale":{},"transform":{},"focused":false,"disabled":{},"activeWorkspace":{{"id":{},"name":"{}"}}}}"#,
                             m.name, m.width, m.height, m.refresh, m.x, m.y, m.scale, m.transform,
-                            state.shown(&m.name), state.shown(&m.name)
+                            m.disabled, state.shown(&m.name), state.shown(&m.name)
                         )
                     })
                     .collect();
@@ -857,10 +866,22 @@ pub mod fake {
                 state.cursor_invisible = lua.starts_with("true");
                 return Ok("ok".into());
             }
+            if let Some(name) = command
+                .strip_prefix("eval hl.monitor({ output = \"")
+                .and_then(|rest| rest.strip_suffix("\", disabled = true })"))
+            {
+                return Ok(match state.monitors.iter_mut().find(|m| m.name == name) {
+                    Some(m) => {
+                        m.disabled = true;
+                        "ok".into()
+                    }
+                    None => "error: hl.monitor: no such output".into(),
+                });
+            }
             if let Some(lua) = command.strip_prefix("eval ") {
                 return Ok(match parse_rule(lua) {
                     Some(rule) => {
-                        Self::apply_rule(&mut state, rule);
+                        Self::apply_rule(&mut state, rule, lua.contains("disabled = false"));
                         "ok".into()
                     }
                     None => "error: hl.monitor: error applying field".into(),

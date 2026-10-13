@@ -65,6 +65,8 @@ pub enum Msg {
     Feedback(ClientMsg),
     /// Remote to home: the picture goes on, but home's input cannot be injected (the reason).
     NoInput(String),
+    /// Remote to home: the mode goes on, but the lid is left alone (the reason).
+    NoLid(String),
 }
 
 /// The display's orders and their answers.
@@ -82,6 +84,10 @@ pub enum Display {
         /// The other monitors, outputs 1, 2…, in home's left-to-right order.
         #[n(2)]
         others: Option<Vec<OutputCopy>>,
+        /// `closed_lid = on` in home's `mode.conf`: the remote laptop works with its lid
+        /// closed while the mode runs (`crate::lid`). An agent that does not know it ignores it.
+        #[n(3)]
+        closed_lid: Option<bool>,
     },
     /// Home to remote: stop streaming and remove the output.
     #[n(1)]
@@ -94,6 +100,9 @@ pub enum Display {
         /// The names of outputs 1, 2…; an agent that knows only one output never sends them.
         #[n(1)]
         others: Option<Vec<String>>,
+        /// `Some(true)` when `closed_lid` was asked: an agent that does not know it never says.
+        #[n(2)]
+        closed_lid: Option<bool>,
     },
     /// Remote to home: the output could not be made; nothing was left behind.
     #[n(3)]
@@ -137,6 +146,7 @@ pub enum Incoming {
         msg: ClientMsg,
     },
     NoInput(String),
+    NoLid(String),
 }
 
 /// One live connection, as the display and its input see it. `inbox` ends when the link drops.
