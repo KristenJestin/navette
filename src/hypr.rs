@@ -335,6 +335,8 @@ pub mod fake {
         down: bool,
         /// The scale Hyprland gives a monitor whatever its rule asks (it rounds fractional ones).
         chosen_scale: Option<f32>,
+        /// `cursor:invisible`, set at runtime; a reload or a restart sets it back.
+        cursor_invisible: bool,
     }
 
     #[derive(Default)]
@@ -369,6 +371,10 @@ pub mod fake {
             self.state.lock().unwrap().binds.clone()
         }
 
+        pub fn cursor_invisible(&self) -> bool {
+            self.state.lock().unwrap().cursor_invisible
+        }
+
         pub fn monitor(&self, name: &str) -> Option<FakeMonitor> {
             let state = self.state.lock().unwrap();
             state.monitors.iter().find(|m| m.name == name).cloned()
@@ -380,6 +386,7 @@ pub mod fake {
             state.down = down;
             state.monitors = monitors;
             state.rules.clear();
+            state.cursor_invisible = false;
         }
 
         /// Every monitor rule from now on gets `scale`, as Hyprland rounds a fractional one.
@@ -391,6 +398,7 @@ pub mod fake {
         pub fn reload(&self) {
             let mut state = self.state.lock().unwrap();
             state.rules.clear();
+            state.cursor_invisible = false;
             for m in &mut state.monitors {
                 if m.name.starts_with("NAVETTE") {
                     m.scale = 2.0;
@@ -472,6 +480,10 @@ pub mod fake {
                     return Ok("error: hl.bind: invalid key".into());
                 }
                 state.binds.push(lua.to_string());
+                return Ok("ok".into());
+            }
+            if let Some(lua) = command.strip_prefix("eval hl.config({ cursor = { invisible = ") {
+                state.cursor_invisible = lua.starts_with("true");
                 return Ok("ok".into());
             }
             if let Some(lua) = command.strip_prefix("eval ") {
