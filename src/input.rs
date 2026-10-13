@@ -319,6 +319,8 @@ pub struct Capture {
     queue: Queue,
     hotkey: Option<Hotkey>,
     keys: Option<Keys>,
+    /// The keymap last sent: the compositor may send the same one again on each focus.
+    keymap: String,
     held_keys: BTreeSet<u32>,
     held_buttons: BTreeSet<u32>,
     /// The hotkey gave the keyboard back; until the pointer leaves, keys stay home.
@@ -331,6 +333,7 @@ impl Capture {
             queue,
             hotkey,
             keys: None,
+            keymap: String::new(),
             held_keys: BTreeSet::new(),
             held_buttons: BTreeSet::new(),
             released: false,
@@ -338,7 +341,11 @@ impl Capture {
     }
 
     pub fn keymap(&mut self, text: String) {
+        if text == self.keymap {
+            return;
+        }
         self.keys = Keys::new(&text);
+        self.keymap.clone_from(&text);
         if text.len() <= MAX_KEYMAP {
             self.queue.push(Event::Keymap(text));
         }
@@ -642,6 +649,17 @@ mod tests {
         assert!(Hotkey::parse("Shift+Esc").unwrap().is_some());
         assert!(Hotkey::parse("shift+nokey").unwrap_err().contains("nokey"));
         assert!(Hotkey::parse("shift").unwrap_err().contains("no key"));
+    }
+
+    #[test]
+    fn the_same_keymap_is_sent_once() {
+        let queue = Queue::default();
+        let mut capture = Capture::new(queue.clone(), None);
+        capture.keymap(us());
+        let _ = sent(&queue);
+        // Sent again by the compositor once the first went over the link: nothing to send.
+        capture.keymap(us());
+        assert!(queue.queued().is_empty());
     }
 
     #[test]
