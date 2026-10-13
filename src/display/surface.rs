@@ -69,7 +69,7 @@ use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 use super::Ended;
 use super::decode::Picture;
-use crate::input::{self, Capture, Focus, Hotkey};
+use crate::input::{self, Capture, Grab, Hotkey, Seat};
 
 /// How long the compositor has to place the surface.
 const PLACE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -492,35 +492,64 @@ struct State {
     physical_width: Option<f64>,
 }
 
+/// The layer surface's hold on the keyboard; nothing before the surface is mapped.
+struct LayerGrab<'a> {
+    layer: Option<&'a LayerSurface>,
+    inhibit: Option<&'a ZwpKeyboardShortcutsInhibitManagerV1>,
+    inhibitor: &'a mut Option<ZwpKeyboardShortcutsInhibitorV1>,
+    seat: &'a wl_seat::WlSeat,
+    qh: &'a QueueHandle<State>,
+}
+
+impl Grab for LayerGrab<'_> {
+    fn interactive(&mut self, on: bool) {
+        if let Some(layer) = self.layer {
+            layer.set_keyboard_interactivity(if on {
+                KeyboardInteractivity::OnDemand
+            } else {
+                KeyboardInteractivity::None
+            });
+        }
+    }
+
+    fn inhibit(&mut self) {
+        if self.inhibitor.is_none()
+            && let (Some(layer), Some(inhibit)) = (self.layer, self.inhibit)
+        {
+            *self.inhibitor =
+                Some(inhibit.inhibit_shortcuts(layer.wl_surface(), self.seat, self.qh, ()));
+        }
+    }
+
+    fn uninhibit(&mut self) {
+        if let Some(inhibitor) = self.inhibitor.take() {
+            inhibitor.destroy();
+        }
+    }
+
+    fn commit(&mut self) {
+        if let Some(layer) = self.layer {
+            layer.commit();
+        }
+    }
+}
+
 impl State {
     fn surface(&self) -> Option<&wl_surface::WlSurface> {
         self.layer.as_ref().map(|l| l.wl_surface())
     }
 
-    /// Takes the keyboard and the shortcuts, or gives them back.
-    fn focus(&mut self, focus: Focus) {
-        let Some(layer) = &self.layer else {
-            return;
+    /// What the seat says goes to the capture, which takes the keyboard and the shortcuts or
+    /// gives them back.
+    fn seat(&mut self, event: Seat) {
+        let mut grab = LayerGrab {
+            layer: self.layer.as_ref(),
+            inhibit: self.inhibit.as_ref(),
+            inhibitor: &mut self.inhibitor,
+            seat: &self.seat,
+            qh: &self.qh,
         };
-        match focus {
-            Focus::Take => {
-                layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
-                if self.inhibitor.is_none()
-                    && let Some(inhibit) = &self.inhibit
-                {
-                    let surface = layer.wl_surface();
-                    self.inhibitor =
-                        Some(inhibit.inhibit_shortcuts(surface, &self.seat, &self.qh, ()));
-                }
-            }
-            Focus::Give => {
-                layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-                if let Some(inhibitor) = self.inhibitor.take() {
-                    inhibitor.destroy();
-                }
-            }
-        }
-        layer.commit();
+        input::handle(&mut self.capture, &mut grab, event);
     }
 
     fn ours(&self, surface: &wl_surface::WlSurface) -> bool {
@@ -901,13 +930,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
             } if state.ours(&surface) => {
                 state.entered = Some(serial);
                 state.set_cursor();
-                let focus = state.capture.enter(surface_x, surface_y);
-                state.focus(focus);
+                state.seat(Seat::PointerEnter {
+                    x: surface_x,
+                    y: surface_y,
+                });
             }
             Event::Leave { surface, .. } if state.ours(&surface) => {
                 state.entered = None;
-                let focus = state.capture.leave();
-                state.focus(focus);
+                state.seat(Seat::PointerLeave);
             }
             Event::Motion {
                 surface_x,
@@ -962,13 +992,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 fd,
                 size,
             } => match read_keymap(fd, size) {
-                Ok(text) => state.capture.keymap(text),
+                Ok(text) => state.seat(Seat::Keymap(text)),
                 Err(e) => tracing::warn!("cannot read home's keymap: {e}"),
             },
             Event::Enter { surface, keys, .. } if state.ours(&surface) => {
                 let (codes, _) = keys.as_chunks::<4>();
                 let codes: Vec<u32> = codes.iter().map(|code| u32::from_ne_bytes(*code)).collect();
-                state.capture.keyboard_entered(&codes);
+                state.seat(Seat::KeyboardEnter { keys: &codes });
             }
             Event::Modifiers {
                 mods_depressed,
@@ -976,20 +1006,23 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 mods_locked,
                 group,
                 ..
-            } => state
-                .capture
-                .modifiers(mods_depressed, mods_latched, mods_locked, group),
-            Event::Leave { surface, .. } if state.ours(&surface) => state.capture.keyboard_left(),
+            } => state.seat(Seat::Modifiers {
+                depressed: mods_depressed,
+                latched: mods_latched,
+                locked: mods_locked,
+                group,
+            }),
+            Event::Leave { surface, .. } => state.seat(Seat::KeyboardLeave {
+                ours: state.ours(&surface),
+            }),
             Event::Key {
                 key,
                 state: WEnum::Value(pressed),
                 ..
-            } => {
-                let pressed = pressed == wl_keyboard::KeyState::Pressed;
-                if let Some(focus) = state.capture.key(key, pressed) {
-                    state.focus(focus);
-                }
-            }
+            } => state.seat(Seat::Key {
+                code: key,
+                pressed: pressed == wl_keyboard::KeyState::Pressed,
+            }),
             _ => {}
         }
     }

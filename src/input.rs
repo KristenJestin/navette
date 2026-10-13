@@ -492,6 +492,90 @@ impl Drop for Capture {
     }
 }
 
+/// What the seat tells the surface, as far as input goes.
+pub enum Seat<'a> {
+    Keymap(String),
+    PointerEnter {
+        x: f64,
+        y: f64,
+    },
+    PointerLeave,
+    /// With the keys already held at home.
+    KeyboardEnter {
+        keys: &'a [u32],
+    },
+    /// `ours` is false when the keyboard left another of this client's surfaces.
+    KeyboardLeave {
+        ours: bool,
+    },
+    Modifiers {
+        depressed: u32,
+        latched: u32,
+        locked: u32,
+        group: u32,
+    },
+    Key {
+        code: u32,
+        pressed: bool,
+    },
+}
+
+/// The surface's hold on home's keyboard: its keyboard interactivity (`on_demand` or `none`)
+/// and the shortcuts inhibitor.
+pub trait Grab {
+    fn interactive(&mut self, on: bool);
+    /// Creates the inhibitor, unless one lives.
+    fn inhibit(&mut self);
+    /// Destroys the inhibitor, if one lives.
+    fn uninhibit(&mut self);
+    fn commit(&mut self);
+}
+
+/// The focus lifecycle: what the seat says goes to `capture`, and the keyboard and the
+/// shortcuts are taken or given back as it decides.
+pub fn handle(capture: &mut Capture, grab: &mut dyn Grab, event: Seat) {
+    let focus = match event {
+        Seat::Keymap(text) => {
+            capture.keymap(text);
+            None
+        }
+        Seat::PointerEnter { x, y } => Some(capture.enter(x, y)),
+        Seat::PointerLeave => Some(capture.leave()),
+        Seat::KeyboardEnter { keys } => {
+            capture.keyboard_entered(keys);
+            None
+        }
+        Seat::KeyboardLeave { ours } => {
+            if ours {
+                capture.keyboard_left();
+            }
+            None
+        }
+        Seat::Modifiers {
+            depressed,
+            latched,
+            locked,
+            group,
+        } => {
+            capture.modifiers(depressed, latched, locked, group);
+            None
+        }
+        Seat::Key { code, pressed } => capture.key(code, pressed),
+    };
+    match focus {
+        Some(Focus::Take) => {
+            grab.interactive(true);
+            grab.inhibit();
+        }
+        Some(Focus::Give) => {
+            grab.interactive(false);
+            grab.uninhibit();
+        }
+        None => return,
+    }
+    grab.commit();
+}
+
 /// Records a press or a release; false for a repeat or a release of nothing held.
 fn track(held: &mut BTreeSet<u32>, code: u32, pressed: bool) -> bool {
     if pressed {
@@ -723,6 +807,109 @@ mod tests {
         // Giving the keyboard back makes it leave too.
         capture.keyboard_left();
         assert_eq!(sent(&queue), [key(KEY_T, true), Event::ReleaseAll]);
+    }
+
+    /// The surface's hold on the keyboard, as calls.
+    #[derive(Default)]
+    struct FakeGrab(Vec<&'static str>);
+
+    impl Grab for FakeGrab {
+        fn interactive(&mut self, on: bool) {
+            self.0.push(if on { "on_demand" } else { "none" });
+        }
+        fn inhibit(&mut self) {
+            self.0.push("inhibit");
+        }
+        fn uninhibit(&mut self) {
+            self.0.push("uninhibit");
+        }
+        fn commit(&mut self) {
+            self.0.push("commit");
+        }
+    }
+
+    fn calls(grab: &mut FakeGrab) -> Vec<&'static str> {
+        std::mem::take(&mut grab.0)
+    }
+
+    #[test]
+    fn the_pointer_entering_takes_the_keyboard_and_the_shortcuts_and_leaving_gives_them_back() {
+        let queue = Queue::default();
+        let mut capture = Capture::new(queue.clone(), Hotkey::parse(DEFAULT_HOTKEY).unwrap());
+        let mut grab = FakeGrab::default();
+        handle(&mut capture, &mut grab, Seat::Keymap(us()));
+        assert_eq!(calls(&mut grab), [] as [&str; 0]);
+        handle(
+            &mut capture,
+            &mut grab,
+            Seat::PointerEnter { x: 1.0, y: 2.0 },
+        );
+        assert_eq!(calls(&mut grab), ["on_demand", "inhibit", "commit"]);
+        handle(&mut capture, &mut grab, Seat::KeyboardEnter { keys: &[] });
+        handle(
+            &mut capture,
+            &mut grab,
+            Seat::Key {
+                code: KEY_T,
+                pressed: true,
+            },
+        );
+        assert_eq!(calls(&mut grab), [] as [&str; 0]);
+        handle(&mut capture, &mut grab, Seat::PointerLeave);
+        assert_eq!(calls(&mut grab), ["none", "uninhibit", "commit"]);
+        handle(&mut capture, &mut grab, Seat::KeyboardLeave { ours: true });
+        assert_eq!(calls(&mut grab), [] as [&str; 0]);
+        assert_eq!(sent(&queue), [key(KEY_T, true), Event::ReleaseAll]);
+    }
+
+    #[test]
+    fn the_release_hotkey_gives_the_keyboard_and_the_shortcuts_back() {
+        let queue = Queue::default();
+        let mut capture = Capture::new(queue.clone(), Hotkey::parse(DEFAULT_HOTKEY).unwrap());
+        let mut grab = FakeGrab::default();
+        handle(&mut capture, &mut grab, Seat::Keymap(us()));
+        handle(
+            &mut capture,
+            &mut grab,
+            Seat::PointerEnter { x: 1.0, y: 2.0 },
+        );
+        handle(
+            &mut capture,
+            &mut grab,
+            Seat::Key {
+                code: KEY_LEFTSHIFT,
+                pressed: true,
+            },
+        );
+        let _ = calls(&mut grab);
+        handle(
+            &mut capture,
+            &mut grab,
+            Seat::Key {
+                code: KEY_ESC,
+                pressed: true,
+            },
+        );
+        assert_eq!(calls(&mut grab), ["none", "uninhibit", "commit"]);
+    }
+
+    #[test]
+    fn the_keyboard_leaving_another_surface_releases_nothing() {
+        let (mut capture, queue) = armed(DEFAULT_HOTKEY);
+        let mut grab = FakeGrab::default();
+        handle(
+            &mut capture,
+            &mut grab,
+            Seat::Key {
+                code: KEY_T,
+                pressed: true,
+            },
+        );
+        handle(&mut capture, &mut grab, Seat::KeyboardLeave { ours: false });
+        assert_eq!(sent(&queue), [key(KEY_T, true)]);
+        handle(&mut capture, &mut grab, Seat::KeyboardLeave { ours: true });
+        assert_eq!(sent(&queue), [Event::ReleaseAll]);
+        assert_eq!(calls(&mut grab), [] as [&str; 0]);
     }
 
     #[test]
