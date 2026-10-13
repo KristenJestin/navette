@@ -293,7 +293,8 @@ pub async fn serve(
                     if let Some(a) = short {
                         // An agent that knows only one output made one.
                         let why = format!(
-                            "the remote machine made {} output(s) for {} monitors: update                              navette there",
+                            "the remote machine made {} output(s) for {} monitors: update \
+                             navette there",
                             outputs.len(),
                             a.monitors.len()
                         );
@@ -1614,7 +1615,11 @@ mod tests {
         let desk = four_monitors("monitor = DP-3, DP-2\n");
         let (remote, text) = started_with(&desk, &["NAVETTE-1"]).await;
         let error = text.unwrap_err().to_string();
-        assert!(error.contains("update"), "{error}");
+        assert_eq!(
+            error,
+            "the mode ended: the remote machine made 1 output(s) for 2 monitors: update \
+             navette there"
+        );
         until(|| desk.covered.lock().unwrap().is_empty()).await;
         assert_eq!(
             remote.outbox.queued().last(),
