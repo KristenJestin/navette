@@ -4,7 +4,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use super::jitter::Jitter;
-use super::{DefaultNode, Device, Graph, OnSound};
+use super::{DefaultNode, Device, Graph, Level, OnLevel, OnSound};
 
 #[derive(Default)]
 pub struct State {
@@ -12,6 +12,10 @@ pub struct State {
     pub default: Option<DefaultNode>,
     pub default_source: Option<DefaultNode>,
     pub sinks: Vec<(String, Arc<Mutex<OnSound>>)>,
+    /// Where each sink's mixer tells its level.
+    pub sink_levels: Vec<(String, Arc<Mutex<OnLevel>>)>,
+    /// The levels set on the playbacks, in order, by the playback's name.
+    pub levels: Vec<(String, Level)>,
     pub playbacks: Vec<(String, Arc<Mutex<Jitter>>)>,
     pub sources: Vec<(String, Arc<Mutex<Jitter>>)>,
     /// The echo-cancelled mics open, each with where its sound goes.
@@ -42,11 +46,26 @@ impl FakeGraph {
         self.0.lock().unwrap()
     }
 
+    /// The mixer of the sink `name` sets its level, as PipeWire tells the sink's owner.
+    pub fn mixer_sets(&self, name: &str, level: Level) {
+        let on_level = {
+            let state = self.state();
+            let (_, on_level) = state
+                .sink_levels
+                .iter()
+                .find(|(n, _)| n == name)
+                .expect("the sink is open");
+            on_level.clone()
+        };
+        (on_level.lock().unwrap())(level);
+    }
+
     /// PipeWire restarts: every node goes with it.
     pub fn restart(&self) {
         let mut state = self.state();
         state.restarts += 1;
         state.sinks.clear();
+        state.sink_levels.clear();
         state.playbacks.clear();
         state.sources.clear();
         state.mics.clear();
@@ -68,6 +87,7 @@ impl Drop for FakeNode {
             return;
         }
         state.sinks.retain(|(name, _)| *name != self.name);
+        state.sink_levels.retain(|(name, _)| *name != self.name);
         state.playbacks.retain(|(name, _)| *name != self.name);
         state.sources.retain(|(name, _)| *name != self.name);
         state.mics.retain(|(name, _)| *name != self.name);
@@ -109,11 +129,20 @@ impl Graph for FakeGraph {
         Ok(())
     }
 
-    fn open_sink(&self, name: &str, _description: &str, on_sound: OnSound) -> io::Result<FakeNode> {
+    fn open_sink(
+        &self,
+        name: &str,
+        _description: &str,
+        on_sound: OnSound,
+        on_level: OnLevel,
+    ) -> io::Result<FakeNode> {
         let mut state = self.state();
         state
             .sinks
             .push((name.to_owned(), Arc::new(Mutex::new(on_sound))));
+        state
+            .sink_levels
+            .push((name.to_owned(), Arc::new(Mutex::new(on_level))));
         state.log.push(format!("sink {name}"));
         Ok(FakeNode {
             graph: self.clone(),
@@ -136,6 +165,16 @@ impl Graph for FakeGraph {
             name: name.to_owned(),
             restarts: state.restarts,
         })
+    }
+
+    fn set_level(&self, node: &FakeNode, level: Level) -> io::Result<()> {
+        let mut state = self.state();
+        state.levels.push((node.name.clone(), level));
+        state.log.push(format!(
+            "level {} {} {} {}",
+            node.name, level.left, level.right, level.muted
+        ));
+        Ok(())
     }
 
     fn open_source(

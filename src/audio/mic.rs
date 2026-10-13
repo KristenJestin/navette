@@ -325,6 +325,7 @@ mod tests {
             graph.clone(),
             saved.clone(),
             Box::new(|_| {}),
+            Box::new(|_| {}),
         ));
         std::mem::forget(Voice::start(graph.clone(), saved.clone(), 1).unwrap());
 
@@ -349,6 +350,7 @@ mod tests {
             graph.clone(),
             saved.clone(),
             Box::new(|_| {}),
+            Box::new(|_| {}),
         ));
         std::mem::forget(Voice::start(graph.clone(), saved.clone(), 1).unwrap());
 
@@ -371,6 +373,7 @@ mod tests {
         std::mem::forget(super::super::RemoteSink::start(
             graph.clone(),
             saved.clone(),
+            Box::new(|_| {}),
             Box::new(|_| {}),
         ));
         graph.state().default = Some(DefaultNode::named("headset"));
