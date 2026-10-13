@@ -207,14 +207,7 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
                 let listener = bound
                     .add_listener_local()
                     .property(move |subject, key, _type, value| {
-                        match key {
-                            Some(CONFIGURED_SINK) if subject == pw::core::PW_ID_CORE => {
-                                *configured.borrow_mut() = value.map(str::to_owned);
-                            }
-                            // Every key cleared.
-                            None => *configured.borrow_mut() = None,
-                            _ => {}
-                        }
+                        follow(&mut configured.borrow_mut(), subject, key, value);
                         0
                     })
                     .register();
@@ -313,6 +306,20 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
         mainloop.run();
     }
     Ok(())
+}
+
+/// Follows the changes of the `default` metadata to the configured sink.
+/// Only the core's keys hold the defaults; other subjects are nodes with metadata of their own.
+fn follow(configured: &mut Option<String>, subject: u32, key: Option<&str>, value: Option<&str>) {
+    if subject != pw::core::PW_ID_CORE {
+        return;
+    }
+    match key {
+        Some(CONFIGURED_SINK) => *configured = value.map(str::to_owned),
+        // Every key of the core cleared.
+        None => *configured = None,
+        _ => {}
+    }
 }
 
 /// Runs the loop until the server has answered everything asked so far.
@@ -492,4 +499,31 @@ fn open_playback(
         _listener: Box::new(listener),
         _stream: stream,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SPEAKERS: &str = "{ \"name\": \"invented-speakers\" }";
+
+    #[test]
+    fn the_configured_sink_follows_its_key_on_the_core() {
+        let mut configured = None;
+        follow(&mut configured, 0, Some(CONFIGURED_SINK), Some(SPEAKERS));
+        assert_eq!(configured.as_deref(), Some(SPEAKERS));
+        follow(&mut configured, 0, Some("default.audio.sink"), None);
+        assert_eq!(configured.as_deref(), Some(SPEAKERS));
+        follow(&mut configured, 0, None, None);
+        assert_eq!(configured, None);
+    }
+
+    #[test]
+    fn a_clear_on_another_subject_keeps_the_default() {
+        let mut configured = Some(SPEAKERS.to_owned());
+        // A node's own metadata cleared (its id as the subject), not the core's.
+        follow(&mut configured, 42, None, None);
+        follow(&mut configured, 42, Some(CONFIGURED_SINK), None);
+        assert_eq!(configured.as_deref(), Some(SPEAKERS));
+    }
 }
