@@ -59,10 +59,8 @@ pub fn monitor(config_dir: &Path) -> io::Result<String> {
         }
         Err(e) => return Err(e),
     };
-    text.lines()
-        .filter_map(|line| line.split_once('='))
-        .find(|(key, _)| key.trim() == "monitor")
-        .map(|(_, value)| value.trim().to_string())
+    setting(&text, "monitor")
+        .map(str::to_string)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| {
             io::Error::new(
@@ -75,16 +73,21 @@ pub fn monitor(config_dir: &Path) -> io::Result<String> {
         })
 }
 
+/// The value of `key = value` in the mode's config, where `#` starts a comment.
+fn setting<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines()
+        .map(|line| line.split_once('#').map_or(line, |(kept, _)| kept))
+        .filter_map(|line| line.split_once('='))
+        .find(|(name, _)| name.trim() == key)
+        .map(|(_, value)| value.trim())
+}
+
 /// The release hotkey, from `release = <chord>` in the mode's config: `shift+escape` when it
-/// says none, no hotkey for `release = none`.
+/// says none, no hotkey for `release = none` or an empty `release =`.
 pub fn release_hotkey(config_dir: &Path) -> io::Result<Option<Hotkey>> {
     let path = config_dir.join(CONFIG_FILE);
     let text = std::fs::read_to_string(&path)?;
-    let spec = text
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .find(|(key, _)| key.trim() == "release")
-        .map_or(input::DEFAULT_HOTKEY, |(_, value)| value.trim());
+    let spec = setting(&text, "release").unwrap_or(input::DEFAULT_HOTKEY);
     Hotkey::parse(spec).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -877,6 +880,38 @@ mod tests {
             .unwrap();
         until(|| !desk.cursors.lock().unwrap().is_empty()).await;
         assert_eq!(&desk.cursors.lock().unwrap()[0].argb[..], &[1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn the_mode_config_of_the_docs_is_read_comments_and_all() {
+        let docs = include_str!("../docs/mode.md");
+        let example = docs
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("release =") && line.contains('#'))
+            .expect("the docs show a release hotkey with a comment");
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join(CONFIG_FILE),
+            format!("# the work monitor\nmonitor = DP-2   # the middle one\n{example}\n"),
+        )
+        .unwrap();
+        assert_eq!(monitor(config.path()).unwrap(), "DP-2");
+        assert_eq!(
+            release_hotkey(config.path()).unwrap(),
+            Hotkey::parse("ctrl+alt+q").unwrap()
+        );
+    }
+
+    #[test]
+    fn an_empty_release_hotkey_means_none() {
+        let config = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config.path().join(CONFIG_FILE),
+            "monitor = DP-2\nrelease =\n",
+        )
+        .unwrap();
+        assert_eq!(release_hotkey(config.path()).unwrap(), None);
     }
 
     #[tokio::test]

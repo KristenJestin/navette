@@ -55,7 +55,9 @@ other monitor they stay home.
   the remote machine.
 - **The release hotkey** gives the keyboard back to home without moving the pointer:
   `Shift+Escape` by default (Escape alone still goes to the remote). Moving the pointer off
-  the monitor and back captures it again. Choose another chord, or none, in `mode.conf`:
+  the monitor and back captures it again. Choose another chord (modifiers and one key), or
+  none (`release = none`, or `release =` left empty), in `mode.conf`, where `#` starts a
+  comment:
 
   ```
   release = ctrl+alt+q     # or: release = none
