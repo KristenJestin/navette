@@ -7,7 +7,7 @@
 //! `LICENSES/gliff-MIT.txt`): a video frame waits alone, and a newer cursor or stream message
 //! replaces an older one still queued, so the queue stays short however slow the link.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,6 +16,10 @@ use gliff_proto::{ClientCaps, ClientMsg, ServerMsg};
 use minicbor::{Decode, Encode};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Notify, watch};
+
+/// The most outputs a mode streams: an output id from 0 to `MAX_OUTPUTS - 1`, and a message
+/// for another one ends the link.
+pub const MAX_OUTPUTS: u8 = 8;
 
 /// The largest cursor taken, as gliff's client, in pixels a side: a cursor image declaring
 /// more ends the link.
@@ -50,7 +54,8 @@ impl Default for Pointer {
     }
 }
 
-/// What the display sends.
+/// What the display sends. A stream's messages (`Video`, `Feedback`) are for the output of the
+/// [`Outbox`] they go through.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {
     Display(Display),
@@ -68,11 +73,15 @@ pub enum Display {
     /// Home to remote: make a headless output that copies this home monitor, and stream it.
     #[n(0)]
     Start {
+        /// Output 0, the leftmost.
         #[n(0)]
         output: OutputCopy,
         /// What home decodes.
         #[n(1)]
         caps: ClientCaps,
+        /// The other monitors, outputs 1, 2…, in home's left-to-right order.
+        #[n(2)]
+        others: Option<Vec<OutputCopy>>,
     },
     /// Home to remote: stop streaming and remove the output.
     #[n(1)]
@@ -82,6 +91,9 @@ pub enum Display {
     Started {
         #[n(0)]
         output: String,
+        /// The names of outputs 1, 2…; an agent that knows only one output never sends them.
+        #[n(1)]
+        others: Option<Vec<String>>,
     },
     /// Remote to home: the output could not be made; nothing was left behind.
     #[n(3)]
@@ -115,11 +127,15 @@ pub enum Incoming {
     Display(Display),
     /// A gliff stream message; `main` and `aux` hold a video frame's two streams.
     Video {
+        output: u8,
         msg: ServerMsg,
         main: Bytes,
         aux: Bytes,
     },
-    Feedback(ClientMsg),
+    Feedback {
+        output: u8,
+        msg: ClientMsg,
+    },
     NoInput(String),
 }
 
@@ -127,14 +143,17 @@ pub enum Incoming {
 pub struct Peer {
     pub outbox: Outbox,
     pub inbox: mpsc::Receiver<Incoming>,
-    /// Remote to home; it ends with the inbox.
-    pub pointer: watch::Receiver<Pointer>,
+    /// Remote to home, each output's at its id (none yet: the default); it ends with the inbox.
+    pub pointer: watch::Receiver<Vec<Pointer>>,
     pub input: crate::input::Wire,
 }
 
+/// A message queued, with the output it is for and its payloads.
+type Packet = (u8, Msg, Vec<Vec<u8>>);
+
 #[derive(Default)]
 struct Queue {
-    packets: VecDeque<(Msg, Vec<Vec<u8>>)>,
+    packets: VecDeque<Packet>,
     closed: bool,
 }
 
@@ -142,23 +161,28 @@ fn is_video(msg: &Msg) -> bool {
     matches!(msg, Msg::Video(ServerMsg::VideoFrame { .. }))
 }
 
+/// Each output's stream has its own rules: one frame of its own waiting, its own newest cursor.
 impl Queue {
-    fn video_ready(&self) -> bool {
-        !self.packets.iter().any(|(msg, _)| is_video(msg))
+    fn video_ready(&self, output: u8) -> bool {
+        !self
+            .packets
+            .iter()
+            .any(|(o, msg, _)| *o == output && is_video(msg))
     }
 
-    fn push(&mut self, msg: Msg, payloads: Vec<Vec<u8>>) {
+    fn push(&mut self, output: u8, msg: Msg, payloads: Vec<Vec<u8>>) {
         match &msg {
             Msg::Video(ServerMsg::StreamConfig { .. }) => {
                 // A config queued after the last frame is superseded; one before it is not.
                 let after_video = self
                     .packets
                     .iter()
-                    .rposition(|(msg, _)| is_video(msg))
+                    .rposition(|(o, msg, _)| *o == output && is_video(msg))
                     .map_or(0, |i| i + 1);
                 let mut index = 0;
-                self.packets.retain(|(msg, _)| {
+                self.packets.retain(|(o, msg, _)| {
                     let keep = index < after_video
+                        || *o != output
                         || !matches!(msg, Msg::Video(ServerMsg::StreamConfig { .. }));
                     index += 1;
                     keep
@@ -177,11 +201,12 @@ impl Queue {
                     }
                     (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
                 };
-                self.packets.retain(|(queued, _)| !same(queued));
+                self.packets
+                    .retain(|(o, queued, _)| *o != output || !same(queued));
             }
             _ => {}
         }
-        self.packets.push_back((msg, payloads));
+        self.packets.push_back((output, msg, payloads));
     }
 }
 
@@ -189,71 +214,88 @@ impl Queue {
 struct Shared {
     queue: Mutex<Queue>,
     notify: Notify,
-    /// How long each write took, for whoever paces a video stream.
-    reports: Mutex<Option<UnboundedSender<Duration>>>,
+    /// How long each write of an output's took, for whoever paces its video stream.
+    reports: Mutex<HashMap<u8, UnboundedSender<Duration>>>,
 }
 
-/// The sending side of a link: `send` only queues, so a caller never waits on the network.
+/// The sending side of a link: `send` only queues, so a caller never waits on the network. Its
+/// messages are for output 0; [`Outbox::on`] gives the same link for another output.
 #[derive(Clone, Default)]
-pub struct Outbox(Arc<Shared>);
+pub struct Outbox {
+    shared: Arc<Shared>,
+    output: u8,
+}
 
 impl Outbox {
+    /// The same link, its stream messages for `output`.
+    pub fn on(&self, output: u8) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            output,
+        }
+    }
+
     /// Queues a message and the payloads it declares. Dropped once the link is down.
     pub fn send(&self, msg: Msg, payloads: Vec<Vec<u8>>) {
-        let mut queue = self.0.queue.lock().unwrap();
+        let mut queue = self.shared.queue.lock().unwrap();
         if queue.closed {
             return;
         }
-        queue.push(msg, payloads);
+        queue.push(self.output, msg, payloads);
         drop(queue);
-        self.0.notify.notify_one();
+        self.shared.notify.notify_one();
     }
 
-    /// No video frame waits to be written: the encoder works one frame ahead at most.
+    /// No video frame of this output waits to be written: its encoder works one frame ahead
+    /// at most.
     pub fn video_ready(&self) -> bool {
-        self.0.queue.lock().unwrap().video_ready()
+        self.shared.queue.lock().unwrap().video_ready(self.output)
     }
 
     pub fn is_closed(&self) -> bool {
-        self.0.queue.lock().unwrap().closed
+        self.shared.queue.lock().unwrap().closed
     }
 
-    /// The duration of every write from now on, for the rate controller.
+    /// The duration of every write of this output's from now on, for its rate controller.
     pub fn write_reports(&self) -> UnboundedReceiver<Duration> {
         let (tx, rx) = mpsc::unbounded_channel();
-        *self.0.reports.lock().unwrap() = Some(tx);
+        self.shared.reports.lock().unwrap().insert(self.output, tx);
         rx
     }
 
-    /// What waits to be written, oldest first.
+    /// What waits to be written, oldest first, whatever its output.
     #[cfg(test)]
     pub fn queued(&self) -> Vec<Msg> {
-        let queue = self.0.queue.lock().unwrap();
-        queue.packets.iter().map(|(msg, _)| msg.clone()).collect()
+        let queue = self.shared.queue.lock().unwrap();
+        queue
+            .packets
+            .iter()
+            .map(|(_, msg, _)| msg.clone())
+            .collect()
     }
 
     /// The link is down: nothing more is queued, and nothing waits.
     pub(crate) fn close(&self) {
-        let mut queue = self.0.queue.lock().unwrap();
+        let mut queue = self.shared.queue.lock().unwrap();
         queue.closed = true;
         queue.packets.clear();
         drop(queue);
-        *self.0.reports.lock().unwrap() = None;
+        self.shared.reports.lock().unwrap().clear();
     }
 
-    /// The next message to write, oldest first.
-    pub(crate) async fn next(&self) -> (Msg, Vec<Vec<u8>>) {
+    /// The next message to write, oldest first, with its output.
+    pub(crate) async fn next(&self) -> Packet {
         loop {
-            if let Some(packet) = self.0.queue.lock().unwrap().packets.pop_front() {
+            if let Some(packet) = self.shared.queue.lock().unwrap().packets.pop_front() {
                 return packet;
             }
-            self.0.notify.notified().await;
+            self.shared.notify.notified().await;
         }
     }
 
-    /// How long a write took, for the rate controller.
-    pub(crate) fn report_write(&self, took: Duration) {
-        if let Some(reports) = self.0.reports.lock().unwrap().as_ref() {
+    /// How long a write of `output`'s took, for its rate controller.
+    pub(crate) fn report_write(&self, output: u8, took: Duration) {
+        if let Some(reports) = self.shared.reports.lock().unwrap().get(&output) {
             let _ = reports.send(took);
         }
     }
@@ -300,10 +342,11 @@ mod tests {
     fn the_queue_holds_one_frame_and_the_newest_cursor() {
         let mut queue = Queue::default();
         let (msg, payloads) = frame(1, 4);
-        queue.push(msg, payloads);
-        assert!(!queue.video_ready());
+        queue.push(0, msg, payloads);
+        assert!(!queue.video_ready(0));
         for id in 0..100 {
             queue.push(
+                0,
                 Msg::Video(ServerMsg::CursorPos {
                     x: id as f64,
                     y: 0.0,
@@ -312,11 +355,11 @@ mod tests {
                 }),
                 Vec::new(),
             );
-            queue.push(Msg::Feedback(ClientMsg::Pong { t: id }), Vec::new());
+            queue.push(0, Msg::Feedback(ClientMsg::Pong { t: id }), Vec::new());
         }
         assert_eq!(queue.packets.len(), 3);
         assert!(matches!(
-            queue.packets[1].0,
+            queue.packets[1].1,
             Msg::Video(ServerMsg::CursorPos { x: 99.0, .. })
         ));
     }
@@ -330,7 +373,7 @@ mod tests {
             shape_id: 0,
             visible: false,
         });
-        queue.push(hidden.clone(), Vec::new());
+        queue.push(0, hidden.clone(), Vec::new());
         for id in 1..=2 {
             let shape = ServerMsg::CursorShape {
                 id,
@@ -340,9 +383,13 @@ mod tests {
                 hot_y: 0,
                 argb_len: 4,
             };
-            queue.push(Msg::Video(shape), vec![vec![0; 4]]);
+            queue.push(0, Msg::Video(shape), vec![vec![0; 4]]);
         }
-        let queued: Vec<_> = queue.packets.iter().map(|(msg, _)| msg.clone()).collect();
+        let queued: Vec<_> = queue
+            .packets
+            .iter()
+            .map(|(_, msg, _)| msg.clone())
+            .collect();
         assert_eq!(queued.len(), 2);
         assert_eq!(queued[0], hidden);
         assert!(matches!(
@@ -357,6 +404,80 @@ mod tests {
         outbox.close();
         outbox.send(Msg::Feedback(ClientMsg::RequestKeyframe), Vec::new());
         assert!(outbox.is_closed());
-        assert!(outbox.0.queue.lock().unwrap().packets.is_empty());
+        assert!(outbox.shared.queue.lock().unwrap().packets.is_empty());
+    }
+
+    fn cursor_at(x: f64) -> Msg {
+        Msg::Video(ServerMsg::CursorPos {
+            x,
+            y: 0.0,
+            shape_id: 0,
+            visible: true,
+        })
+    }
+
+    #[test]
+    fn two_outputs_queue_a_frame_each_and_keep_their_own_cursor() {
+        let outbox = Outbox::default();
+        let (left, right) = (outbox.on(0), outbox.on(1));
+        let (msg, payloads) = frame(1, 4);
+        left.send(msg, payloads);
+        // Output 0's frame waiting does not hold output 1's encoder back.
+        assert!(!left.video_ready());
+        assert!(right.video_ready());
+        let (msg, payloads) = frame(1, 4);
+        right.send(msg, payloads);
+        assert!(!right.video_ready());
+        left.send(cursor_at(1.0), Vec::new());
+        right.send(cursor_at(2.0), Vec::new());
+        left.send(cursor_at(3.0), Vec::new());
+        let queued = outbox.shared.queue.lock().unwrap();
+        let outputs: Vec<_> = queued
+            .packets
+            .iter()
+            .map(|(o, msg, _)| (*o, msg.clone()))
+            .collect();
+        assert_eq!(outputs.len(), 4, "{outputs:?}");
+        assert_eq!(outputs[2], (1, cursor_at(2.0)));
+        assert_eq!(outputs[3], (0, cursor_at(3.0)));
+    }
+
+    #[test]
+    fn a_stream_config_supersedes_only_its_own_output_s() {
+        let mut queue = Queue::default();
+        let config = |width| {
+            Msg::Video(ServerMsg::StreamConfig {
+                codec: gliff_proto::Codec::H264,
+                chroma: gliff_proto::ChromaMode::Single420,
+                pipeline: None,
+                width,
+                height: 1080,
+                scale_milli: 1000,
+                extradata: vec![],
+                aux_extradata: None,
+                view_width: width,
+                view_height: 1080,
+                fps_cap: 60,
+            })
+        };
+        queue.push(0, config(1920), Vec::new());
+        queue.push(1, config(2560), Vec::new());
+        queue.push(0, config(1280), Vec::new());
+        let queued: Vec<_> = queue
+            .packets
+            .iter()
+            .map(|(o, msg, _)| (*o, msg.clone()))
+            .collect();
+        assert_eq!(queued, [(1, config(2560)), (0, config(1280))]);
+    }
+
+    #[tokio::test]
+    async fn each_output_s_writes_go_to_its_own_rate_controller() {
+        let outbox = Outbox::default();
+        let mut left = outbox.on(0).write_reports();
+        let mut right = outbox.on(1).write_reports();
+        outbox.report_write(1, Duration::from_millis(7));
+        assert_eq!(right.recv().await, Some(Duration::from_millis(7)));
+        assert!(left.try_recv().is_err());
     }
 }

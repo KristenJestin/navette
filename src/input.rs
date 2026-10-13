@@ -16,6 +16,11 @@
 //! the remote until it is pressed again. A keymap replaces one still queued, so the queue holds
 //! one at most, and its memory stays bounded.
 //!
+//! **Several outputs.** A mode of several monitors has one surface, and one remote output, per
+//! monitor: each event names its output, and the remote injects it there. The queue's rules
+//! hold per output: a motion replaces only its own output's, a cut keeps each output's area
+//! and releases everything on each output it dropped events of.
+//!
 //! The release hotkey and the held-key bookkeeping are adapted from gliff's client
 //! (`crates/gliff/src/main.rs`; gliff, MIT, see `LICENSES/gliff-MIT.txt`).
 
@@ -94,7 +99,8 @@ pub enum Event {
 
 #[derive(Default)]
 struct Waiting {
-    events: VecDeque<Event>,
+    /// With the output each is for.
+    events: VecDeque<(u8, Event)>,
     closed: bool,
 }
 
@@ -104,57 +110,76 @@ struct Shared {
     notify: Notify,
 }
 
-/// One direction's queue (see the module's doc for its policy).
+/// One direction's queue (see the module's doc for its policy). What it is given is for output
+/// 0; [`Queue::on`] gives the same queue for another output.
 #[derive(Clone, Default)]
-pub struct Queue(Arc<Shared>);
+pub struct Queue {
+    shared: Arc<Shared>,
+    output: u8,
+}
 
 impl Queue {
+    /// The same queue, its events for `output`.
+    pub fn on(&self, output: u8) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            output,
+        }
+    }
+
     /// Queues an event; never waits. Dropped once the queue is closed.
     pub fn push(&self, event: Event) {
-        let mut waiting = self.0.waiting.lock().unwrap();
+        let output = self.output;
+        let mut waiting = self.shared.waiting.lock().unwrap();
         if waiting.closed {
             return;
         }
         let events = &mut waiting.events;
         let follows_a_motion = matches!(event, Event::Motion { .. })
-            && matches!(events.back(), Some(Event::Motion { .. }));
+            && matches!(events.back(), Some((o, Event::Motion { .. })) if *o == output);
         let full = events.len() >= QUEUE;
         match events.back_mut() {
-            Some(last) if follows_a_motion => *last = event,
+            Some((_, last)) if follows_a_motion => *last = event,
             _ if full => {
                 // A keymap coming now replaces the one queued.
                 let keymap = events
                     .iter()
-                    .rfind(|e| matches!(e, Event::Keymap(_)))
+                    .rfind(|(_, e)| matches!(e, Event::Keymap(_)))
                     .filter(|_| !matches!(event, Event::Keymap(_)))
                     .cloned();
-                let area = events
+                let dropped: BTreeSet<u8> = events.iter().map(|(o, _)| *o).collect();
+                let areas: Vec<_> = dropped
                     .iter()
-                    .rfind(|e| matches!(e, Event::Area { .. }))
-                    .cloned();
+                    .filter_map(|&o| {
+                        events
+                            .iter()
+                            .rfind(|(e_o, e)| *e_o == o && matches!(e, Event::Area { .. }))
+                            .cloned()
+                    })
+                    .collect();
                 events.clear();
                 events.extend(keymap);
-                events.extend(area);
-                events.push_back(Event::ReleaseAll);
-                events.push_back(event);
+                events.extend(areas);
+                events.extend(dropped.into_iter().map(|o| (o, Event::ReleaseAll)));
+                events.push_back((output, event));
             }
             _ => {
                 // Only the newest keymap matters: the queue holds one at most.
                 if matches!(event, Event::Keymap(_)) {
-                    events.retain(|e| !matches!(e, Event::Keymap(_)));
+                    events.retain(|(_, e)| !matches!(e, Event::Keymap(_)));
                 }
-                events.push_back(event);
+                events.push_back((output, event));
             }
         }
         drop(waiting);
-        self.0.notify.notify_one();
+        self.shared.notify.notify_one();
     }
 
-    /// The next event, oldest first; `None` once closed.
-    pub async fn next(&self) -> Option<Event> {
+    /// The next event, oldest first, with its output; `None` once closed.
+    pub async fn next(&self) -> Option<(u8, Event)> {
         loop {
             {
-                let mut waiting = self.0.waiting.lock().unwrap();
+                let mut waiting = self.shared.waiting.lock().unwrap();
                 if let Some(event) = waiting.events.pop_front() {
                     return Some(event);
                 }
@@ -162,29 +187,29 @@ impl Queue {
                     return None;
                 }
             }
-            self.0.notify.notified().await;
+            self.shared.notify.notified().await;
         }
     }
 
     /// The link is down: nothing more is queued, and `next` ends.
     pub fn close(&self) {
-        let mut waiting = self.0.waiting.lock().unwrap();
+        let mut waiting = self.shared.waiting.lock().unwrap();
         waiting.closed = true;
         waiting.events.clear();
         drop(waiting);
-        self.0.notify.notify_one();
+        self.shared.notify.notify_one();
+    }
+
+    /// What waits, whatever its output.
+    #[cfg(test)]
+    pub fn queued(&self) -> Vec<Event> {
+        self.queued_on().into_iter().map(|(_, e)| e).collect()
     }
 
     #[cfg(test)]
-    pub fn queued(&self) -> Vec<Event> {
-        self.0
-            .waiting
-            .lock()
-            .unwrap()
-            .events
-            .iter()
-            .cloned()
-            .collect()
+    pub fn queued_on(&self) -> Vec<(u8, Event)> {
+        let waiting = self.shared.waiting.lock().unwrap();
+        waiting.events.iter().cloned().collect()
     }
 }
 
@@ -689,7 +714,15 @@ mod tests {
 
     fn sent(queue: &Queue) -> Vec<Event> {
         let events = queue.queued();
-        while queue.0.waiting.lock().unwrap().events.pop_front().is_some() {}
+        while queue
+            .shared
+            .waiting
+            .lock()
+            .unwrap()
+            .events
+            .pop_front()
+            .is_some()
+        {}
         events
             .into_iter()
             .filter(|e| !matches!(e, Event::Keymap(_) | Event::Motion { .. }))
@@ -1070,10 +1103,58 @@ mod tests {
             locked(&["Lock"]),
         ];
         for event in events {
-            let msg = crate::wire::LinkMsg::Input(event.clone());
+            let msg = crate::wire::LinkMsg::Input(event.clone(), None);
             let bytes = minicbor::to_vec(&msg).unwrap();
             let back: crate::wire::LinkMsg = minicbor::decode(&bytes).unwrap();
             assert_eq!(back, msg);
         }
+    }
+
+    #[test]
+    fn a_motion_on_the_next_output_does_not_replace_the_last_one_on_the_first() {
+        let queue = Queue::default();
+        let (left, right) = (queue.on(0), queue.on(1));
+        left.push(Event::Motion { x: 1.0, y: 1.0 });
+        left.push(Event::ReleaseAll);
+        left.push(Event::Motion { x: 1919.0, y: 5.0 });
+        right.push(Event::Motion { x: 0.0, y: 5.0 });
+        right.push(Event::Motion { x: 3.0, y: 5.0 });
+        assert_eq!(
+            queue.queued_on(),
+            [
+                (0, Event::Motion { x: 1.0, y: 1.0 }),
+                (0, Event::ReleaseAll),
+                (0, Event::Motion { x: 1919.0, y: 5.0 }),
+                (1, Event::Motion { x: 3.0, y: 5.0 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cut_keeps_each_output_s_area_and_releases_each_output_it_dropped() {
+        let queue = Queue::default();
+        let (left, right) = (queue.on(0), queue.on(1));
+        let area = |width| Event::Area {
+            width,
+            height: 1080,
+        };
+        left.push(area(1920));
+        right.push(area(2560));
+        right.push(key(KEY_T, true));
+        // Full to the last place: the last key is what cuts it.
+        for n in 0..QUEUE - 2 {
+            left.push(key(KEY_LEFTSHIFT, n % 2 == 0));
+        }
+        let queued = queue.queued_on();
+        assert_eq!(
+            queued,
+            [
+                (0, area(1920)),
+                (1, area(2560)),
+                (0, Event::ReleaseAll),
+                (1, Event::ReleaseAll),
+                (0, key(KEY_LEFTSHIFT, false)),
+            ]
+        );
     }
 }

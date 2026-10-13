@@ -244,7 +244,7 @@ pub async fn serve(
                         stop(&mut active, "the link to the remote machine dropped").await;
                     }
                 }
-                Heard::Msg(Incoming::Display(Display::Started { output })) => {
+                Heard::Msg(Incoming::Display(Display::Started { output, .. })) => {
                     if let Some(a) = &mut active
                         && let Some((reply, _)) = a.starting.take()
                     {
@@ -275,12 +275,12 @@ pub async fn serve(
                     "navette: the remote machine shows its picture but cannot take home's \
                      keyboard and pointer: {reason}"
                 ),
-                Heard::Pointer(pointer) => {
+                Heard::Pointer(pointers) => {
                     if let Some(a) = &active {
-                        a.screen.cursor(pointer);
+                        a.screen.cursor(pointers.first().cloned().unwrap_or_default());
                     }
                 }
-                Heard::Msg(Incoming::Video { msg, main, aux }) => {
+                Heard::Msg(Incoming::Video { output: 0, msg, main, aux }) => {
                     if let Some(a) = &active {
                         a.decoding.video(Video { msg, main, aux });
                     }
@@ -363,7 +363,7 @@ async fn ended(active: &mut Option<Active>) -> Option<String> {
 /// What the link brings: a message, the remote pointer as it changed, or its end.
 enum Heard {
     Msg(Incoming),
-    Pointer(Pointer),
+    Pointer(Vec<Pointer>),
     Gone,
 }
 
@@ -456,7 +456,11 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
     .await?;
     let caps = decode::caps(&home.gpu, (3840, 2160));
     peer.outbox.send(
-        Msg::Display(Display::Start { output: copy, caps }),
+        Msg::Display(Display::Start {
+            output: copy,
+            caps,
+            others: None,
+        }),
         Vec::new(),
     );
     *active = Some(Active {
@@ -803,13 +807,13 @@ mod tests {
     struct Remote {
         outbox: Outbox,
         to_home: mpsc::Sender<Incoming>,
-        pointer: watch::Sender<Pointer>,
+        pointer: watch::Sender<Vec<Pointer>>,
     }
 
     fn connect(desk: &Desk) -> Remote {
         let outbox = Outbox::default();
         let (to_home, inbox) = mpsc::channel(64);
-        let (pointer, pointer_rx) = watch::channel(Pointer::default());
+        let (pointer, pointer_rx) = watch::channel(Vec::new());
         desk.peers
             .send(Peer {
                 outbox: outbox.clone(),
@@ -886,6 +890,7 @@ mod tests {
             .to_home
             .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
+                others: None,
             }))
             .unwrap();
         let text = answer(pending).await.unwrap();
@@ -907,6 +912,7 @@ mod tests {
             .to_home
             .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
+                others: None,
             }))
             .unwrap();
         answer(pending).await.unwrap();
@@ -1039,6 +1045,7 @@ mod tests {
             .to_home
             .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
+                others: None,
             }))
             .unwrap();
         answer(pending).await.unwrap();
@@ -1074,9 +1081,10 @@ mod tests {
             hot_y: 0,
             argb: bytes::Bytes::from_static(&[1, 2, 3, 255]),
         };
-        remote
-            .pointer
-            .send_modify(|pointer| pointer.shape = Some(cursor.clone()));
+        remote.pointer.send_replace(vec![Pointer {
+            shape: Some(cursor.clone()),
+            visible: true,
+        }]);
         until(|| !desk.cursors.lock().unwrap().is_empty()).await;
         assert_eq!(desk.cursors.lock().unwrap()[0].shape, Some(cursor));
     }
@@ -1183,6 +1191,7 @@ mod tests {
             .to_home
             .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
+                others: None,
             }))
             .unwrap();
         answer(pending).await.unwrap();
@@ -1222,6 +1231,7 @@ mod tests {
             .to_home
             .try_send(Incoming::Display(Display::Started {
                 output: "NAVETTE-1".into(),
+                others: None,
             }))
             .unwrap();
         answer(pending).await.unwrap();

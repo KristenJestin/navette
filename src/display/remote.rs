@@ -172,7 +172,7 @@ pub async fn serve_peer(
         tokio::select! {
             msg = peer.inbox.recv() => match msg {
                 None => break,
-                Some(Incoming::Display(Display::Start { output, caps })) => {
+                Some(Incoming::Display(Display::Start { output, caps, .. })) => {
                     stop(&mut active, hypr).await;
                     let started = bring_up(&output, &caps, ports, &home, &peer.outbox).await;
                     let reply = match started {
@@ -186,7 +186,7 @@ pub async fn serve_peer(
                             };
                             mode.run(running, &peer.outbox);
                             active = Some(mode);
-                            Display::Started { output: output::NAME.into() }
+                            Display::Started { output: output::NAME.into(), others: None }
                         }
                         Err(e) => {
                             remove(hypr).await;
@@ -196,14 +196,14 @@ pub async fn serve_peer(
                     peer.outbox.send(Msg::Display(reply), Vec::new());
                 }
                 Some(Incoming::Display(Display::Stop)) => stop(&mut active, hypr).await,
-                Some(Incoming::Feedback(msg)) => {
+                Some(Incoming::Feedback { msg, .. }) => {
                     if let Some(Active { stream: Stream::Running(running), .. }) = &active {
                         let _ = running.feedback.send(msg);
                     }
                 }
                 Some(_) => {}
             },
-            event = peer.input.from_peer.next(), if input_open => match event {
+            event = peer.input.from_peer.next(), if input_open => match event.map(|(_, e)| e) {
                 // A compositor's keymap is compiled whole; an `include` would have this
                 // machine's xkbcommon read files of its own for home.
                 Some(input::Event::Keymap(text)) if text.contains("include") => {
@@ -521,6 +521,7 @@ mod tests {
                 chroma: vec![ChromaMode::Single420],
                 features: Vec::new(),
             },
+            others: None,
         })
     }
 
@@ -736,7 +737,8 @@ mod tests {
                 .outbox
                 .queued()
                 .contains(&Msg::Display(Display::Started {
-                    output: output::NAME.into()
+                    output: output::NAME.into(),
+                    others: None
                 }))
         );
         // The stream starts again after a stop of its own: still a picture, no second word.
@@ -808,7 +810,8 @@ mod tests {
         assert_eq!(
             agent.outbox.queued()[1],
             Msg::Display(Display::Started {
-                output: output::NAME.into()
+                output: output::NAME.into(),
+                others: None
             })
         );
     }
