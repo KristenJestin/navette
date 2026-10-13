@@ -594,18 +594,18 @@ impl State {
 
     /// Draws the remote cursor's new image, and shows it if the pointer is over the surface.
     fn remote_cursor(&mut self, pointer: Pointer) {
+        tracing::debug!(
+            visible = pointer.visible,
+            size = ?pointer.shape.as_ref().map(|c| (c.width, c.height)),
+            shows = pointer.shape.as_ref().is_some_and(Cursor::shows),
+            "remote cursor"
+        );
         self.cursor_hidden = !pointer.visible;
         let Some(cursor) = pointer.shape else {
             self.hotspot = None;
             self.set_cursor();
             return;
         };
-        tracing::debug!(
-            width = cursor.width,
-            height = cursor.height,
-            shows = cursor.shows(),
-            "remote cursor"
-        );
         if !cursor.shows() {
             self.hotspot = None;
             self.set_cursor();
