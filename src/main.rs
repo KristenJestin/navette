@@ -122,9 +122,12 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             );
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
-            let graph = PipeWire::default();
+            // Without `--audio`, home never reaches PipeWire.
+            let graph = audio.then(PipeWire::default);
             link::serve(acceptor, Heartbeat::default(), events, move |peer| {
-                if let Err(e) = audio::home(graph.clone(), peer, audio) {
+                if let Some(graph) = &graph
+                    && let Err(e) = audio::home(graph.clone(), peer)
+                {
                     eprintln!("navette: audio: {e}");
                 }
             })

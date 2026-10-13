@@ -445,14 +445,14 @@ impl<G: Graph> Home<G> {
     }
 }
 
-/// Home's side of one link, on a thread of its own: with `start`, plays the remote's sound
-/// until the link drops.
-pub fn home<G: Graph>(graph: G, mut peer: Peer, start: bool) -> io::Result<JoinHandle<()>> {
+/// Home's side of one link, on a thread of its own: plays the remote's sound until the link
+/// drops.
+pub fn home<G: Graph>(graph: G, mut peer: Peer) -> io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("navette-audio".into())
         .spawn(move || {
             let mut home = Home::new(graph, peer.send);
-            if start && let Err(e) = home.start() {
+            if let Err(e) = home.start() {
                 eprintln!("navette: audio: could not start the playback: {e}");
             }
             while let Some(frame) = peer.received.blocking_recv() {
@@ -647,7 +647,7 @@ mod tests {
         let (_tmp, saved) = saved();
         let (home_peer, remote_peer, _link) = linked();
         remote(remote_graph.clone(), saved.clone(), remote_peer, None).unwrap();
-        home(home_graph.clone(), home_peer, true).unwrap();
+        home(home_graph.clone(), home_peer).unwrap();
 
         until(&remote_graph, |s| !s.sinks.is_empty()).await;
         assert_eq!(remote_graph.state().default, Some(DefaultSink::named(SINK)));
