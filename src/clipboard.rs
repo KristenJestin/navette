@@ -878,20 +878,6 @@ mod tests {
             .await;
     }
 
-    /// Home's side of a link that is accepted from a queue of in-memory connections.
-    struct Queue(mpsc::UnboundedReceiver<tokio::io::DuplexStream>);
-
-    impl crate::transport::Accept for Queue {
-        type Stream = tokio::io::DuplexStream;
-
-        async fn accept(&mut self) -> io::Result<Self::Stream> {
-            self.0
-                .recv()
-                .await
-                .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))
-        }
-    }
-
     /// Records when a bridge starts and when it stops.
     struct Live(Rc<RefCell<Vec<&'static str>>>);
 
@@ -917,7 +903,7 @@ mod tests {
                 let (events, _log) = mpsc::unbounded_channel();
                 let service_log = log.clone();
                 tokio::task::spawn_local(link::serve(
-                    Queue(queue),
+                    link::tests::Queue(queue),
                     heartbeat(),
                     events,
                     move |_wire| {

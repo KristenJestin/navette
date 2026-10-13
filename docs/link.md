@@ -39,8 +39,9 @@ refuses a request against an offer that a newer copy has replaced.
 
 - **One bridge per link, never per monitor.** Two bridges on one machine's clipboard replace
   each other's offers, and every paste then fails with "the peer aborted the transfer"; the
-  link has exactly one. When home accepts a new connection from the remote, it ends the older
-  one, and its bridge, before it starts the new one's.
+  link has exactly one. When a new connection from the remote has said hello, home ends the
+  older one, and its bridge, before it starts the new one's; a connection whose hello fails
+  leaves the link that is up alone.
 - **Both machines use `ext-data-control`** (Hyprland has it), through gliff's `hypr-input`.
   The display is `$WAYLAND_DISPLAY`, else the running Hyprland session. If it is not there
   yet (the agent starting before the session) the link stays up, and the bridge looks again

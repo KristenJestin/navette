@@ -5,9 +5,9 @@
 //!
 //! The agent reconnects with an exponential backoff whenever the link drops; home keeps the
 //! newest connection of its one paired remote and drops the older one, which a laptop that
-//! changed network may have left half-open. It ends the older connection, and so its service,
-//! before it starts the newer one's: a service such as the clipboard bridge is never twice
-//! alive on the same machine.
+//! changed network may have left half-open. Once the newer one has said hello, it ends the
+//! older connection, and so its service, before it starts the newer one's: a service such as
+//! the clipboard bridge is never twice alive on the same machine.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -26,7 +26,7 @@ use tokio::task::JoinSet;
 
 use crate::frame::{read_frame, write_frame};
 use crate::store::{Role, Store};
-use crate::transport::{Accept, Dial, Stream, TlsAcceptor, TlsDialer};
+use crate::transport::{Accept, Dial, TlsAcceptor, TlsDialer};
 use crate::wire::{Clip, LinkMsg, checked};
 
 /// The version of the link's messages; peers of another version refuse each other.
@@ -267,46 +267,60 @@ pub async fn serve<A, F, Fut>(
     events: UnboundedSender<Event>,
     attach: F,
 ) where
-    A: Accept,
+    A: Accept + 'static,
     F: Fn(Wire) -> Fut + Clone + 'static,
     Fut: Future<Output = ()> + 'static,
 {
-    let mut sessions = JoinSet::new();
+    // The listener runs on its own, so a connection still saying hello holds up neither the
+    // next one nor the link that is up.
+    let (accepted, mut connections) = mpsc::channel(1);
+    let failed = events.clone();
+    let mut listener = JoinSet::new();
+    listener.spawn_local(async move {
+        loop {
+            match acceptor.accept().await {
+                Ok(stream) => {
+                    if accepted.send(stream).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = failed.send(Event::Failed(e));
+                    // Paces a listener that keeps failing (out of file descriptors, say).
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    });
+    let mut greetings = JoinSet::new();
+    let mut session = JoinSet::new();
     loop {
-        match acceptor.accept().await {
-            Ok(stream) => {
-                // The older link, with its service, is gone before the newer one's starts.
-                sessions.abort_all();
-                while sessions.join_next().await.is_some() {}
-                sessions.spawn_local(session(stream, heartbeat, events.clone(), attach.clone()));
+        tokio::select! {
+            Some(mut stream) = connections.recv() => {
+                greetings.spawn_local(async move {
+                    hello(&mut stream, heartbeat).await.map(|()| stream)
+                });
             }
-            Err(e) => {
-                let _ = events.send(Event::Failed(e));
-                // Paces a listener that keeps failing (out of file descriptors, say).
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            Some(greeted) = greetings.join_next() => match greeted {
+                Ok(Ok(stream)) => {
+                    // Only a connection that said hello replaces the link. The older link, with
+                    // its service, is gone before the newer one's starts.
+                    session.abort_all();
+                    while session.join_next().await.is_some() {}
+                    let _ = events.send(Event::Connected);
+                    let (events, attach) = (events.clone(), attach.clone());
+                    session.spawn_local(async move {
+                        let ended = run(stream, heartbeat, attach).await;
+                        let _ = events.send(Event::Disconnected(ended));
+                    });
+                }
+                Ok(Err(e)) => {
+                    let _ = events.send(Event::Failed(e));
+                }
+                Err(_) => {}
+            },
         }
     }
-}
-
-async fn session<S, F, Fut>(
-    mut stream: S,
-    heartbeat: Heartbeat,
-    events: UnboundedSender<Event>,
-    attach: F,
-) where
-    S: Stream,
-    F: Fn(Wire) -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let event = match hello(&mut stream, heartbeat).await {
-        Ok(()) => {
-            let _ = events.send(Event::Connected);
-            Event::Disconnected(run(stream, heartbeat, attach).await)
-        }
-        Err(e) => Event::Failed(e),
-    };
-    let _ = events.send(event);
 }
 
 /// The remote's dialer, from its pairing.
@@ -344,7 +358,7 @@ fn paired_as(store: &Store, role: Role) -> io::Result<crate::store::Pairing> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use gliff_proto::ClipboardFile;
     use tokio::sync::mpsc;
 
@@ -561,6 +575,52 @@ mod tests {
             matches!(&offer, ClipboardMsg::Offer { files, .. } if files.is_empty()),
             "{offer:?}"
         );
+    }
+
+    /// Home's side of a link that is accepted from a queue of in-memory connections.
+    pub(crate) struct Queue(pub(crate) mpsc::UnboundedReceiver<tokio::io::DuplexStream>);
+
+    impl Accept for Queue {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn accept(&mut self) -> io::Result<Self::Stream> {
+            self.0
+                .recv()
+                .await
+                .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paired_peer_whose_hello_fails_does_not_kill_the_good_link() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (connections, queue) = mpsc::unbounded_channel();
+                let (events, mut home_events) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(serve(Queue(queue), fast(), events, nothing));
+
+                let (home_end, mut good) = tokio::io::duplex(1024);
+                connections.send(home_end).unwrap();
+                hello(&mut good, fast()).await.unwrap();
+                until_connected(&mut home_events).await;
+                let good = tokio::task::spawn_local(run(good, fast(), nothing));
+
+                let (home_end, mut bad) = tokio::io::duplex(1024);
+                connections.send(home_end).unwrap();
+                write_frame(&mut bad, &[HELLO, VERSION + 1]).await.unwrap();
+                match next(&mut home_events).await {
+                    Event::Failed(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+                    other => panic!("the bad hello must fail alone: {other:?}"),
+                }
+                let quiet = tokio::time::sleep(fast().timeout * 3);
+                tokio::pin!(quiet);
+                tokio::select! {
+                    () = &mut quiet => {}
+                    event = home_events.recv() => panic!("the good link moved: {event:?}"),
+                }
+                assert!(!good.is_finished(), "home dropped the good link");
+            })
+            .await;
     }
 
     #[test]
