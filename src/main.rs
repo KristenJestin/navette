@@ -18,6 +18,7 @@ use navette::clipboard;
 use navette::desk::Desk;
 use navette::display::{decode, remote};
 use navette::hypr::{self, Eval};
+use navette::input;
 use navette::link::{self, Backoff, Event, Heartbeat, Wire};
 use navette::mode::{self, Home};
 use navette::pair::{self, Pin, Timeouts};
@@ -210,6 +211,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 peers_rx,
                 Arc::new(hypr::Live),
                 Arc::new(remote::LiveStreams),
+                Arc::new(input::LiveInjectors),
                 hypr_events_rx,
             ));
             let graph = PipeWire::default();

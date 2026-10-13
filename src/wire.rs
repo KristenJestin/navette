@@ -2,7 +2,8 @@
 //! the raw bytes it declares) carrying Navette's own messages. A heartbeat shows the sender
 //! alive; the clipboard messages are the five of gliff's transfer engine, so its rules (chunk
 //! size, ack window, serials) apply unchanged; the display's are its orders, gliff's stream
-//! messages (a video frame's bytes follow it) and their feedback. A message this build does not know is skipped,
+//! messages (a video frame's bytes follow it) and their feedback; the input's, home's keyboard
+//! and pointer. A message this build does not know is skipped,
 //! so a newer peer can add some without breaking an older one.
 //!
 //! To extend the link without a new [`VERSION`](crate::link::VERSION), add a top-level variant
@@ -18,6 +19,7 @@ use minicbor::{Decode, Encode};
 
 use crate::audio;
 use crate::display::wire::{Display, Msg};
+use crate::input;
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum LinkMsg {
@@ -74,6 +76,9 @@ pub enum LinkMsg {
     /// Home to remote.
     #[n(22)]
     Feedback(#[n(0)] ClientMsg),
+    // Input (`crate::input`), home to remote, a block of numbers of its own.
+    #[n(30)]
+    Input(#[n(0)] input::Event),
     // The remote machine's sound (`crate::audio`), a block of numbers of its own.
     #[n(48)]
     AudioStart {
@@ -163,6 +168,7 @@ impl LinkMsg {
             | Self::Display(_)
             | Self::Video(_)
             | Self::Feedback(_)
+            | Self::Input(_)
             | Self::AudioStart { .. }
             | Self::AudioStop
             | Self::AudioFrame { .. } => return None,

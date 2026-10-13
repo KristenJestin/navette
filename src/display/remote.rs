@@ -1,6 +1,10 @@
 //! The agent's side of the display: on home's order, make the headless output and stream it;
 //! take it away when home says stop or the link drops. While a mode is active, a reload gets
 //! the monitor rule back and a Hyprland restart (or a vanished output) gets the output back.
+//!
+//! Home's input is injected on that output while its stream runs: the injector starts and
+//! stops with the stream, so it always points at the output that is there, and it is gone
+//! (every key and button released) before the output is removed.
 
 use std::io;
 use std::sync::Arc;
@@ -14,6 +18,7 @@ use super::output;
 use super::stream::{self, Source};
 use crate::display::wire::{Display, Incoming, Msg, Outbox, OutputCopy, Peer};
 use crate::hypr::{self, Hypr};
+use crate::input::{self, Inject, Injectors};
 
 /// The first wait before a lost stream is started again, doubled after each failure up to
 /// [`LONGEST_WAIT`].
@@ -66,6 +71,7 @@ pub async fn serve(
     mut peers: UnboundedReceiver<Peer>,
     hypr: Arc<dyn Hypr>,
     streams: Arc<dyn Streams>,
+    injectors: Arc<dyn Injectors>,
     mut events: UnboundedReceiver<hypr::Event>,
 ) {
     let removed = {
@@ -79,8 +85,28 @@ pub async fn serve(
         _ => {}
     }
     while let Some(peer) = peers.recv().await {
-        serve_peer(peer, hypr.clone(), streams.clone(), &mut events).await;
+        let ports = Ports {
+            hypr: hypr.clone(),
+            streams: streams.clone(),
+            injectors: injectors.clone(),
+        };
+        serve_peer(peer, &ports, &mut events).await;
     }
+}
+
+/// What the agent drives: Hyprland, the picture path and the input injection.
+#[derive(Clone)]
+pub struct Ports {
+    pub hypr: Arc<dyn Hypr>,
+    pub streams: Arc<dyn Streams>,
+    pub injectors: Arc<dyn Injectors>,
+}
+
+/// What home said of its input, kept for the next injector: its keymap and its surface's size.
+#[derive(Default)]
+struct Home {
+    keymap: Option<String>,
+    area: Option<input::Event>,
 }
 
 /// An active mode: the copy asked for, and its stream when it runs.
@@ -99,7 +125,10 @@ enum Stream {
 }
 
 struct Running {
+    // Field order is drop order: the capture, then the injector, both before the output goes
+    // (Hyprland 0.56 aborts when a cursor capture outlives its monitor).
     _stream: Box<dyn Send + Sync>,
+    input: Box<dyn Inject>,
     feedback: UnboundedSender<ClientMsg>,
     ended: oneshot::Receiver<io::Error>,
     since: tokio::time::Instant,
@@ -109,11 +138,13 @@ struct Running {
 /// start and stop block, so they run off the executor thread.
 pub async fn serve_peer(
     mut peer: Peer,
-    hypr: Arc<dyn Hypr>,
-    streams: Arc<dyn Streams>,
+    ports: &Ports,
     events: &mut UnboundedReceiver<hypr::Event>,
 ) {
+    let hypr = &ports.hypr;
     let mut active: Option<Active> = None;
+    let mut home = Home::default();
+    let mut input_open = true;
     loop {
         let retry_at = match &active {
             Some(Active {
@@ -126,8 +157,8 @@ pub async fn serve_peer(
             msg = peer.inbox.recv() => match msg {
                 None => break,
                 Some(Incoming::Display(Display::Start { output, caps })) => {
-                    stop(&mut active, &hypr).await;
-                    let started = bring_up(&output, &caps, &hypr, &streams, &peer.outbox).await;
+                    stop(&mut active, hypr).await;
+                    let started = bring_up(&output, &caps, ports, &home, &peer.outbox).await;
                     let reply = match started {
                         Ok(running) => {
                             active = Some(Active {
@@ -139,19 +170,32 @@ pub async fn serve_peer(
                             Display::Started { output: output::NAME.into() }
                         }
                         Err(e) => {
-                            remove(&hypr).await;
+                            remove(hypr).await;
                             Display::Failed { reason: e.to_string() }
                         }
                     };
                     peer.outbox.send(Msg::Display(reply), Vec::new());
                 }
-                Some(Incoming::Display(Display::Stop)) => stop(&mut active, &hypr).await,
+                Some(Incoming::Display(Display::Stop)) => stop(&mut active, hypr).await,
                 Some(Incoming::Feedback(msg)) => {
                     if let Some(Active { stream: Stream::Running(running), .. }) = &active {
                         let _ = running.feedback.send(msg);
                     }
                 }
                 Some(_) => {}
+            },
+            event = peer.input.from_peer.next(), if input_open => match event {
+                Some(event) => {
+                    match &event {
+                        input::Event::Keymap(text) => home.keymap = Some(text.clone()),
+                        input::Event::Area { .. } => home.area = Some(event.clone()),
+                        _ => {}
+                    }
+                    if let Some(Active { stream: Stream::Running(running), .. }) = &active {
+                        running.input.send(&event);
+                    }
+                }
+                None => input_open = false,
             },
             Some(event) = events.recv() => {
                 if let (hypr::Event::ConfigReloaded, Some(mode)) = (event, &active) {
@@ -174,21 +218,21 @@ pub async fn serve_peer(
                     let _ = tokio::task::spawn_blocking(move || drop(running)).await;
                 }
                 eprintln!("navette: the stream stopped ({reason})");
-                failed(&mut active, reason, &hypr, &peer.outbox).await;
+                failed(&mut active, reason, hypr, &peer.outbox).await;
             }
             () = sleep_until(retry_at), if retry_at.is_some() => {
                 let Some(mode) = &mut active else { continue };
-                match bring_up(&mode.copy, &mode.caps, &hypr, &streams, &peer.outbox).await {
+                match bring_up(&mode.copy, &mode.caps, ports, &home, &peer.outbox).await {
                     Ok(running) => mode.stream = Stream::Running(running),
                     Err(e) => {
                         eprintln!("navette: the stream could not start again ({e})");
-                        failed(&mut active, e, &hypr, &peer.outbox).await;
+                        failed(&mut active, e, hypr, &peer.outbox).await;
                     }
                 }
             }
         }
     }
-    stop(&mut active, &hypr).await;
+    stop(&mut active, hypr).await;
 }
 
 async fn sleep_until(at: Option<tokio::time::Instant>) {
@@ -239,33 +283,37 @@ async fn ended(active: &mut Option<Active>) -> Option<io::Error> {
     }
 }
 
-/// Starts the stream, on the output if it is still there as asked, else on a new one. A panic
-/// in the encoder's or the capture's start is a failure like another.
+/// Starts the stream and the injector, on the output if it is still there as asked, else on a
+/// new one. A panic in the encoder's or the capture's start is a failure like another.
 async fn bring_up(
     copy: &OutputCopy,
     caps: &ClientCaps,
-    hypr: &Arc<dyn Hypr>,
-    streams: &Arc<dyn Streams>,
+    ports: &Ports,
+    home: &Home,
     outbox: &Outbox,
 ) -> io::Result<Running> {
-    let (copy, caps) = (copy.clone(), caps.clone());
-    let (hypr, streams, outbox) = (hypr.clone(), streams.clone(), outbox.clone());
-    tokio::task::spawn_blocking(move || start_blocking(&copy, caps, &*hypr, &*streams, outbox))
-        .await
-        .unwrap_or_else(|e| {
-            Err(io::Error::other(format!(
-                "the picture's start crashed: {e}"
-            )))
-        })
+    let (copy, caps, ports, outbox) = (copy.clone(), caps.clone(), ports.clone(), outbox.clone());
+    let (keymap, area) = (home.keymap.clone(), home.area.clone());
+    tokio::task::spawn_blocking(move || {
+        start_blocking(&copy, caps, &ports, keymap.as_deref(), area, outbox)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err(io::Error::other(format!(
+            "the picture's start crashed: {e}"
+        )))
+    })
 }
 
 fn start_blocking(
     copy: &OutputCopy,
     caps: ClientCaps,
-    hypr: &dyn Hypr,
-    streams: &dyn Streams,
+    ports: &Ports,
+    keymap: Option<&str>,
+    area: Option<input::Event>,
     outbox: Outbox,
 ) -> io::Result<Running> {
+    let hypr = &*ports.hypr;
     let scale = match output::live(hypr, copy)? {
         Some(scale) => scale,
         None => output::create(hypr, copy)?,
@@ -276,9 +324,16 @@ fn start_blocking(
         output: output::NAME.into(),
         scale,
     };
-    let stream = streams.start(source, caps, outbox, feedback_rx, ended_tx)?;
+    let stream = ports
+        .streams
+        .start(source, caps, outbox, feedback_rx, ended_tx)?;
+    let input = ports.injectors.start(output::NAME, keymap)?;
+    if let Some(area) = &area {
+        input.send(area);
+    }
     Ok(Running {
         _stream: stream,
+        input,
         feedback,
         ended,
         since: tokio::time::Instant::now(),
@@ -427,12 +482,66 @@ mod tests {
         })
     }
 
+    /// Injectors that record what each one got, and when it went whether its output was there.
+    struct FakeInjectors {
+        hypr: Arc<FakeHypr>,
+        started: Arc<Mutex<Vec<Injected>>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct Injected {
+        output: String,
+        keymap: Option<String>,
+        events: Vec<input::Event>,
+        /// Dropped, with its output still there.
+        dropped: Option<bool>,
+    }
+
+    struct FakeInject {
+        hypr: Arc<FakeHypr>,
+        started: Arc<Mutex<Vec<Injected>>>,
+        index: usize,
+    }
+
+    impl Injectors for FakeInjectors {
+        fn start(&self, output: &str, keymap: Option<&str>) -> io::Result<Box<dyn Inject>> {
+            let mut started = self.started.lock().unwrap();
+            started.push(Injected {
+                output: output.into(),
+                keymap: keymap.map(str::to_string),
+                ..Default::default()
+            });
+            Ok(Box::new(FakeInject {
+                hypr: self.hypr.clone(),
+                started: self.started.clone(),
+                index: started.len() - 1,
+            }))
+        }
+    }
+
+    impl Inject for FakeInject {
+        fn send(&self, event: &input::Event) {
+            self.started.lock().unwrap()[self.index]
+                .events
+                .push(event.clone());
+        }
+    }
+
+    impl Drop for FakeInject {
+        fn drop(&mut self) {
+            let there = self.hypr.monitor(output::NAME).is_some();
+            self.started.lock().unwrap()[self.index].dropped = Some(there);
+        }
+    }
+
     struct Agent {
         inbox: mpsc::Sender<Incoming>,
         outbox: Outbox,
+        input: input::Queue,
         events: UnboundedSender<hypr::Event>,
         hypr: Arc<FakeHypr>,
         streams: Arc<FakeStreams>,
+        injected: Arc<Mutex<Vec<Injected>>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -441,27 +550,130 @@ mod tests {
             "eDP-1", 1920, 1200, 0,
         )]));
         let streams = Arc::new(FakeStreams::new(hypr.clone()));
+        let injected = Arc::new(Mutex::new(Vec::new()));
         let (inbox, inbox_rx) = mpsc::channel(64);
         let (events, mut events_rx) = mpsc::unbounded_channel();
         let outbox = Outbox::default();
+        let wire = input::Wire::default();
         let peer = Peer {
             outbox: outbox.clone(),
             inbox: inbox_rx,
+            input: wire.clone(),
         };
-        let task = {
-            let (hypr, streams) = (hypr.clone(), streams.clone());
-            tokio::spawn(async move {
-                serve_peer(peer, hypr, streams, &mut events_rx).await;
-            })
+        let ports = Ports {
+            hypr: hypr.clone(),
+            streams: streams.clone(),
+            injectors: Arc::new(FakeInjectors {
+                hypr: hypr.clone(),
+                started: injected.clone(),
+            }),
         };
+        let task = tokio::spawn(async move {
+            serve_peer(peer, &ports, &mut events_rx).await;
+        });
         Agent {
             inbox,
             outbox,
+            input: wire.from_peer,
             events,
             hypr,
             streams,
+            injected,
             task,
         }
+    }
+
+    impl Agent {
+        fn injected(&self, index: usize) -> Option<(String, Option<String>, Vec<input::Event>)> {
+            let injected = self.injected.lock().unwrap();
+            injected
+                .get(index)
+                .map(|i| (i.output.clone(), i.keymap.clone(), i.events.clone()))
+        }
+
+        fn dropped(&self, index: usize) -> Option<bool> {
+            self.injected.lock().unwrap().get(index)?.dropped
+        }
+    }
+
+    const KEY_T: u32 = 20;
+
+    fn key(pressed: bool) -> input::Event {
+        input::Event::Key {
+            code: KEY_T,
+            pressed,
+        }
+    }
+
+    #[tokio::test]
+    async fn home_s_input_is_injected_on_the_remote_output_with_home_s_keymap() {
+        let agent = agent();
+        // Home's surface says its keymap and size before the remote output exists.
+        agent.input.push(input::Event::Keymap("home keymap".into()));
+        let area = input::Event::Area {
+            width: 1280,
+            height: 720,
+        };
+        agent.input.push(area.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        agent.inbox.try_send(start()).unwrap();
+        until(|| agent.injected(0).is_some()).await;
+        agent.input.push(key(true));
+        until(|| agent.injected(0).unwrap().2.len() == 2).await;
+        let (output, keymap, events) = agent.injected(0).unwrap();
+        assert_eq!(output, output::NAME);
+        assert_eq!(keymap.as_deref(), Some("home keymap"));
+        assert_eq!(events, [area, key(true)]);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_releases_everything_before_the_output_goes() {
+        let agent = agent();
+        agent.inbox.try_send(start()).unwrap();
+        until(|| agent.injected(0).is_some()).await;
+        agent.input.push(key(true));
+        until(|| agent.injected(0).unwrap().2.len() == 1).await;
+        let Agent {
+            inbox,
+            task,
+            hypr,
+            injected,
+            ..
+        } = agent;
+        drop(inbox);
+        task.await.unwrap();
+        // Dropping the injector releases what it holds; the output was still there for it.
+        assert_eq!(injected.lock().unwrap()[0].dropped, Some(true));
+        assert!(hypr.monitor(output::NAME).is_none());
+    }
+
+    #[tokio::test]
+    async fn stopping_the_mode_releases_everything_before_the_output_goes() {
+        let agent = agent();
+        agent.inbox.try_send(start()).unwrap();
+        until(|| agent.injected(0).is_some()).await;
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        until(|| agent.dropped(0).is_some()).await;
+        assert_eq!(agent.dropped(0), Some(true));
+    }
+
+    #[tokio::test]
+    async fn the_injector_starts_again_with_the_stream_and_keeps_home_s_keymap() {
+        let agent = agent();
+        agent.input.push(input::Event::Keymap("home keymap".into()));
+        agent.inbox.try_send(start()).unwrap();
+        until(|| agent.injected(0).is_some()).await;
+        agent.streams.end_last();
+        until(|| agent.injected(1).is_some()).await;
+        assert_eq!(agent.dropped(0), Some(true));
+        assert_eq!(agent.injected(1).unwrap().1.as_deref(), Some("home keymap"));
+        // The new one gets what follows; the old one, gone, nothing.
+        agent.input.push(key(false));
+        until(|| agent.injected(1).unwrap().2 == [key(false)]).await;
+        assert!(!agent.injected(0).unwrap().2.contains(&key(false)));
     }
 
     /// Lets the agent handle what was sent, then waits until `done` holds.
@@ -636,7 +848,11 @@ mod tests {
         let (_peers, peers_rx) = mpsc::unbounded_channel();
         let (_events, events_rx) = mpsc::unbounded_channel();
         let streams = Arc::new(FakeStreams::new(hypr.clone()));
-        tokio::spawn(serve(peers_rx, hypr.clone(), streams, events_rx));
+        let injectors = Arc::new(FakeInjectors {
+            hypr: hypr.clone(),
+            started: Arc::default(),
+        });
+        tokio::spawn(serve(peers_rx, hypr.clone(), streams, injectors, events_rx));
         until(|| hypr.monitor(output::NAME).is_none()).await;
     }
 

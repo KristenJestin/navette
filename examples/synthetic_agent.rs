@@ -190,6 +190,7 @@ async fn main() -> io::Result<()> {
         peers_rx,
         hypr,
         Arc::new(Synthetic),
+        Arc::new(navette::input::LiveInjectors),
         hypr_events_rx,
     ));
     // The display only: no clipboard bridge here.

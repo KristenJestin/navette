@@ -28,6 +28,7 @@ use tokio::task::JoinSet;
 use crate::audio::{self, codec::MAX_PACKET};
 use crate::display::wire::{Incoming, Outbox, Peer};
 use crate::frame::{read_frame, write_frame};
+use crate::input;
 use crate::store::{Role, Store};
 use crate::transport::{Accept, Dial, TlsAcceptor, TlsDialer};
 use crate::wire::{Clip, LinkMsg, checked};
@@ -160,9 +161,11 @@ where
     let (to_peer, outbound_rx) = outbound_channel();
     let outbox = Outbox::default();
     let (display_tx, display_rx) = mpsc::channel(DISPLAY_INBOUND);
+    let input = input::Wire::default();
     let display = Peer {
         outbox: outbox.clone(),
         inbox: display_rx,
+        input: input.clone(),
     };
     let (sound, sound_end) = audio::wire();
     let service = async {
@@ -182,6 +185,7 @@ where
             outbound_rx,
             sound_end.from_audio,
             &outbox,
+            &input.to_peer,
         ) => result,
         result = receive(
             Framed::new(reader),
@@ -190,10 +194,12 @@ where
             sound_end.to_audio,
             display_tx,
             &outbox,
+            &input.from_peer,
         ) => result,
         never = service => match never {},
     };
     outbox.close();
+    input.close();
     match result {
         Ok(never) => match never {},
         Err(e) => e,
@@ -214,6 +220,7 @@ async fn send<W: AsyncWrite + Unpin>(
     mut outbound: mpsc::Receiver<Clip>,
     mut sound: mpsc::Receiver<audio::Message>,
     display: &Outbox,
+    input: &input::Queue,
 ) -> io::Result<Infallible> {
     let mut tick = tokio::time::interval(interval);
     // A long chunk write must not be followed by a burst of heartbeats.
@@ -222,6 +229,11 @@ async fn send<W: AsyncWrite + Unpin>(
     let mut sound_open = true;
     loop {
         tokio::select! {
+            // Input first: a key must not wait behind a video frame already queued.
+            biased;
+            Some(event) = input.next() => {
+                writer.write_msg(&LinkMsg::Input(event)).await.map_err(io_error)?
+            }
             msg = sound.recv(), if sound_open => match msg {
                 Some(msg) => {
                     let packet = match &msg {
@@ -263,6 +275,7 @@ async fn receive<R: AsyncRead + Unpin>(
     sound: SyncSender<audio::Message>,
     display: mpsc::Sender<Incoming>,
     outbox: &Outbox,
+    input: &input::Queue,
 ) -> io::Result<Infallible> {
     let silent = || io::Error::new(io::ErrorKind::TimedOut, "the peer went silent");
     loop {
@@ -317,6 +330,17 @@ async fn receive<R: AsyncRead + Unpin>(
                 {
                     outbox.refuse_frame(&msg);
                 }
+                continue;
+            }
+            LinkMsg::Input(input::Event::Keymap(text)) if text.len() > input::MAX_KEYMAP => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "a keymap larger than any keyboard's",
+                ));
+            }
+            // Never waits: the queue's own policy keeps it bounded and no key held.
+            LinkMsg::Input(event) => {
+                input.push(event);
                 continue;
             }
             LinkMsg::Feedback(msg) => {
@@ -1079,6 +1103,74 @@ pub(crate) mod tests {
             .await
             .expect("the link ends within its timeout");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn home_s_input_reaches_the_remote_in_order() {
+        let ends = display_link(64 * 1024).await;
+        let events = [
+            input::Event::Key {
+                code: 125,
+                pressed: true,
+            },
+            input::Event::Motion { x: 10.0, y: 20.0 },
+            input::Event::ReleaseAll,
+        ];
+        for event in events.clone() {
+            ends.home.input.to_peer.push(event);
+        }
+        for event in events {
+            let got =
+                tokio::time::timeout(Duration::from_secs(5), ends.remote.input.from_peer.next())
+                    .await
+                    .expect("an event in time");
+            assert_eq!(got, Some(event));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_ends_the_remote_s_input() {
+        let ends = display_link(64 * 1024).await;
+        ends.home_ended.abort();
+        let _ = ends.home_ended.await;
+        let got = tokio::time::timeout(Duration::from_secs(5), ends.remote.input.from_peer.next())
+            .await
+            .expect("the input ends with the link");
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn an_input_queue_nobody_reads_does_not_stop_the_reader() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut peer = Framed::new(b);
+        for code in 0..(4 * input::QUEUE as u32) {
+            peer.write_msg(&LinkMsg::Input(input::Event::Key {
+                code,
+                pressed: true,
+            }))
+            .await
+            .unwrap();
+        }
+        let deaf = |wire: Wire| async move {
+            let _wire = wire;
+            std::future::pending::<()>().await
+        };
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), deaf))
+            .await
+            .expect("the reader must keep reading past an input nobody takes");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn a_keymap_larger_than_any_keyboard_s_ends_the_link() {
+        let (a, b) = tokio::io::duplex(2 * input::MAX_KEYMAP);
+        let mut peer = Framed::new(b);
+        let keymap = input::Event::Keymap("x".repeat(input::MAX_KEYMAP + 1));
+        peer.write_msg(&LinkMsg::Input(keymap)).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), nothing))
+            .await
+            .expect("the link must give up on an oversized keymap");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

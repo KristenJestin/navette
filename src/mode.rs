@@ -631,6 +631,7 @@ mod tests {
             .send(Peer {
                 outbox: outbox.clone(),
                 inbox,
+                input: Default::default(),
             })
             .unwrap();
         Remote { outbox, to_home }

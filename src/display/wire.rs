@@ -87,10 +87,11 @@ pub enum Incoming {
     Feedback(ClientMsg),
 }
 
-/// One live connection, as the display sees it. `inbox` ends when the link drops.
+/// One live connection, as the display and its input see it. `inbox` ends when the link drops.
 pub struct Peer {
     pub outbox: Outbox,
     pub inbox: mpsc::Receiver<Incoming>,
+    pub input: crate::input::Wire,
 }
 
 #[derive(Default)]
