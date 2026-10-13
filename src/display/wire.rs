@@ -235,6 +235,11 @@ impl Outbox {
         }
     }
 
+    /// The output its stream messages are for.
+    pub fn output(&self) -> u8 {
+        self.output
+    }
+
     /// Queues a message and the payloads it declares. Dropped once the link is down.
     pub fn send(&self, msg: Msg, payloads: Vec<Vec<u8>>) {
         let mut queue = self.shared.queue.lock().unwrap();
