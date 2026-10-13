@@ -49,8 +49,10 @@ fn right_edge(monitors: &[Monitor]) -> i32 {
         .unwrap_or(0)
 }
 
-/// Makes the copy and checks it. On any failure, nothing is left behind.
-pub fn create(hypr: &dyn Hypr, copy: &OutputCopy) -> io::Result<()> {
+/// Makes the copy and checks it; gives the scale Hyprland chose, which may not be the one asked
+/// (it rounds a fractional scale so the logical size is whole). On any failure, nothing is left
+/// behind.
+pub fn create(hypr: &dyn Hypr, copy: &OutputCopy) -> io::Result<f32> {
     let monitors = hypr::monitors(hypr)?;
     if monitors.iter().any(|m| m.name == NAME) {
         // Left by an agent that did not stop cleanly.
@@ -59,7 +61,7 @@ pub fn create(hypr: &dyn Hypr, copy: &OutputCopy) -> io::Result<()> {
     hypr::dispatch(hypr, &rule(copy, right_edge(&monitors)))?;
     hypr::dispatch(hypr, &format!("output create headless {NAME}"))?;
     match check(hypr, copy) {
-        Ok(()) => Ok(()),
+        Ok(scale) => Ok(scale),
         Err(e) => {
             let _ = remove(hypr);
             Err(e)
@@ -67,8 +69,20 @@ pub fn create(hypr: &dyn Hypr, copy: &OutputCopy) -> io::Result<()> {
     }
 }
 
+/// The copy's scale if it is there as asked, so a stream can start again on it untouched.
+pub fn live(hypr: &dyn Hypr, copy: &OutputCopy) -> io::Result<Option<f32>> {
+    Ok(hypr::monitors(hypr)?
+        .into_iter()
+        .find(|m| m.name == NAME && matches(m, copy))
+        .map(|m| m.scale))
+}
+
+fn matches(m: &Monitor, copy: &OutputCopy) -> bool {
+    (m.width, m.height, m.transform) == (copy.width, copy.height, copy.transform as i32)
+}
+
 /// Hyprland applies a mode asynchronously: the copy is checked for half a second.
-fn check(hypr: &dyn Hypr, copy: &OutputCopy) -> io::Result<()> {
+fn check(hypr: &dyn Hypr, copy: &OutputCopy) -> io::Result<f32> {
     let mut seen = None;
     for attempt in 0..10 {
         if attempt > 0 {
@@ -77,9 +91,9 @@ fn check(hypr: &dyn Hypr, copy: &OutputCopy) -> io::Result<()> {
         let monitors = hypr::monitors(hypr)?;
         seen = monitors.into_iter().find(|m| m.name == NAME);
         if let Some(m) = &seen
-            && (m.width, m.height, m.transform) == (copy.width, copy.height, copy.transform as i32)
+            && matches(m, copy)
         {
-            return Ok(());
+            return Ok(m.scale);
         }
     }
     Err(io::Error::other(match seen {
@@ -156,6 +170,24 @@ mod tests {
         create(&hypr, &copy()).unwrap();
         assert_eq!(hypr.changes()[0], "output remove NAVETTE-1");
         assert_eq!(hypr.monitor(NAME).unwrap().width, 2560);
+    }
+
+    #[test]
+    fn the_scale_is_the_one_hyprland_chose() {
+        let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
+        hypr.choose_scale(1.2);
+        assert_eq!(create(&hypr, &copy()).unwrap(), 1.2);
+        assert_eq!(live(&hypr, &copy()).unwrap(), Some(1.2));
+    }
+
+    #[test]
+    fn a_copy_of_another_size_is_not_live() {
+        let hypr = FakeHypr::with(vec![
+            FakeMonitor::new("eDP-1", 1920, 1080, 0),
+            FakeMonitor::new(NAME, 1280, 720, 1920),
+        ]);
+        assert_eq!(live(&hypr, &copy()).unwrap(), None);
+        assert_eq!(live(&FakeHypr::default(), &copy()).unwrap(), None);
     }
 
     #[test]

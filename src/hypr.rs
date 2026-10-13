@@ -344,6 +344,8 @@ pub mod fake {
         /// `hl.window_rule` tables, as sent.
         window_rules: Vec<String>,
         down: bool,
+        /// The scale Hyprland gives a monitor whatever its rule asks (it rounds fractional ones).
+        chosen_scale: Option<f32>,
     }
 
     #[derive(Default)]
@@ -387,6 +389,11 @@ pub mod fake {
             state.rules.clear();
         }
 
+        /// Every monitor rule from now on gets `scale`, as Hyprland rounds a fractional one.
+        pub fn choose_scale(&self, scale: f32) {
+            self.state.lock().unwrap().chosen_scale = Some(scale);
+        }
+
         /// `hyprctl reload`: the runtime rules are gone, the outputs stay, at scale 2.
         pub fn reload(&self) {
             let mut state = self.state.lock().unwrap();
@@ -398,7 +405,8 @@ pub mod fake {
             }
         }
 
-        fn apply_rule(state: &mut State, rule: FakeMonitor) {
+        fn apply_rule(state: &mut State, mut rule: FakeMonitor) {
+            rule.scale = state.chosen_scale.unwrap_or(rule.scale);
             if let Some(m) = state.monitors.iter_mut().find(|m| m.name == rule.name) {
                 *m = rule.clone();
             }
