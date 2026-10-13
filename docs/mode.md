@@ -69,6 +69,8 @@ While the mode runs:
   monitor that it does not show goes too, and stays out of sight. Special workspaces stay
   where they are. These moves are not undone when the mode stops: the windows are left home,
   and the monitor takes windows again as usual.
+- **The remote's sound**, with `navette serve --audio`, plays at home while the mode runs, and
+  on the remote machine's own output again once it stops ([the sound](audio.md)).
 - **The home mic**, with `navette serve --audio`, goes to the remote machine while the mode runs,
   and the hotkey switches it either way ([the mic](mic.md)).
 

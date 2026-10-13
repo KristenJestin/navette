@@ -35,7 +35,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -927,16 +927,58 @@ impl<G: Graph> Home<G> {
     }
 }
 
-/// Home's side of one link, on a thread of its own: plays the remote's sound until the link
-/// drops.
-pub fn home<G: Graph>(graph: G, wire: Wire) -> io::Result<JoinHandle<()>> {
+/// The remote's sound at home, across links: a mode starts it and stops it, on the link that
+/// is up then.
+pub struct HomeSound<G: Graph> {
+    /// The current link's side; it goes with the link's audio thread.
+    current: Mutex<Weak<Mutex<Home<G>>>>,
+}
+
+impl<G: Graph> Default for HomeSound<G> {
+    fn default() -> Self {
+        Self {
+            current: Mutex::new(Weak::new()),
+        }
+    }
+}
+
+impl<G: Graph> HomeSound<G> {
+    /// A mode started: the remote's sound comes home.
+    pub fn start(&self) -> io::Result<()> {
+        let home = lock(&self.current)
+            .upgrade()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "the link is down"))?;
+        lock(&home).start()
+    }
+
+    /// The mode stopped: the remote plays on its own output again.
+    pub fn stop(&self) {
+        let home = lock(&self.current).upgrade();
+        if let Some(home) = home {
+            // A link already down puts the remote's output back on its own.
+            let _ = lock(&home).stop();
+        }
+    }
+}
+
+impl<G: Graph + Sync> crate::mode::Sound for HomeSound<G> {
+    fn start(&self) -> io::Result<()> {
+        HomeSound::start(self)
+    }
+
+    fn stop(&self) {
+        HomeSound::stop(self);
+    }
+}
+
+/// Home's side of one link, on a thread of its own: plays the remote's sound while `sound`
+/// says so, until the link drops.
+pub fn home<G: Graph>(graph: G, wire: Wire, sound: &HomeSound<G>) -> io::Result<JoinHandle<()>> {
+    let home = Arc::new(Mutex::new(Home::new(graph, wire.to_peer)));
+    *lock(&sound.current) = Arc::downgrade(&home);
     std::thread::Builder::new()
         .name("navette-audio".into())
         .spawn(move || {
-            let mut home = Home::new(graph, wire.to_peer);
-            if let Err(e) = home.start() {
-                eprintln!("navette: audio: could not start the playback: {e}");
-            }
             let mut due = Instant::now() + REPORT_EVERY;
             loop {
                 match wire
@@ -944,7 +986,7 @@ pub fn home<G: Graph>(graph: G, wire: Wire) -> io::Result<JoinHandle<()>> {
                     .recv_timeout(due.saturating_duration_since(Instant::now()))
                 {
                     Ok(message) => {
-                        if let Err(e) = home.received(message) {
+                        if let Err(e) = lock(&home).received(message) {
                             eprintln!("navette: audio: {e}");
                         }
                     }
@@ -953,12 +995,12 @@ pub fn home<G: Graph>(graph: G, wire: Wire) -> io::Result<JoinHandle<()>> {
                 }
                 if Instant::now() >= due {
                     due = Instant::now() + REPORT_EVERY;
-                    if let Some(stats) = home.stats(wire.from_peer.dropped()) {
+                    if let Some(stats) = lock(&home).stats(wire.from_peer.dropped()) {
                         eprintln!("navette: audio: {stats}");
                     }
                 }
             }
-            if let Some(stats) = home.stats(wire.from_peer.dropped()) {
+            if let Some(stats) = lock(&home).stats(wire.from_peer.dropped()) {
                 eprintln!("navette: audio: at the end, {stats}");
             }
         })
@@ -1176,6 +1218,97 @@ mod tests {
         );
     }
 
+    /// Home's side of a link, the sound started as a mode starts it.
+    async fn mode_started(graph: &FakeGraph, wire: Wire) -> Arc<HomeSound<FakeGraph>> {
+        let sound = Arc::new(HomeSound::default());
+        home(graph.clone(), wire, &sound).unwrap();
+        let started = sound.clone();
+        blocking(move || started.start()).await.unwrap();
+        sound
+    }
+
+    /// A link in memory to a remote machine whose own output is `laptop-speakers`, with home's
+    /// audio thread on it and no mode running: home's graph and audio thread, the remote's
+    /// graph and audio thread.
+    async fn sound_linked() -> (
+        Arc<HomeSound<FakeGraph>>,
+        (FakeGraph, JoinHandle<()>),
+        (FakeGraph, JoinHandle<()>),
+        tokio::task::JoinHandle<io::Error>,
+        tempfile::TempDir,
+    ) {
+        let home_graph = FakeGraph::with_default("home-speakers");
+        let remote_graph = FakeGraph::with_default("laptop-speakers");
+        let (tmp, saved) = saved();
+        let (home_peer, remote_peer, link) = linked().await;
+        let remote_thread = remote(remote_graph.clone(), saved, remote_peer, None).unwrap();
+        let sound = Arc::new(HomeSound::default());
+        let home_thread = home(home_graph.clone(), home_peer, &sound).unwrap();
+        (
+            sound,
+            (home_graph, home_thread),
+            (remote_graph, remote_thread),
+            link,
+            tmp,
+        )
+    }
+
+    fn plays_on_its_own_speakers(state: &fake::State) -> bool {
+        state.sinks.is_empty() && state.default == Some(DefaultNode::named("laptop-speakers"))
+    }
+
+    #[tokio::test]
+    async fn no_sound_comes_home_without_a_mode() {
+        let (_sound, (home_graph, _), (remote_graph, _), _link, _tmp) = sound_linked().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(plays_on_its_own_speakers(&remote_graph.state()));
+        assert!(home_graph.state().playbacks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mode_starting_brings_the_sound_home() {
+        let (sound, (home_graph, _), (remote_graph, _), _link, _tmp) = sound_linked().await;
+        blocking(move || sound.start()).await.unwrap();
+        until(&remote_graph, |s| !s.sinks.is_empty()).await;
+        assert_eq!(remote_graph.state().default, Some(DefaultNode::named(SINK)));
+        assert_eq!(home_graph.state().playbacks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_mode_stopping_stops_the_sound_and_restores_the_remote_default() {
+        let (sound, (home_graph, _), (remote_graph, _), _link, _tmp) = sound_linked().await;
+        let started = sound.clone();
+        blocking(move || started.start()).await.unwrap();
+        until(&remote_graph, |s| !s.sinks.is_empty()).await;
+
+        let stopped = sound.clone();
+        blocking(move || stopped.stop()).await;
+        until(&remote_graph, plays_on_its_own_speakers).await;
+        assert!(home_graph.state().playbacks.is_empty());
+
+        // And again: a mode can start and stop several times on one link.
+        blocking(move || sound.start()).await.unwrap();
+        until(&remote_graph, |s| !s.sinks.is_empty()).await;
+    }
+
+    #[tokio::test]
+    async fn the_link_dropping_stops_the_sound_and_restores_the_remote_default() {
+        let (sound, (home_graph, home_thread), (remote_graph, remote_thread), link, _tmp) =
+            sound_linked().await;
+        let started = sound.clone();
+        blocking(move || started.start()).await.unwrap();
+        until(&remote_graph, |s| !s.sinks.is_empty()).await;
+
+        link.abort();
+        // Each thread ends once its side is put back.
+        blocking(move || remote_thread.join().unwrap()).await;
+        assert!(plays_on_its_own_speakers(&remote_graph.state()));
+        blocking(move || home_thread.join().unwrap()).await;
+        assert!(home_graph.state().playbacks.is_empty());
+        // The mode, ending with the link, finds nothing left to stop.
+        blocking(move || sound.stop()).await;
+    }
+
     #[tokio::test]
     async fn the_remote_sound_plays_at_home() {
         let home_graph = FakeGraph::with_default("home-speakers");
@@ -1183,7 +1316,7 @@ mod tests {
         let (_tmp, saved) = saved();
         let (home_peer, remote_peer, _link) = linked().await;
         remote(remote_graph.clone(), saved.clone(), remote_peer, None).unwrap();
-        home(home_graph.clone(), home_peer).unwrap();
+        let _sound = mode_started(&home_graph, home_peer).await;
 
         until(&remote_graph, |s| !s.sinks.is_empty()).await;
         assert_eq!(remote_graph.state().default, Some(DefaultNode::named(SINK)));
@@ -1233,7 +1366,7 @@ mod tests {
         let (tmp, saved) = saved();
         let (home_peer, remote_peer, link) = linked().await;
         remote(remote_graph.clone(), saved, remote_peer, None).unwrap();
-        home(home_graph.clone(), home_peer).unwrap();
+        mode_started(&home_graph, home_peer).await;
         until(&remote_graph, |s| !s.sinks.is_empty()).await;
         until(&home_graph, |s| !s.playbacks.is_empty()).await;
         (home_graph, remote_graph, tmp, link)
