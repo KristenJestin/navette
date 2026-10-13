@@ -34,8 +34,9 @@ pub const VERSION: u8 = 2;
 
 const HELLO: u8 = 1;
 
-/// Clipboard messages read from the peer and not yet taken by the bridge. A full queue stops
-/// the reads, so a peer cannot grow the bridge's memory.
+/// Clipboard messages read from the peer and not yet taken by the bridge. The reader never
+/// waits on a service: past this many, a message for it is dropped, so a stuck service cannot
+/// stall the heartbeats (or another service) nor grow its memory.
 const INBOUND: usize = 64;
 
 /// What a connection's service gets: the clipboard messages of the peer, and where to put its own.
@@ -213,8 +214,9 @@ async fn receive<R: AsyncRead + Unpin>(
             }
             _ => Bytes::new(),
         };
-        // A service that went away leaves the link up: the message is dropped.
-        let _ = inbound.send((clip, payload)).await;
+        // A service that went away or fell behind leaves the link up: the message is dropped,
+        // and its transfer fails on its own (gliff's idle timeout).
+        let _ = inbound.try_send((clip, payload));
     }
 }
 
@@ -462,6 +464,27 @@ mod tests {
             .await
             .expect("the link must give up on an oversized chunk");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_service_that_never_reads_does_not_stop_the_reader() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut peer = Framed::new(b);
+        // Far more than the service's queue holds, then silence: a reader that still reads
+        // sees the silence and ends the link on time.
+        for id in 0..(4 * INBOUND as u32) {
+            peer.write_msg(&LinkMsg::ClipboardAck { id, received: 0 })
+                .await
+                .unwrap();
+        }
+        let deaf = |wire: Wire| async move {
+            let _wire = wire;
+            std::future::pending::<()>().await
+        };
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), deaf))
+            .await
+            .expect("the reader must keep reading past a service that does not");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
