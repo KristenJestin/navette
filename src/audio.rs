@@ -256,11 +256,21 @@ fn sender(home: mpsc::Sender<Vec<u8>>) -> io::Result<OnSound> {
 }
 
 /// The remote's side of one link, on a thread of its own: follows home's orders until the
-/// link drops, then puts the previous default sink back. Joining the thread waits for that.
-pub fn remote<G: Graph>(graph: G, saved: Saved, mut peer: Peer) -> io::Result<JoinHandle<()>> {
+/// link drops, then puts the previous default sink back. Joining the thread waits for that;
+/// `after`, the previous link's thread, is joined before anything else.
+pub fn remote<G: Graph>(
+    graph: G,
+    saved: Saved,
+    mut peer: Peer,
+    after: Option<JoinHandle<()>>,
+) -> io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("navette-audio".into())
         .spawn(move || {
+            // The previous link's thread first puts the default back, or the two would race.
+            if let Some(previous) = after {
+                let _ = previous.join();
+            }
             let mut sink = None;
             while let Some(frame) = peer.received.blocking_recv() {
                 match Message::decode(&frame) {
@@ -541,7 +551,7 @@ mod tests {
         let remote_graph = FakeGraph::with_default("laptop-speakers");
         let (_tmp, saved) = saved();
         let (home_peer, remote_peer, _link) = linked();
-        remote(remote_graph.clone(), saved.clone(), remote_peer).unwrap();
+        remote(remote_graph.clone(), saved.clone(), remote_peer, None).unwrap();
         home(home_graph.clone(), home_peer, true).unwrap();
 
         until(&remote_graph, |s| !s.sinks.is_empty()).await;
@@ -579,7 +589,7 @@ mod tests {
         let remote_graph = FakeGraph::with_default("laptop-speakers");
         let (_tmp, saved) = saved();
         let (home_peer, remote_peer, _link) = linked();
-        remote(remote_graph.clone(), saved.clone(), remote_peer).unwrap();
+        remote(remote_graph.clone(), saved.clone(), remote_peer, None).unwrap();
         let mut home = Home::new(home_graph.clone(), home_peer.send);
         // Home's calls block: off the runtime, as in `home`.
         let mut home = blocking(move || {
@@ -611,7 +621,7 @@ mod tests {
         let remote_graph = FakeGraph::with_default("laptop-speakers");
         let (_tmp, saved) = saved();
         let (home_peer, remote_peer, link) = linked();
-        let audio = remote(remote_graph.clone(), saved.clone(), remote_peer).unwrap();
+        let audio = remote(remote_graph.clone(), saved.clone(), remote_peer, None).unwrap();
         home_peer.send.send(Message::Start.encode()).await.unwrap();
         until(&remote_graph, |s| !s.sinks.is_empty()).await;
 
@@ -619,6 +629,50 @@ mod tests {
         // The thread ends once it has put the default back.
         blocking(move || audio.join().unwrap()).await;
         assert!(remote_graph.state().sinks.is_empty());
+        assert_eq!(
+            remote_graph.state().default,
+            Some(DefaultSink::named("laptop-speakers"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_link_waits_for_the_previous_one_to_put_the_default_back() {
+        let remote_graph = FakeGraph::with_default("laptop-speakers");
+        let (_tmp, saved) = saved();
+        let (home_peer, remote_peer, link) = linked();
+        let first = remote(remote_graph.clone(), saved.clone(), remote_peer, None).unwrap();
+        home_peer.send.send(Message::Start.encode()).await.unwrap();
+        until(&remote_graph, |s| !s.sinks.is_empty()).await;
+
+        // The link drops and comes back at once, while the first thread is still putting the
+        // default back.
+        remote_graph.state().slow_defaults = Duration::from_millis(200);
+        link.abort();
+        let (home_peer, remote_peer, link) = linked();
+        let second = remote(
+            remote_graph.clone(),
+            saved.clone(),
+            remote_peer,
+            Some(first),
+        )
+        .unwrap();
+        home_peer.send.send(Message::Start.encode()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        until(&remote_graph, |s| {
+            s.default == Some(DefaultSink::named(SINK))
+        })
+        .await;
+        // Long enough for a late put-back of the first link to land, if it were still coming.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(remote_graph.state().default, Some(DefaultSink::named(SINK)));
+        // And the second link's save is not wiped by the first one's clean-up.
+        assert_eq!(
+            saved.load().unwrap(),
+            Some(Some(DefaultSink::named("laptop-speakers")))
+        );
+
+        link.abort();
+        blocking(move || second.join().unwrap()).await;
         assert_eq!(
             remote_graph.state().default,
             Some(DefaultSink::named("laptop-speakers"))

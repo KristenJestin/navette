@@ -15,6 +15,8 @@ pub struct State {
     pub log: Vec<String>,
     /// Changes of the default fail, as when PipeWire is gone.
     pub refuse_defaults: bool,
+    /// How long a change of the default takes.
+    pub slow_defaults: std::time::Duration,
 }
 
 #[derive(Clone, Default)]
@@ -54,6 +56,8 @@ impl Graph for FakeGraph {
     }
 
     fn set_default_sink(&self, sink: Option<&DefaultSink>) -> io::Result<()> {
+        let slow = self.state().slow_defaults;
+        std::thread::sleep(slow);
         let mut state = self.state();
         if state.refuse_defaults {
             return Err(io::Error::new(

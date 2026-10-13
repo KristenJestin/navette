@@ -137,27 +137,27 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             tokio::spawn(print_events(log));
             let graph = PipeWire::default();
             let saved = audio::Saved::in_dir(audio::Saved::default_dir()?);
-            let threads = Arc::new(Mutex::new(Vec::new()));
+            // The latest link's audio thread; each one joins the one before it.
+            let audio_thread = Arc::new(Mutex::new(None));
             let agent = link::agent(dialer, Heartbeat::default(), Backoff::default(), events, {
-                let threads = threads.clone();
-                move |peer| match audio::remote(graph.clone(), saved.clone(), peer) {
-                    Ok(thread) => {
-                        let mut threads = threads.lock().unwrap();
-                        threads.retain(|t: &std::thread::JoinHandle<()>| !t.is_finished());
-                        threads.push(thread);
+                let audio_thread = audio_thread.clone();
+                move |peer| {
+                    let mut latest = audio_thread.lock().unwrap();
+                    match audio::remote(graph.clone(), saved.clone(), peer, latest.take()) {
+                        Ok(thread) => *latest = Some(thread),
+                        Err(e) => eprintln!("navette: audio: {e}"),
                     }
-                    Err(e) => eprintln!("navette: audio: {e}"),
                 }
             });
             tokio::select! {
                 () = agent => {}
                 result = stopped() => result?,
             }
-            // The link is dropped: each audio thread removes its sink and puts the previous
+            // The link is dropped: the audio thread removes its sink and puts the previous
             // default output back, and the process waits for that before it exits.
-            let threads = std::mem::take(&mut *threads.lock().unwrap());
+            let latest = audio_thread.lock().unwrap().take();
             tokio::task::spawn_blocking(move || {
-                for thread in threads {
+                if let Some(thread) = latest {
                     let _ = thread.join();
                 }
             })
