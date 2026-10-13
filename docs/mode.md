@@ -37,8 +37,8 @@ navette mode stop      # DP-2, DP-3 are back home
 
 `mode start` checks everything before it changes anything, and says what is missing: no
 `mode.conf`, a monitor named twice or that does not exist at home, or no remote machine
-connected. `mode stop` answers once the monitors are back. The two commands reach `navette serve` over a Unix socket in
-`$XDG_RUNTIME_DIR/navette`, private to the user.
+connected. `mode stop` answers once the monitors are back. The two commands reach
+`navette serve` over a Unix socket in `$XDG_RUNTIME_DIR/navette`, private to the user.
 
 While the mode runs:
 
@@ -69,8 +69,12 @@ Focus follows the pointer, with nothing to click. Over a reserved monitor, the k
 the pointer, the wheel and every shortcut, Super included, go to the remote machine; over any
 other monitor they stay home.
 
-- **From one work monitor to the next**, the pointer moves from one remote output to the next
-  at the same height, and the keyboard stays with the remote machine. Each reserved monitor has
+- **From one work monitor to the next**, the pointer moves from one remote output to the next,
+  and the keyboard stays with the remote machine. It crosses where home's compositor puts it:
+  the remote's outputs stand side by side, tops aligned, but the position on each comes from
+  home. With two monitors of different heights, or not level at home, the pointer crosses at
+  the point home puts it on the next monitor, and below the bottom of the shorter one it does
+  not cross, as at home. Each reserved monitor has
   its own surface, and the remote machine its own virtual keyboard and pointer on each output:
   keys held as the pointer crosses are released, as when it leaves for a home monitor. A drag
   (a button held) stays on the monitor where it began: home's compositor keeps the pointer's
@@ -128,9 +132,10 @@ shared memory: one copy; so it is too when the decoder's GPU is not the one the 
 draws with. With several outputs, each one decodes on a device of its own, opened on the
 same GPU, never shared between two decoders; when one cannot be opened, `navette mode start`
 fails and names its monitor: the CPU does not decode the streams offered for a GPU.
-Without a usable GPU, or with `GLIFF_VIDEO=cpu`, home decodes on the CPU (OpenH264). `navette serve` says which path it took, and every ten seconds prints, for each remote
-output, the frames, the frame rate, the decode time and the time from capture to decoded
-picture, on stderr.
+Without a usable GPU, or with `GLIFF_VIDEO=cpu`, home decodes on the CPU (OpenH264).
+`navette serve` says which path it took, and every ten seconds prints, for each remote output,
+the frames, the frame rate, the decode time and the time from capture to decoded picture, on
+stderr.
 
 ## Checking home's side without a remote machine
 
