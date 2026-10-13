@@ -56,6 +56,15 @@ impl<G: Graph> Voice<G> {
         })
     }
 
+    /// Takes a new session, which home started without stopping the last: the source stays the
+    /// default mic.
+    pub fn restart(&mut self, session: u32) -> io::Result<()> {
+        self.decoder = Decoder::new()?;
+        self.undecoded = Undecoded::new("mic");
+        self.session = session;
+        Ok(())
+    }
+
     /// A frame of the mic; one of an earlier session, still on its way, is dropped.
     pub fn received(&mut self, session: u32, seq: u32, packet: &[u8]) -> io::Result<()> {
         if session != self.session {
@@ -600,6 +609,45 @@ mod tests {
             s.sources.is_empty() && s.default_source == Some(DefaultNode::named("laptop-mic"))
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn a_new_session_keeps_the_source_the_default_mic() {
+        let graph = FakeGraph::default();
+        graph.state().default_source = Some(DefaultNode::named("laptop-mic"));
+        let (_tmp, saved) = saved();
+        let (wire, link) = super::super::wire();
+        let _audio = remote(graph.clone(), saved, wire, None).unwrap();
+        link.to_audio
+            .send(Message::MicStart { session: 1 })
+            .unwrap();
+        // A home that restarted, say: no stop came first.
+        link.to_audio
+            .send(Message::MicStart { session: 2 })
+            .unwrap();
+        let packets = super::super::codec::tests::packets(
+            &mut super::super::codec::Encoder::new().unwrap(),
+            &tone(20),
+        );
+        for (seq, packet) in packets.into_iter().enumerate() {
+            link.to_audio
+                .send(Message::MicFrame {
+                    session: 2,
+                    seq: seq as u32,
+                    packet: packet.into(),
+                })
+                .unwrap();
+        }
+        until(&graph, |s| !s.sources.is_empty()).await;
+        assert!(heard(&graph).await, "the new session was not heard");
+        let log = graph.state().log.clone();
+        assert_eq!(
+            log,
+            [
+                format!("source {SOURCE}"),
+                format!("default source {}", DefaultNode::named(SOURCE).0),
+            ]
+        );
     }
 
     #[tokio::test]

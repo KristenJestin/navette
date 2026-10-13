@@ -585,8 +585,12 @@ pub fn remote<G: Graph>(
                     }
                     Ok(Message::Stop) => drop(sink.take()),
                     Ok(Message::MicStart { session }) => {
-                        drop(voice.take());
-                        match mic::Voice::start(graph.clone(), saved.clone(), session) {
+                        let started = match voice.take() {
+                            // No flip of the default away and back.
+                            Some(mut running) => running.restart(session).map(|()| running),
+                            None => mic::Voice::start(graph.clone(), saved.clone(), session),
+                        };
+                        match started {
                             Ok(started) => voice = Some(started),
                             Err(e) => eprintln!("navette: mic: could not start the source: {e}"),
                         }

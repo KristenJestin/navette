@@ -97,7 +97,7 @@ home → remote:
 
 | Variant | Fields |
 |---|---|
-| `51` `MicStart` | the session number: open the source and make it the default mic |
+| `51` `MicStart` | the session number: open the source and make it the default mic; over a running session, only the number changes |
 | `52` `MicStop` | none: put the previous default mic back and remove the source |
 | `53` `MicFrame` | the session and a sequence number, and `data_len`: the Opus packet follows (4000 bytes at most, or the link ends) |
 
