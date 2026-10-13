@@ -1,0 +1,47 @@
+# The shape of a pull request, checked by the machine so nobody has to ask for it.
+#
+# A pull request names the issue it closes (`Closes #n` in its description). From that issue the
+# job copies the labels and the milestone onto the pull request and asks the maintainer for a
+# review. Without it the check is red, like a failing test: the tracker stays whole because the
+# pipeline keeps it whole, not because someone remembered.
+name: pull-request
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, ready_for_review, synchronize]
+
+permissions:
+  pull-requests: write
+  issues: read
+
+jobs:
+  shape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request
+            const body = pr.body ?? ''
+            // Housekeeping has no issue: ci, docs, chore and build pull requests are exempt.
+            if (/^(ci|docs|chore|build)[(:]/.test(pr.title)) { core.info('housekeeping pull request, no issue required'); return }
+            const match = /\b(?:closes|fixes|resolves)\s+#(\d+)\b/i.exec(body)
+            if (!match) {
+              core.setFailed('The description must say which issue this closes: `Closes #<n>` on its own line.')
+              return
+            }
+            const number = Number(match[1])
+            const { data: issue } = await github.rest.issues.get({ ...context.repo, issue_number: number })
+            if (issue.pull_request) { core.setFailed(`#${number} is a pull request, not an issue.`); return }
+            if (issue.state !== 'open') { core.setFailed(`#${number} is closed; a pull request closes an open issue.`); return }
+
+            const labels = issue.labels.map((l) => (typeof l === 'string' ? l : l.name)).filter((n) => /^(type|area|tranche):/.test(n))
+            if (labels.length) await github.rest.issues.addLabels({ ...context.repo, issue_number: pr.number, labels })
+            if (issue.milestone && pr.milestone?.number !== issue.milestone.number) {
+              await github.rest.issues.update({ ...context.repo, issue_number: pr.number, milestone: issue.milestone.number })
+            }
+            const owner = context.repo.owner
+            if (pr.user.login !== owner && !pr.draft && !(pr.requested_reviewers ?? []).some((r) => r.login === owner)) {
+              await github.rest.pulls.requestReviewers({ ...context.repo, pull_number: pr.number, reviewers: [owner] })
+            }
+            core.info(`Closes #${number}: labels ${labels.join(', ') || 'none'}, milestone ${issue.milestone?.title ?? 'none'}`)

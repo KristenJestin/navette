@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+jobs:
+  commit-messages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # The first push of a branch has no `before` (forty zeros): every commit it holds is checked.
+      - name: Check the Angular commit convention
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          head="${{ github.event.pull_request.head.sha || github.sha }}"
+          if [ -z "${base//0/}" ]; then
+            tools/commit-message.sh --range "$head"
+          else
+            tools/commit-message.sh --range "$base..$head"
+          fi
+      # A pull request is squashed: its title becomes the commit subject.
+      - name: Check the title of the pull request
+        if: github.event_name == 'pull_request'
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n' "$TITLE" > "$RUNNER_TEMP/title"
+          tools/commit-message.sh "$RUNNER_TEMP/title"
+
+  # No Hyprland, no PipeWire and no second machine here: the suites run against fakes (see AGENTS.md, Testing).
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked

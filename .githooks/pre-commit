@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "$(git rev-parse --show-toplevel)/tools/branch-guard.sh" "$(git rev-parse --abbrev-ref HEAD)"
