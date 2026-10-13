@@ -31,6 +31,11 @@ cargo build
 cargo test
 ```
 
+## Install
+
+A release or the beta of `dev`, without building: [docs/install.md](docs/install.md). What a
+version promises: [docs/versions.md](docs/versions.md).
+
 ## Licence
 
 Apache-2.0. Code reused from gliff (MIT) keeps its MIT notice.

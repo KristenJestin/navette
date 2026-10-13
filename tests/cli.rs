@@ -199,3 +199,19 @@ fn home_refuses_a_wildcard_address_on_the_command_line() {
     }
     assert!(fs::read_dir(tmp.path()).unwrap().next().is_none());
 }
+
+// `Cargo.toml` stays at 0.0.0: a release build names its version in NAVETTE_VERSION (the tag
+// without its `v`), a local build is `0.0.0-dev`.
+#[test]
+fn version_comes_from_the_build_not_from_cargo_toml() {
+    let output = Command::new(env!("CARGO_BIN_EXE_navette"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let expected = option_env!("NAVETTE_VERSION").unwrap_or("0.0.0-dev");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("navette {expected}\n")
+    );
+}
