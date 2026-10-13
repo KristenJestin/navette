@@ -128,9 +128,40 @@ fn now_us() -> u64 {
 
 /// Events from the capture thread.
 enum Incoming {
-    Frame(CapturedFrame),
+    Frame(Frame),
     Stopped,
     Error(String),
+}
+
+/// A picture to encode.
+enum Frame {
+    Captured(CapturedFrame),
+}
+
+impl Frame {
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Captured(frame) => (frame.buffer.info.width & !1, frame.buffer.info.height & !1),
+        }
+    }
+}
+
+/// What the session asks of the capture: `hypr-capture` live, a fake in tests.
+trait Capture {
+    /// Deliver the next frame with damage.
+    fn request_frame(&mut self);
+    /// Deliver the current picture, damaged or not.
+    fn recapture(&mut self);
+}
+
+impl Capture for Capturer {
+    fn request_frame(&mut self) {
+        Capturer::request_frame(self).ok();
+    }
+
+    fn recapture(&mut self) {
+        Capturer::recapture(self).ok();
+    }
 }
 
 struct Session {
@@ -150,9 +181,9 @@ struct Session {
     chroma: ChromaMode,
     settings: EncoderSettings,
     encoder: VideoEncoder,
-    capturer: Capturer,
+    capturer: Box<dyn Capture>,
     /// The newest captured frame not yet encoded.
-    pending: Option<CapturedFrame>,
+    pending: Option<Frame>,
     capture_asked: bool,
     /// The pending frame has already counted as blocked for the rate controller.
     blocked_noted: bool,
@@ -164,7 +195,7 @@ struct Session {
     encode_us: f64,
     next_send_at: Instant,
     /// The last frame that went out, kept for still-picture refinement.
-    last_frame: Option<CapturedFrame>,
+    last_frame: Option<Frame>,
     refines: u8,
     next_refine_at: Instant,
     recaptured: bool,
@@ -204,6 +235,20 @@ impl Session {
             ));
         }
         let video = VideoTier::open(VideoMode::resolve(None), &render_node);
+        let (cap_tx, captures) = mpsc::unbounded_channel();
+        let capturer = start_capture(&source.output, &render_node, cap_tx)?;
+        let session = Self::new(source, caps, outbox, output, video, Box::new(capturer))?;
+        Ok((session, captures))
+    }
+
+    fn new(
+        source: Source,
+        caps: ClientCaps,
+        outbox: Outbox,
+        output: (u32, u32),
+        video: VideoTier,
+        capturer: Box<dyn Capture>,
+    ) -> io::Result<Self> {
         let ladder = Ladder::new(START_LEVEL);
         let fps_cmd = ladder.level().fps_cap.min(MAX_FPS);
         let on_gpu = matches!(video, VideoTier::Gpu(_));
@@ -222,9 +267,7 @@ impl Session {
             output.1,
             start.video.pipeline().label()
         );
-        let (cap_tx, captures) = mpsc::unbounded_channel();
-        let capturer = start_capture(&source.output, &render_node, cap_tx)?;
-        let session = Self {
+        Ok(Self {
             outbox,
             video: start.video,
             source,
@@ -254,8 +297,7 @@ impl Session {
             ladder,
             base_stream: start.stream,
             base_chroma: start.chroma,
-        };
-        Ok((session, captures))
+        })
     }
 
     async fn run(
@@ -271,7 +313,7 @@ impl Session {
             Vec::new(),
         );
         self.send_config();
-        self.capturer.request_frame().ok();
+        self.capturer.request_frame();
         self.capture_asked = true;
         let first_frame_deadline =
             tokio::time::Instant::from_std(Instant::now() + FIRST_FRAME_DEADLINE);
@@ -304,7 +346,7 @@ impl Session {
                     if self.frame_id == 0 && !self.recaptured =>
                 {
                     self.recaptured = true;
-                    self.capturer.recapture().ok();
+                    self.capturer.recapture();
                 }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(self.refine_wake())),
                     if self.can_refine() => {}
@@ -374,8 +416,8 @@ impl Session {
         Ok(())
     }
 
-    fn on_frame(&mut self, frame: CapturedFrame) -> io::Result<()> {
-        let size = (frame.buffer.info.width & !1, frame.buffer.info.height & !1);
+    fn on_frame(&mut self, frame: Frame) -> io::Result<()> {
+        let size = frame.size();
         if size != self.output {
             // A reload dropped the monitor rule and Hyprland changed the mode before the rule
             // came back: stream what is there.
@@ -432,7 +474,7 @@ impl Session {
         // Keep one capture request outstanding even while blocked: a newer frame replaces
         // `pending`, so the frame that finally goes out on a slow link is current.
         if !self.capture_asked {
-            self.capturer.request_frame().ok();
+            self.capturer.request_frame();
             self.capture_asked = true;
         }
         Ok(())
@@ -452,9 +494,8 @@ impl Session {
         Duration::from_secs_f64(1.0 / self.fps_cmd.max(1) as f64)
     }
 
-    fn matches_output(&self, frame: &CapturedFrame) -> bool {
-        let info = &frame.buffer.info;
-        (info.width & !1, info.height & !1) == self.output
+    fn matches_output(&self, frame: &Frame) -> bool {
+        frame.size() == self.output
     }
 
     fn refined_done_bytes(&self) -> f64 {
@@ -595,7 +636,7 @@ impl Session {
 
     /// Encodes `frame` and queues it; returns the coded byte count. `app_limited` marks a send
     /// that does not use the capacity (a refinement pass), so it cannot lower the estimate.
-    fn encode_and_send(&mut self, frame: &CapturedFrame, app_limited: bool) -> io::Result<usize> {
+    fn encode_and_send(&mut self, frame: &Frame, app_limited: bool) -> io::Result<usize> {
         let (width, height) = self.stream;
         let key = std::mem::take(&mut self.want_keyframe);
         let t0 = Instant::now();
@@ -784,12 +825,12 @@ impl VideoEncoder {
     /// scales the pixels before converting.
     fn encode(
         &mut self,
-        frame: &CapturedFrame,
+        frame: &Frame,
         stream: (u32, u32),
         force_keyframe: bool,
     ) -> io::Result<EncodedFrame> {
-        match self {
-            Self::Gpu(enc) => {
+        match (self, frame) {
+            (Self::Gpu(enc), Frame::Captured(frame)) => {
                 let info = &frame.buffer.info;
                 let fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc).map_err(|_| {
                     io::Error::other(format!(
@@ -812,7 +853,7 @@ impl VideoEncoder {
                 enc.encode_dmabuf(buffer_key, &plane, force_keyframe)
                     .map_err(|e| other("GPU encode", e))
             }
-            Self::Cpu(enc) => {
+            (Self::Cpu(enc), Frame::Captured(frame)) => {
                 let image = frame
                     .buffer
                     .read_bgra()
@@ -829,17 +870,25 @@ impl VideoEncoder {
                         h,
                     )
                 };
-                let f = enc
-                    .encode_bgra(&pixels, force_keyframe)
-                    .map_err(|e| other("CPU encode", e))?;
-                Ok(EncodedFrame {
-                    main: f.main,
-                    aux: f.aux,
-                    keyframe: f.keyframe,
-                })
+                encode_on_cpu(enc, &pixels, force_keyframe)
             }
         }
     }
+}
+
+fn encode_on_cpu(
+    enc: &mut gliff_sw::Encoder,
+    bgra: &[u8],
+    force_keyframe: bool,
+) -> io::Result<EncodedFrame> {
+    let f = enc
+        .encode_bgra(bgra, force_keyframe)
+        .map_err(|e| other("CPU encode", e))?;
+    Ok(EncodedFrame {
+        main: f.main,
+        aux: f.aux,
+        keyframe: f.keyframe,
+    })
 }
 
 /// The encoder's largest picture, no larger than home said it decodes.
@@ -866,7 +915,7 @@ fn start_capture(
     config.buffers = 4;
     let sink = Box::new(move |ev: CaptureEvent| {
         let msg = match ev {
-            CaptureEvent::Frame(frame) => Incoming::Frame(frame),
+            CaptureEvent::Frame(frame) => Incoming::Frame(Frame::Captured(frame)),
             CaptureEvent::Stopped => Incoming::Stopped,
             CaptureEvent::Error(e) => Incoming::Error(e),
             _ => return,
