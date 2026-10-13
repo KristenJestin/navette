@@ -8,5 +8,7 @@ set -eu
 
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
+  libclang-dev \
+  libpipewire-0.3-dev \
   libwayland-dev \
   libxkbcommon-dev
