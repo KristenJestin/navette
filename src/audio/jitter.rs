@@ -26,11 +26,16 @@ impl Jitter {
     }
 
     pub fn push(&mut self, pcm: &[f32]) {
-        self.samples.extend(pcm);
-        if self.samples.len() > self.max {
-            let excess = self.samples.len() - self.target;
-            self.samples.drain(..excess);
+        // Trimmed before it grows, so the buffer never outgrows what it was given at first.
+        let mut pcm = pcm;
+        let total = self.samples.len() + pcm.len();
+        if total > self.max {
+            let excess = total - self.target;
+            let buffered = excess.min(self.samples.len());
+            self.samples.drain(..buffered);
+            pcm = &pcm[excess - buffered..];
         }
+        self.samples.extend(pcm);
         if self.samples.len() >= self.target {
             self.playing = true;
         }
@@ -82,6 +87,23 @@ mod tests {
         assert_eq!(pulled(&mut jitter, 1), [0.0]);
         jitter.push(&[5.0]);
         assert_eq!(pulled(&mut jitter, 2), [4.0, 5.0]);
+    }
+
+    #[test]
+    fn a_push_past_the_maximum_does_not_allocate() {
+        let mut jitter = Jitter::new(2, 4);
+        jitter.push(&[1.0, 2.0, 3.0]);
+        let allocated = crate::audio::allocations::during(|| jitter.push(&[4.0, 5.0, 6.0]));
+        assert_eq!(allocated, 0);
+        assert_eq!(pulled(&mut jitter, 2), [5.0, 6.0]);
+    }
+
+    #[test]
+    fn a_block_longer_than_the_maximum_keeps_its_newest_sound() {
+        let mut jitter = Jitter::new(2, 4);
+        jitter.push(&[1.0]);
+        jitter.push(&[2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(pulled(&mut jitter, 3), [6.0, 7.0, 0.0]);
     }
 
     #[test]
