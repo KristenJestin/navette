@@ -2,14 +2,17 @@
 //! mode start` checks everything first (the config, the monitor, the link) and changes nothing
 //! when a check fails; then home covers the monitor with its surface, asks the remote for its
 //! output, and shows its stream. `navette mode stop`, or the link dropping, gives the monitor
-//! back. Home monitors are never moved or reconfigured.
+//! back. Home monitors are never moved or reconfigured: the one change to the home desk is a
+//! window rule that opens home windows on another home monitor rather than hidden under the
+//! surface (#2), made through the desk recorder so it is undone on stop, on a dropped link and
+//! after a crash, and made again after a config reload.
 //!
 //! `navette serve` owns the link and the surface, so the two commands reach it over a Unix
 //! socket in `$XDG_RUNTIME_DIR/navette`, private to the user.
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gliff_vk::Gpu;
@@ -18,9 +21,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
+use crate::desk::{Change, Desk, DeskError};
 use crate::display::decode::{self, Decoding, Picture, Video};
 use crate::display::wire::{Display, Incoming, Msg, OutputCopy, Peer};
-use crate::hypr::{self, Hypr};
+use crate::hypr::{self, Eval, Hypr, lua_string};
 
 const CONFIG_FILE: &str = "mode.conf";
 /// How long the remote has to make its output.
@@ -96,6 +100,8 @@ pub struct Home {
     pub screens: Arc<dyn Screens>,
     /// The GPU that decodes, or none for the CPU.
     pub gpu: Option<Arc<Gpu>>,
+    /// Where the desk recorder keeps what it must undo.
+    pub desk_record: PathBuf,
 }
 
 struct Active {
@@ -103,6 +109,7 @@ struct Active {
     // Field order is drop order: the decoder stops before the surface goes.
     decoding: Decoding,
     _screen: Box<dyn Screen>,
+    desk: Arc<Mutex<Desk<Eval>>>,
     /// The `navette mode start` waiting for the remote's answer.
     starting: Option<(oneshot::Sender<io::Result<String>>, tokio::time::Instant)>,
 }
@@ -112,6 +119,7 @@ pub async fn serve(
     home: Home,
     mut peers: UnboundedReceiver<Peer>,
     mut orders: UnboundedReceiver<Order>,
+    mut events: UnboundedReceiver<hypr::Event>,
 ) {
     let mut peer: Option<Peer> = None;
     let mut active: Option<Active> = None;
@@ -194,6 +202,17 @@ pub async fn serve(
                 }
                 None => break,
             },
+            Some(event) = events.recv() => {
+                if let Some(a) = &active {
+                    let desk = a.desk.clone();
+                    let handled =
+                        blocking(move || desk.lock().unwrap().handle(&event).map_err(desk_error))
+                            .await;
+                    if let Err(e) = handled {
+                        eprintln!("navette: the home desk could not be restored after a reload: {e}");
+                    }
+                }
+            }
             _ = sleep_until(deadline) => {
                 if let Some(peer) = &peer {
                     peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
@@ -262,8 +281,15 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
         scale_milli: (found.scale * 1000.0).round() as u32,
         transform: found.transform.clamp(0, 7) as u8,
     };
+    let desk = open_desk(home, &monitor, &monitors).await?;
     let (screens, name) = (home.screens.clone(), monitor.clone());
-    let screen = blocking(move || screens.open(&name)).await?;
+    let screen = match blocking(move || screens.open(&name)).await {
+        Ok(screen) => screen,
+        Err(e) => {
+            tokio::task::spawn_blocking(move || drop(desk));
+            return Err(e);
+        }
+    };
     let decoding = Decoding::start(home.gpu.clone(), peer.outbox.clone(), screen.pictures())?;
     let caps = decode::caps(&home.gpu, (3840, 2160));
     peer.outbox.send(
@@ -274,9 +300,55 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
         monitor,
         decoding,
         _screen: screen,
+        desk: Arc::new(Mutex::new(desk)),
         starting: None,
     });
     Ok(())
+}
+
+/// Opens the desk (undoing what a previous run left) and keeps home windows off `monitor`:
+/// those that would open on its workspace go to the leftmost other home monitor.
+async fn open_desk(
+    home: &Home,
+    monitor: &str,
+    monitors: &[hypr::Monitor],
+) -> io::Result<Desk<Eval>> {
+    let other = monitors
+        .iter()
+        .filter(|m| m.name != monitor && !m.disabled)
+        .min_by_key(|m| (m.x, m.y))
+        .map(|m| m.name.clone());
+    let (hypr, record, monitor) = (
+        home.hypr.clone(),
+        home.desk_record.clone(),
+        monitor.to_string(),
+    );
+    blocking(move || {
+        let mut desk = Desk::start(Eval(hypr.clone()), record).map_err(|e| match e {
+            DeskError::Hypr(crate::hypr::HyprError::Io(e)) => io::Error::other(format!(
+                "Hyprland could not be reached to undo what a previous run left ({e}); \
+                 nothing was changed, try again"
+            )),
+            other => desk_error(other),
+        })?;
+        let workspace = hypr::active_workspace(&*hypr, &monitor)?;
+        if let (Some(workspace), Some(other)) = (workspace, other) {
+            let fields = format!(
+                "match = {{ workspace = {} }}, monitor = {}",
+                lua_string(&workspace.to_string()),
+                lua_string(&other)
+            );
+            let name = desk.rule_name("home-windows");
+            desk.apply(Change::window_rule(&name, &fields))
+                .map_err(desk_error)?;
+        }
+        Ok(desk)
+    })
+    .await
+}
+
+fn desk_error(e: DeskError) -> io::Error {
+    io::Error::other(e.to_string())
 }
 
 /// Takes the cover away.
@@ -428,6 +500,7 @@ mod tests {
         covered: Arc<Mutex<Vec<String>>>,
         peers: UnboundedSender<Peer>,
         orders: UnboundedSender<Order>,
+        events: UnboundedSender<hypr::Event>,
     }
 
     fn desk(monitor: &str) -> Desk {
@@ -445,19 +518,22 @@ mod tests {
         let covered = screens.covered.clone();
         let (peers, peers_rx) = mpsc::unbounded_channel();
         let (orders, orders_rx) = mpsc::unbounded_channel();
+        let (events, events_rx) = mpsc::unbounded_channel();
         let home = Home {
             config_dir: config.path().to_path_buf(),
             hypr: hypr.clone(),
             screens: Arc::new(screens),
             gpu: None,
+            desk_record: config.path().join("desk"),
         };
-        tokio::spawn(serve(home, peers_rx, orders_rx));
+        tokio::spawn(serve(home, peers_rx, orders_rx, events_rx));
         Desk {
             _config: config,
             hypr,
             covered,
             peers,
             orders,
+            events,
         }
     }
 
@@ -544,6 +620,46 @@ mod tests {
             .unwrap();
         let text = answer(pending).await.unwrap();
         assert!(text.contains("DP-2"), "{text}");
+        // Home windows that would open on DP-2's workspace go to DP-1 instead.
+        let rules = desk.hypr.window_rules();
+        assert_eq!(rules.len(), 1);
+        assert!(
+            rules[0].contains(r#"match = { workspace = "2" }, monitor = "DP-1""#),
+            "{rules:?}"
+        );
+    }
+
+    async fn started(desk: &Desk) -> Remote {
+        let remote = connect(desk);
+        let pending = ask(desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        remote
+            .to_home
+            .send(Incoming::Display(Display::Started {
+                output: "NAVETTE-1".into(),
+            }))
+            .unwrap();
+        answer(pending).await.unwrap();
+        remote
+    }
+
+    #[tokio::test]
+    async fn stopping_undoes_the_home_window_rule() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        answer(ask(&desk, false).await).await.unwrap();
+        until(|| desk.hypr.window_rules().len() == 2).await;
+        assert!(desk.hypr.window_rules()[1].contains("enabled = false"));
+    }
+
+    #[tokio::test]
+    async fn a_reload_brings_the_home_window_rule_back() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        desk.events.send(hypr::Event::ConfigReloaded).unwrap();
+        until(|| desk.hypr.window_rules().len() == 2).await;
+        let rules = desk.hypr.window_rules();
+        assert_eq!(rules[0], rules[1]);
     }
 
     #[tokio::test]
@@ -636,6 +752,8 @@ mod tests {
         answer(pending).await.unwrap();
         drop(remote);
         until(|| desk.covered.lock().unwrap().is_empty()).await;
+        until(|| desk.hypr.window_rules().len() == 2).await;
+        assert!(desk.hypr.window_rules()[1].contains("enabled = false"));
     }
 
     #[tokio::test]
