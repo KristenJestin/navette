@@ -11,6 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -49,54 +50,113 @@ enum Command {
         reply: Reply<u64>,
     },
     Close(u64),
+    /// Ends a loop that stopped answering, and with it every stream it holds.
+    Quit,
 }
 
-#[derive(Clone, Default)]
+/// The way to one PipeWire loop: its commands, and whether it still runs.
+#[derive(Clone)]
+struct Loop {
+    commands: Arc<dyn Fn(Command) -> Result<(), Command> + Send + Sync>,
+    running: Arc<AtomicBool>,
+}
+
+impl Loop {
+    /// Gives the command back when the loop has ended.
+    fn send(&self, command: Command) -> Result<(), Command> {
+        if !self.running.load(Ordering::Acquire) {
+            return Err(command);
+        }
+        (self.commands)(command)
+    }
+}
+
+type Connect = Arc<dyn Fn() -> io::Result<Loop> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct PipeWire {
-    connection: Arc<Mutex<Option<pw::channel::Sender<Command>>>>,
+    current: Arc<Mutex<Option<Loop>>>,
+    connect: Connect,
+    answer: Duration,
 }
 
-/// A stream of ours in the graph; removed when dropped.
+impl Default for PipeWire {
+    fn default() -> Self {
+        Self::with(Arc::new(connect), ANSWER)
+    }
+}
+
+/// A stream of ours in the graph; removed when dropped. It keeps the loop it was opened on:
+/// its id means nothing to the loop of a later connection.
 pub struct Node {
-    graph: PipeWire,
+    on: Loop,
     id: u64,
 }
 
 impl Drop for Node {
     fn drop(&mut self) {
-        if let Some(sender) = self.graph.connection.lock().unwrap().as_ref() {
-            let _ = sender.send(Command::Close(self.id));
-        }
+        // An ended loop took its streams with it.
+        let _ = self.on.send(Command::Close(self.id));
     }
 }
 
+/// A lock that a panic elsewhere does not turn into a panic here.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl PipeWire {
-    fn call<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> io::Result<T> {
-        let mut connection = self.connection.lock().unwrap();
-        let sender = match connection.as_ref() {
-            Some(sender) => sender.clone(),
-            None => connection.insert(connect()?).clone(),
-        };
-        let (reply, answer) = std_mpsc::channel();
-        let answer = match sender.send(command(reply)) {
-            Ok(()) => answer.recv_timeout(ANSWER).ok(),
-            Err(_) => None,
-        };
-        answer.unwrap_or_else(|| {
-            // The loop is gone (PipeWire restarted) or hung: the next call connects again.
-            *connection = None;
-            Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "PipeWire did not answer",
-            ))
-        })
+    fn with(connect: Connect, answer: Duration) -> Self {
+        Self {
+            current: Arc::default(),
+            connect,
+            answer,
+        }
     }
 
-    fn node(&self, id: u64) -> Node {
-        Node {
-            graph: self.clone(),
-            id,
+    /// Sends `command` to the current loop and waits for its answer. A loop that has ended
+    /// (PipeWire restarted) gives the command back, which goes once more to a new connection.
+    fn call<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> io::Result<(T, Loop)> {
+        let mut current = lock(&self.current);
+        let (reply, answer) = std_mpsc::channel();
+        let mut command = command(reply);
+        for _ in 0..2 {
+            let pipewire = match current.as_ref() {
+                Some(pipewire) => pipewire.clone(),
+                None => current.insert((self.connect)()?).clone(),
+            };
+            match pipewire.send(command) {
+                Ok(()) => {
+                    return match answer.recv_timeout(self.answer) {
+                        Ok(result) => result.map(|value| (value, pipewire)),
+                        Err(_) => {
+                            // Hung, or ended with the command: if it ever wakes up, it must not
+                            // come back with a second sink.
+                            let _ = pipewire.send(Command::Quit);
+                            *current = None;
+                            Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "PipeWire did not answer",
+                            ))
+                        }
+                    };
+                }
+                Err(returned) => {
+                    command = returned;
+                    *current = None;
+                }
+            }
         }
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "PipeWire ended twice in a row",
+        ))
+    }
+
+    fn node(&self, id: u64, on: Loop) -> Node {
+        Node { on, id }
     }
 }
 
@@ -104,11 +164,12 @@ impl Graph for PipeWire {
     type Node = Node;
 
     fn default_sink(&self) -> io::Result<Option<DefaultSink>> {
-        self.call(Command::DefaultSink)
+        Ok(self.call(Command::DefaultSink)?.0)
     }
 
     fn set_default_sink(&self, sink: Option<&DefaultSink>) -> io::Result<()> {
         self.call(|reply| Command::SetDefaultSink(sink.cloned(), reply))
+            .map(drop)
     }
 
     fn open_sink(&self, name: &str, description: &str, on_sound: OnSound) -> io::Result<Node> {
@@ -118,7 +179,7 @@ impl Graph for PipeWire {
             on_sound,
             reply,
         })?;
-        Ok(self.node(id))
+        Ok(self.node(id.0, id.1))
     }
 
     fn open_playback(
@@ -133,7 +194,7 @@ impl Graph for PipeWire {
             jitter,
             reply,
         })?;
-        Ok(self.node(id))
+        Ok(self.node(id.0, id.1))
     }
 }
 
@@ -142,20 +203,28 @@ fn pw_error(e: pw::Error) -> io::Error {
 }
 
 /// Starts PipeWire's thread, once it has connected and read the default metadata.
-fn connect() -> io::Result<pw::channel::Sender<Command>> {
+fn connect() -> io::Result<Loop> {
     let (sender, receiver) = pw::channel::channel();
     let (ready, started) = std_mpsc::channel();
+    let running = Arc::new(AtomicBool::new(true));
     std::thread::Builder::new()
         .name("navette-pipewire".into())
-        .spawn(move || {
-            if let Err(e) = run(receiver, &ready) {
-                let _ = ready.send(Err(e));
+        .spawn({
+            let running = running.clone();
+            move || {
+                if let Err(e) = run(receiver, &ready) {
+                    let _ = ready.send(Err(e));
+                }
+                running.store(false, Ordering::Release);
             }
         })?;
     started
         .recv_timeout(ANSWER)
         .unwrap_or_else(|_| Err(io::Error::other("PipeWire did not answer")))?;
-    Ok(sender)
+    Ok(Loop {
+        commands: Arc::new(move |command| sender.send(command)),
+        running,
+    })
 }
 
 /// A stream of ours, its listener dropped first so it unhooks from a live stream.
@@ -241,6 +310,7 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
         })
         .register();
     let streams: Rc<RefCell<HashMap<u64, Open>>> = Rc::default();
+    let quit = mainloop.clone();
     let next_id = Cell::new(0u64);
     let _commands = commands.attach(mainloop.loop_(), move |command| match command {
         Command::DefaultSink(reply) => {
@@ -301,6 +371,7 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
         Command::Close(id) => {
             streams.borrow_mut().remove(&id);
         }
+        Command::Quit => quit.quit(),
     });
     if !failed.get() {
         mainloop.run();
@@ -504,6 +575,120 @@ fn open_playback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Loops that answer every command and log what they got, as `<loop>: <command>`.
+    #[derive(Clone, Default)]
+    struct FakeLoops {
+        log: Arc<Mutex<Vec<String>>>,
+        running: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
+        /// The loops from this one on never answer a change of the default.
+        hung_from: Option<usize>,
+    }
+
+    impl FakeLoops {
+        fn pipewire(&self) -> PipeWire {
+            let loops = self.clone();
+            PipeWire::with(
+                Arc::new(move || Ok(loops.start())),
+                Duration::from_millis(200),
+            )
+        }
+
+        fn start(&self) -> Loop {
+            let n = {
+                let mut running = lock(&self.running);
+                running.push(Arc::new(AtomicBool::new(true)));
+                running.len() - 1
+            };
+            let running = lock(&self.running)[n].clone();
+            let hung = self.hung_from.is_some_and(|from| n >= from);
+            let (sender, commands) = std_mpsc::channel::<Command>();
+            let log = self.log.clone();
+            std::thread::spawn(move || {
+                let mut next_id = 0;
+                for command in commands {
+                    let entry = match command {
+                        Command::DefaultSink(reply) => {
+                            let _ = reply.send(Ok(None));
+                            "default?".to_owned()
+                        }
+                        Command::SetDefaultSink(sink, reply) => {
+                            if !hung {
+                                let _ = reply.send(Ok(()));
+                            }
+                            format!("default {}", sink.map_or("cleared".into(), |s| s.0))
+                        }
+                        Command::OpenSink { reply, .. } | Command::OpenPlayback { reply, .. } => {
+                            let _ = reply.send(Ok(next_id));
+                            next_id += 1;
+                            format!("open {}", next_id - 1)
+                        }
+                        Command::Close(id) => format!("close {id}"),
+                        Command::Quit => "quit".to_owned(),
+                    };
+                    lock(&log).push(format!("{n}: {entry}"));
+                }
+            });
+            Loop {
+                commands: Arc::new(move |command| sender.send(command).map_err(|e| e.0)),
+                running,
+            }
+        }
+
+        /// PipeWire restarted: loop `n` ended.
+        fn end(&self, n: usize) {
+            lock(&self.running)[n].store(false, Ordering::Release);
+        }
+
+        fn log(&self) -> Vec<String> {
+            // The loops log on their own threads, after answering.
+            std::thread::sleep(Duration::from_millis(50));
+            lock(&self.log).clone()
+        }
+    }
+
+    fn sink(pipewire: &PipeWire) -> io::Result<Node> {
+        pipewire.open_sink("navette-test", "Test", Box::new(|_| {}))
+    }
+
+    #[test]
+    fn an_old_node_is_not_closed_on_a_new_loop() {
+        let loops = FakeLoops::default();
+        let pipewire = loops.pipewire();
+        let old = sink(&pipewire).unwrap();
+        loops.end(0);
+        // The first call after the restart may fail; the one after it reaches a new loop.
+        let _ = pipewire.default_sink();
+        let new = sink(&pipewire).unwrap();
+        drop(old);
+        let log = loops.log();
+        assert!(log.contains(&"1: open 0".to_owned()), "{log:?}");
+        assert!(!log.contains(&"1: close 0".to_owned()), "{log:?}");
+        drop(new);
+        assert!(loops.log().contains(&"1: close 0".to_owned()));
+    }
+
+    #[test]
+    fn the_default_is_put_back_after_pipewire_restarts() {
+        let loops = FakeLoops::default();
+        let pipewire = loops.pipewire();
+        pipewire.default_sink().unwrap();
+        loops.end(0);
+        let previous = DefaultSink::named("invented-speakers");
+        pipewire.set_default_sink(Some(&previous)).unwrap();
+        assert!(loops.log().contains(&format!("1: default {}", previous.0)));
+    }
+
+    #[test]
+    fn a_loop_that_does_not_answer_is_told_to_quit() {
+        let loops = FakeLoops {
+            hung_from: Some(0),
+            ..FakeLoops::default()
+        };
+        let pipewire = loops.pipewire();
+        assert!(pipewire.set_default_sink(None).is_err());
+        assert!(loops.log().contains(&"0: quit".to_owned()));
+    }
 
     const SPEAKERS: &str = "{ \"name\": \"invented-speakers\" }";
 
