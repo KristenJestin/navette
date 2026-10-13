@@ -122,6 +122,8 @@ struct Home {
 /// An active mode: the copies asked for, in home's order, and each one's stream.
 struct Active {
     copies: Vec<OutputCopy>,
+    /// The scale Hyprland chose for each output made, which places the ones right of it.
+    scales: Vec<Option<f32>>,
     caps: ClientCaps,
     outputs: Vec<Output>,
     told_no_input: bool,
@@ -141,6 +143,7 @@ impl Active {
             self.told_no_input = true;
             outbox.send(Msg::NoInput(reason.clone()), Vec::new());
         }
+        self.scales[index] = Some(running.scale);
         self.outputs[index].stream = Stream::Running(running);
     }
 
@@ -178,6 +181,8 @@ struct Running {
     feedback: UnboundedSender<ClientMsg>,
     ended: oneshot::Receiver<io::Error>,
     since: tokio::time::Instant,
+    /// The scale Hyprland chose for the output.
+    scale: f32,
 }
 
 /// One link, until it drops; the outputs never outlive it. Hyprland requests and the streams'
@@ -250,9 +255,12 @@ pub async fn serve_peer(
             },
             Some(event) = events.recv() => {
                 if let (hypr::Event::ConfigReloaded, Some(mode)) = (event, &active) {
-                    let (hypr, copies) = (hypr.clone(), mode.copies.clone());
-                    let reapplied =
-                        tokio::task::spawn_blocking(move || output::reapply(&*hypr, &copies)).await;
+                    let (hypr, copies, scales) =
+                        (hypr.clone(), mode.copies.clone(), mode.scales.clone());
+                    let reapplied = tokio::task::spawn_blocking(move || {
+                        output::reapply(&*hypr, &copies, &scales)
+                    })
+                    .await;
                     if let Ok(Err(e)) = reapplied {
                         eprintln!("navette: could not restore the outputs after a reload: {e}");
                     }
@@ -283,7 +291,7 @@ pub async fn serve_peer(
                 for index in due {
                     let Some(mode) = &mut active else { break };
                     let started =
-                        bring_up(&mode.copies, index, &mode.caps, ports, &home, &peer.outbox).await;
+                        bring_up(mode, index, ports, &home, &peer.outbox).await;
                     match started {
                         Ok(running) => mode.run(index, running, &peer.outbox),
                         Err(e) => {
@@ -331,13 +339,14 @@ async fn start(
                 stream: Stream::Lost(now),
             })
             .collect(),
+        scales: vec![None; copies.len()],
         copies,
         caps,
         told_no_input: false,
     });
     for index in 0..mode.as_ref().map_or(0, |m| m.copies.len()) {
         let m = mode.as_mut().expect("made above");
-        match bring_up(&m.copies, index, &m.caps, ports, home, outbox).await {
+        match bring_up(m, index, ports, home, outbox).await {
             Ok(running) => m.run(index, running, outbox),
             Err(e) => {
                 stop(&mut mode, &ports.hypr).await;
@@ -409,14 +418,18 @@ async fn ended(active: &mut Option<Active>) -> (usize, io::Error) {
 /// Starts output `index`'s stream and injector, on the output if it is still there as asked,
 /// else on a new one. A panic in the encoder's or the capture's start is a failure like another.
 async fn bring_up(
-    copies: &[OutputCopy],
+    mode: &Active,
     index: usize,
-    caps: &ClientCaps,
     ports: &Ports,
     home: &Home,
     outbox: &Outbox,
 ) -> io::Result<Running> {
-    let (copies, caps, ports) = (copies.to_vec(), caps.clone(), ports.clone());
+    let (copies, scales, caps, ports) = (
+        mode.copies.clone(),
+        mode.scales.clone(),
+        mode.caps.clone(),
+        ports.clone(),
+    );
     let outbox = outbox.on(index as u8);
     let keymap = home.keymap.clone();
     let replay: Vec<_> = [&home.areas[index], &home.locked]
@@ -426,7 +439,7 @@ async fn bring_up(
         .collect();
     tokio::task::spawn_blocking(move || {
         start_blocking(
-            &copies,
+            (&copies, &scales),
             index,
             caps,
             &ports,
@@ -444,7 +457,7 @@ async fn bring_up(
 }
 
 fn start_blocking(
-    copies: &[OutputCopy],
+    (copies, scales): (&[OutputCopy], &[Option<f32>]),
     index: usize,
     caps: ClientCaps,
     ports: &Ports,
@@ -456,7 +469,7 @@ fn start_blocking(
     let name = output::name(index);
     let scale = match output::live(hypr, &copies[index], index)? {
         Some(scale) => scale,
-        None => output::create(hypr, copies, index)?,
+        None => output::create(hypr, copies, scales, index)?,
     };
     let (feedback, feedback_rx) = mpsc::unbounded_channel();
     let (ended_tx, ended) = oneshot::channel();
@@ -488,6 +501,7 @@ fn start_blocking(
         feedback,
         ended,
         since: tokio::time::Instant::now(),
+        scale,
     })
 }
 
@@ -1429,5 +1443,14 @@ mod tests {
         assert!(!agent.hypr.cursor_invisible());
         agent.events.send(hypr::Event::ConfigReloaded).unwrap();
         until(|| agent.hypr.cursor_invisible()).await;
+    }
+
+    #[tokio::test]
+    async fn the_second_output_goes_right_of_the_size_hyprland_chose_for_the_first() {
+        let agent = agent();
+        agent.hypr.choose_scale(1.2);
+        two(&agent).await;
+        // 1920 at 1.2 is 1600 wide.
+        assert_eq!(agent.hypr.monitor(SECOND).unwrap().x, 1920 + 1600);
     }
 }

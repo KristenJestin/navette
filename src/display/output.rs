@@ -52,8 +52,9 @@ fn logical_width(width: u32, height: u32, transform: i32, scale: f32) -> i32 {
 }
 
 /// Where copy `index` goes: right of every output that is not a copy, so the remote's own
-/// screens keep their place, after the copies left of it.
-fn place(monitors: &[Monitor], copies: &[OutputCopy], index: usize) -> i32 {
+/// screens keep their place, after the copies left of it, each at the scale Hyprland chose for
+/// it when it is known (`scales`, by index), else at the one asked.
+fn place(monitors: &[Monitor], copies: &[OutputCopy], scales: &[Option<f32>], index: usize) -> i32 {
     let edge = monitors
         .iter()
         .filter(|m| !is_copy(&m.name))
@@ -62,8 +63,10 @@ fn place(monitors: &[Monitor], copies: &[OutputCopy], index: usize) -> i32 {
         .unwrap_or(0);
     let before: i32 = copies[..index]
         .iter()
-        .map(|c| {
-            let scale = c.scale_milli as f32 / 1000.0;
+        .enumerate()
+        .map(|(i, c)| {
+            let asked = c.scale_milli as f32 / 1000.0;
+            let scale = scales.get(i).copied().flatten().unwrap_or(asked);
             logical_width(c.width, c.height, i32::from(c.transform), scale)
         })
         .sum();
@@ -73,14 +76,22 @@ fn place(monitors: &[Monitor], copies: &[OutputCopy], index: usize) -> i32 {
 /// Makes copy `index` of `copies` and checks it; gives the scale Hyprland chose, which may not
 /// be the one asked (it rounds a fractional scale so the logical size is whole). On any
 /// failure, nothing of it is left behind.
-pub fn create(hypr: &dyn Hypr, copies: &[OutputCopy], index: usize) -> io::Result<f32> {
+pub fn create(
+    hypr: &dyn Hypr,
+    copies: &[OutputCopy],
+    scales: &[Option<f32>],
+    index: usize,
+) -> io::Result<f32> {
     let (name, copy) = (name(index), &copies[index]);
     let monitors = hypr::monitors(hypr)?;
     if monitors.iter().any(|m| m.name == name) {
         // Left by an agent that did not stop cleanly, or of another size.
         hypr::dispatch(hypr, &format!("output remove {name}"))?;
     }
-    hypr::dispatch(hypr, &rule(index, copy, place(&monitors, copies, index)))?;
+    hypr::dispatch(
+        hypr,
+        &rule(index, copy, place(&monitors, copies, scales, index)),
+    )?;
     hypr::dispatch(hypr, &format!("output create headless {name}"))?;
     match check(hypr, &name, copy).and_then(|scale| hide_cursor(hypr).map(|()| scale)) {
         Ok(scale) => Ok(scale),
@@ -130,10 +141,13 @@ fn check(hypr: &dyn Hypr, name: &str, copy: &OutputCopy) -> io::Result<f32> {
 
 /// Declares every rule again, and hides the cursor again, after a `hyprctl reload` dropped
 /// them.
-pub fn reapply(hypr: &dyn Hypr, copies: &[OutputCopy]) -> io::Result<()> {
+pub fn reapply(hypr: &dyn Hypr, copies: &[OutputCopy], scales: &[Option<f32>]) -> io::Result<()> {
     let monitors = hypr::monitors(hypr)?;
     for (index, copy) in copies.iter().enumerate() {
-        hypr::dispatch(hypr, &rule(index, copy, place(&monitors, copies, index)))?;
+        hypr::dispatch(
+            hypr,
+            &rule(index, copy, place(&monitors, copies, scales, index)),
+        )?;
     }
     hide_cursor(hypr)
 }
@@ -196,7 +210,7 @@ mod tests {
     #[test]
     fn the_rule_is_declared_before_the_output_is_created() {
         let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
-        create(&hypr, &[copy()], 0).unwrap();
+        create(&hypr, &[copy()], &[], 0).unwrap();
         assert_eq!(
             hypr.changes(),
             [
@@ -216,7 +230,7 @@ mod tests {
         portrait.transform = 3;
         portrait.scale = 2.0;
         let hypr = FakeHypr::with(vec![portrait]);
-        create(&hypr, &[copy()], 0).unwrap();
+        create(&hypr, &[copy()], &[], 0).unwrap();
         // 1600 wide once turned, 800 at scale 2, from x = 100.
         assert!(hypr.changes()[0].contains("position = \"900x0\""));
     }
@@ -227,7 +241,7 @@ mod tests {
             FakeMonitor::new("eDP-1", 1920, 1080, 0),
             FakeMonitor::new("NAVETTE-1", 1280, 720, 1920),
         ]);
-        create(&hypr, &[copy()], 0).unwrap();
+        create(&hypr, &[copy()], &[], 0).unwrap();
         assert_eq!(hypr.changes()[0], "output remove NAVETTE-1");
         assert_eq!(hypr.monitor("NAVETTE-1").unwrap().width, 2560);
     }
@@ -236,7 +250,7 @@ mod tests {
     fn the_scale_is_the_one_hyprland_chose() {
         let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
         hypr.choose_scale(1.2);
-        assert_eq!(create(&hypr, &[copy()], 0).unwrap(), 1.2);
+        assert_eq!(create(&hypr, &[copy()], &[], 0).unwrap(), 1.2);
         assert_eq!(live(&hypr, &copy(), 0).unwrap(), Some(1.2));
     }
 
@@ -260,8 +274,8 @@ mod tests {
     fn the_remote_cursor_is_hidden_while_the_copy_is_there() {
         let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
         let copies = [copy(), copy()];
-        create(&hypr, &copies, 0).unwrap();
-        create(&hypr, &copies, 1).unwrap();
+        create(&hypr, &copies, &[], 0).unwrap();
+        create(&hypr, &copies, &[], 1).unwrap();
         assert!(hypr.cursor_invisible());
         // One copy made again: the other is still there, the cursor stays hidden.
         remove(&hypr, 1).unwrap();
@@ -273,9 +287,9 @@ mod tests {
     #[test]
     fn a_reload_hides_the_remote_cursor_again() {
         let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
-        create(&hypr, &[copy()], 0).unwrap();
+        create(&hypr, &[copy()], &[], 0).unwrap();
         hypr.reload();
-        reapply(&hypr, &[copy()]).unwrap();
+        reapply(&hypr, &[copy()], &[]).unwrap();
         assert!(hypr.cursor_invisible());
     }
 
@@ -323,7 +337,7 @@ mod tests {
         let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
         let copies = three();
         for index in [2, 0, 1] {
-            create(&hypr, &copies, index).unwrap();
+            create(&hypr, &copies, &[], index).unwrap();
         }
         let placed: Vec<_> = (0..3)
             .map(|i| {
@@ -347,10 +361,10 @@ mod tests {
         let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
         let copies = three();
         for index in 0..3 {
-            create(&hypr, &copies, index).unwrap();
+            create(&hypr, &copies, &[], index).unwrap();
         }
         remove(&hypr, 1).unwrap();
-        create(&hypr, &copies, 1).unwrap();
+        create(&hypr, &copies, &[], 1).unwrap();
         assert_eq!(hypr.monitor("NAVETTE-2").unwrap().x, 3840);
     }
 
@@ -359,10 +373,10 @@ mod tests {
         let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
         let copies = three();
         for index in 0..3 {
-            create(&hypr, &copies, index).unwrap();
+            create(&hypr, &copies, &[], index).unwrap();
         }
         hypr.reload();
-        reapply(&hypr, &copies).unwrap();
+        reapply(&hypr, &copies, &[]).unwrap();
         let rules: Vec<_> = hypr
             .changes()
             .into_iter()
@@ -389,5 +403,24 @@ mod tests {
             .filter(|n| hypr.monitor(n).is_some())
             .collect();
         assert_eq!(left, ["eDP-1", "NAVETTE-OTHER"]);
+    }
+
+    #[test]
+    fn a_copy_goes_right_of_the_size_hyprland_chose_for_the_one_before() {
+        let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
+        let copies = [landscape(2560, 1440, 1250), landscape(1920, 1080, 1000)];
+        hypr.choose_scale(1.2);
+        let first = create(&hypr, &copies, &[], 0).unwrap();
+        // 2560 at 1.2 is 2133 wide, not the 2048 of the 1.25 asked.
+        create(&hypr, &copies, &[Some(first)], 1).unwrap();
+        assert_eq!(hypr.monitor("NAVETTE-2").unwrap().x, 1920 + 2133);
+        hypr.reload();
+        reapply(&hypr, &copies, &[Some(first), Some(1.2)]).unwrap();
+        let second = hypr
+            .changes()
+            .into_iter()
+            .rfind(|c| c.contains("NAVETTE-2"))
+            .unwrap();
+        assert!(second.contains("\"4053x0\""), "{second}");
     }
 }
