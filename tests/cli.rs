@@ -241,3 +241,29 @@ fn mode_start_with_no_mode_configured_says_where_to_write_it() {
     assert!(output.contains("monitor = <output name>"), "{output}");
     assert!(output.contains("mode.conf"), "{output}");
 }
+
+#[test]
+fn mic_status_without_serve_says_the_mic_is_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Navette::start(tmp.path(), &["mic", "status", "--json"]).finish();
+    assert!(output.contains(r#""alt":"off""#), "{output}");
+}
+
+#[test]
+fn mic_toggle_without_serve_says_to_start_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Navette::start(tmp.path(), &["mic", "toggle"]).finish();
+    assert!(
+        output.contains("`navette serve` is not running"),
+        "{output}"
+    );
+}
+
+#[test]
+fn mic_toggle_without_audio_says_to_turn_it_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (_serve, _agent, _) = paired_link(&home, &remote);
+    let output = Navette::start(&home, &["mic", "toggle"]).finish();
+    assert!(output.contains("navette serve --audio"), "{output}");
+}
