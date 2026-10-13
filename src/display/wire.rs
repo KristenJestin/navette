@@ -278,36 +278,39 @@ async fn read_loop<R: AsyncRead + Unpin>(
     timeout: Duration,
 ) -> io::Error {
     loop {
-        let msg = match tokio::time::timeout(timeout, framed.read_msg::<Msg>()).await {
+        // The whole message, payloads included: a peer gone in the middle of a frame would
+        // otherwise hold the link until TCP gives up, many minutes later.
+        let incoming = match tokio::time::timeout(timeout, read_one(&mut framed)).await {
             Err(_) => return io::Error::new(io::ErrorKind::TimedOut, "the peer went silent"),
             Ok(Err(e)) => return io_error(e),
-            Ok(Ok(msg)) => msg,
-        };
-        let incoming = match msg {
-            Msg::Heartbeat => continue,
-            Msg::Display(display) => Incoming::Display(display),
-            Msg::Feedback(feedback) => Incoming::Feedback(feedback),
-            Msg::Video(msg) => {
-                let (main, aux) = match &msg {
-                    ServerMsg::VideoFrame {
-                        data_len, aux_len, ..
-                    } => (*data_len, *aux_len),
-                    _ => (0, 0),
-                };
-                let main = match framed.read_payload(main).await {
-                    Ok(bytes) => bytes,
-                    Err(e) => return io_error(e),
-                };
-                let aux = match framed.read_payload(aux).await {
-                    Ok(bytes) => bytes,
-                    Err(e) => return io_error(e),
-                };
-                Incoming::Video { msg, main, aux }
-            }
+            Ok(Ok(None)) => continue,
+            Ok(Ok(Some(incoming))) => incoming,
         };
         // Nobody listening (an idle link): the message is dropped, the link stays up.
         let _ = inbox.send(incoming);
     }
+}
+
+/// One message and its payloads; `None` for a heartbeat.
+async fn read_one<R: AsyncRead + Unpin>(
+    framed: &mut Framed<R>,
+) -> Result<Option<Incoming>, gliff_transport::Error> {
+    Ok(Some(match framed.read_msg::<Msg>().await? {
+        Msg::Heartbeat => return Ok(None),
+        Msg::Display(display) => Incoming::Display(display),
+        Msg::Feedback(feedback) => Incoming::Feedback(feedback),
+        Msg::Video(msg) => {
+            let (main, aux) = match &msg {
+                ServerMsg::VideoFrame {
+                    data_len, aux_len, ..
+                } => (*data_len, *aux_len),
+                _ => (0, 0),
+            };
+            let main = framed.read_payload(main).await?;
+            let aux = framed.read_payload(aux).await?;
+            Incoming::Video { msg, main, aux }
+        }
+    }))
 }
 
 fn io_error(e: gliff_transport::Error) -> io::Error {
@@ -416,6 +419,27 @@ mod tests {
 
         let (a, _silent) = tokio::io::duplex(1024);
         let error = carry(a, ms(20), ms(200), None).await;
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn a_peer_gone_in_the_middle_of_a_frame_ends_the_link_in_time() {
+        let ms = Duration::from_millis;
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        // The frame's header says 100 kB follow; the peer sends 10 and is heard no more.
+        let (msg, _) = frame(0, 100_000);
+        let body = minicbor::to_vec(&msg).unwrap();
+        let mut bytes = (body.len() as u32).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&100_003u32.to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&[7; 10]);
+        let mut peer = b;
+        tokio::io::AsyncWriteExt::write_all(&mut peer, &bytes)
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(ms(2000), carry(a, ms(20), ms(200), None))
+            .await
+            .expect("the link ends within its timeout");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
