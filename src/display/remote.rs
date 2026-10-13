@@ -1310,6 +1310,8 @@ mod tests {
         );
         assert!(agent.hypr.monitor(FIRST).is_none());
         assert!(agent.hypr.monitor(SECOND).is_none());
+        // The first output hid the laptop's cursor: shown again with the outputs gone.
+        assert!(!agent.hypr.cursor_invisible());
         // The first stream went before its output.
         let dropped = agent.streams.dropped.lock().unwrap();
         assert_eq!(dropped.len(), 1);
