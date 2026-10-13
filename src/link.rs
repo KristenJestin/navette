@@ -1,18 +1,19 @@
 //! The link once paired: the remote's agent dials home and keeps an idle connection, home
-//! serves it. Over it, for now, only a hello (the link's version) and a heartbeat each way;
-//! the orders come with the next issues, over the same authenticated stream.
+//! serves it. Both sides say hello (the link's version), then [`crate::wire`] carries the
+//! heartbeats, the display's orders and the video over the same authenticated stream.
 //!
 //! The agent reconnects with an exponential backoff whenever the link drops; home keeps the
 //! newest connection of its one paired remote and drops the older one, which a laptop that
 //! changed network may have left half-open.
 
-use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::UnboundedSender;
+
+use crate::wire::{self, Peer};
 use tokio::task::JoinSet;
 
 use crate::frame::{read_frame, write_frame};
@@ -20,10 +21,9 @@ use crate::store::{Role, Store};
 use crate::transport::{Accept, Dial, Stream, TlsAcceptor, TlsDialer};
 
 /// The version of the link's messages; peers of another version refuse each other.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 const HELLO: u8 = 1;
-const HEARTBEAT: u8 = 2;
 
 /// How often each side shows it is alive, and how long a silence ends the link.
 #[derive(Clone, Copy, Debug)]
@@ -108,54 +108,22 @@ pub async fn hello<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// Keeps a link alive after its hello, and returns what ended it.
-pub async fn idle<S: AsyncRead + AsyncWrite>(stream: S, heartbeat: Heartbeat) -> io::Error {
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let result = tokio::select! {
-        result = send_heartbeats(&mut writer, heartbeat.interval) => result,
-        result = receive_heartbeats(&mut reader, heartbeat.timeout) => result,
-    };
-    match result {
-        Ok(never) => match never {},
-        Err(e) => e,
-    }
+/// Keeps a link alive after its hello, with nobody listening, and returns what ended it.
+pub async fn idle<S: AsyncRead + AsyncWrite + Send + 'static>(
+    stream: S,
+    heartbeat: Heartbeat,
+) -> io::Error {
+    wire::carry(stream, heartbeat.interval, heartbeat.timeout, None).await
 }
 
-async fn send_heartbeats<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    interval: Duration,
-) -> io::Result<Infallible> {
-    let mut tick = tokio::time::interval(interval);
-    loop {
-        tick.tick().await;
-        write_frame(writer, &[HEARTBEAT]).await?;
-    }
-}
-
-async fn receive_heartbeats<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    timeout: Duration,
-) -> io::Result<Infallible> {
-    loop {
-        let frame = tokio::time::timeout(timeout, read_frame(reader))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the peer went silent"))??;
-        if frame != [HEARTBEAT] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "an unexpected message on the link",
-            ));
-        }
-    }
-}
-
-/// `navette agent`: dials home, keeps the link up, and dials again whenever it drops. Never
-/// returns.
+/// `navette agent`: dials home, keeps the link up, and dials again whenever it drops. Each
+/// link goes to `peers`. Never returns.
 pub async fn agent<D: Dial>(
     dialer: D,
     heartbeat: Heartbeat,
     mut backoff: Backoff,
     events: UnboundedSender<Event>,
+    peers: UnboundedSender<Peer>,
 ) {
     loop {
         match dialer.dial().await {
@@ -163,7 +131,10 @@ pub async fn agent<D: Dial>(
                 Ok(()) => {
                     backoff.reset();
                     let _ = events.send(Event::Connected);
-                    let _ = events.send(Event::Disconnected(idle(stream, heartbeat).await));
+                    let error =
+                        wire::carry(stream, heartbeat.interval, heartbeat.timeout, Some(&peers))
+                            .await;
+                    let _ = events.send(Event::Disconnected(error));
                 }
                 Err(e) => {
                     let _ = events.send(Event::Failed(e));
@@ -179,12 +150,13 @@ pub async fn agent<D: Dial>(
     }
 }
 
-/// `navette serve`: waits for the paired remote and keeps its link up. Never returns; dropping
-/// it closes the link.
+/// `navette serve`: waits for the paired remote and keeps its link up, handed to `peers`.
+/// Never returns; dropping it closes the link.
 pub async fn serve<A: Accept>(
     mut acceptor: A,
     heartbeat: Heartbeat,
     events: UnboundedSender<Event>,
+    peers: UnboundedSender<Peer>,
 ) {
     let mut sessions = JoinSet::new();
     loop {
@@ -192,7 +164,7 @@ pub async fn serve<A: Accept>(
             Ok(stream) => {
                 while sessions.try_join_next().is_some() {}
                 sessions.abort_all();
-                sessions.spawn(session(stream, heartbeat, events.clone()));
+                sessions.spawn(session(stream, heartbeat, events.clone(), peers.clone()));
             }
             Err(e) => {
                 let _ = events.send(Event::Failed(e));
@@ -203,11 +175,18 @@ pub async fn serve<A: Accept>(
     }
 }
 
-async fn session<S: Stream>(mut stream: S, heartbeat: Heartbeat, events: UnboundedSender<Event>) {
+async fn session<S: Stream>(
+    mut stream: S,
+    heartbeat: Heartbeat,
+    events: UnboundedSender<Event>,
+    peers: UnboundedSender<Peer>,
+) {
     let event = match hello(&mut stream, heartbeat).await {
         Ok(()) => {
             let _ = events.send(Event::Connected);
-            Event::Disconnected(idle(stream, heartbeat).await)
+            let error =
+                wire::carry(stream, heartbeat.interval, heartbeat.timeout, Some(&peers)).await;
+            Event::Disconnected(error)
         }
         Err(e) => Event::Failed(e),
     };
@@ -363,12 +342,18 @@ mod tests {
         let (home_tx, mut home_events) = mpsc::unbounded_channel();
         let (remote_tx, mut remote_events) = mpsc::unbounded_channel();
         let acceptor = home_acceptor(&desk.home, None).await.unwrap();
-        let home = tokio::spawn(serve(acceptor, fast(), home_tx));
+        let home = tokio::spawn(serve(
+            acceptor,
+            fast(),
+            home_tx,
+            mpsc::unbounded_channel().0,
+        ));
         let remote = tokio::spawn(agent(
             remote_dialer(&desk.remote).unwrap(),
             fast(),
             quick_backoff(),
             remote_tx,
+            mpsc::unbounded_channel().0,
         ));
         until_connected(&mut home_events).await;
         until_connected(&mut remote_events).await;
@@ -385,11 +370,17 @@ mod tests {
             fast(),
             quick_backoff(),
             remote_tx,
+            mpsc::unbounded_channel().0,
         ));
 
         let (home_tx, mut home_events) = mpsc::unbounded_channel();
         let acceptor = home_acceptor(&desk.home, None).await.unwrap();
-        let home = tokio::spawn(serve(acceptor, fast(), home_tx));
+        let home = tokio::spawn(serve(
+            acceptor,
+            fast(),
+            home_tx,
+            mpsc::unbounded_channel().0,
+        ));
         until_connected(&mut home_events).await;
         until_connected(&mut remote_events).await;
 
@@ -403,7 +394,12 @@ mod tests {
 
         let (home_tx, mut home_events) = mpsc::unbounded_channel();
         let acceptor = home_acceptor(&desk.home, None).await.unwrap();
-        let home = tokio::spawn(serve(acceptor, fast(), home_tx));
+        let home = tokio::spawn(serve(
+            acceptor,
+            fast(),
+            home_tx,
+            mpsc::unbounded_channel().0,
+        ));
         until_connected(&mut home_events).await;
         until_connected(&mut remote_events).await;
         home.abort();

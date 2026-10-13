@@ -115,14 +115,23 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             );
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
-            link::serve(acceptor, Heartbeat::default(), events).await;
+            let (peers, _) = mpsc::unbounded_channel();
+            link::serve(acceptor, Heartbeat::default(), events, peers).await;
             Ok(())
         }
         Command::Agent => {
             let dialer = link::remote_dialer(&store)?;
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
-            link::agent(dialer, Heartbeat::default(), Backoff::default(), events).await;
+            let (peers, _) = mpsc::unbounded_channel();
+            link::agent(
+                dialer,
+                Heartbeat::default(),
+                Backoff::default(),
+                events,
+                peers,
+            )
+            .await;
             Ok(())
         }
     }
