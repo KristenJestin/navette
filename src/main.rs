@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use gliff_transport::clipboard::Side;
+use hypr_input::Target;
+use navette::clipboard;
 use navette::link::{self, Backoff, Event, Heartbeat};
 use navette::pair::{self, Pin, Timeouts};
 use navette::store::Store;
@@ -115,14 +118,29 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             );
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
-            link::serve(acceptor, Heartbeat::default(), events).await;
+            // The clipboard bridge is not `Send`: it runs on this thread, in a local set.
+            let attach =
+                |wire| clipboard::attach(Side::Client, clipboard::hypr(Target::default()), wire);
+            tokio::task::LocalSet::new()
+                .run_until(link::serve(acceptor, Heartbeat::default(), events, attach))
+                .await;
             Ok(())
         }
         Command::Agent => {
             let dialer = link::remote_dialer(&store)?;
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
-            link::agent(dialer, Heartbeat::default(), Backoff::default(), events).await;
+            let attach =
+                |wire| clipboard::attach(Side::Server, clipboard::hypr(Target::default()), wire);
+            tokio::task::LocalSet::new()
+                .run_until(link::agent(
+                    dialer,
+                    Heartbeat::default(),
+                    Backoff::default(),
+                    events,
+                    attach,
+                ))
+                .await;
             Ok(())
         }
     }
