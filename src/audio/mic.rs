@@ -216,6 +216,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_agent_that_crashed_is_repaired_as_soon_as_audio_starts_again() {
+        let graph = FakeGraph::with_default("laptop-speakers");
+        graph.state().default_source = Some(DefaultNode::named("laptop-mic"));
+        let (_tmp, saved) = saved();
+        std::mem::forget(super::super::RemoteSink::start(
+            graph.clone(),
+            saved.clone(),
+            Box::new(|_| {}),
+        ));
+        std::mem::forget(Voice::start(graph.clone(), saved.clone(), 1).unwrap());
+
+        // The next agent: no session asked for yet.
+        let (wire, _link) = super::super::wire();
+        remote(graph.clone(), saved.clone(), wire, None).unwrap();
+        until(&graph, |s| {
+            s.default == Some(DefaultNode::named("laptop-speakers"))
+                && s.default_source == Some(DefaultNode::named("laptop-mic"))
+        })
+        .await;
+        assert_eq!(saved.load(Device::Sink).unwrap(), None);
+        assert_eq!(saved.load(Device::Source).unwrap(), None);
+    }
+
+    #[test]
+    fn a_default_the_user_changed_since_the_crash_is_left_alone() {
+        let graph = FakeGraph::with_default("laptop-speakers");
+        let (_tmp, saved) = saved();
+        std::mem::forget(super::super::RemoteSink::start(
+            graph.clone(),
+            saved.clone(),
+            Box::new(|_| {}),
+        ));
+        graph.state().default = Some(DefaultNode::named("headset"));
+        super::super::repair(&graph, &saved);
+        assert_eq!(graph.state().default, Some(DefaultNode::named("headset")));
+        assert_eq!(saved.load(Device::Sink).unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn the_home_mic_is_heard_on_the_remote_source() {
         let home_graph = FakeGraph::default();
         let remote_graph = FakeGraph::default();

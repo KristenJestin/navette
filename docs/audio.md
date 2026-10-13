@@ -31,8 +31,9 @@ PipeWire's `default` metadata), so WirePlumber moves the playing apps to the Nav
 back. Before switching, the agent saves the default it replaces in
 `$XDG_STATE_HOME/navette/previous-default-sink` (0600), and removes the file once it is put
 back. If the agent is killed without a chance to clean up (`SIGKILL`, a crash), the Navette sink
-disappears with it and WirePlumber falls back to another output on its own; the next start
-finds the default still on the Navette sink, and puts back the saved one when it stops.
+disappears with it and WirePlumber falls back to another output on its own; once the agent is
+back and connected, it puts the saved default back at once, unless the user chose another one
+meanwhile, and removes the file.
 
 ## The messages
 

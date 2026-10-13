@@ -371,6 +371,31 @@ impl<G: Graph> Drop for Switch<G> {
     }
 }
 
+/// Puts back the defaults an agent that died left on Navette's nodes, as soon as audio starts
+/// again rather than at the next session; a default the user changed since stays.
+pub(crate) fn repair<G: Graph>(graph: &G, saved: &Saved) {
+    for (device, ours) in [(Device::Sink, SINK), (Device::Source, mic::SOURCE)] {
+        if let Err(e) = repair_one(graph, saved, device, ours) {
+            eprintln!("navette: audio: could not put back a default a previous run left: {e}");
+        }
+    }
+}
+
+fn repair_one<G: Graph>(graph: &G, saved: &Saved, device: Device, ours: &str) -> io::Result<()> {
+    let Some(previous) = saved.load(device)? else {
+        return Ok(());
+    };
+    if graph
+        .default_node(device)?
+        .and_then(|c| c.name().map(str::to_owned))
+        .as_deref()
+        == Some(ours)
+    {
+        graph.set_default_node(device, previous.as_ref())?;
+    }
+    saved.clear(device)
+}
+
 /// The remote's sink while home asks for the sound. Dropping it puts the previous default
 /// back, then removes the sink.
 pub struct RemoteSink<G: Graph> {
@@ -523,6 +548,7 @@ pub fn remote<G: Graph>(
             if let Some(previous) = after {
                 let _ = previous.join();
             }
+            repair(&graph, &saved);
             let mut sink = None;
             let mut voice: Option<mic::Voice<G>> = None;
             // Told once per outage, not at each check while PipeWire is still away.

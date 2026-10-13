@@ -11,8 +11,8 @@ machine's sound at home ([the sound](audio.md)).
   (30 ms before playing, 120 ms at most), and silence while the mic is home: switching never
   changes the remote's devices, so a call keeps its mic. When the mode stops, the link drops or
   the agent stops, the previous default mic is put back, then the source is removed. It is saved
-  meanwhile in `$XDG_STATE_HOME/navette/previous-default-source` (0600), as the default output
-  is, and a source gone with a PipeWire restart is opened again within a quarter of a second.
+  meanwhile in `$XDG_STATE_HOME/navette/previous-default-source` (0600), and put back after a
+  crash as soon as the agent is connected again, as the default output is, and a source gone with a PipeWire restart is opened again within a quarter of a second.
 - **At home**, Navette loads PipeWire's echo canceller (`libpipewire-module-echo-cancel`,
   WebRTC) into its own process for the mode, and unloads it after; a crash takes it away too. It
   captures the default mic, and cancels what the default output plays, read from its monitor
