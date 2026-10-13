@@ -16,15 +16,18 @@ mixed with home sound. There is no output toggle: both machines are heard at onc
 
 ## The jitter buffer
 
-What the buffer keeps after each cycle of the playback (its *target*) starts at a cycle's worth
-plus 10 ms: with PipeWire's default quantum (1024 samples, 21 ms), about 31 ms are left after
-each cycle, 52 ms on average before it. The extra cycle is there because the laptop sends a
+What the buffer keeps after each cycle of the playback (its *target*) is at least a cycle's
+worth plus 10 ms: with PipeWire's default quantum (1024 samples, 21 ms), about 31 ms are left
+after each cycle, 52 ms on average before it. It starts 20 ms above that, as the link has not
+shown how it behaves yet, and comes down once it is calm. The extra cycle is there because the laptop sends a
 cycle of its own at a time: as the two clocks drift, one of them now and then reaches home just
 after the cycle it used to be in time for, and that cycle finds 21 ms less. Without it, the
 buffer ran dry every few minutes even on a cable (about every 7 minutes at 50 ppm of drift).
 
 - **The link falls behind** (Wi-Fi): each time the buffer runs dry (an *underrun*, a gap of
-  silence), the target grows by 10 ms, up to 100 ms. Two minutes in which the buffer always
+  silence), the target grows by 10 ms, up to 100 ms. A silence of more than half a second is
+  the laptop's sound pausing (music paused, the end of a video): no underrun, and the target
+  stays. Two minutes in which the buffer always
   had 30 ms to spare lower it by 10 ms, down to the start.
 - **The clocks drift**: the two sound cards never run at quite the same rate. Rather than drop
   sound once the buffer is too full, or run dry once it is empty, home asks the playback to take
@@ -89,7 +92,8 @@ navette: audio: buffer 52 ms, target 31 ms, rate +0.004 %; underruns 0, trims 0,
   cycle of the playback; *rate*, how much faster (or slower) than the graph the playback takes
   the sound, to stay on that target while the two clocks drift.
 - *underruns*: the playback found the buffer empty: a gap of silence, then a wait for the
-  buffer to fill again.
+  buffer to fill again; counted once the sound is back, unless it stayed away for more than
+  half a second (a pause).
 - *trims*: the buffer was past its maximum and its oldest sound was dropped: a jump.
 - *concealed*: frames that never came, filled from the next packet's FEC or by concealment.
 - *lost*: frames that never came, in a gap too long to fill: the sound jumps over them.

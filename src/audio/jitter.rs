@@ -19,6 +19,8 @@ const SMOOTHING: usize = 2 * SECOND;
 const GAIN: f64 = 1e-3 / (SECOND / 100) as f64;
 /// ...and never by more than 0.5 %: 9 cents, the edge of what an ear tells on a held note.
 const MAX_CORRECTION: f64 = 5e-3;
+/// A silence longer than this is the remote's sound pausing, not the link falling behind.
+const PAUSE: usize = SECOND / 2;
 /// How long the buffer must have had room to spare before it keeps less.
 const WINDOW: usize = 120 * SECOND;
 
@@ -31,6 +33,8 @@ pub struct Jitter {
     /// The size of the playback's last pull: playing starts once a pull and the target are in.
     pull: usize,
     playing: bool,
+    /// The silence played since the buffer ran dry, until it is told an underrun or a pause.
+    dry: Option<usize>,
     /// What was left after the pulls, smoothed.
     level: f64,
     /// Samples pulled since the window started, and the least left after a pull in it.
@@ -42,16 +46,18 @@ pub struct Jitter {
 /// What went wrong since the buffer was made, for the periodic stats: each is a crackle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
-    /// Pulls that found less than they asked for while playing: a gap of silence.
+    /// Gaps of silence, the buffer having run dry while playing; told once the sound is back,
+    /// and only when it was back within half a second (longer, the remote's sound paused).
     pub underruns: u64,
     /// Pushes that dropped the oldest sound, the buffer being past its maximum: a jump.
     pub trims: u64,
 }
 
 impl Jitter {
-    /// At first, a pull's worth and `floor` interleaved samples are to be left after each pull;
-    /// each underrun raises that by `floor`, up to `ceiling`, and two minutes that always had
-    /// three `floor`s to spare lower it by one. Beyond `ceiling` more than it starts with, the
+    /// At first, a pull's worth and three `floor`s of interleaved samples are to be left after
+    /// each pull, never less than a pull and one `floor`; each underrun raises that by `floor`,
+    /// up to `ceiling`, and two minutes that always had three `floor`s to spare lower it by
+    /// one. A silence of more than half a second is a pause, and no underrun. Beyond `ceiling` more than it starts with, the
     /// oldest sound is dropped.
     pub fn new(floor: usize, ceiling: usize) -> Self {
         assert!(0 < floor && floor <= ceiling);
@@ -63,6 +69,7 @@ impl Jitter {
             ceiling,
             pull: 0,
             playing: false,
+            dry: None,
             level: 0.0,
             window: 0,
             low: usize::MAX,
@@ -122,6 +129,15 @@ impl Jitter {
         }
         self.samples.extend(pcm);
         if !self.playing && self.samples.len() >= start {
+            // The sound is back after a gap: short, the link fell behind, and from now on the
+            // buffer waits for more.
+            if self.dry.take().is_some_and(|silence| silence < PAUSE) {
+                self.counts.underruns += 1;
+                self.target = (self.target + self.floor).min(self.ceiling);
+                if self.samples.len() < self.start() {
+                    return;
+                }
+            }
             self.playing = true;
             self.level = self.target as f64;
         }
@@ -129,8 +145,15 @@ impl Jitter {
 
     /// Fills `out` with what is buffered, silence where nothing is.
     pub fn pull(&mut self, out: &mut [f32]) {
+        let first = self.pull == 0;
         self.pull = out.len();
-        self.target = self.target.max(self.least());
+        self.target = if first {
+            // Room to spare at first, which two calm minutes take back: the link has not shown
+            // how it behaves yet.
+            (self.least() + 2 * self.floor).min(self.ceiling)
+        } else {
+            self.target.max(self.least())
+        };
         let mut filled = 0;
         if self.playing {
             filled = out.len().min(self.samples.len());
@@ -140,14 +163,15 @@ impl Jitter {
         }
         out[filled..].fill(0.0);
         if !self.playing {
+            if let Some(silence) = &mut self.dry {
+                *silence += out.len();
+            }
             return;
         }
         if filled < out.len() {
-            // Fell behind: wait for a full buffer again rather than play in crumbs, and keep
-            // more from now on.
+            // Ran dry: wait for a full buffer again rather than play in crumbs.
             self.playing = false;
-            self.counts.underruns += 1;
-            self.target = (self.target + self.floor).min(self.ceiling);
+            self.dry = Some(out.len() - filled);
             self.window = 0;
             self.low = usize::MAX;
             return;
@@ -184,28 +208,60 @@ mod tests {
 
     #[test]
     fn silence_until_the_buffer_holds_a_pull_and_its_target() {
-        let mut jitter = Jitter::new(2, 8);
-        // The playback asks before any sound comes: 2 now, and 2 + 2 to keep after a pull.
+        let mut jitter = Jitter::new(2, 20);
+        // The playback asks before any sound comes: 2 now, and 2 + 3 × 2 to keep after a pull.
         assert_eq!(pulled(&mut jitter, 2), [0.0, 0.0]);
-        jitter.push(&sound(1, 5));
+        jitter.push(&sound(1, 9));
         assert_eq!(pulled(&mut jitter, 2), [0.0, 0.0]);
-        jitter.push(&[6.0]);
+        jitter.push(&[10.0]);
         assert_eq!(pulled(&mut jitter, 2), [1.0, 2.0]);
+    }
+
+    /// A buffer that keeps 8 after a pull of 2, and has just run dry.
+    fn run_dry() -> Jitter {
+        let mut jitter = Jitter::new(2, 20);
+        pulled(&mut jitter, 2);
+        jitter.push(&sound(1, 10));
+        for _ in 0..5 {
+            pulled(&mut jitter, 2);
+        }
+        assert_eq!(pulled(&mut jitter, 2), [0.0, 0.0]);
+        jitter
     }
 
     #[test]
     fn falling_behind_plays_silence_then_waits_for_more_than_before() {
-        let mut jitter = Jitter::new(2, 8);
-        pulled(&mut jitter, 2);
-        jitter.push(&sound(1, 6));
-        for expected in [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [0.0, 0.0]] {
-            assert_eq!(pulled(&mut jitter, 2), expected);
-        }
-        // It now keeps 6 after a pull, not 4.
-        jitter.push(&sound(7, 13));
+        let mut jitter = run_dry();
+        // It now keeps 10 after a pull, not 8.
+        jitter.push(&sound(11, 20));
         assert_eq!(pulled(&mut jitter, 2), [0.0, 0.0]);
-        jitter.push(&[14.0]);
-        assert_eq!(pulled(&mut jitter, 2), [7.0, 8.0]);
+        jitter.push(&sound(21, 22));
+        assert_eq!(pulled(&mut jitter, 2), [11.0, 12.0]);
+    }
+
+    #[test]
+    fn an_underrun_is_counted() {
+        let mut jitter = Jitter::new(2, 20);
+        // Silence before the first sound is no underrun.
+        pulled(&mut jitter, 2);
+        assert_eq!(jitter.counts().underruns, 0);
+        let mut jitter = run_dry();
+        // Waiting for the target again is the same gap.
+        pulled(&mut jitter, 2);
+        jitter.push(&sound(11, 22));
+        assert_eq!(jitter.counts().underruns, 1);
+    }
+
+    #[test]
+    fn a_pause_in_the_sound_is_no_underrun() {
+        let mut jitter = run_dry();
+        for _ in 0..PAUSE / 2 {
+            pulled(&mut jitter, 2);
+        }
+        jitter.push(&sound(11, 20));
+        assert_eq!(jitter.counts().underruns, 0);
+        // Nor does it keep more: it plays as soon as it holds what it did before.
+        assert_eq!(pulled(&mut jitter, 2), [11.0, 12.0]);
     }
 
     #[test]
@@ -224,23 +280,6 @@ mod tests {
         jitter.push(&[1.0]);
         jitter.push(&sound(2, 7));
         assert_eq!(pulled(&mut jitter, 3), [6.0, 7.0, 0.0]);
-    }
-
-    #[test]
-    fn an_underrun_is_counted() {
-        let mut jitter = Jitter::new(2, 8);
-        // Silence before the first sound is no underrun.
-        pulled(&mut jitter, 2);
-        jitter.push(&sound(1, 6));
-        for _ in 0..3 {
-            pulled(&mut jitter, 2);
-        }
-        assert_eq!(jitter.counts().underruns, 0);
-        pulled(&mut jitter, 2);
-        assert_eq!(jitter.counts().underruns, 1);
-        // Waiting for the target again is the same gap.
-        pulled(&mut jitter, 2);
-        assert_eq!(jitter.counts().underruns, 1);
     }
 
     #[test]
@@ -402,8 +441,19 @@ mod tests {
                 &mut [(1.0, &mut calm), (1800.0, &mut calm)],
             );
             assert_eq!(heard[1].counts, NONE, "{drift_ppm} ppm: {heard:?}");
-            assert!(heard[1].mean_ms < 60.0, "{drift_ppm} ppm: {heard:?}");
         }
+    }
+
+    #[test]
+    fn the_room_kept_at_first_is_given_back_on_a_calm_link() {
+        let heard = session(
+            &mut home(),
+            50.0,
+            &mut [(1.0, &mut calm), (900.0, &mut calm), (300.0, &mut calm)],
+        );
+        assert_eq!(heard[1].counts, NONE, "{heard:?}");
+        // A cycle's worth and 10 ms after each cycle: 52 ms before it.
+        assert!(heard[2].mean_ms < 55.0, "{heard:?}");
     }
 
     #[test]
