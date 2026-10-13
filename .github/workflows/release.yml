@@ -1,0 +1,81 @@
+# The version of Navette, decided by what was merged.
+#
+# `Cargo.toml` stays at 0.0.0 and nobody edits a version by hand: the tag semantic-release puts on
+# `main` is the version, and the binary is built with it (`NAVETTE_VERSION`). No plugin here writes
+# a commit, so the history of a branch is what was merged into it and nothing the pipeline added
+# afterwards. The only secret is the GITHUB_TOKEN of the run.
+#
+# Only `main` publishes: merging `dev` into `main` (a merge commit, never a squash) publishes
+# `vX.Y.Z`, read from the subjects of the squashed pull requests it brings. `dev` publishes
+# betas instead (beta.yml). Navette starts in `0.x`: a breaking change moves the minor, a 1.0 is
+# the maintainer's decision, not something a commit message brings about.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+
+# One release at a time, in the order of the pushes: two tags are never computed from the same
+# history.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # semantic-release is a Node tool and Navette is not a Node project: package.json and its
+      # lockfile exist only to pin it and its plugins (`npm ci` installs exactly those).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci --ignore-scripts
+      - name: Tag what was merged, and write the release notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release
+      # The release tag semantic-release just put on this commit, if it made one. A beta tag that
+      # came along with a fast-forward of `dev` is not a release: only X.Y.Z counts.
+      - name: The tag to build
+        id: tag
+        run: |
+          tag=$(git tag --points-at HEAD --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  # The binary, built from the tag on Linux x86_64, attached to its release with a checksum. No
+  # tag, nothing built. If this job fails the release exists without its archive: re-run the job.
+  build:
+    needs: tag
+    if: needs.tag.outputs.tag != ''
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+          persist-credentials: false
+      # The one list of system libraries, shared with the other builds.
+      - name: Install the system libraries
+        run: tools/install-build-libraries.sh
+      - name: Build, which takes its version from the tag
+        run: NAVETTE_VERSION="${TAG#v}" cargo build --locked --release
+      - name: Pack it with its checksum
+        run: tools/package.sh "${TAG#v}" target/release/navette "$RUNNER_TEMP/dist"
+      - name: Attach both to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG" "$RUNNER_TEMP"/dist/navette-*.tar.gz "$RUNNER_TEMP"/dist/navette-*.tar.gz.sha256 --clobber

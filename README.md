@@ -16,7 +16,9 @@ It is one program, `navette`, with two roles:
   refuses any peer it has not been paired with (a one-time PIN, then mutual TLS).
 
 Navette is built on the library crates of [gliff](https://github.com/omacom/gliff) (capture,
-encode and decode, input, protocol, transport), pinned to an upstream commit and unchanged. What
+encode and decode, input, protocol, transport), taken from the fork
+[navette-gliff](https://github.com/KristenJestin/navette-gliff) (branch `navette`: upstream plus
+Navette's changes, kept in sync with upstream) and pinned by commit. What
 is specific to the work-from-home mode (pairing, modes, monitor mapping, mic routing) is Navette's
 own.
 
@@ -28,6 +30,11 @@ Agents read `AGENTS.md`. Work in progress: see the issues.
 cargo build
 cargo test
 ```
+
+## Install
+
+A release or the beta of `dev`, without building: [docs/install.md](docs/install.md). What a
+version promises: [docs/versions.md](docs/versions.md).
 
 ## Licence
 

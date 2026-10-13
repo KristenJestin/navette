@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 #[derive(Parser)]
 #[command(
     name = "navette",
-    version,
+    version = option_env!("NAVETTE_VERSION").unwrap_or("0.0.0-dev"),
     about = "The work-from-home mode for two Hyprland machines"
 )]
 struct Cli {

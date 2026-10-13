@@ -28,7 +28,7 @@ pub trait Streams: Send + Sync {
         outbox: Outbox,
         feedback: UnboundedReceiver<ClientMsg>,
         ended: oneshot::Sender<io::Error>,
-    ) -> io::Result<Box<dyn Send>>;
+    ) -> io::Result<Box<dyn Send + Sync>>;
 }
 
 /// The real picture path: capture, encode, send.
@@ -42,7 +42,7 @@ impl Streams for LiveStreams {
         outbox: Outbox,
         feedback: UnboundedReceiver<ClientMsg>,
         ended: oneshot::Sender<io::Error>,
-    ) -> io::Result<Box<dyn Send>> {
+    ) -> io::Result<Box<dyn Send + Sync>> {
         Ok(Box::new(stream::start(
             source, caps, outbox, feedback, ended,
         )?))
@@ -69,7 +69,7 @@ struct Active {
 }
 
 struct Running {
-    _stream: Box<dyn Send>,
+    _stream: Box<dyn Send + Sync>,
     feedback: UnboundedSender<ClientMsg>,
     ended: oneshot::Receiver<io::Error>,
 }
@@ -228,7 +228,7 @@ mod tests {
             outbox: Outbox,
             _feedback: UnboundedReceiver<ClientMsg>,
             ended: oneshot::Sender<io::Error>,
-        ) -> io::Result<Box<dyn Send>> {
+        ) -> io::Result<Box<dyn Send + Sync>> {
             if *self.refuse.lock().unwrap() {
                 return Err(io::Error::other("no encoder"));
             }

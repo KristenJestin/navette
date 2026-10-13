@@ -39,9 +39,11 @@ Windows `mstsc /multimon` setup did.
 
 Navette uses gliff (`omacom/gliff`, MIT) as a code base, not as an application. It depends on
 gliff's library crates (`hypr-capture`, `gliff-va`, `gliff-vk`, `gliff-sw`, `hypr-input`,
-`gliff-proto`, `gliff-transport`, `hypr-ipc`, `hypr-wl`) through a git dependency pinned to an
-upstream commit, unchanged, with no fork. These give the capture, the encode and decode, the
-input injection, the wire protocol and framing, and the Hyprland and Wayland plumbing.
+`gliff-proto`, `gliff-transport`, `hypr-ipc`, `hypr-wl`) through a git dependency on the fork
+`KristenJestin/navette-gliff`, branch `navette`: upstream `main` plus Navette's changes, kept in
+sync with upstream, pinned by commit in `Cargo.lock`. These give the capture, the encode and
+decode, the input injection, the wire protocol and framing, and the Hyprland and Wayland
+plumbing.
 
 gliff's two programs (`gliff`, `gliff-server`) are not libraries. The session and rate-control
 logic Navette needs from them is adapted inside Navette, keeping gliff's MIT notice.
@@ -117,10 +119,11 @@ git config core.hooksPath .githooks     # once per clone: the commit-msg and pre
   must not leave the desk half-switched.
 - The mic toggle hotkey uses the per-bind `dont_inhibit` flag so it still fires while shortcuts
   are inhibited over a reserved monitor.
-- **gliff is pinned, never forked.** The gliff library crates are a git dependency pinned to an
-  upstream commit, unchanged. When a change is only possible inside one of them, copy only that
-  crate into Navette with the change, and remove the copy once upstream has it. Keep gliff's MIT
-  notice on everything adapted or copied from it.
+- **gliff comes from the fork, pinned by commit.** The gliff library crates come from
+  `KristenJestin/navette-gliff`, branch `navette` (upstream `main` plus Navette's changes, kept in
+  sync with upstream), pinned by commit in `Cargo.lock`. A change inside a gliff crate is made
+  in the fork: one pull request into `navette`, tracked by an issue in Navette. The rest of gliff
+  stays as upstream has it. Keep gliff's MIT notice on everything adapted or copied from it.
 - **Upstream proposals are validated by the maintainer first.** The generic gaps (a mic path,
   several outputs per session) are meant to go to gliff (MIT); never open an upstream issue or
   pull request without the maintainer's approval. Navette holds only what embodies the

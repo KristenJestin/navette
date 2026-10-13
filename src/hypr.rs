@@ -1,13 +1,194 @@
-//! Hyprland, reached over its IPC socket behind a port, so the logic around it is tested with a
-//! fake. The live side goes through gliff's `hypr-ipc` and finds the running instance again on
-//! every request: after a Hyprland restart the next request reaches the new one.
+//! The Hyprland port: what Navette asks of the home compositor, behind a trait so the logic
+//! around it is tested with a fake.
 //!
-//! Thread #9 builds the full desk-change port; this one holds only what the display needs.
+//! The real implementation talks to the instance's sockets directly, as `hyprctl` does: the
+//! command socket (`.socket.sock`) takes one request per connection and answers until it closes
+//! it; the event socket (`.socket2.sock`) streams one `name>>data` line per event. Changes are
+//! runtime Lua (`eval`), never written into the user's config.
 
-use std::io;
+use std::fmt;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use hypr_ipc::Monitor;
+
+/// A command Hyprland did not take.
+#[derive(Debug)]
+pub enum HyprError {
+    /// The socket could not be reached or broke mid-request.
+    Io(io::Error),
+    /// Hyprland answered with something other than `ok`: its error text.
+    Refused(String),
+}
+
+impl fmt::Display for HyprError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HyprError::Io(e) => write!(f, "Hyprland IPC: {e}"),
+            HyprError::Refused(answer) => write!(f, "Hyprland refused: {answer}"),
+        }
+    }
+}
+
+impl std::error::Error for HyprError {}
+
+impl From<io::Error> for HyprError {
+    fn from(e: io::Error) -> Self {
+        HyprError::Io(e)
+    }
+}
+
+/// The home compositor, as Navette uses it.
+pub trait Hyprland {
+    /// Runs a Lua chunk at runtime (`hyprctl eval`).
+    fn eval(&mut self, lua: &str) -> Result<(), HyprError>;
+}
+
+/// An event from `.socket2.sock` that Navette acts on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// The config was reloaded: every runtime rule is gone.
+    ConfigReloaded,
+    MonitorAdded(String),
+    MonitorRemoved(String),
+    /// Anything else, ignored.
+    Other,
+}
+
+impl Event {
+    /// Parses one line of the event socket, without its newline.
+    pub fn parse(line: &str) -> Event {
+        let (name, data) = line.split_once(">>").unwrap_or((line, ""));
+        match name {
+            "configreloaded" => Event::ConfigReloaded,
+            "monitoradded" => Event::MonitorAdded(data.to_owned()),
+            "monitorremoved" => Event::MonitorRemoved(data.to_owned()),
+            _ => Event::Other,
+        }
+    }
+}
+
+/// A running Hyprland instance, reached through its sockets.
+#[derive(Clone, Debug)]
+pub struct HyprIpc {
+    dir: PathBuf,
+}
+
+/// Hyprland 0.56.2 reads a request 1023 bytes at a time, on its main thread, and takes a shorter
+/// read as the end (`hyprCtlFDTick` in `src/debug/HyprCtl.cpp`). A request of 1023 bytes or more
+/// can be cut, and one whose length is a multiple of 1023 blocks the compositor until the client
+/// gives up (measured: no answer in 8 s at 1023 and 2046 bytes). It also stops at a NUL byte.
+const MAX_REQUEST: usize = 1022;
+
+/// Long enough for a busy compositor, short enough that a hung one does not hang Navette.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl HyprIpc {
+    /// The instance whose sockets are in `dir` (`$XDG_RUNTIME_DIR/hypr/<signature>`).
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+
+    /// The instance this process runs under, from `XDG_RUNTIME_DIR` and
+    /// `HYPRLAND_INSTANCE_SIGNATURE`.
+    pub fn from_env() -> io::Result<Self> {
+        let var = |name: &str| {
+            std::env::var_os(name)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| io::Error::other(format!("{name} is not set: is Hyprland running?")))
+        };
+        let runtime = PathBuf::from(var("XDG_RUNTIME_DIR")?);
+        Ok(Self::new(
+            runtime
+                .join("hypr")
+                .join(var("HYPRLAND_INSTANCE_SIGNATURE")?),
+        ))
+    }
+
+    /// Sends one request to the command socket and returns the whole answer.
+    ///
+    /// No `[flags]/` prefix: Hyprland looks for flags only before the first space, so a `/`
+    /// in an `eval` chunk is never taken for the separator.
+    pub fn request(&self, request: &str) -> io::Result<String> {
+        if request.len() > MAX_REQUEST || request.contains('\0') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "a Hyprland request must be at most {MAX_REQUEST} bytes with no NUL; this one is {}",
+                    request.len()
+                ),
+            ));
+        }
+        let mut stream = UnixStream::connect(self.dir.join(".socket.sock"))?;
+        stream.set_read_timeout(Some(REPLY_TIMEOUT))?;
+        stream.set_write_timeout(Some(REPLY_TIMEOUT))?;
+        stream.write_all(request.as_bytes())?;
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer)?;
+        Ok(answer)
+    }
+
+    /// Subscribes to the event socket.
+    pub fn events(&self) -> io::Result<Events> {
+        let stream = UnixStream::connect(self.dir.join(".socket2.sock"))?;
+        Ok(Events {
+            lines: BufReader::new(stream),
+        })
+    }
+}
+
+impl Hyprland for HyprIpc {
+    fn eval(&mut self, lua: &str) -> Result<(), HyprError> {
+        match self.request(&format!("eval {lua}"))?.trim_end() {
+            "ok" => Ok(()),
+            answer => Err(HyprError::Refused(answer.to_owned())),
+        }
+    }
+}
+
+/// The event stream; it ends when Hyprland exits. Reconnecting to the next instance and calling
+/// [`crate::desk::Desk::reapply`] is the mode runner's job (#6).
+pub struct Events {
+    lines: BufReader<UnixStream>,
+}
+
+impl Iterator for Events {
+    type Item = io::Result<Event>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut line = String::new();
+        match self.lines.read_line(&mut line) {
+            Ok(0) => None,
+            Ok(_) => Some(Ok(Event::parse(line.trim_end_matches('\n')))),
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
+/// `s` as a Lua string literal.
+pub fn lua_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\000"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+// The request port of the display (#6): the whole command socket, for the monitor list and
+// the remote's outputs. It finds the running instance on every request, so after a Hyprland
+// restart the next request reaches the new one.
 
 /// Hyprland's command socket: one request, one reply.
 pub trait Hypr: Send + Sync {
@@ -23,6 +204,19 @@ pub fn monitors(hypr: &dyn Hypr) -> io::Result<Vec<Monitor>> {
             format!("Hyprland's monitor list: {e}"),
         )
     })
+}
+
+/// The workspace shown on `monitor`, by id.
+pub fn active_workspace(hypr: &dyn Hypr, monitor: &str) -> io::Result<Option<i64>> {
+    let reply = hypr.request("j/monitors all")?;
+    let list: serde_json::Value = serde_json::from_str(&reply)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(list.as_array().and_then(|monitors| {
+        monitors
+            .iter()
+            .find(|m| m["name"] == monitor)
+            .and_then(|m| m["activeWorkspace"]["id"].as_i64())
+    }))
 }
 
 /// A request whose reply must be `ok`: Hyprland has no other error channel.
@@ -52,18 +246,10 @@ impl Hypr for Live {
     }
 }
 
-/// What Hyprland tells on its event socket that the display cares about.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
-    /// `hyprctl reload`: every runtime monitor rule is gone.
-    ConfigReloaded,
-}
-
 /// Follows the event socket (`.socket2.sock`) of whichever Hyprland runs, on its own thread,
 /// across restarts. Ends when `events` is dropped.
 pub fn watch_events(events: tokio::sync::mpsc::UnboundedSender<Event>) {
     std::thread::spawn(move || {
-        use std::io::BufRead;
         while !events.is_closed() {
             let socket = hypr_ipc::Instance::discover(None)
                 .map(|i| i.dir.join(".socket2.sock"))
@@ -73,14 +259,25 @@ pub fn watch_events(events: tokio::sync::mpsc::UnboundedSender<Event>) {
                 continue;
             };
             for line in io::BufReader::new(socket).lines().map_while(Result::ok) {
-                if line.starts_with("configreloaded>>")
-                    && events.send(Event::ConfigReloaded).is_err()
-                {
+                let event = Event::parse(&line);
+                if event != Event::Other && events.send(event).is_err() {
                     return;
                 }
             }
         }
     });
+}
+
+/// [`Hyprland`] over a [`Hypr`], so the desk recorder reaches the same instance.
+pub struct Eval(pub Arc<dyn Hypr>);
+
+impl Hyprland for Eval {
+    fn eval(&mut self, lua: &str) -> Result<(), HyprError> {
+        match self.0.request(&format!("eval {lua}"))?.trim_end() {
+            "ok" => Ok(()),
+            answer => Err(HyprError::Refused(answer.to_owned())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +322,8 @@ pub mod fake {
         /// `hl.monitor` rules by output name, as declared.
         rules: Vec<(String, FakeMonitor)>,
         requests: Vec<String>,
+        /// `hl.window_rule` tables, as sent.
+        window_rules: Vec<String>,
         down: bool,
     }
 
@@ -149,6 +348,11 @@ pub mod fake {
                 .filter(|r| !r.starts_with("j/"))
                 .cloned()
                 .collect()
+        }
+
+        /// The window rules sent, in order, `enabled = false` ones included.
+        pub fn window_rules(&self) -> Vec<String> {
+            self.state.lock().unwrap().window_rules.clone()
         }
 
         pub fn monitor(&self, name: &str) -> Option<FakeMonitor> {
@@ -227,12 +431,18 @@ pub mod fake {
                     .enumerate()
                     .map(|(id, m)| {
                         format!(
-                            r#"{{"id":{id},"name":"{}","width":{},"height":{},"refreshRate":{},"x":{},"y":{},"scale":{},"transform":{},"focused":false,"disabled":false}}"#,
-                            m.name, m.width, m.height, m.refresh, m.x, m.y, m.scale, m.transform
+                            r#"{{"id":{id},"name":"{}","width":{},"height":{},"refreshRate":{},"x":{},"y":{},"scale":{},"transform":{},"focused":false,"disabled":false,"activeWorkspace":{{"id":{},"name":"{}"}}}}"#,
+                            m.name, m.width, m.height, m.refresh, m.x, m.y, m.scale, m.transform, id + 1, id + 1
                         )
                     })
                     .collect();
                 return Ok(format!("[{}]", list.join(",")));
+            }
+            if let Some(rule) = command.strip_prefix("eval hl.window_rule(") {
+                state
+                    .window_rules
+                    .push(rule.trim_end_matches(')').to_string());
+                return Ok("ok".into());
             }
             if let Some(lua) = command.strip_prefix("eval ") {
                 return Ok(match parse_rule(lua) {
@@ -274,6 +484,125 @@ pub mod fake {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    #[test]
+    fn events_are_parsed_by_name() {
+        assert_eq!(Event::parse("configreloaded>>"), Event::ConfigReloaded);
+        assert_eq!(
+            Event::parse("monitoradded>>DP-2"),
+            Event::MonitorAdded("DP-2".into())
+        );
+        assert_eq!(
+            Event::parse("monitorremoved>>HDMI-A-1"),
+            Event::MonitorRemoved("HDMI-A-1".into())
+        );
+        assert_eq!(Event::parse("monitoraddedv2>>3,DP-2,desc"), Event::Other);
+        assert_eq!(Event::parse("workspace>>2"), Event::Other);
+        assert_eq!(Event::parse("garbage"), Event::Other);
+    }
+
+    #[test]
+    fn lua_strings_are_quoted_and_escaped() {
+        assert_eq!(lua_string("HOME-1"), r#""HOME-1""#);
+        assert_eq!(lua_string("a\"b\\c\nd"), r#""a\"b\\c\nd""#);
+        // `\0` followed by a digit would read as another code: `\01` is byte 1.
+        assert_eq!(lua_string("\u{0}1"), r#""\0001""#);
+    }
+
+    /// A stand-in for Hyprland's command socket: answers each connection with `answer` and
+    /// hands back what it was sent.
+    fn fake_command_socket(
+        dir: &std::path::Path,
+        answer: &'static str,
+    ) -> thread::JoinHandle<String> {
+        let listener = UnixListener::bind(dir.join(".socket.sock")).unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            stream.write_all(answer.as_bytes()).unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        })
+    }
+
+    #[test]
+    fn eval_sends_the_chunk_and_accepts_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = fake_command_socket(dir.path(), "ok");
+        HyprIpc::new(dir.path())
+            .eval("hl.window_rule({ name = \"x\", enabled = false })")
+            .unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            "eval hl.window_rule({ name = \"x\", enabled = false })"
+        );
+    }
+
+    #[test]
+    fn a_slash_in_the_chunk_is_sent_as_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = fake_command_socket(dir.path(), "ok");
+        let chunk = r#"hl.window_rule({ name = "a/b", match = { class = "^x/y$" } })"#;
+        HyprIpc::new(dir.path()).eval(chunk).unwrap();
+        assert_eq!(server.join().unwrap(), format!("eval {chunk}"));
+    }
+
+    #[test]
+    fn a_request_hyprland_cannot_read_in_one_go_is_refused_before_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = format!("hl.window_rule({{ name = \"{}\" }})", "x".repeat(1100));
+        let err = HyprIpc::new(dir.path()).request(&format!("eval {long}"));
+        assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        // Exactly one full read: Hyprland waits for a next read that never comes.
+        let err = HyprIpc::new(dir.path()).request(&"x".repeat(1023));
+        assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let err = HyprIpc::new(dir.path()).request("eval nul\0byte");
+        assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn eval_reports_what_hyprland_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let _server =
+            fake_command_socket(dir.path(), "error: hl.window_rule: unknown field 'nope'");
+        match HyprIpc::new(dir.path()).eval("hl.window_rule({ nope = 1 })") {
+            Err(HyprError::Refused(answer)) => assert!(answer.contains("unknown field")),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn events_are_read_until_hyprland_closes_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(dir.path().join(".socket2.sock")).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(b"workspace>>1\nconfigreloaded>>\nmonitorremoved>>DP-3\n")
+                .unwrap();
+        });
+        let events: Vec<Event> = HyprIpc::new(dir.path())
+            .events()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        server.join().unwrap();
+        assert_eq!(
+            events,
+            [
+                Event::Other,
+                Event::ConfigReloaded,
+                Event::MonitorRemoved("DP-3".into())
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
     use super::fake::{FakeHypr, FakeMonitor};
     use super::*;
 
