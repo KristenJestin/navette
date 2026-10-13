@@ -80,7 +80,7 @@ impl Fingerprint {
     }
 
     pub fn from_hex(text: &str) -> Option<Self> {
-        if text.len() != 64 || !text.is_ascii() {
+        if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         let mut bytes = [0u8; 32];
@@ -116,6 +116,16 @@ mod tests {
         assert_eq!(Fingerprint::from_hex(&hex), Some(fingerprint));
         assert_eq!(Fingerprint::from_hex("not hex"), None);
         assert_eq!(Fingerprint::from_hex(&hex[..62]), None);
+    }
+
+    #[test]
+    fn a_fingerprint_in_hex_has_hex_digits_only() {
+        let hex = Identity::generate().unwrap().fingerprint().to_hex();
+        for sign in ['+', '-', ' '] {
+            let signed = format!("{sign}{}", &hex[1..]);
+            assert_eq!(signed.len(), 64);
+            assert_eq!(Fingerprint::from_hex(&signed), None, "{sign:?}");
+        }
     }
 
     #[test]

@@ -133,12 +133,15 @@ impl Store {
 
     fn write_private(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write;
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&self.dir)?;
+        // `mode` only applies to a directory this call creates; one made earlier (by hand, or
+        // by an older version) keeps whatever it had.
+        fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))?;
         let tmp = self.dir.join(format!(".{name}.tmp"));
         let _ = fs::remove_file(&tmp);
         let mut file = fs::OpenOptions::new()
@@ -218,5 +221,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join(PAIRING_FILE), "role = home\n").unwrap();
         assert!(Store::new(tmp.path()).pairing().is_err());
+    }
+
+    #[test]
+    fn an_existing_directory_is_made_private() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("navette");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let store = Store::new(&dir);
+        store.identity().unwrap();
+        assert_eq!(mode(&dir), 0o700);
     }
 }
