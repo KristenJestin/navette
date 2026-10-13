@@ -1,29 +1,48 @@
-//! The link once paired: the remote's agent dials home and keeps an idle connection, home
-//! serves it. Over it, for now, only a hello (the link's version) and a heartbeat each way;
-//! the orders come with the next issues, over the same authenticated stream.
+//! The link once paired: the remote's agent dials home and keeps a connection, home serves it.
+//! Over it, a hello (the link's version), then gliff's framing carrying a heartbeat each way
+//! and whatever service the connection is given (the clipboard bridge today, the orders with
+//! the next issues), over the same authenticated stream.
 //!
 //! The agent reconnects with an exponential backoff whenever the link drops; home keeps the
 //! newest connection of its one paired remote and drops the older one, which a laptop that
-//! changed network may have left half-open.
+//! changed network may have left half-open. It ends the older connection, and so its service,
+//! before it starts the newer one's: a service such as the clipboard bridge is never twice
+//! alive on the same machine.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use bytes::Bytes;
+use gliff_proto::ClipboardMsg;
+use gliff_proto::clipboard::CHUNK;
+use gliff_transport::Framed;
+use gliff_transport::clipboard::{Outbound, outbound_channel};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinSet;
 
 use crate::frame::{read_frame, write_frame};
 use crate::store::{Role, Store};
 use crate::transport::{Accept, Dial, Stream, TlsAcceptor, TlsDialer};
+use crate::wire::{Clip, LinkMsg};
 
 /// The version of the link's messages; peers of another version refuse each other.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 const HELLO: u8 = 1;
-const HEARTBEAT: u8 = 2;
+
+/// Clipboard messages read from the peer and not yet taken by the bridge. A full queue stops
+/// the reads, so a peer cannot grow the bridge's memory.
+const INBOUND: usize = 64;
+
+/// What a connection's service gets: the clipboard messages of the peer, and where to put its own.
+pub struct Wire {
+    pub from_peer: mpsc::Receiver<Clip>,
+    pub to_peer: Outbound,
+}
 
 /// How often each side shows it is alive, and how long a silence ends the link.
 #[derive(Clone, Copy, Debug)]
@@ -108,12 +127,25 @@ pub async fn hello<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// Keeps a link alive after its hello, and returns what ended it.
-pub async fn idle<S: AsyncRead + AsyncWrite>(stream: S, heartbeat: Heartbeat) -> io::Error {
-    let (mut reader, mut writer) = tokio::io::split(stream);
+/// Keeps a link alive after its hello, running `attach` beside the heartbeats, and returns
+/// what ended the link. The service ending (or failing to start) does not end the link.
+pub async fn run<S, F, Fut>(stream: S, heartbeat: Heartbeat, attach: F) -> io::Error
+where
+    S: AsyncRead + AsyncWrite,
+    F: FnOnce(Wire) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let (reader, writer) = tokio::io::split(stream);
+    let (inbound_tx, from_peer) = mpsc::channel(INBOUND);
+    let (to_peer, outbound_rx) = outbound_channel();
+    let service = async {
+        attach(Wire { from_peer, to_peer }).await;
+        std::future::pending::<Infallible>().await
+    };
     let result = tokio::select! {
-        result = send_heartbeats(&mut writer, heartbeat.interval) => result,
-        result = receive_heartbeats(&mut reader, heartbeat.timeout) => result,
+        result = send(Framed::new(writer), heartbeat.interval, outbound_rx) => result,
+        result = receive(Framed::new(reader), heartbeat.timeout, inbound_tx) => result,
+        never = service => match never {},
     };
     match result {
         Ok(never) => match never {},
@@ -121,49 +153,92 @@ pub async fn idle<S: AsyncRead + AsyncWrite>(stream: S, heartbeat: Heartbeat) ->
     }
 }
 
-async fn send_heartbeats<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    interval: Duration,
-) -> io::Result<Infallible> {
-    let mut tick = tokio::time::interval(interval);
-    loop {
-        tick.tick().await;
-        write_frame(writer, &[HEARTBEAT]).await?;
+fn io_error(e: gliff_transport::Error) -> io::Error {
+    match e {
+        gliff_transport::Error::Io(e) => e,
+        gliff_transport::Error::Closed => io::ErrorKind::UnexpectedEof.into(),
+        other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
     }
 }
 
-async fn receive_heartbeats<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    timeout: Duration,
+async fn send<W: AsyncWrite + Unpin>(
+    mut writer: Framed<W>,
+    interval: Duration,
+    mut outbound: mpsc::Receiver<Clip>,
 ) -> io::Result<Infallible> {
+    let mut tick = tokio::time::interval(interval);
+    // A long chunk write must not be followed by a burst of heartbeats.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut open = true;
     loop {
-        let frame = tokio::time::timeout(timeout, read_frame(reader))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the peer went silent"))??;
-        if frame != [HEARTBEAT] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "an unexpected message on the link",
-            ));
+        tokio::select! {
+            _ = tick.tick() => writer.write_msg(&LinkMsg::Heartbeat).await.map_err(io_error)?,
+            clip = outbound.recv(), if open => match clip {
+                Some((msg, payload)) => writer
+                    .write_msg_with_payloads(&LinkMsg::from(msg), &[&payload])
+                    .await
+                    .map_err(io_error)?,
+                None => open = false,
+            },
         }
     }
 }
 
-/// `navette agent`: dials home, keeps the link up, and dials again whenever it drops. Never
-/// returns.
-pub async fn agent<D: Dial>(
+async fn receive<R: AsyncRead + Unpin>(
+    mut reader: Framed<R>,
+    timeout: Duration,
+    inbound: mpsc::Sender<Clip>,
+) -> io::Result<Infallible> {
+    let silent = || io::Error::new(io::ErrorKind::TimedOut, "the peer went silent");
+    loop {
+        let msg = tokio::time::timeout(timeout, reader.read_msg::<LinkMsg>())
+            .await
+            .map_err(|_| silent())?
+            .map_err(io_error)?;
+        let Some(clip) = msg.into_clipboard() else {
+            continue;
+        };
+        let payload = match &clip {
+            ClipboardMsg::Data { data_len, .. } if *data_len as usize <= CHUNK => {
+                tokio::time::timeout(timeout, reader.read_payload(*data_len))
+                    .await
+                    .map_err(|_| silent())?
+                    .map_err(io_error)?
+            }
+            ClipboardMsg::Data { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "a clipboard chunk larger than the agreed size",
+                ));
+            }
+            _ => Bytes::new(),
+        };
+        // A service that went away leaves the link up: the message is dropped.
+        let _ = inbound.send((clip, payload)).await;
+    }
+}
+
+/// `navette agent`: dials home, keeps the link up, and dials again whenever it drops. `attach`
+/// starts the connection's service each time the link is up. Never returns.
+pub async fn agent<D, F, Fut>(
     dialer: D,
     heartbeat: Heartbeat,
     mut backoff: Backoff,
     events: UnboundedSender<Event>,
-) {
+    attach: F,
+) where
+    D: Dial,
+    F: Fn(Wire) -> Fut,
+    Fut: Future<Output = ()>,
+{
     loop {
         match dialer.dial().await {
             Ok(mut stream) => match hello(&mut stream, heartbeat).await {
                 Ok(()) => {
                     backoff.reset();
                     let _ = events.send(Event::Connected);
-                    let _ = events.send(Event::Disconnected(idle(stream, heartbeat).await));
+                    let ended = run(stream, heartbeat, &attach).await;
+                    let _ = events.send(Event::Disconnected(ended));
                 }
                 Err(e) => {
                     let _ = events.send(Event::Failed(e));
@@ -179,20 +254,27 @@ pub async fn agent<D: Dial>(
     }
 }
 
-/// `navette serve`: waits for the paired remote and keeps its link up. Never returns; dropping
-/// it closes the link.
-pub async fn serve<A: Accept>(
+/// `navette serve`: waits for the paired remote and keeps its link up, running `attach` on
+/// each connection. Needs a `LocalSet`, since a service need not be `Send`. Never returns;
+/// dropping it closes the link.
+pub async fn serve<A, F, Fut>(
     mut acceptor: A,
     heartbeat: Heartbeat,
     events: UnboundedSender<Event>,
-) {
+    attach: F,
+) where
+    A: Accept,
+    F: Fn(Wire) -> Fut + Clone + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
     let mut sessions = JoinSet::new();
     loop {
         match acceptor.accept().await {
             Ok(stream) => {
-                while sessions.try_join_next().is_some() {}
+                // The older link, with its service, is gone before the newer one's starts.
                 sessions.abort_all();
-                sessions.spawn(session(stream, heartbeat, events.clone()));
+                while sessions.join_next().await.is_some() {}
+                sessions.spawn_local(session(stream, heartbeat, events.clone(), attach.clone()));
             }
             Err(e) => {
                 let _ = events.send(Event::Failed(e));
@@ -203,11 +285,20 @@ pub async fn serve<A: Accept>(
     }
 }
 
-async fn session<S: Stream>(mut stream: S, heartbeat: Heartbeat, events: UnboundedSender<Event>) {
+async fn session<S, F, Fut>(
+    mut stream: S,
+    heartbeat: Heartbeat,
+    events: UnboundedSender<Event>,
+    attach: F,
+) where
+    S: Stream,
+    F: Fn(Wire) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let event = match hello(&mut stream, heartbeat).await {
         Ok(()) => {
             let _ = events.send(Event::Connected);
-            Event::Disconnected(idle(stream, heartbeat).await)
+            Event::Disconnected(run(stream, heartbeat, attach).await)
         }
         Err(e) => Event::Failed(e),
     };
@@ -263,6 +354,8 @@ mod tests {
         }
     }
 
+    async fn nothing(_: Wire) {}
+
     fn quick_backoff() -> Backoff {
         Backoff::new(Duration::from_millis(10), Duration::from_millis(100))
     }
@@ -316,8 +409,8 @@ mod tests {
         hb.unwrap();
         let both = async {
             tokio::select! {
-                e = idle(a, fast()) => e,
-                e = idle(b, fast()) => e,
+                e = run(a, fast(), nothing) => e,
+                e = run(b, fast(), nothing) => e,
             }
         };
         // Ten heartbeat timeouts later, neither side has dropped the link.
@@ -331,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn a_silent_peer_is_dropped_after_the_heartbeat_timeout() {
         let (a, _silent) = tokio::io::duplex(1024);
-        let error = tokio::time::timeout(Duration::from_secs(5), idle(a, fast()))
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), nothing))
             .await
             .expect("idle must give up on a silent peer");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
@@ -348,6 +441,28 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
+    #[tokio::test]
+    async fn a_clipboard_chunk_larger_than_agreed_ends_the_link() {
+        let (a, b) = tokio::io::duplex(2 * CHUNK);
+        let mut peer = Framed::new(b);
+        let data = vec![0u8; CHUNK + 1];
+        peer.write_msg_with_payloads(
+            &LinkMsg::ClipboardData {
+                id: 1,
+                offset: 0,
+                data_len: data.len() as u32,
+                done: false,
+            },
+            &[&data],
+        )
+        .await
+        .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), nothing))
+            .await
+            .expect("the link must give up on an oversized chunk");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn the_backoff_doubles_up_to_its_cap_and_resets() {
         let mut backoff = Backoff::new(Duration::from_secs(1), Duration::from_secs(5));
@@ -360,54 +475,64 @@ mod tests {
     #[tokio::test]
     async fn after_pairing_the_remote_connects_on_its_own() {
         let desk = paired_desk().await;
-        let (home_tx, mut home_events) = mpsc::unbounded_channel();
-        let (remote_tx, mut remote_events) = mpsc::unbounded_channel();
-        let acceptor = home_acceptor(&desk.home, None).await.unwrap();
-        let home = tokio::spawn(serve(acceptor, fast(), home_tx));
-        let remote = tokio::spawn(agent(
-            remote_dialer(&desk.remote).unwrap(),
-            fast(),
-            quick_backoff(),
-            remote_tx,
-        ));
-        until_connected(&mut home_events).await;
-        until_connected(&mut remote_events).await;
-        home.abort();
-        remote.abort();
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (home_tx, mut home_events) = mpsc::unbounded_channel();
+                let (remote_tx, mut remote_events) = mpsc::unbounded_channel();
+                let acceptor = home_acceptor(&desk.home, None).await.unwrap();
+                let home = tokio::task::spawn_local(serve(acceptor, fast(), home_tx, nothing));
+                let remote = tokio::task::spawn_local(agent(
+                    remote_dialer(&desk.remote).unwrap(),
+                    fast(),
+                    quick_backoff(),
+                    remote_tx,
+                    nothing,
+                ));
+                until_connected(&mut home_events).await;
+                until_connected(&mut remote_events).await;
+                home.abort();
+                remote.abort();
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn the_remote_reconnects_after_the_home_side_restarts() {
         let desk = paired_desk().await;
-        let (remote_tx, mut remote_events) = mpsc::unbounded_channel();
-        let remote = tokio::spawn(agent(
-            remote_dialer(&desk.remote).unwrap(),
-            fast(),
-            quick_backoff(),
-            remote_tx,
-        ));
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (remote_tx, mut remote_events) = mpsc::unbounded_channel();
+                let remote = tokio::task::spawn_local(agent(
+                    remote_dialer(&desk.remote).unwrap(),
+                    fast(),
+                    quick_backoff(),
+                    remote_tx,
+                    nothing,
+                ));
 
-        let (home_tx, mut home_events) = mpsc::unbounded_channel();
-        let acceptor = home_acceptor(&desk.home, None).await.unwrap();
-        let home = tokio::spawn(serve(acceptor, fast(), home_tx));
-        until_connected(&mut home_events).await;
-        until_connected(&mut remote_events).await;
+                let (home_tx, mut home_events) = mpsc::unbounded_channel();
+                let acceptor = home_acceptor(&desk.home, None).await.unwrap();
+                let home = tokio::task::spawn_local(serve(acceptor, fast(), home_tx, nothing));
+                until_connected(&mut home_events).await;
+                until_connected(&mut remote_events).await;
 
-        home.abort();
-        let _ = home.await;
-        loop {
-            if let Event::Disconnected(_) = next(&mut remote_events).await {
-                break;
-            }
-        }
+                home.abort();
+                let _ = home.await;
+                loop {
+                    if let Event::Disconnected(_) = next(&mut remote_events).await {
+                        break;
+                    }
+                }
 
-        let (home_tx, mut home_events) = mpsc::unbounded_channel();
-        let acceptor = home_acceptor(&desk.home, None).await.unwrap();
-        let home = tokio::spawn(serve(acceptor, fast(), home_tx));
-        until_connected(&mut home_events).await;
-        until_connected(&mut remote_events).await;
-        home.abort();
-        remote.abort();
+                let (home_tx, mut home_events) = mpsc::unbounded_channel();
+                let acceptor = home_acceptor(&desk.home, None).await.unwrap();
+                let home = tokio::task::spawn_local(serve(acceptor, fast(), home_tx, nothing));
+                until_connected(&mut home_events).await;
+                until_connected(&mut remote_events).await;
+                home.abort();
+                remote.abort();
+            })
+            .await;
     }
 
     #[tokio::test]
