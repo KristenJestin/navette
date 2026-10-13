@@ -26,6 +26,7 @@ use crate::display::Ended;
 use crate::display::decode::{self, Decoding, Picture, Video};
 use crate::display::wire::{Display, Incoming, Msg, OutputCopy, Peer};
 use crate::hypr::{self, Eval, Hypr, lua_string};
+use crate::input::{self, Hotkey};
 
 const CONFIG_FILE: &str = "mode.conf";
 /// How long the remote has to make its output.
@@ -72,11 +73,35 @@ pub fn monitor(config_dir: &Path) -> io::Result<String> {
         })
 }
 
+/// The release hotkey, from `release = <chord>` in the mode's config: `shift+escape` when it
+/// says none, no hotkey for `release = none`.
+pub fn release_hotkey(config_dir: &Path) -> io::Result<Option<Hotkey>> {
+    let path = config_dir.join(CONFIG_FILE);
+    let text = std::fs::read_to_string(&path)?;
+    let spec = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .find(|(key, _)| key.trim() == "release")
+        .map_or(input::DEFAULT_HOTKEY, |(_, value)| value.trim());
+    Hotkey::parse(spec).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: `release = {spec}`: {e}", path.display()),
+        )
+    })
+}
+
 /// Covers a home monitor (the port behind which tests put a fake).
 pub trait Screens: Send + Sync {
-    /// Covers `monitor`; the guard takes the cover away when dropped. `ended` hears it if the
-    /// cover goes away on its own.
-    fn open(&self, monitor: &str, ended: Ended) -> io::Result<Box<dyn Screen>>;
+    /// Covers `monitor`; the guard takes the cover away when dropped. Home's input over it goes
+    /// to `input`, until `hotkey`. `ended` hears it if the cover goes away on its own.
+    fn open(
+        &self,
+        monitor: &str,
+        input: input::Queue,
+        hotkey: Option<Hotkey>,
+        ended: Ended,
+    ) -> io::Result<Box<dyn Screen>>;
 }
 
 pub trait Screen: Send {
@@ -89,9 +114,15 @@ pub trait Screen: Send {
 pub struct LiveScreens;
 
 impl Screens for LiveScreens {
-    fn open(&self, monitor: &str, ended: Ended) -> io::Result<Box<dyn Screen>> {
+    fn open(
+        &self,
+        monitor: &str,
+        input: input::Queue,
+        hotkey: Option<Hotkey>,
+        ended: Ended,
+    ) -> io::Result<Box<dyn Screen>> {
         Ok(Box::new(crate::display::surface::Surface::open(
-            monitor, ended,
+            monitor, input, hotkey, ended,
         )?))
     }
 }
@@ -297,6 +328,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
         ));
     }
     let monitor = self::monitor(&home.config_dir)?;
+    let hotkey = release_hotkey(&home.config_dir)?;
     let (hypr, name) = (home.hypr.clone(), monitor.clone());
     let monitors = blocking(move || hypr::monitors(&*hypr)).await?;
     let Some(found) = monitors.iter().find(|m| m.name == name && !m.disabled) else {
@@ -326,14 +358,15 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
     let desk = open_desk(home, &monitor, &monitors).await?;
     // Off the executor, and so is the undo when one fails: the desk drops with the closure.
     let (ended_tx, ended) = tokio::sync::mpsc::unbounded_channel();
-    let (screens, name, gpu, outbox) = (
+    let (screens, name, gpu, outbox, input) = (
         home.screens.clone(),
         monitor.clone(),
         home.gpu.clone(),
         peer.outbox.clone(),
+        peer.input.to_peer.clone(),
     );
     let (screen, decoding, desk) = blocking(move || {
-        let screen = screens.open(&name, ended_tx.clone())?;
+        let screen = screens.open(&name, input, hotkey, ended_tx.clone())?;
         let decoding = Decoding::start(
             gpu,
             screen.takes_dmabuf(),
@@ -538,6 +571,8 @@ mod tests {
         covered: Arc<Mutex<Vec<String>>>,
         /// How each screen says it went away.
         ends: Arc<Mutex<Vec<Ended>>>,
+        /// The release hotkey each screen was given.
+        hotkeys: Arc<Mutex<Vec<Option<Hotkey>>>>,
     }
 
     struct FakeScreen {
@@ -546,7 +581,14 @@ mod tests {
     }
 
     impl Screens for FakeScreens {
-        fn open(&self, monitor: &str, ended: Ended) -> io::Result<Box<dyn Screen>> {
+        fn open(
+            &self,
+            monitor: &str,
+            _input: input::Queue,
+            hotkey: Option<Hotkey>,
+            ended: Ended,
+        ) -> io::Result<Box<dyn Screen>> {
+            self.hotkeys.lock().unwrap().push(hotkey);
             self.covered.lock().unwrap().push(monitor.to_string());
             self.ends.lock().unwrap().push(ended);
             Ok(Box::new(FakeScreen {
@@ -577,18 +619,19 @@ mod tests {
         hypr: Arc<FakeHypr>,
         covered: Arc<Mutex<Vec<String>>>,
         ends: Arc<Mutex<Vec<Ended>>>,
+        hotkeys: Arc<Mutex<Vec<Option<Hotkey>>>>,
         peers: UnboundedSender<Peer>,
         orders: UnboundedSender<Order>,
         events: UnboundedSender<hypr::Event>,
     }
 
     fn desk(monitor: &str) -> Desk {
+        desk_with(&format!("monitor = {monitor}\n"))
+    }
+
+    fn desk_with(config_text: &str) -> Desk {
         let config = tempfile::tempdir().unwrap();
-        std::fs::write(
-            config.path().join(CONFIG_FILE),
-            format!("monitor = {monitor}\n"),
-        )
-        .unwrap();
+        std::fs::write(config.path().join(CONFIG_FILE), config_text).unwrap();
         let hypr = Arc::new(FakeHypr::with(vec![
             FakeMonitor::new("DP-1", 1920, 1080, 0),
             FakeMonitor::new("DP-2", 2560, 1440, 1920),
@@ -596,6 +639,7 @@ mod tests {
         let screens = FakeScreens::default();
         let covered = screens.covered.clone();
         let ends = screens.ends.clone();
+        let hotkeys = screens.hotkeys.clone();
         let (peers, peers_rx) = mpsc::unbounded_channel();
         let (orders, orders_rx) = mpsc::unbounded_channel();
         let (events, events_rx) = mpsc::unbounded_channel();
@@ -612,6 +656,7 @@ mod tests {
             hypr,
             covered,
             ends,
+            hotkeys,
             peers,
             orders,
             events,
@@ -780,6 +825,30 @@ mod tests {
         until(|| desk.hypr.window_rules().len() == 2).await;
         let rules = desk.hypr.window_rules();
         assert_eq!(rules[0], rules[1]);
+    }
+
+    #[tokio::test]
+    async fn the_release_hotkey_comes_from_the_mode_config() {
+        let desk = desk("DP-2");
+        started(&desk).await;
+        let default = Hotkey::parse(input::DEFAULT_HOTKEY).unwrap();
+        assert_eq!(*desk.hotkeys.lock().unwrap(), [default]);
+
+        let desk = desk_with("monitor = DP-2\nrelease = ctrl+alt+q\n");
+        started(&desk).await;
+        let chosen = Hotkey::parse("ctrl+alt+q").unwrap();
+        assert_eq!(*desk.hotkeys.lock().unwrap(), [chosen]);
+    }
+
+    #[tokio::test]
+    async fn a_release_hotkey_with_no_known_key_fails_clearly_and_changes_nothing() {
+        let desk = desk_with("monitor = DP-2\nrelease = shift+nokey\n");
+        let remote = connect(&desk);
+        let error = answer(ask(&desk, true).await).await.unwrap_err();
+        assert!(error.to_string().contains("nokey"), "{error}");
+        assert!(desk.covered.lock().unwrap().is_empty());
+        assert!(remote.outbox.queued().is_empty());
+        assert!(desk.hypr.changes().is_empty());
     }
 
     #[tokio::test]

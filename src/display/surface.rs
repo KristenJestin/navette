@@ -6,12 +6,22 @@
 //! is not the compositor's. The newest picture wins: one is shown per frame callback, and an
 //! older one still waiting is dropped, which gives its image back to the decoder.
 //!
-//! The keyboard (focus, the shortcuts inhibitor) comes with the input issue (#7): until then the
-//! surface takes none, so home's keyboard stays where it was.
+//! Focus follows the pointer (#7): the surface takes the keyboard (`on_demand`) and a shortcuts
+//! inhibitor, so Super and every bind but the `dont_inhibit` ones reach the remote, when the
+//! pointer enters it, and gives both back when it leaves or the release hotkey is typed.
+//! - It is mapped with no keyboard, so its appearing does not take home's keys (#2: a layer
+//!   surface that can take the keyboard takes it when it appears).
+//! - Hyprland 0.56 hands the keyboard over at the next motion over the surface, which a real
+//!   pointer crossing gives at once.
+//! - It gives the keyboard back on leaving: Hyprland would leave it on the surface when the
+//!   pointer moves onto a monitor with no window.
+//! - Not `exclusive`: Hyprland then keeps the pointer on the surface wherever it goes.
+//!
+//! The pointer and keyboard events go to [`crate::input::Capture`].
 
 use std::collections::HashMap;
 use std::io;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
@@ -37,8 +47,14 @@ use smithay_client_toolkit::{
 };
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_buffer, wl_output, wl_shm, wl_surface};
-use wayland_client::{Connection, Proxy, QueueHandle, delegate_noop};
+use wayland_client::protocol::{
+    wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
+};
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop};
+use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
+    zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
+    zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
+};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1,
 };
@@ -46,6 +62,7 @@ use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 use super::Ended;
 use super::decode::Picture;
+use crate::input::{self, Capture, Focus, Hotkey};
 
 /// How long the compositor has to place the surface.
 const PLACE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -91,13 +108,26 @@ pub struct Surface {
 }
 
 impl Surface {
-    /// Puts the surface on `output` and waits until the compositor has placed it. `ended` hears
-    /// it if the surface goes away on its own: the monitor unplugged, the compositor gone.
-    pub fn open(output: &str, ended: Ended) -> io::Result<Self> {
-        Self::open_on(compositor()?, output, PLACE_TIMEOUT, ended)
+    /// Puts the surface on `output` and waits until the compositor has placed it. Home's input
+    /// over it goes to `input`; `hotkey` gives the keyboard back. `ended` hears it if the
+    /// surface goes away on its own: the monitor unplugged, the compositor gone.
+    pub fn open(
+        output: &str,
+        input: input::Queue,
+        hotkey: Option<Hotkey>,
+        ended: Ended,
+    ) -> io::Result<Self> {
+        let capture = (input, hotkey);
+        Self::open_on(compositor()?, output, capture, PLACE_TIMEOUT, ended)
     }
 
-    fn open_on(socket: UnixStream, output: &str, wait: Duration, ended: Ended) -> io::Result<Self> {
+    fn open_on(
+        socket: UnixStream,
+        output: &str,
+        (input, hotkey): (input::Queue, Option<Hotkey>),
+        wait: Duration,
+        ended: Ended,
+    ) -> io::Result<Self> {
         let shutdown = socket.try_clone()?;
         let conn = Connection::from_socket(socket).map_err(wayland)?;
         let (pictures, channel) = channel::channel();
@@ -106,7 +136,8 @@ impl Surface {
         let thread = std::thread::Builder::new()
             .name("navette-surface".into())
             .spawn(move || {
-                let why = match run(conn, &output, channel, &ready_tx) {
+                let capture = Capture::new(input, hotkey);
+                let why = match run(conn, &output, channel, capture, &ready_tx) {
                     Ok(None) => return,
                     Ok(Some(why)) => why,
                     Err(e) => {
@@ -202,6 +233,7 @@ fn run(
     conn: Connection,
     output_name: &str,
     pictures: Channel<Picture>,
+    capture: Capture,
     ready: &std::sync::mpsc::Sender<Ready>,
 ) -> io::Result<Option<String>> {
     let (globals, queue) = registry_queue_init::<State>(&conn).map_err(wayland)?;
@@ -212,6 +244,17 @@ fn run(
     let viewporter: wp_viewporter::WpViewporter = globals
         .bind(&qh, 1..=1, ())
         .map_err(|_| io::Error::other("the compositor has no viewporter"))?;
+    // Version 7 at most: version 8 replaces the wheel's discrete steps by value120.
+    let seat: wl_seat::WlSeat = globals
+        .bind(&qh, 1..=7, ())
+        .map_err(|_| io::Error::other("the compositor has no seat"))?;
+    let inhibit: Option<ZwpKeyboardShortcutsInhibitManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+    if inhibit.is_none() {
+        eprintln!(
+            "navette: the compositor cannot inhibit its shortcuts: they stay home over the \
+             remote monitor"
+        );
+    }
     let mut state = State {
         registry: RegistryState::new(&globals),
         outputs: OutputState::new(&globals, &qh),
@@ -231,6 +274,13 @@ fn run(
         shown_dmabuf: HashMap::new(),
         exit: None,
         qh: qh.clone(),
+        capture,
+        seat,
+        inhibit,
+        inhibitor: None,
+        pointer: None,
+        keyboard: None,
+        discrete: None,
     };
 
     if state.dmabuf.version().is_some_and(|v| v >= 4) {
@@ -287,7 +337,7 @@ fn run(
     layer.set_anchor(Anchor::all());
     layer.set_size(0, 0);
     layer.set_exclusive_zone(-1);
-    // No keyboard until the input issue (#7).
+    // No keyboard until the pointer comes over it.
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.commit();
     state.viewport = Some(viewporter.get_viewport(&surface, &qh, ()));
@@ -339,11 +389,50 @@ struct State {
     /// Set to stop: `None` when dropped, else why the surface went away.
     exit: Option<Option<String>>,
     qh: QueueHandle<State>,
+    capture: Capture,
+    seat: wl_seat::WlSeat,
+    inhibit: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
+    /// Present while the surface holds the keyboard.
+    inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
+    pointer: Option<wl_pointer::WlPointer>,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    /// The wheel's step, sent with the axis event that follows it.
+    discrete: Option<i32>,
 }
 
 impl State {
     fn surface(&self) -> Option<&wl_surface::WlSurface> {
         self.layer.as_ref().map(|l| l.wl_surface())
+    }
+
+    /// Takes the keyboard and the shortcuts, or gives them back.
+    fn focus(&mut self, focus: Focus) {
+        let Some(layer) = &self.layer else {
+            return;
+        };
+        match focus {
+            Focus::Take => {
+                layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+                if self.inhibitor.is_none()
+                    && let Some(inhibit) = &self.inhibit
+                {
+                    let surface = layer.wl_surface();
+                    self.inhibitor =
+                        Some(inhibit.inhibit_shortcuts(surface, &self.seat, &self.qh, ()));
+                }
+            }
+            Focus::Give => {
+                layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+                if let Some(inhibitor) = self.inhibitor.take() {
+                    inhibitor.destroy();
+                }
+            }
+        }
+        layer.commit();
+    }
+
+    fn ours(&self, surface: &wl_surface::WlSurface) -> bool {
+        self.surface() == Some(surface)
     }
 
     /// Shows the waiting picture if the compositor is ready for one.
@@ -488,6 +577,9 @@ impl LayerShellHandler for State {
     ) {
         let size = configure.new_size;
         let first = self.size.is_none();
+        if self.size != Some(size) {
+            self.capture.area(size.0, size.1);
+        }
         self.size = Some(size);
         if first {
             // Black until the first picture, so the monitor shows at once that it is taken.
@@ -591,6 +683,143 @@ delegate_dmabuf!(State);
 delegate_layer!(State);
 delegate_registry!(State);
 delegate_noop!(State: wp_viewporter::WpViewporter);
+delegate_noop!(State: ZwpKeyboardShortcutsInhibitManagerV1);
+delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
+
+impl Dispatch<wl_seat::WlSeat, ()> for State {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(caps),
+        } = event
+        else {
+            return;
+        };
+        if caps.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
+            state.pointer = Some(seat.get_pointer(qh, ()));
+        }
+        if caps.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
+            state.keyboard = Some(seat.get_keyboard(qh, ()));
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use wl_pointer::Event;
+        match event {
+            Event::Enter {
+                surface,
+                surface_x,
+                surface_y,
+                ..
+            } if state.ours(&surface) => {
+                let focus = state.capture.enter(surface_x, surface_y);
+                state.focus(focus);
+            }
+            Event::Leave { surface, .. } if state.ours(&surface) => {
+                let focus = state.capture.leave();
+                state.focus(focus);
+            }
+            Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => state.capture.motion(surface_x, surface_y),
+            Event::Button {
+                button,
+                state: WEnum::Value(pressed),
+                ..
+            } => state
+                .capture
+                .button(button, pressed == wl_pointer::ButtonState::Pressed),
+            Event::AxisDiscrete { discrete, .. } => state.discrete = Some(discrete),
+            Event::Axis {
+                axis: WEnum::Value(axis),
+                value,
+                ..
+            } => {
+                let discrete = state.discrete.take();
+                state.capture.axis(axis_of(axis), value, discrete, false);
+            }
+            Event::AxisStop {
+                axis: WEnum::Value(axis),
+                ..
+            } => state.capture.axis(axis_of(axis), 0.0, None, true),
+            _ => {}
+        }
+    }
+}
+
+fn axis_of(axis: wl_pointer::Axis) -> gliff_proto::Axis {
+    match axis {
+        wl_pointer::Axis::HorizontalScroll => gliff_proto::Axis::Horizontal,
+        _ => gliff_proto::Axis::Vertical,
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use wl_keyboard::Event;
+        match event {
+            Event::Keymap {
+                format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
+                fd,
+                size,
+            } => match read_keymap(fd, size) {
+                Ok(text) => state.capture.keymap(text),
+                Err(e) => tracing::warn!("cannot read home's keymap: {e}"),
+            },
+            Event::Leave { surface, .. } if state.ours(&surface) => state.capture.keyboard_left(),
+            Event::Key {
+                key,
+                state: WEnum::Value(pressed),
+                ..
+            } => {
+                let pressed = pressed == wl_keyboard::KeyState::Pressed;
+                if let Some(focus) = state.capture.key(key, pressed) {
+                    state.focus(focus);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The keymap the compositor shares, read without moving the file's offset (other clients
+/// read the same file).
+fn read_keymap(fd: OwnedFd, size: u32) -> io::Result<String> {
+    use std::os::unix::fs::FileExt;
+    if size as usize > input::MAX_KEYMAP {
+        return Err(io::Error::other("a keymap larger than any keyboard's"));
+    }
+    let mut bytes = vec![0; size as usize];
+    std::fs::File::from(fd).read_exact_at(&mut bytes, 0)?;
+    while bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    String::from_utf8(bytes).map_err(io::Error::other)
+}
 delegate_noop!(State: wp_viewport::WpViewport);
 
 #[cfg(test)]
@@ -606,6 +835,7 @@ mod tests {
         let error = Surface::open_on(
             ours,
             "DP-1",
+            Default::default(),
             std::time::Duration::from_millis(300),
             tokio::sync::mpsc::unbounded_channel().0,
         )
