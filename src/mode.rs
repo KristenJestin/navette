@@ -22,6 +22,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use crate::desk::{Change, Desk, DeskError};
+use crate::display::Ended;
 use crate::display::decode::{self, Decoding, Picture, Video};
 use crate::display::wire::{Display, Incoming, Msg, OutputCopy, Peer};
 use crate::hypr::{self, Eval, Hypr, lua_string};
@@ -29,6 +30,15 @@ use crate::hypr::{self, Eval, Hypr, lua_string};
 const CONFIG_FILE: &str = "mode.conf";
 /// How long the remote has to make its output.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `navette mode` waits for `navette serve`: its checks, the surface, the remote.
+const ORDER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long, and how much, `navette serve` reads of an order.
+const ORDER_READ: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(5)
+};
+const ORDER_LONGEST: u64 = 64;
 
 /// The mode's config: which home monitor the remote machine takes, by output name.
 pub fn monitor(config_dir: &Path) -> io::Result<String> {
@@ -64,8 +74,9 @@ pub fn monitor(config_dir: &Path) -> io::Result<String> {
 
 /// Covers a home monitor (the port behind which tests put a fake).
 pub trait Screens: Send + Sync {
-    /// Covers `monitor`; the guard takes the cover away when dropped.
-    fn open(&self, monitor: &str) -> io::Result<Box<dyn Screen>>;
+    /// Covers `monitor`; the guard takes the cover away when dropped. `ended` hears it if the
+    /// cover goes away on its own.
+    fn open(&self, monitor: &str, ended: Ended) -> io::Result<Box<dyn Screen>>;
 }
 
 pub trait Screen: Send {
@@ -78,8 +89,10 @@ pub trait Screen: Send {
 pub struct LiveScreens;
 
 impl Screens for LiveScreens {
-    fn open(&self, monitor: &str) -> io::Result<Box<dyn Screen>> {
-        Ok(Box::new(crate::display::surface::Surface::open(monitor)?))
+    fn open(&self, monitor: &str, ended: Ended) -> io::Result<Box<dyn Screen>> {
+        Ok(Box::new(crate::display::surface::Surface::open(
+            monitor, ended,
+        )?))
     }
 }
 
@@ -116,6 +129,8 @@ struct Active {
     decoding: Decoding,
     _screen: Box<dyn Screen>,
     desk: Arc<Mutex<Desk<Eval>>>,
+    /// Why the surface or the decoder cannot go on.
+    ended: UnboundedReceiver<String>,
     /// The `navette mode start` waiting for the remote's answer.
     starting: Option<(oneshot::Sender<io::Result<String>>, tokio::time::Instant)>,
 }
@@ -139,7 +154,7 @@ pub async fn serve(
             new = peers.recv() => match new {
                 Some(new) => {
                     if active.is_some() {
-                        stop(&mut active, "the link was replaced");
+                        stop(&mut active, "the link was replaced").await;
                     }
                     peer = Some(new);
                 }
@@ -149,7 +164,7 @@ pub async fn serve(
                 None => {
                     peer = None;
                     if active.is_some() {
-                        stop(&mut active, "the link to the remote machine dropped");
+                        stop(&mut active, "the link to the remote machine dropped").await;
                     }
                 }
                 Some(Incoming::Display(Display::Started { output })) => {
@@ -164,12 +179,19 @@ pub async fn serve(
                 }
                 Some(Incoming::Display(Display::Failed { reason })) => {
                     if let Some(mut a) = active.take() {
-                        if let Some((reply, _)) = a.starting.take() {
-                            let _ = reply.send(Err(io::Error::other(format!(
-                                "the remote machine could not make its output: {reason}"
-                            ))));
+                        match a.starting.take() {
+                            Some((reply, _)) => {
+                                let _ = reply.send(Err(io::Error::other(format!(
+                                    "the remote machine could not make its output: {reason}"
+                                ))));
+                            }
+                            None => eprintln!(
+                                "navette: {} given back, the remote machine ended the mode: \
+                                 {reason}",
+                                a.monitor
+                            ),
                         }
-                        release(a);
+                        release(a).await;
                     }
                 }
                 Some(Incoming::Video { msg, main, aux }) => {
@@ -199,7 +221,7 @@ pub async fn serve(
                             if let Some(peer) = &peer {
                                 peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
                             }
-                            stop(&mut active, "stopped");
+                            stop(&mut active, "stopped").await;
                             Ok(format!("{monitor} is back home"))
                         }
                         None => Ok("no mode was running".to_string()),
@@ -219,6 +241,12 @@ pub async fn serve(
                     }
                 }
             }
+            Some(why) = ended(&mut active) => {
+                if let Some(peer) = &peer {
+                    peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
+                }
+                stop(&mut active, &why).await;
+            }
             _ = sleep_until(deadline) => {
                 if let Some(peer) = &peer {
                     peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
@@ -230,12 +258,20 @@ pub async fn serve(
                             "the remote machine did not answer in time",
                         )));
                     }
-                    release(a);
+                    release(a).await;
                 }
             }
         }
     }
-    stop(&mut active, "navette is stopping");
+    stop(&mut active, "navette is stopping").await;
+}
+
+/// Why the running mode's surface or decoder gave up; pending forever with no mode.
+async fn ended(active: &mut Option<Active>) -> Option<String> {
+    match active {
+        Some(a) => a.ended.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn next(peer: &mut Option<Peer>) -> Option<Incoming> {
@@ -288,20 +324,26 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
         transform: found.transform.clamp(0, 7) as u8,
     };
     let desk = open_desk(home, &monitor, &monitors).await?;
-    let (screens, name) = (home.screens.clone(), monitor.clone());
-    let screen = match blocking(move || screens.open(&name)).await {
-        Ok(screen) => screen,
-        Err(e) => {
-            tokio::task::spawn_blocking(move || drop(desk));
-            return Err(e);
-        }
-    };
-    let decoding = Decoding::start(
+    // Off the executor, and so is the undo when one fails: the desk drops with the closure.
+    let (ended_tx, ended) = tokio::sync::mpsc::unbounded_channel();
+    let (screens, name, gpu, outbox) = (
+        home.screens.clone(),
+        monitor.clone(),
         home.gpu.clone(),
-        screen.takes_dmabuf(),
         peer.outbox.clone(),
-        screen.pictures(),
-    )?;
+    );
+    let (screen, decoding, desk) = blocking(move || {
+        let screen = screens.open(&name, ended_tx.clone())?;
+        let decoding = Decoding::start(
+            gpu,
+            screen.takes_dmabuf(),
+            outbox,
+            screen.pictures(),
+            ended_tx,
+        )?;
+        Ok((screen, decoding, desk))
+    })
+    .await?;
     let caps = decode::caps(&home.gpu, (3840, 2160));
     peer.outbox.send(
         Msg::Display(Display::Start { output: copy, caps }),
@@ -312,13 +354,14 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
         decoding,
         _screen: screen,
         desk: Arc::new(Mutex::new(desk)),
+        ended,
         starting: None,
     });
     Ok(())
 }
 
 /// Opens the desk (undoing what a previous run left) and keeps home windows off `monitor`:
-/// those that would open on its workspace go to the leftmost other home monitor.
+/// those that would open on any of its workspaces go to the leftmost other home monitor.
 async fn open_desk(
     home: &Home,
     monitor: &str,
@@ -342,11 +385,10 @@ async fn open_desk(
             )),
             other => desk_error(other),
         })?;
-        let workspace = hypr::active_workspace(&*hypr, &monitor)?;
-        if let (Some(workspace), Some(other)) = (workspace, other) {
+        if let Some(other) = other {
             let fields = format!(
                 "match = {{ workspace = {} }}, monitor = {}",
-                lua_string(&workspace.to_string()),
+                lua_string(&format!("m[{monitor}]")),
                 lua_string(&other)
             );
             let name = desk.rule_name("home-windows");
@@ -362,20 +404,20 @@ fn desk_error(e: DeskError) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// Takes the cover away.
-fn stop(active: &mut Option<Active>, why: &str) {
+/// Takes the cover away, and returns once it is gone and the desk given back.
+async fn stop(active: &mut Option<Active>, why: &str) {
     if let Some(mut a) = active.take() {
         if let Some((reply, _)) = a.starting.take() {
             let _ = reply.send(Err(io::Error::other(format!("the mode ended: {why}"))));
         }
         eprintln!("navette: {} given back ({why})", a.monitor);
-        release(a);
+        release(a).await;
     }
 }
 
-/// Drops a mode off the executor: the surface thread is joined.
-fn release(active: Active) {
-    tokio::task::spawn_blocking(move || drop(active));
+/// Drops a mode off the executor (the threads are joined, the desk undone), and waits for it.
+async fn release(active: Active) {
+    let _ = tokio::task::spawn_blocking(move || drop(active)).await;
 }
 
 async fn blocking<T: Send + 'static>(
@@ -420,9 +462,12 @@ pub async fn accept_orders(listener: UnixListener, orders: UnboundedSender<Order
         let orders = orders.clone();
         tokio::spawn(async move {
             let (read, mut write) = stream.into_split();
+            // One short line, soon: a client that says nothing, or too much, is let go.
             let mut line = String::new();
-            if BufReader::new(read).read_line(&mut line).await.is_err() {
-                return;
+            let mut read = BufReader::new(tokio::io::AsyncReadExt::take(read, ORDER_LONGEST));
+            match tokio::time::timeout(ORDER_READ, read.read_line(&mut line)).await {
+                Ok(Ok(_)) if line.ends_with('\n') => {}
+                _ => return,
             }
             let (reply, answer) = oneshot::channel();
             let order = match line.trim() {
@@ -445,6 +490,21 @@ pub async fn accept_orders(listener: UnixListener, orders: UnboundedSender<Order
 
 /// `navette mode start|stop`: sends the order to `navette serve` and returns its answer.
 pub async fn order(path: &Path, order: &str) -> io::Result<String> {
+    order_within(path, order, ORDER_TIMEOUT).await
+}
+
+async fn order_within(path: &Path, order: &str, timeout: Duration) -> io::Result<String> {
+    tokio::time::timeout(timeout, send_order(path, order))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "`navette serve` did not answer in time",
+            )
+        })?
+}
+
+async fn send_order(path: &Path, order: &str) -> io::Result<String> {
     let stream = UnixStream::connect(path).await.map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -476,6 +536,8 @@ mod tests {
     struct FakeScreens {
         /// Monitors covered right now.
         covered: Arc<Mutex<Vec<String>>>,
+        /// How each screen says it went away.
+        ends: Arc<Mutex<Vec<Ended>>>,
     }
 
     struct FakeScreen {
@@ -484,8 +546,9 @@ mod tests {
     }
 
     impl Screens for FakeScreens {
-        fn open(&self, monitor: &str) -> io::Result<Box<dyn Screen>> {
+        fn open(&self, monitor: &str, ended: Ended) -> io::Result<Box<dyn Screen>> {
             self.covered.lock().unwrap().push(monitor.to_string());
+            self.ends.lock().unwrap().push(ended);
             Ok(Box::new(FakeScreen {
                 monitor: monitor.to_string(),
                 covered: self.covered.clone(),
@@ -513,6 +576,7 @@ mod tests {
         _config: tempfile::TempDir,
         hypr: Arc<FakeHypr>,
         covered: Arc<Mutex<Vec<String>>>,
+        ends: Arc<Mutex<Vec<Ended>>>,
         peers: UnboundedSender<Peer>,
         orders: UnboundedSender<Order>,
         events: UnboundedSender<hypr::Event>,
@@ -531,6 +595,7 @@ mod tests {
         ]));
         let screens = FakeScreens::default();
         let covered = screens.covered.clone();
+        let ends = screens.ends.clone();
         let (peers, peers_rx) = mpsc::unbounded_channel();
         let (orders, orders_rx) = mpsc::unbounded_channel();
         let (events, events_rx) = mpsc::unbounded_channel();
@@ -546,6 +611,7 @@ mod tests {
             _config: config,
             hypr,
             covered,
+            ends,
             peers,
             orders,
             events,
@@ -639,7 +705,7 @@ mod tests {
         let rules = desk.hypr.window_rules();
         assert_eq!(rules.len(), 1);
         assert!(
-            rules[0].contains(r#"match = { workspace = "2" }, monitor = "DP-1""#),
+            rules[0].contains(r#"match = { workspace = "m[DP-2]" }, monitor = "DP-1""#),
             "{rules:?}"
         );
     }
@@ -656,6 +722,44 @@ mod tests {
             .unwrap();
         answer(pending).await.unwrap();
         remote
+    }
+
+    #[tokio::test]
+    async fn a_surface_that_goes_away_ends_the_mode() {
+        let desk = desk("DP-2");
+        let remote = started(&desk).await;
+        let end = desk.ends.lock().unwrap().pop().unwrap();
+        end.send("the monitor was unplugged".into()).unwrap();
+        until(|| desk.covered.lock().unwrap().is_empty()).await;
+        until(|| desk.hypr.window_rules().len() == 2).await;
+        assert!(desk.hypr.window_rules()[1].contains("enabled = false"));
+        assert_eq!(
+            remote.outbox.queued().last(),
+            Some(&Msg::Display(Display::Stop))
+        );
+        // Nothing runs any more: a new start is not refused.
+        let pending = ask(&desk, true).await;
+        until(|| starts(&remote).len() == 2).await;
+        drop(pending);
+    }
+
+    #[tokio::test]
+    async fn a_start_right_after_a_stop_finds_home_given_back() {
+        let desk = desk("DP-2");
+        let remote = started(&desk).await;
+        answer(ask(&desk, false).await).await.unwrap();
+        // The answer comes once the surface is gone and the rule undone.
+        assert!(desk.covered.lock().unwrap().is_empty());
+        assert_eq!(desk.hypr.window_rules().len(), 2);
+        let pending = ask(&desk, true).await;
+        until(|| starts(&remote).len() == 2).await;
+        remote
+            .to_home
+            .send(Incoming::Display(Display::Started {
+                output: "NAVETTE-1".into(),
+            }))
+            .unwrap();
+        answer(pending).await.unwrap();
     }
 
     #[tokio::test]
@@ -800,6 +904,79 @@ mod tests {
         let error = order(&path, "start").await.unwrap_err();
         assert_eq!(error.to_string(), "no monitor X");
         assert!(listen(&path).is_err(), "a second serve is refused");
+    }
+
+    async fn control(dir: &Path) -> (PathBuf, UnboundedReceiver<Order>) {
+        let path = dir.join("navette").join("control.sock");
+        let listener = listen(&path).unwrap();
+        let (orders, orders_rx) = mpsc::unbounded_channel();
+        tokio::spawn(accept_orders(listener, orders));
+        (path, orders_rx)
+    }
+
+    /// Reads until the other side closes, in time.
+    async fn closed(stream: &mut UnixStream) {
+        use tokio::io::AsyncReadExt;
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut rest))
+            .await
+            .expect("serve lets the connection go")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_control_client_that_says_nothing_is_let_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut orders) = control(dir.path()).await;
+        let mut silent = UnixStream::connect(&path).await.unwrap();
+        closed(&mut silent).await;
+        assert!(orders.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn an_endless_control_line_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut orders) = control(dir.path()).await;
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (mut read, mut write) = stream.into_split();
+        tokio::spawn(async move {
+            let _ = write.write_all(&vec![b's'; 1 << 20]).await;
+        });
+        use tokio::io::AsyncReadExt;
+        let mut rest = Vec::new();
+        // Closed with bytes unread: the end may come as a reset.
+        let _ = tokio::time::timeout(Duration::from_secs(2), read.read_to_end(&mut rest))
+            .await
+            .expect("serve lets the connection go");
+        assert!(orders.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_cli_gives_up_on_a_serve_that_never_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.sock");
+        let _deaf = UnixListener::bind(&path).unwrap();
+        let error = order_within(&path, "start", Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn a_socket_left_by_a_serve_that_crashed_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("navette").join("control.sock");
+        drop(listen(&path).unwrap());
+        assert!(path.exists(), "the crashed serve left its socket");
+        let listener = listen(&path).unwrap();
+        let (orders, mut orders_rx) = mpsc::unbounded_channel();
+        tokio::spawn(accept_orders(listener, orders));
+        tokio::spawn(async move {
+            if let Some(Order::Stop(reply)) = orders_rx.recv().await {
+                let _ = reply.send(Ok("no mode was running".into()));
+            }
+        });
+        assert_eq!(order(&path, "stop").await.unwrap(), "no mode was running");
     }
 
     #[tokio::test]

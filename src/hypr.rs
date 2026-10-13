@@ -206,19 +206,6 @@ pub fn monitors(hypr: &dyn Hypr) -> io::Result<Vec<Monitor>> {
     })
 }
 
-/// The workspace shown on `monitor`, by id.
-pub fn active_workspace(hypr: &dyn Hypr, monitor: &str) -> io::Result<Option<i64>> {
-    let reply = hypr.request("j/monitors all")?;
-    let list: serde_json::Value = serde_json::from_str(&reply)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok(list.as_array().and_then(|monitors| {
-        monitors
-            .iter()
-            .find(|m| m["name"] == monitor)
-            .and_then(|m| m["activeWorkspace"]["id"].as_i64())
-    }))
-}
-
 /// A request whose reply must be `ok`: Hyprland has no other error channel.
 pub fn dispatch(hypr: &dyn Hypr, command: &str) -> io::Result<()> {
     let reply = hypr.request(command)?;
