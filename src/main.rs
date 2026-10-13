@@ -170,8 +170,9 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 events,
                 attach,
             );
+            let local = tokio::task::LocalSet::new();
             tokio::select! {
-                () = tokio::task::LocalSet::new().run_until(agent) => {}
+                () = local.run_until(agent) => {}
                 result = stopped() => result?,
             }
             // The link is dropped: the audio thread removes its sink and puts the previous
@@ -190,8 +191,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
 
 /// SIGTERM (`systemctl --user stop`) or Ctrl-C.
 async fn stopped() -> std::io::Result<()> {
-    let mut terminate =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         _ = terminate.recv() => Ok(()),
         result = tokio::signal::ctrl_c() => result,

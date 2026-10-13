@@ -15,7 +15,7 @@ pub const FRAME_SAMPLES: usize = FRAME * CHANNELS;
 pub const SAMPLES_PER_CYCLE: usize = 8192 * CHANNELS;
 
 /// Far above what Opus makes of 10 ms at the chosen bitrate.
-const MAX_PACKET: usize = 4000;
+pub const MAX_PACKET: usize = 4000;
 const BITRATE: i32 = 128_000;
 /// What the encoder plans for: enough to make it spend bits on FEC.
 const EXPECTED_LOSS_PERCENT: i32 = 10;

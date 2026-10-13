@@ -15,6 +15,8 @@ use gliff_proto::clipboard::validate_files;
 use gliff_proto::{ClipboardFile, ClipboardItem, ClipboardMsg};
 use minicbor::{Decode, Encode};
 
+use crate::audio;
+
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum LinkMsg {
     #[n(0)]
@@ -61,6 +63,24 @@ pub enum LinkMsg {
         #[n(0)]
         id: u32,
     },
+    // The remote machine's sound (`crate::audio`), a block of numbers of its own.
+    #[n(48)]
+    AudioStart {
+        #[n(0)]
+        session: u32,
+    },
+    #[n(49)]
+    AudioStop,
+    /// One Opus packet of `data_len` bytes follows the message.
+    #[n(50)]
+    AudioFrame {
+        #[n(0)]
+        session: u32,
+        #[n(1)]
+        seq: u32,
+        #[n(2)]
+        data_len: u32,
+    },
 }
 
 impl From<ClipboardMsg> for LinkMsg {
@@ -95,11 +115,33 @@ impl From<ClipboardMsg> for LinkMsg {
     }
 }
 
+impl From<&audio::Message> for LinkMsg {
+    /// A frame's packet goes after the message, as its payload.
+    fn from(msg: &audio::Message) -> Self {
+        match msg {
+            audio::Message::Start { session } => Self::AudioStart { session: *session },
+            audio::Message::Stop => Self::AudioStop,
+            audio::Message::Frame {
+                session,
+                seq,
+                packet,
+            } => Self::AudioFrame {
+                session: *session,
+                seq: *seq,
+                data_len: packet.len() as u32,
+            },
+        }
+    }
+}
+
 impl LinkMsg {
     /// The clipboard message this carries, or `None` for a heartbeat.
     pub fn into_clipboard(self) -> Option<ClipboardMsg> {
         Some(match self {
-            Self::Heartbeat => return None,
+            Self::Heartbeat
+            | Self::AudioStart { .. }
+            | Self::AudioStop
+            | Self::AudioFrame { .. } => return None,
             Self::ClipboardOffer {
                 serial,
                 mime_types,

@@ -31,13 +31,10 @@ use std::thread::JoinHandle;
 
 use tokio::sync::mpsc;
 
-use crate::link::Peer;
-use codec::{Decoder, Encoder, FRAME_SAMPLES};
-use jitter::Jitter;
+use bytes::{Bytes, BytesMut};
 
-const START: u8 = 0x30;
-const STOP: u8 = 0x31;
-const FRAME: u8 = 0x32;
+use codec::{Decoder, Encoder, FRAME_SAMPLES, MAX_PACKET};
+use jitter::Jitter;
 
 /// The remote's virtual sink.
 pub const SINK: &str = "navette-home-speakers";
@@ -50,7 +47,9 @@ const PLAYBACK_DESCRIPTION: &str = "Remote machine (Navette)";
 const JITTER_TARGET: usize = 3 * FRAME_SAMPLES;
 const JITTER_MAX: usize = 12 * FRAME_SAMPLES;
 
-#[derive(Debug, PartialEq, Eq)]
+/// The audio messages; on the link, they are top-level variants of
+/// [`LinkMsg`](crate::wire::LinkMsg).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// Home numbers each time it asks, so that frames still on the way from the time before
     /// are told apart.
@@ -61,48 +60,38 @@ pub enum Message {
     Frame {
         session: u32,
         seq: u32,
-        packet: Vec<u8>,
+        packet: Bytes,
     },
 }
 
-impl Message {
-    pub fn encode(&self) -> Vec<u8> {
-        match self {
-            Message::Start { session } => {
-                let mut frame = vec![START];
-                frame.extend_from_slice(&session.to_be_bytes());
-                frame
-            }
-            Message::Stop => vec![STOP],
-            Message::Frame {
-                session,
-                seq,
-                packet,
-            } => frame(*session, *seq, packet),
-        }
-    }
+/// Audio messages waiting between the link and the audio thread, each way: 64 frames are
+/// 640 ms of sound. The link's reader never waits on the audio thread, nor the sink's callback
+/// on the link: past this many, a message is dropped, and home fills the gap.
+pub const QUEUE: usize = 64;
 
-    pub fn decode(frame: &[u8]) -> io::Result<Self> {
-        match frame {
-            [START, session @ ..] if session.len() == 4 => Ok(Message::Start {
-                session: u32::from_be_bytes(session.try_into().unwrap_or_default()),
-            }),
-            [STOP] => Ok(Message::Stop),
-            [FRAME, header @ ..] if header.len() >= 8 => {
-                let (session, rest) = header.split_at(4);
-                let (seq, packet) = rest.split_at(4);
-                Ok(Message::Frame {
-                    session: u32::from_be_bytes(session.try_into().unwrap_or_default()),
-                    seq: u32::from_be_bytes(seq.try_into().unwrap_or_default()),
-                    packet: packet.to_vec(),
-                })
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not an audio message",
-            )),
-        }
-    }
+/// What the audio thread of one link gets: the peer's audio messages, and where to put its own.
+/// The first ends when the link drops.
+pub struct Wire {
+    pub from_peer: std::sync::mpsc::Receiver<Message>,
+    pub to_peer: mpsc::Sender<Message>,
+}
+
+/// The link's end of a [`Wire`].
+pub struct LinkEnd {
+    pub to_audio: std::sync::mpsc::SyncSender<Message>,
+    pub from_audio: mpsc::Receiver<Message>,
+}
+
+pub fn wire() -> (Wire, LinkEnd) {
+    let (to_audio, from_peer) = std::sync::mpsc::sync_channel(QUEUE);
+    let (to_peer, from_audio) = mpsc::channel(QUEUE);
+    (
+        Wire { from_peer, to_peer },
+        LinkEnd {
+            to_audio,
+            from_audio,
+        },
+    )
 }
 
 /// A lock that a panic elsewhere does not turn into a panic here: the buffers it guards stay
@@ -111,16 +100,6 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// A `FRAME` message, in one allocation: the queue to the link takes it whole.
-fn frame(session: u32, seq: u32, packet: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(9 + packet.len());
-    frame.push(FRAME);
-    frame.extend_from_slice(&session.to_be_bytes());
-    frame.extend_from_slice(&seq.to_be_bytes());
-    frame.extend_from_slice(packet);
-    frame
 }
 
 /// The configured default sink, as PipeWire's `default` metadata holds it: kept as is, to be
@@ -277,20 +256,34 @@ impl<G: Graph> Drop for RemoteSink<G> {
     }
 }
 
+/// The block the packets are cut from: a few seconds of sound.
+const ARENA: usize = 64 * 1024;
+
 /// Encodes the sink's sound and sends it home, on PipeWire's thread: it only counts its
 /// failures, for the audio thread to report.
 fn sender(
-    home: mpsc::Sender<Vec<u8>>,
+    home: mpsc::Sender<Message>,
     session: u32,
     failures: Arc<AtomicU64>,
 ) -> io::Result<OnSound> {
     let mut encoder = Encoder::new()?;
     let mut seq = 0u32;
+    // The packets are cut from one block, so a frame costs no allocation of its own.
+    let mut arena = BytesMut::with_capacity(ARENA);
     Ok(Box::new(move |pcm| {
         let sent = encoder.push(pcm, |packet| {
+            if arena.capacity() - arena.len() < MAX_PACKET {
+                arena.reserve(ARENA);
+            }
+            arena.extend_from_slice(packet);
+            let frame = Message::Frame {
+                session,
+                seq,
+                packet: arena.split().freeze(),
+            };
             // Late sound is worse than lost sound: a full link drops the frame, and home fills
             // the gap.
-            let _ = home.try_send(frame(session, seq, packet));
+            let _ = home.try_send(frame);
             seq = seq.wrapping_add(1);
         });
         if sent.is_err() {
@@ -309,7 +302,7 @@ impl<G: Graph> Capture<G> {
     fn start(
         graph: G,
         saved: Saved,
-        home: mpsc::Sender<Vec<u8>>,
+        home: mpsc::Sender<Message>,
         session: u32,
     ) -> io::Result<Self> {
         let failures = Arc::new(AtomicU64::new(0));
@@ -336,7 +329,7 @@ impl<G: Graph> Drop for Capture<G> {
 pub fn remote<G: Graph>(
     graph: G,
     saved: Saved,
-    mut peer: Peer,
+    wire: Wire,
     after: Option<JoinHandle<()>>,
 ) -> io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
@@ -347,24 +340,23 @@ pub fn remote<G: Graph>(
                 let _ = previous.join();
             }
             let mut sink = None;
-            while let Some(frame) = peer.received.blocking_recv() {
-                match Message::decode(&frame) {
-                    Ok(Message::Start { session }) => {
+            while let Ok(message) = wire.from_peer.recv() {
+                match message {
+                    Message::Start { session } => {
                         // A new session replaces the one running, if any.
                         drop(sink.take());
                         match Capture::start(
                             graph.clone(),
                             saved.clone(),
-                            peer.send.clone(),
+                            wire.to_peer.clone(),
                             session,
                         ) {
                             Ok(started) => drop(sink.replace(started)),
                             Err(e) => eprintln!("navette: audio: could not start the sink: {e}"),
                         }
                     }
-                    Ok(Message::Stop) => drop(sink.take()),
-                    Ok(_) => {}
-                    Err(e) => eprintln!("navette: audio: {e}"),
+                    Message::Stop => drop(sink.take()),
+                    Message::Frame { .. } => {}
                 }
             }
         })
@@ -381,13 +373,13 @@ struct Playback<G: Graph> {
 /// the link: they are made from an audio thread, never from the async runtime.
 pub struct Home<G: Graph> {
     graph: G,
-    remote: mpsc::Sender<Vec<u8>>,
+    remote: mpsc::Sender<Message>,
     playback: Option<Playback<G>>,
     sessions: u32,
 }
 
 impl<G: Graph> Home<G> {
-    pub fn new(graph: G, remote: mpsc::Sender<Vec<u8>>) -> Self {
+    pub fn new(graph: G, remote: mpsc::Sender<Message>) -> Self {
         Self {
             graph,
             remote,
@@ -422,18 +414,18 @@ impl<G: Graph> Home<G> {
 
     fn order(&self, message: Message) -> io::Result<()> {
         self.remote
-            .blocking_send(message.encode())
+            .blocking_send(message)
             .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "the link is down"))
     }
 
     /// A message from the remote; its sound is ignored unless home is playing, and plays only
     /// when it belongs to the session home asked for last.
-    pub fn received(&mut self, frame: &[u8]) -> io::Result<()> {
+    pub fn received(&mut self, message: Message) -> io::Result<()> {
         if let Message::Frame {
             session,
             seq,
             packet,
-        } = Message::decode(frame)?
+        } = message
             && let Some(playback) = &mut self.playback
             // Sent before home stopped: its numbering is not the new session's.
             && session == playback.session
@@ -447,16 +439,16 @@ impl<G: Graph> Home<G> {
 
 /// Home's side of one link, on a thread of its own: plays the remote's sound until the link
 /// drops.
-pub fn home<G: Graph>(graph: G, mut peer: Peer) -> io::Result<JoinHandle<()>> {
+pub fn home<G: Graph>(graph: G, wire: Wire) -> io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("navette-audio".into())
         .spawn(move || {
-            let mut home = Home::new(graph, peer.send);
+            let mut home = Home::new(graph, wire.to_peer);
             if let Err(e) = home.start() {
                 eprintln!("navette: audio: could not start the playback: {e}");
             }
-            while let Some(frame) = peer.received.blocking_recv() {
-                if let Err(e) = home.received(&frame) {
+            while let Ok(message) = wire.from_peer.recv() {
+                if let Err(e) = home.received(message) {
                     eprintln!("navette: audio: {e}");
                 }
             }
@@ -473,15 +465,23 @@ mod tests {
 
     const WAIT: Duration = Duration::from_secs(10);
 
-    /// Two peers over a link in memory, and home's end of the link, to drop it.
-    fn linked() -> (Peer, Peer, tokio::task::JoinHandle<io::Error>) {
+    /// The audio wires of the two ends of a link in memory, and home's end of the link, to
+    /// drop it.
+    async fn linked() -> (Wire, Wire, tokio::task::JoinHandle<io::Error>) {
         let (home_stream, remote_stream) = tokio::io::duplex(64 * 1024);
-        let (home, home_wire) = link::peer();
-        let (remote, remote_wire) = link::peer();
         let heartbeat = link::Heartbeat::default();
-        let home_end = tokio::spawn(link::idle(home_stream, heartbeat, home_wire));
-        tokio::spawn(link::idle(remote_stream, heartbeat, remote_wire));
-        (home, remote, home_end)
+        let end = |stream| {
+            let (taken, wire) = tokio::sync::oneshot::channel();
+            let link = tokio::spawn(link::run(stream, heartbeat, move |mut wire: link::Wire| {
+                let _ = taken.send(wire.audio.take().unwrap());
+                // The clipboard's queues stay open, unused.
+                async move { std::future::pending::<()>().await }
+            }));
+            (link, wire)
+        };
+        let (home_end, home) = end(home_stream);
+        let (_remote_end, remote) = end(remote_stream);
+        (home.await.unwrap(), remote.await.unwrap(), home_end)
     }
 
     async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
@@ -511,22 +511,28 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn the_audio_messages_round_trip() {
-        for message in [
+    #[tokio::test]
+    async fn the_audio_messages_cross_the_link() {
+        let (home, remote, _link) = linked().await;
+        let messages = [
             Message::Start { session: 7 },
-            Message::Stop,
             Message::Frame {
                 session: 7,
                 seq: 0x0102_0304,
-                packet: vec![9, 8, 7],
+                packet: Bytes::from_static(&[9, 8, 7]),
             },
-        ] {
-            assert_eq!(Message::decode(&message.encode()).unwrap(), message);
+            Message::Stop,
+        ];
+        for message in &messages {
+            home.to_peer.send(message.clone()).await.unwrap();
         }
-        assert!(Message::decode(&[FRAME, 0, 0, 0, 0, 0, 0]).is_err());
-        assert!(Message::decode(&[START]).is_err());
-        assert!(Message::decode(&[0x02]).is_err());
+        let received = blocking(move || {
+            (0..3)
+                .map(|_| remote.from_peer.recv_timeout(WAIT).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .await;
+        assert_eq!(received, messages);
     }
 
     /// A saved-default file of its own, in a temporary directory.
@@ -645,7 +651,7 @@ mod tests {
         let home_graph = FakeGraph::with_default("home-speakers");
         let remote_graph = FakeGraph::with_default("laptop-speakers");
         let (_tmp, saved) = saved();
-        let (home_peer, remote_peer, _link) = linked();
+        let (home_peer, remote_peer, _link) = linked().await;
         remote(remote_graph.clone(), saved.clone(), remote_peer, None).unwrap();
         home(home_graph.clone(), home_peer).unwrap();
 
@@ -683,9 +689,9 @@ mod tests {
         let home_graph = FakeGraph::default();
         let remote_graph = FakeGraph::with_default("laptop-speakers");
         let (_tmp, saved) = saved();
-        let (home_peer, remote_peer, _link) = linked();
+        let (home_peer, remote_peer, _link) = linked().await;
         remote(remote_graph.clone(), saved.clone(), remote_peer, None).unwrap();
-        let mut home = Home::new(home_graph.clone(), home_peer.send);
+        let mut home = Home::new(home_graph.clone(), home_peer.to_peer);
         // Home's calls block: off the runtime, as in `home`.
         let mut home = blocking(move || {
             home.start().unwrap();
@@ -715,11 +721,11 @@ mod tests {
     async fn the_link_dropping_restores_the_remote_default() {
         let remote_graph = FakeGraph::with_default("laptop-speakers");
         let (_tmp, saved) = saved();
-        let (home_peer, remote_peer, link) = linked();
+        let (home_peer, remote_peer, link) = linked().await;
         let audio = remote(remote_graph.clone(), saved.clone(), remote_peer, None).unwrap();
         home_peer
-            .send
-            .send(Message::Start { session: 1 }.encode())
+            .to_peer
+            .send(Message::Start { session: 1 })
             .await
             .unwrap();
         until(&remote_graph, |s| !s.sinks.is_empty()).await;
@@ -740,27 +746,20 @@ mod tests {
         let (to_remote, mut orders) = mpsc::channel(8);
         let mut home = Home::new(graph.clone(), to_remote);
         let packets = codec::tests::packets(&mut Encoder::new().unwrap(), &tone(20));
-        let session = |orders: &mut mpsc::Receiver<Vec<u8>>| match Message::decode(
-            &orders.try_recv().unwrap(),
-        )
-        .unwrap()
-        {
+        let session = |orders: &mut mpsc::Receiver<Message>| match orders.try_recv().unwrap() {
             Message::Start { session } => session,
             other => panic!("{other:?}"),
         };
-        let frame = |session, seq: u32| {
-            Message::Frame {
-                session,
-                seq,
-                packet: packets[seq as usize % packets.len()].clone(),
-            }
-            .encode()
+        let frame = |session, seq: u32| Message::Frame {
+            session,
+            seq,
+            packet: Bytes::from(packets[seq as usize % packets.len()].clone()),
         };
 
         home.start().unwrap();
         let first = session(&mut orders);
         for seq in 100..105 {
-            home.received(&frame(first, seq)).unwrap();
+            home.received(frame(first, seq)).unwrap();
         }
         home.stop().unwrap();
         orders.try_recv().unwrap();
@@ -768,9 +767,9 @@ mod tests {
         let second = session(&mut orders);
         assert_ne!(first, second);
         // Still on its way when home stopped.
-        home.received(&frame(first, 105)).unwrap();
+        home.received(frame(first, 105)).unwrap();
         for seq in 0..10 {
-            home.received(&frame(second, seq)).unwrap();
+            home.received(frame(second, seq)).unwrap();
         }
         let jitter = graph.state().playbacks[0].1.clone();
         let mut out = vec![0.0; 10 * FRAME_SAMPLES];
@@ -785,11 +784,11 @@ mod tests {
     async fn a_new_link_waits_for_the_previous_one_to_put_the_default_back() {
         let remote_graph = FakeGraph::with_default("laptop-speakers");
         let (_tmp, saved) = saved();
-        let (home_peer, remote_peer, link) = linked();
+        let (home_peer, remote_peer, link) = linked().await;
         let first = remote(remote_graph.clone(), saved.clone(), remote_peer, None).unwrap();
         home_peer
-            .send
-            .send(Message::Start { session: 1 }.encode())
+            .to_peer
+            .send(Message::Start { session: 1 })
             .await
             .unwrap();
         until(&remote_graph, |s| !s.sinks.is_empty()).await;
@@ -798,7 +797,7 @@ mod tests {
         // default back.
         remote_graph.state().slow_defaults = Duration::from_millis(200);
         link.abort();
-        let (home_peer, remote_peer, link) = linked();
+        let (home_peer, remote_peer, link) = linked().await;
         let second = remote(
             remote_graph.clone(),
             saved.clone(),
@@ -807,8 +806,8 @@ mod tests {
         )
         .unwrap();
         home_peer
-            .send
-            .send(Message::Start { session: 1 }.encode())
+            .to_peer
+            .send(Message::Start { session: 1 })
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
