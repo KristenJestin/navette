@@ -1,6 +1,7 @@
 // Copied from gliff (https://github.com/omacom/gliff), crates/gliff-server/src/rate.rs at
-// 58273cb (the fork's navette branch), unchanged. Copyright (c) 2026 Kevin McConnell, MIT
-// license: see LICENSES/gliff-MIT.txt.
+// 58273cb (the fork's navette branch). Copyright (c) 2026 Kevin McConnell, MIT license: see
+// LICENSES/gliff-MIT.txt. Changed for Navette: `RateController::ceiling_bitrate` is added, for
+// still-picture refinement; gliff's logic is unchanged.
 
 //! Link estimation and rate control for a frame-paced stream.
 //!
@@ -609,6 +610,11 @@ impl RateController {
     /// The CBR bitrate handed to one encoder stream.
     pub fn stream_bitrate(&self) -> u32 {
         (self.target / self.streams).max(1)
+    }
+
+    /// The ceiling's share for one encoder stream (added for Navette).
+    pub fn ceiling_bitrate(&self) -> u32 {
+        (self.effective_max() / self.streams).max(1)
     }
 
     pub fn is_slow_start(&self) -> bool {

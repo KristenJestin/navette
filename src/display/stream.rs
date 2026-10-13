@@ -23,8 +23,9 @@ use crate::display::wire::{Msg, Outbox};
 
 /// The session-wide fps ceiling; ladder levels cap below it.
 const MAX_FPS: u32 = 60;
-/// Still-picture refinement: at most this many re-encodes of an unchanged frame, at least
-/// this far apart.
+/// Still-picture refinement: this many re-encodes of an unchanged frame, at least this far
+/// apart. All of them run: the encoder lowers its quantiser only after a pass came in under
+/// budget, so the first passes are small even when the picture is still soft.
 const MAX_REFINES: u8 = 8;
 const REFINE_EVERY: Duration = Duration::from_millis(200);
 /// A static screen produces no damage and so no first frame; after this long the capture is
@@ -128,9 +129,48 @@ fn now_us() -> u64 {
 
 /// Events from the capture thread.
 enum Incoming {
-    Frame(CapturedFrame),
+    Frame(Frame),
     Stopped,
     Error(String),
+}
+
+/// A picture to encode: a captured frame, or plain pixels in tests.
+enum Frame {
+    Captured(CapturedFrame),
+    #[cfg(test)]
+    Pixels {
+        width: u32,
+        height: u32,
+        bgra: Arc<Vec<u8>>,
+    },
+}
+
+impl Frame {
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Self::Captured(frame) => (frame.buffer.info.width & !1, frame.buffer.info.height & !1),
+            #[cfg(test)]
+            Self::Pixels { width, height, .. } => (*width, *height),
+        }
+    }
+}
+
+/// What the session asks of the capture: `hypr-capture` live, a fake in tests.
+trait Capture {
+    /// Deliver the next frame with damage.
+    fn request_frame(&mut self);
+    /// Deliver the current picture, damaged or not.
+    fn recapture(&mut self);
+}
+
+impl Capture for Capturer {
+    fn request_frame(&mut self) {
+        Capturer::request_frame(self).ok();
+    }
+
+    fn recapture(&mut self) {
+        Capturer::recapture(self).ok();
+    }
 }
 
 struct Session {
@@ -150,9 +190,9 @@ struct Session {
     chroma: ChromaMode,
     settings: EncoderSettings,
     encoder: VideoEncoder,
-    capturer: Capturer,
+    capturer: Box<dyn Capture>,
     /// The newest captured frame not yet encoded.
-    pending: Option<CapturedFrame>,
+    pending: Option<Frame>,
     capture_asked: bool,
     /// The pending frame has already counted as blocked for the rate controller.
     blocked_noted: bool,
@@ -164,8 +204,10 @@ struct Session {
     encode_us: f64,
     next_send_at: Instant,
     /// The last frame that went out, kept for still-picture refinement.
-    last_frame: Option<CapturedFrame>,
+    last_frame: Option<Frame>,
     refines: u8,
+    /// The encoder runs at the refinement rate, not the controller's target.
+    refining: bool,
     next_refine_at: Instant,
     recaptured: bool,
     ladder: Ladder,
@@ -204,6 +246,20 @@ impl Session {
             ));
         }
         let video = VideoTier::open(VideoMode::resolve(None), &render_node);
+        let (cap_tx, captures) = mpsc::unbounded_channel();
+        let capturer = start_capture(&source.output, &render_node, cap_tx)?;
+        let session = Self::new(source, caps, outbox, output, video, Box::new(capturer))?;
+        Ok((session, captures))
+    }
+
+    fn new(
+        source: Source,
+        caps: ClientCaps,
+        outbox: Outbox,
+        output: (u32, u32),
+        video: VideoTier,
+        capturer: Box<dyn Capture>,
+    ) -> io::Result<Self> {
         let ladder = Ladder::new(START_LEVEL);
         let fps_cmd = ladder.level().fps_cap.min(MAX_FPS);
         let on_gpu = matches!(video, VideoTier::Gpu(_));
@@ -222,9 +278,7 @@ impl Session {
             output.1,
             start.video.pipeline().label()
         );
-        let (cap_tx, captures) = mpsc::unbounded_channel();
-        let capturer = start_capture(&source.output, &render_node, cap_tx)?;
-        let session = Self {
+        Ok(Self {
             outbox,
             video: start.video,
             source,
@@ -249,13 +303,13 @@ impl Session {
             next_send_at: Instant::now(),
             last_frame: None,
             refines: MAX_REFINES,
+            refining: false,
             next_refine_at: Instant::now(),
             recaptured: false,
             ladder,
             base_stream: start.stream,
             base_chroma: start.chroma,
-        };
-        Ok((session, captures))
+        })
     }
 
     async fn run(
@@ -271,7 +325,7 @@ impl Session {
             Vec::new(),
         );
         self.send_config();
-        self.capturer.request_frame().ok();
+        self.capturer.request_frame();
         self.capture_asked = true;
         let first_frame_deadline =
             tokio::time::Instant::from_std(Instant::now() + FIRST_FRAME_DEADLINE);
@@ -304,7 +358,7 @@ impl Session {
                     if self.frame_id == 0 && !self.recaptured =>
                 {
                     self.recaptured = true;
-                    self.capturer.recapture().ok();
+                    self.capturer.recapture();
                 }
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(self.refine_wake())),
                     if self.can_refine() => {}
@@ -374,8 +428,8 @@ impl Session {
         Ok(())
     }
 
-    fn on_frame(&mut self, frame: CapturedFrame) -> io::Result<()> {
-        let size = (frame.buffer.info.width & !1, frame.buffer.info.height & !1);
+    fn on_frame(&mut self, frame: Frame) -> io::Result<()> {
+        let size = frame.size();
         if size != self.output {
             // A reload dropped the monitor rule and Hyprland changed the mode before the rule
             // came back: stream what is there.
@@ -408,6 +462,10 @@ impl Session {
         if self.link_has_room() && now >= self.next_send_at {
             if let Some(frame) = self.pending.take() {
                 if self.matches_output(&frame) {
+                    if self.refining {
+                        self.refining = false;
+                        self.apply_rate();
+                    }
                     self.encode_and_send(&frame, false)?;
                     self.last_frame = Some(frame);
                     self.refines = 0;
@@ -420,19 +478,20 @@ impl Session {
             {
                 // Re-encode the same buffer so a frame that arrived soft under a low budget
                 // converges to sharp while nothing changes on screen.
-                let bytes = self.encode_and_send(&frame, true)?;
+                if !self.refining {
+                    self.refining = true;
+                    self.apply_rate();
+                }
+                self.encode_and_send(&frame, true)?;
                 self.refines += 1;
                 self.next_refine_at = now + REFINE_EVERY;
-                if (bytes as f64) < self.refined_done_bytes() {
-                    self.refines = MAX_REFINES;
-                }
                 self.last_frame = Some(frame);
             }
         }
         // Keep one capture request outstanding even while blocked: a newer frame replaces
         // `pending`, so the frame that finally goes out on a slow link is current.
         if !self.capture_asked {
-            self.capturer.request_frame().ok();
+            self.capturer.request_frame();
             self.capture_asked = true;
         }
         Ok(())
@@ -452,18 +511,8 @@ impl Session {
         Duration::from_secs_f64(1.0 / self.fps_cmd.max(1) as f64)
     }
 
-    fn matches_output(&self, frame: &CapturedFrame) -> bool {
-        let info = &frame.buffer.info;
-        (info.width & !1, info.height & !1) == self.output
-    }
-
-    fn refined_done_bytes(&self) -> f64 {
-        let streams = if self.chroma == ChromaMode::Dual420 {
-            2.0
-        } else {
-            1.0
-        };
-        0.2 * self.ctl.budget_per_frame(self.fps_cmd) as f64 * streams / 8.0
+    fn matches_output(&self, frame: &Frame) -> bool {
+        frame.size() == self.output
     }
 
     fn refine_wake(&self) -> Instant {
@@ -558,6 +607,7 @@ impl Session {
                 self.want_keyframe = true;
                 self.encode_us = 0.0;
                 self.refines = 0;
+                self.refining = false;
                 self.next_refine_at = Instant::now();
                 Ok(true)
             }
@@ -584,8 +634,15 @@ impl Session {
         }
     }
 
+    /// A refinement pass runs at the controller's ceiling, not its target: the screen is still
+    /// and the link idle, and the target only grows on what motion measured, so on a page left
+    /// still it stays at its starting value, too low for small text to ever sharpen.
     fn apply_rate(&mut self) {
-        let bitrate = self.ctl.stream_bitrate();
+        let bitrate = if self.refining {
+            self.ctl.ceiling_bitrate()
+        } else {
+            self.ctl.stream_bitrate()
+        };
         let vbv = self.ctl.vbv_ms(self.fps_cmd);
         self.settings.bitrate = bitrate;
         self.settings.framerate = self.fps_cmd;
@@ -595,7 +652,7 @@ impl Session {
 
     /// Encodes `frame` and queues it; returns the coded byte count. `app_limited` marks a send
     /// that does not use the capacity (a refinement pass), so it cannot lower the estimate.
-    fn encode_and_send(&mut self, frame: &CapturedFrame, app_limited: bool) -> io::Result<usize> {
+    fn encode_and_send(&mut self, frame: &Frame, app_limited: bool) -> io::Result<usize> {
         let (width, height) = self.stream;
         let key = std::mem::take(&mut self.want_keyframe);
         let t0 = Instant::now();
@@ -784,12 +841,12 @@ impl VideoEncoder {
     /// scales the pixels before converting.
     fn encode(
         &mut self,
-        frame: &CapturedFrame,
+        frame: &Frame,
         stream: (u32, u32),
         force_keyframe: bool,
     ) -> io::Result<EncodedFrame> {
-        match self {
-            Self::Gpu(enc) => {
+        match (self, frame) {
+            (Self::Gpu(enc), Frame::Captured(frame)) => {
                 let info = &frame.buffer.info;
                 let fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc).map_err(|_| {
                     io::Error::other(format!(
@@ -812,7 +869,7 @@ impl VideoEncoder {
                 enc.encode_dmabuf(buffer_key, &plane, force_keyframe)
                     .map_err(|e| other("GPU encode", e))
             }
-            Self::Cpu(enc) => {
+            (Self::Cpu(enc), Frame::Captured(frame)) => {
                 let image = frame
                     .buffer
                     .read_bgra()
@@ -829,17 +886,33 @@ impl VideoEncoder {
                         h,
                     )
                 };
-                let f = enc
-                    .encode_bgra(&pixels, force_keyframe)
-                    .map_err(|e| other("CPU encode", e))?;
-                Ok(EncodedFrame {
-                    main: f.main,
-                    aux: f.aux,
-                    keyframe: f.keyframe,
-                })
+                encode_on_cpu(enc, &pixels, force_keyframe)
+            }
+            #[cfg(test)]
+            (Self::Cpu(enc), Frame::Pixels { bgra, .. }) => {
+                encode_on_cpu(enc, bgra, force_keyframe)
+            }
+            #[cfg(test)]
+            (Self::Gpu(_), Frame::Pixels { .. }) => {
+                Err(io::Error::other("test pixels are encoded on the CPU"))
             }
         }
     }
+}
+
+fn encode_on_cpu(
+    enc: &mut gliff_sw::Encoder,
+    bgra: &[u8],
+    force_keyframe: bool,
+) -> io::Result<EncodedFrame> {
+    let f = enc
+        .encode_bgra(bgra, force_keyframe)
+        .map_err(|e| other("CPU encode", e))?;
+    Ok(EncodedFrame {
+        main: f.main,
+        aux: f.aux,
+        keyframe: f.keyframe,
+    })
 }
 
 /// The encoder's largest picture, no larger than home said it decodes.
@@ -866,7 +939,7 @@ fn start_capture(
     config.buffers = 4;
     let sink = Box::new(move |ev: CaptureEvent| {
         let msg = match ev {
-            CaptureEvent::Frame(frame) => Incoming::Frame(frame),
+            CaptureEvent::Frame(frame) => Incoming::Frame(Frame::Captured(frame)),
             CaptureEvent::Stopped => Incoming::Stopped,
             CaptureEvent::Error(e) => Incoming::Error(e),
             _ => return,
@@ -894,5 +967,612 @@ mod tests {
     fn the_largest_picture_home_decodes_bounds_the_stream() {
         assert_eq!(within_home((4096, 4096), &caps(3840, 2160)), (3840, 2160));
         assert_eq!(within_home((1920, 1088), &caps(3840, 2160)), (1920, 1088));
+    }
+
+    /// The first re-encode of a still picture is small whatever the encoder: at the quantiser
+    /// the picture was coded with, the residual quantises to nothing; only the next passes,
+    /// once the rate control has seen a pass come in under budget, sharpen it. None of the
+    /// passes may be skipped on that ground.
+    #[test]
+    fn still_text_gets_every_refinement_pass() {
+        let mut desk = Desk::new(640, 360);
+        desk.show(text_page(640, 360, 1));
+        assert_eq!(desk.frames(12), 1 + MAX_REFINES as usize);
+    }
+
+    /// The controller's target only grows on what motion measured: on a page left still from
+    /// the start it stays at its starting value, a fraction of what a LAN carries. The
+    /// controller hears of no ack here, so the target cannot move.
+    #[test]
+    fn still_text_is_refined_at_the_ceiling_not_the_starting_target() {
+        let mut desk = Desk::new(1280, 720);
+        desk.acks = false;
+        desk.show(text_page(1280, 720, 1));
+        desk.frames(1);
+        assert!(desk.session.ctl.ceiling_bitrate() > desk.session.ctl.stream_bitrate());
+        assert_eq!(
+            desk.session.settings.bitrate,
+            desk.session.ctl.stream_bitrate()
+        );
+        desk.frames(1);
+        assert_eq!(
+            desk.session.settings.bitrate,
+            desk.session.ctl.ceiling_bitrate()
+        );
+    }
+
+    /// Refinement must not leak into motion: the next change is encoded at the target again.
+    #[test]
+    fn motion_after_still_text_is_encoded_at_the_target() {
+        let mut desk = Desk::new(1280, 720);
+        desk.acks = false;
+        desk.show(text_page(1280, 720, 1));
+        assert_eq!(desk.frames(2), 2);
+        desk.show(text_page(1280, 720, 2));
+        assert_eq!(desk.frames(1), 1);
+        assert!(desk.session.ctl.ceiling_bitrate() > desk.session.ctl.stream_bitrate());
+        assert_eq!(
+            desk.session.settings.bitrate,
+            desk.session.ctl.stream_bitrate()
+        );
+    }
+
+    /// A session on the CPU tier, stepped by hand: no clock to wait for, every frame acked at
+    /// once.
+    struct Desk {
+        session: Session,
+        scene: Scene,
+        captures: UnboundedReceiver<Incoming>,
+        outbox: Outbox,
+        runtime: tokio::runtime::Runtime,
+        /// The rate controller hears of home's acks; when not, its target stays where it
+        /// started.
+        acks: bool,
+    }
+
+    impl Desk {
+        fn new(width: u32, height: u32) -> Self {
+            let outbox = Outbox::default();
+            let (tx, captures) = mpsc::unbounded_channel();
+            let scene = Scene::new(tx, (width, height));
+            let session = Session::new(
+                Source {
+                    output: "NAVETTE-1".into(),
+                    scale: 1.0,
+                },
+                dual_caps(),
+                outbox.clone(),
+                (width, height),
+                VideoTier::Cpu,
+                Box::new(scene.clone()),
+            )
+            .expect("the CPU session starts");
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            Self {
+                session,
+                scene,
+                captures,
+                outbox,
+                runtime,
+                acks: true,
+            }
+        }
+
+        fn show(&mut self, page: Vec<u8>) {
+            self.scene.show(Arc::new(page));
+            self.session.capturer.request_frame();
+            self.session.capture_asked = true;
+        }
+
+        /// Lets the session send up to `max` frames, refinement passes included, as if each
+        /// were due; returns how many it sent. Home takes each one off the link at once.
+        fn frames(&mut self, max: usize) -> usize {
+            let mut sent = 0;
+            while sent < max {
+                while let Ok(Incoming::Frame(frame)) = self.captures.try_recv() {
+                    self.session.on_frame(frame).unwrap();
+                }
+                self.session.next_send_at = Instant::now();
+                self.session.next_refine_at = Instant::now();
+                let before = self.session.frame_id;
+                self.session.pump_encoder().unwrap();
+                if self.session.frame_id == before {
+                    break;
+                }
+                sent += 1;
+                while let Some(frame_id) = self.next_frame() {
+                    if !self.acks {
+                        self.session.link.on_ack(Instant::now(), frame_id);
+                        continue;
+                    }
+                    self.session
+                        .on_feedback(ClientMsg::FrameAck {
+                            frame_id,
+                            decoded_at_ms: now_us() / 1000,
+                        })
+                        .unwrap();
+                }
+            }
+            sent
+        }
+
+        fn next_frame(&self) -> Option<u64> {
+            while !self.outbox.queued().is_empty() {
+                if let (Msg::Video(ServerMsg::VideoFrame { frame_id, .. }), _) =
+                    self.runtime.block_on(self.outbox.next())
+                {
+                    return Some(frame_id);
+                }
+            }
+            None
+        }
+    }
+
+    fn dual_caps() -> ClientCaps {
+        ClientCaps {
+            chroma: vec![ChromaMode::Dual420],
+            ..caps(4096, 4096)
+        }
+    }
+
+    /// The headless measure behind the numbers in the pull request: a page left still, then
+    /// scrolling followed by a still page. `NAVETTE_PAGE` names a binary PPM to use as the page
+    /// (`tools/still-text-page.sh` renders one); without it a synthetic page is used.
+    /// `cargo test --release --lib still_text_measure -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a measure, not a check: minutes of CPU encoding"]
+    fn still_text_measure() {
+        let (width, height, page) = match std::env::var_os("NAVETTE_PAGE") {
+            Some(path) => read_ppm(&std::fs::read(path).expect("read the page")),
+            None => (2560, 1440, text_page(2560, 1440, 1)),
+        };
+        let page = Arc::new(page);
+        let shown = page.clone();
+        let still = measure(width, height, Lan::HOME, |scene| async move {
+            scene.show(shown);
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        println!("still page from the start:\n{}", timeline(&still));
+
+        let scroll = Duration::from_secs(4);
+        let arrivals = measure(width, height, Lan::HOME, move |scene| async move {
+            let start = Instant::now();
+            let mut row = 0;
+            while start.elapsed() < scroll {
+                scene.show_moving(Arc::new(scrolled(&page, width, height, row)));
+                row += 3;
+                tokio::time::sleep(Duration::from_millis(16)).await;
+            }
+            scene.show(Arc::new(scrolled(&page, width, height, row)));
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let moving: Vec<_> = arrivals.iter().filter(|a| a.moving).collect();
+        let mut latency: Vec<_> = moving.iter().map(|a| a.latency).collect();
+        latency.sort();
+        let span = moving.last().unwrap().at - moving.first().unwrap().at;
+        println!(
+            "scrolling: {} frames, {:.1} fps, latency p50 {:?} p95 {:?}",
+            moving.len(),
+            moving.len() as f64 / span.as_secs_f64(),
+            latency[latency.len() / 2],
+            latency[latency.len() * 95 / 100],
+        );
+        let settled: Vec<_> = arrivals.into_iter().filter(|a| !a.moving).collect();
+        println!("still page after scrolling:\n{}", timeline(&settled));
+    }
+
+    /// A LAN between the two machines, in one direction.
+    #[derive(Clone, Copy)]
+    struct Lan {
+        bits_per_second: f64,
+        one_way: Duration,
+    }
+
+    impl Lan {
+        const HOME: Lan = Lan {
+            bits_per_second: 300e6,
+            one_way: Duration::from_millis(1),
+        };
+
+        fn transmit(&self, bytes: usize) -> Duration {
+            Duration::from_secs_f64(bytes as f64 * 8.0 / self.bits_per_second)
+        }
+    }
+
+    /// One frame decoded at home.
+    struct Arrival {
+        at: Instant,
+        /// Since the picture last changed, when the frame arrived.
+        since_change: Duration,
+        /// The picture was still changing when the frame arrived.
+        moving: bool,
+        bytes: usize,
+        latency: Duration,
+        /// Against the picture shown last, RGB.
+        psnr: f64,
+    }
+
+    fn timeline(arrivals: &[Arrival]) -> String {
+        arrivals
+            .iter()
+            .map(|a| {
+                format!(
+                    "  +{:>4} ms  {:>6.1} dB  {:>7} B",
+                    a.since_change.as_millis(),
+                    a.psnr,
+                    a.bytes
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The pictures a fake capture delivers, as `hypr-capture` does: one frame per request,
+    /// once the picture has changed since the last one.
+    #[derive(Clone)]
+    struct Scene(Arc<std::sync::Mutex<SceneState>>);
+
+    struct SceneState {
+        tx: UnboundedSender<Incoming>,
+        size: (u32, u32),
+        picture: Arc<Vec<u8>>,
+        changed_at: Instant,
+        changing: bool,
+        asked: bool,
+        damaged: bool,
+    }
+
+    impl SceneState {
+        fn deliver(&mut self) {
+            self.asked = false;
+            self.damaged = false;
+            let _ = self.tx.send(Incoming::Frame(Frame::Pixels {
+                width: self.size.0,
+                height: self.size.1,
+                bgra: self.picture.clone(),
+            }));
+        }
+    }
+
+    impl Scene {
+        fn new(tx: UnboundedSender<Incoming>, size: (u32, u32)) -> Self {
+            Self(Arc::new(std::sync::Mutex::new(SceneState {
+                tx,
+                size,
+                picture: Arc::new(vec![0; size.0 as usize * size.1 as usize * 4]),
+                changed_at: Instant::now(),
+                changing: false,
+                asked: false,
+                damaged: false,
+            })))
+        }
+
+        /// Shows `picture`, to stay.
+        fn show(&self, picture: Arc<Vec<u8>>) {
+            self.change(picture, false);
+        }
+
+        /// Shows `picture`, one of a motion.
+        fn show_moving(&self, picture: Arc<Vec<u8>>) {
+            self.change(picture, true);
+        }
+
+        fn change(&self, picture: Arc<Vec<u8>>, changing: bool) {
+            let mut state = self.0.lock().unwrap();
+            state.picture = picture;
+            state.changing = changing;
+            state.changed_at = Instant::now();
+            state.damaged = true;
+            if state.asked {
+                state.deliver();
+            }
+        }
+
+        fn last_change(&self) -> (Arc<Vec<u8>>, Instant, bool) {
+            let state = self.0.lock().unwrap();
+            (state.picture.clone(), state.changed_at, state.changing)
+        }
+    }
+
+    impl Capture for Scene {
+        fn request_frame(&mut self) {
+            let mut state = self.0.lock().unwrap();
+            state.asked = true;
+            if state.damaged {
+                state.deliver();
+            }
+        }
+
+        fn recapture(&mut self) {
+            self.0.lock().unwrap().deliver();
+        }
+    }
+
+    /// Runs a real session on the CPU tier against a fake capture driven by `script`, over a
+    /// simulated `lan` to a home that decodes on the CPU and acks every frame. Returns every
+    /// frame decoded while the script ran. Dual420, as the remote's GPU tier encodes.
+    fn measure<S, F>(width: u32, height: u32, lan: Lan, script: S) -> Vec<Arrival>
+    where
+        S: FnOnce(Scene) -> F,
+        F: std::future::Future<Output = ()>,
+    {
+        let outbox = Outbox::default();
+        let (cap_tx, captures) = mpsc::unbounded_channel();
+        let scene = Scene::new(cap_tx, (width, height));
+        let (feedback_tx, feedback) = mpsc::unbounded_channel();
+        let (stop_tx, stop) = tokio::sync::oneshot::channel();
+        let session_outbox = outbox.clone();
+        let capture = scene.clone();
+        let session = std::thread::spawn(move || {
+            let source = Source {
+                output: "NAVETTE-1".into(),
+                scale: 1.0,
+            };
+            let session = Session::new(
+                source,
+                dual_caps(),
+                session_outbox,
+                (width, height),
+                VideoTier::Cpu,
+                Box::new(capture),
+            )
+            .expect("the CPU session starts");
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(session.run(captures, feedback, stop))
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime.block_on(async {
+            let home = home(
+                outbox.clone(),
+                feedback_tx,
+                scene.clone(),
+                lan,
+                arrivals.clone(),
+            );
+            let script = async {
+                script(scene.clone()).await;
+            };
+            tokio::select! {
+                _ = script => {}
+                _ = home => unreachable!("home runs until the script ends"),
+            }
+        });
+        let _ = stop_tx.send(());
+        session.join().unwrap().expect("the session ran");
+        std::mem::take(&mut *arrivals.lock().unwrap())
+    }
+
+    /// Home: writes each frame at the link's rate, decodes it and acks it.
+    async fn home(
+        outbox: Outbox,
+        feedback: UnboundedSender<ClientMsg>,
+        scene: Scene,
+        lan: Lan,
+        arrivals: Arc<std::sync::Mutex<Vec<Arrival>>>,
+    ) {
+        let mut decoder = None;
+        let mut config = None;
+        loop {
+            let (msg, payloads) = outbox.next().await;
+            match msg {
+                Msg::Video(ServerMsg::Ping { t }) => {
+                    tokio::time::sleep(2 * lan.one_way).await;
+                    let _ = feedback.send(ClientMsg::Pong { t });
+                }
+                Msg::Video(ServerMsg::StreamConfig {
+                    chroma,
+                    width,
+                    height,
+                    ..
+                }) => {
+                    // As home does: a pace-only change keeps the decoder.
+                    if config != Some((chroma, width, height)) {
+                        config = Some((chroma, width, height));
+                        decoder =
+                            Some(gliff_sw::Decoder::new(chroma == ChromaMode::Dual420).unwrap());
+                    }
+                }
+                Msg::Video(ServerMsg::VideoFrame {
+                    frame_id, pts_us, ..
+                }) => {
+                    let bytes = payloads.iter().map(Vec::len).sum();
+                    let took = lan.transmit(bytes);
+                    tokio::time::sleep(took).await;
+                    outbox.report_write(took);
+                    tokio::time::sleep(lan.one_way).await;
+                    let decoded = decoder
+                        .as_mut()
+                        .expect("a config before the frames")
+                        .decode(&payloads[0], &payloads[1])
+                        .expect("home decodes the frame")
+                        .expect("no picture held back");
+                    let at = Instant::now();
+                    let (picture, changed_at, changing) = scene.last_change();
+                    arrivals.lock().unwrap().push(Arrival {
+                        at,
+                        since_change: at - changed_at,
+                        moving: changing,
+                        bytes,
+                        latency: Duration::from_micros(now_us().saturating_sub(pts_us)),
+                        psnr: gliff_proto::color::psnr(&rgb(&picture), &rgb(&decoded.pixels)),
+                    });
+                    let feedback = feedback.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(lan.one_way).await;
+                        let _ = feedback.send(ClientMsg::FrameAck {
+                            frame_id,
+                            decoded_at_ms: now_us() / 1000,
+                        });
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn rgb(bgra: &[u8]) -> Vec<u8> {
+        bgra.as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect()
+    }
+
+    /// A deterministic page of small text: glyph-like antialiased strokes, coloured code on a
+    /// dark panel and dark prose on a white one, with a bar along the top.
+    fn text_page(width: u32, height: u32, seed: u32) -> Vec<u8> {
+        let (w, h) = (width as usize, height as usize);
+        let mut page = vec![0u8; w * h * 4];
+        let mut fill = |x0: usize, y0: usize, x1: usize, y1: usize, rgb: [u8; 3]| {
+            for y in y0..y1.min(h) {
+                for x in x0..x1.min(w) {
+                    page[(y * w + x) * 4..][..4].copy_from_slice(&[rgb[2], rgb[1], rgb[0], 255]);
+                }
+            }
+        };
+        fill(0, 0, w, h, [0x1e, 0x1e, 0x2e]);
+        fill(0, 0, w, 18, [0x1a, 0x1b, 0x26]);
+        fill(8, 26, w / 2 - 4, h - 8, [0x28, 0x2c, 0x34]);
+        fill(w / 2 + 4, 26, w - 8, h - 8, [0xff, 0xff, 0xff]);
+        let code = [
+            [0xe0, 0x6c, 0x75],
+            [0x98, 0xc3, 0x79],
+            [0xe5, 0xc0, 0x7b],
+            [0x61, 0xaf, 0xef],
+            [0xc6, 0x78, 0xdd],
+            [0xab, 0xb2, 0xbf],
+        ];
+        let mut rng = seed.wrapping_mul(2_654_435_761).max(1);
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng
+        };
+        let panels = [
+            (16, 34, w / 2 - 12, h - 16, None, [0x28, 0x2c, 0x34]),
+            (
+                w / 2 + 16,
+                36,
+                w - 20,
+                h - 16,
+                Some([0x20, 0x20, 0x20]),
+                [0xff; 3],
+            ),
+            (12, 4, w - 12, 16, None, [0x1a, 0x1b, 0x26]),
+        ];
+        for (x0, y0, x1, y1, ink, paper) in panels {
+            let mut y = y0;
+            while y + 10 <= y1 {
+                let mut x = x0;
+                while x + 6 <= x1 {
+                    let letters = 2 + next() as usize % 7;
+                    let color = ink.unwrap_or(code[next() as usize % code.len()]);
+                    for _ in 0..letters {
+                        if x + 6 > x1 {
+                            break;
+                        }
+                        glyph(&mut page, w, x, y, next(), color, paper);
+                        x += 7;
+                    }
+                    x += 7;
+                }
+                y += 14;
+            }
+        }
+        page
+    }
+
+    /// One 6x9 glyph from `bits`: a few strokes, with grey edges as a rasteriser leaves them.
+    fn glyph(
+        page: &mut [u8],
+        w: usize,
+        x0: usize,
+        y0: usize,
+        bits: u32,
+        ink: [u8; 3],
+        paper: [u8; 3],
+    ) {
+        let mut cover = [[0f32; 6]; 9];
+        let strokes: [&dyn Fn(usize, usize) -> bool; 6] = [
+            &|x, _| x == 1,
+            &|x, _| x == 4,
+            &|_, y| y == 1,
+            &|_, y| y == 4,
+            &|_, y| y == 7,
+            &|x, y| x + 1 == y * 2 / 3 + 1,
+        ];
+        for (i, stroke) in strokes.iter().enumerate() {
+            if bits >> i & 1 == 1 {
+                for (y, row) in cover.iter_mut().enumerate() {
+                    for (x, c) in row.iter_mut().enumerate() {
+                        if stroke(x, y) {
+                            *c = 1.0;
+                        }
+                    }
+                }
+            }
+        }
+        for y in 0..9 {
+            for x in 0..6 {
+                let near = [(0, 1), (2, 1), (1, 0), (1, 2)]
+                    .iter()
+                    .filter_map(|(dx, dy)| {
+                        let (nx, ny) = ((x + dx) as isize - 1, (y + dy) as isize - 1);
+                        (nx >= 0 && ny >= 0 && nx < 6 && ny < 9)
+                            .then(|| cover[ny as usize][nx as usize])
+                    })
+                    .fold(0f32, f32::max);
+                let c = cover[y][x].max(0.35 * near);
+                let px = &mut page[((y0 + y) * w + x0 + x) * 4..][..3];
+                for k in 0..3 {
+                    px[2 - k] =
+                        (paper[k] as f32 + (ink[k] as f32 - paper[k] as f32) * c).round() as u8;
+                }
+            }
+        }
+    }
+
+    /// The page scrolled up by `rows`, wrapping.
+    fn scrolled(page: &[u8], width: u32, height: u32, rows: usize) -> Vec<u8> {
+        let stride = width as usize * 4;
+        let shift = (rows % height as usize) * stride;
+        [&page[shift..], &page[..shift]].concat()
+    }
+
+    /// A binary PPM (P6, 8-bit), as BGRA.
+    fn read_ppm(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+        let mut fields = bytes.splitn(4, |b| b.is_ascii_whitespace());
+        assert_eq!(fields.next(), Some(&b"P6"[..]), "a binary PPM");
+        let mut number = || -> usize {
+            std::str::from_utf8(fields.next().unwrap())
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let (width, height) = (number(), number());
+        let rest = fields.next().unwrap();
+        let mut rest = rest.splitn(2, |b| b.is_ascii_whitespace());
+        assert_eq!(rest.next(), Some(&b"255"[..]), "8-bit");
+        let rgb = rest.next().unwrap();
+        let (w, h) = (width & !1, height & !1);
+        let mut bgra = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for p in rgb[y * width * 3..][..w * 3].as_chunks::<3>().0 {
+                bgra.extend_from_slice(&[p[2], p[1], p[0], 255]);
+            }
+        }
+        (w as u32, h as u32, bgra)
     }
 }
