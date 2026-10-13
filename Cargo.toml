@@ -18,7 +18,7 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "rin
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 sha2 = "0.10"
 spake2 = "0.4"
-tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
