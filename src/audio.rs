@@ -15,6 +15,8 @@
 //! - `FRAME` (remote → home): the session number and a sequence number (big-endian `u32`s),
 //!   then one Opus packet.
 
+#[cfg(test)]
+pub(crate) mod allocations;
 pub mod codec;
 #[cfg(test)]
 pub mod fake;
@@ -23,6 +25,7 @@ pub mod pipewire;
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -75,14 +78,7 @@ impl Message {
                 session,
                 seq,
                 packet,
-            } => {
-                let mut frame = Vec::with_capacity(9 + packet.len());
-                frame.push(FRAME);
-                frame.extend_from_slice(&session.to_be_bytes());
-                frame.extend_from_slice(&seq.to_be_bytes());
-                frame.extend_from_slice(packet);
-                frame
-            }
+            } => frame(*session, *seq, packet),
         }
     }
 
@@ -107,6 +103,24 @@ impl Message {
             )),
         }
     }
+}
+
+/// A lock that a panic elsewhere does not turn into a panic here: the buffers it guards stay
+/// usable, and a panic in a PipeWire callback would cross its C code.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A `FRAME` message, in one allocation: the queue to the link takes it whole.
+fn frame(session: u32, seq: u32, packet: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(9 + packet.len());
+    frame.push(FRAME);
+    frame.extend_from_slice(&session.to_be_bytes());
+    frame.extend_from_slice(&seq.to_be_bytes());
+    frame.extend_from_slice(packet);
+    frame
 }
 
 /// The configured default sink, as PipeWire's `default` metadata holds it: kept as is, to be
@@ -263,26 +277,57 @@ impl<G: Graph> Drop for RemoteSink<G> {
     }
 }
 
-/// Encodes the sink's sound and sends it home, on PipeWire's thread.
-fn sender(home: mpsc::Sender<Vec<u8>>, session: u32) -> io::Result<OnSound> {
+/// Encodes the sink's sound and sends it home, on PipeWire's thread: it only counts its
+/// failures, for the audio thread to report.
+fn sender(
+    home: mpsc::Sender<Vec<u8>>,
+    session: u32,
+    failures: Arc<AtomicU64>,
+) -> io::Result<OnSound> {
     let mut encoder = Encoder::new()?;
     let mut seq = 0u32;
-    Ok(Box::new(move |pcm| match encoder.push(pcm) {
-        Ok(packets) => {
-            for packet in packets {
-                let frame = Message::Frame {
-                    session,
-                    seq,
-                    packet,
-                };
-                seq = seq.wrapping_add(1);
-                // Late sound is worse than lost sound: a full link drops the frame, and home
-                // fills the gap.
-                let _ = home.try_send(frame.encode());
-            }
+    Ok(Box::new(move |pcm| {
+        let sent = encoder.push(pcm, |packet| {
+            // Late sound is worse than lost sound: a full link drops the frame, and home fills
+            // the gap.
+            let _ = home.try_send(frame(session, seq, packet));
+            seq = seq.wrapping_add(1);
+        });
+        if sent.is_err() {
+            failures.fetch_add(1, Ordering::Relaxed);
         }
-        Err(e) => eprintln!("navette: audio: {e}"),
     }))
+}
+
+/// The sink while it runs, and the cycles it could not encode.
+struct Capture<G: Graph> {
+    _sink: RemoteSink<G>,
+    failures: Arc<AtomicU64>,
+}
+
+impl<G: Graph> Capture<G> {
+    fn start(
+        graph: G,
+        saved: Saved,
+        home: mpsc::Sender<Vec<u8>>,
+        session: u32,
+    ) -> io::Result<Self> {
+        let failures = Arc::new(AtomicU64::new(0));
+        let on_sound = sender(home, session, failures.clone())?;
+        Ok(Self {
+            _sink: RemoteSink::start(graph, saved, on_sound)?,
+            failures,
+        })
+    }
+}
+
+impl<G: Graph> Drop for Capture<G> {
+    fn drop(&mut self) {
+        let failures = self.failures.load(Ordering::Relaxed);
+        if failures > 0 {
+            eprintln!("navette: audio: {failures} cycles of sound could not be encoded");
+        }
+    }
 }
 
 /// The remote's side of one link, on a thread of its own: follows home's orders until the
@@ -307,9 +352,12 @@ pub fn remote<G: Graph>(
                     Ok(Message::Start { session }) => {
                         // A new session replaces the one running, if any.
                         drop(sink.take());
-                        match sender(peer.send.clone(), session).and_then(|on_sound| {
-                            RemoteSink::start(graph.clone(), saved.clone(), on_sound)
-                        }) {
+                        match Capture::start(
+                            graph.clone(),
+                            saved.clone(),
+                            peer.send.clone(),
+                            session,
+                        ) {
                             Ok(started) => drop(sink.replace(started)),
                             Err(e) => eprintln!("navette: audio: could not start the sink: {e}"),
                         }
@@ -391,7 +439,7 @@ impl<G: Graph> Home<G> {
             && session == playback.session
         {
             let pcm = playback.decoder.decode(seq, &packet)?;
-            playback.jitter.lock().unwrap().push(&pcm);
+            lock(&playback.jitter).push(&pcm);
         }
         Ok(())
     }
@@ -691,7 +739,7 @@ mod tests {
         let graph = FakeGraph::default();
         let (to_remote, mut orders) = mpsc::channel(8);
         let mut home = Home::new(graph.clone(), to_remote);
-        let packets = Encoder::new().unwrap().push(&tone(20)).unwrap();
+        let packets = codec::tests::packets(&mut Encoder::new().unwrap(), &tone(20));
         let session = |orders: &mut mpsc::Receiver<Vec<u8>>| match Message::decode(
             &orders.try_recv().unwrap(),
         )

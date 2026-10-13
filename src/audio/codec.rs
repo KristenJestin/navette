@@ -10,6 +10,9 @@ pub const CHANNELS: usize = 2;
 pub const FRAME: usize = RATE as usize / 100;
 /// Interleaved samples in one frame.
 pub const FRAME_SAMPLES: usize = FRAME * CHANNELS;
+/// Interleaved samples in the largest cycle a graph runs (8192 frames): the realtime buffers
+/// are this big from the start, so a cycle never allocates.
+pub const SAMPLES_PER_CYCLE: usize = 8192 * CHANNELS;
 
 /// Far above what Opus makes of 10 ms at the chosen bitrate.
 const MAX_PACKET: usize = 4000;
@@ -27,6 +30,7 @@ fn opus_error(e: opus::Error) -> io::Error {
 pub struct Encoder {
     opus: opus::Encoder,
     pending: Vec<f32>,
+    packet: Box<[u8; MAX_PACKET]>,
 }
 
 impl Encoder {
@@ -40,24 +44,25 @@ impl Encoder {
             .map_err(opus_error)?;
         Ok(Self {
             opus,
-            pending: Vec::with_capacity(FRAME_SAMPLES * 4),
+            // A cycle, and what was left of a frame from the one before.
+            pending: Vec::with_capacity(SAMPLES_PER_CYCLE + FRAME_SAMPLES),
+            packet: Box::new([0; MAX_PACKET]),
         })
     }
 
-    /// Takes interleaved stereo samples; returns a packet for each frame they complete.
-    pub fn push(&mut self, pcm: &[f32]) -> io::Result<Vec<Vec<u8>>> {
+    /// Takes interleaved stereo samples; hands `each` a packet for each frame they complete.
+    pub fn push(&mut self, pcm: &[f32], mut each: impl FnMut(&[u8])) -> io::Result<()> {
         self.pending.extend_from_slice(pcm);
-        let mut packets = Vec::new();
         let whole = self.pending.len() / FRAME_SAMPLES * FRAME_SAMPLES;
         for frame in self.pending[..whole].as_chunks::<FRAME_SAMPLES>().0 {
-            packets.push(
-                self.opus
-                    .encode_vec_float(frame, MAX_PACKET)
-                    .map_err(opus_error)?,
-            );
+            let len = self
+                .opus
+                .encode_float(frame, &mut self.packet[..])
+                .map_err(opus_error)?;
+            each(&self.packet[..len]);
         }
         self.pending.drain(..whole);
-        Ok(packets)
+        Ok(())
     }
 }
 
@@ -109,7 +114,7 @@ impl Decoder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// `frames` frames of a 440 Hz tone on both channels, at half scale.
@@ -122,6 +127,12 @@ mod tests {
             .collect()
     }
 
+    pub(crate) fn packets(encoder: &mut Encoder, pcm: &[f32]) -> Vec<Vec<u8>> {
+        let mut packets = Vec::new();
+        encoder.push(pcm, |p| packets.push(p.to_vec())).unwrap();
+        packets
+    }
+
     fn rms(samples: &[f32]) -> f32 {
         (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
     }
@@ -131,10 +142,25 @@ mod tests {
         let mut encoder = Encoder::new().unwrap();
         let pcm = tone(5);
         // A graph quantum is rarely a whole number of frames.
-        let first = encoder.push(&pcm[..FRAME_SAMPLES + 100]).unwrap();
-        let rest = encoder.push(&pcm[FRAME_SAMPLES + 100..]).unwrap();
+        let first = packets(&mut encoder, &pcm[..FRAME_SAMPLES + 100]);
+        let rest = packets(&mut encoder, &pcm[FRAME_SAMPLES + 100..]);
         assert_eq!((first.len(), rest.len()), (1, 4));
         assert!(first.iter().chain(&rest).all(|p| !p.is_empty()));
+    }
+
+    #[test]
+    fn encoding_a_cycle_does_not_allocate() {
+        let mut encoder = Encoder::new().unwrap();
+        let pcm = tone(20);
+        let mut packets = 0;
+        // A graph quantum's worth at a time, the way the sink hands it over.
+        for block in pcm.chunks(1024 * CHANNELS) {
+            let allocated = crate::audio::allocations::during(|| {
+                encoder.push(block, |_| packets += 1).unwrap();
+            });
+            assert_eq!(allocated, 0);
+        }
+        assert_eq!(packets, 20);
     }
 
     #[test]
@@ -143,7 +169,7 @@ mod tests {
         let mut decoder = Decoder::new().unwrap();
         let input = tone(50);
         let mut output = Vec::new();
-        for (seq, packet) in encoder.push(&input).unwrap().iter().enumerate() {
+        for (seq, packet) in packets(&mut encoder, &input).iter().enumerate() {
             output.extend(decoder.decode(seq as u32, packet).unwrap());
         }
         assert_eq!(output.len(), input.len());
@@ -157,7 +183,7 @@ mod tests {
     fn a_lost_frame_is_filled_in() {
         let mut encoder = Encoder::new().unwrap();
         let mut decoder = Decoder::new().unwrap();
-        let packets = encoder.push(&tone(4)).unwrap();
+        let packets = packets(&mut encoder, &tone(4));
         let mut output = Vec::new();
         for seq in [0u32, 1, 3] {
             output.extend(decoder.decode(seq, &packets[seq as usize]).unwrap());
@@ -169,7 +195,7 @@ mod tests {
     fn a_late_packet_is_dropped() {
         let mut encoder = Encoder::new().unwrap();
         let mut decoder = Decoder::new().unwrap();
-        let packets = encoder.push(&tone(3)).unwrap();
+        let packets = packets(&mut encoder, &tone(3));
         decoder.decode(0, &packets[0]).unwrap();
         decoder.decode(2, &packets[2]).unwrap();
         assert!(decoder.decode(1, &packets[1]).unwrap().is_empty());

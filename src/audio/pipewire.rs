@@ -21,9 +21,9 @@ use pw::metadata::{Metadata, MetadataListener};
 use pw::spa;
 use pw::types::ObjectType;
 
-use super::codec::{CHANNELS, FRAME, RATE};
+use super::codec::{CHANNELS, FRAME, RATE, SAMPLES_PER_CYCLE};
 use super::jitter::Jitter;
-use super::{DefaultSink, Graph, OnSound};
+use super::{DefaultSink, Graph, OnSound, lock};
 
 const CONFIGURED_SINK: &str = "default.configured.audio.sink";
 /// Long enough for a busy PipeWire, short enough that a hung one does not hang the link.
@@ -98,13 +98,6 @@ impl Drop for Node {
         // An ended loop took its streams with it.
         let _ = self.on.send(Command::Close(self.id));
     }
-}
-
-/// A lock that a panic elsewhere does not turn into a panic here.
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl PipeWire {
@@ -474,6 +467,24 @@ fn connect_stream(
         .map_err(pw_error)
 }
 
+/// The sink's bytes as samples, into `samples`.
+fn read_samples(bytes: &[u8], samples: &mut Vec<f32>) {
+    samples.clear();
+    samples.extend(
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b)),
+    );
+}
+
+/// What the playback plays next. A panic on the other side of the lock leaves the buffer
+/// usable, and a panic here would cross PipeWire's C code.
+fn fill(jitter: &Mutex<Jitter>, out: &mut [f32]) {
+    lock(jitter).pull(out);
+}
+
 fn open_sink(
     core: &pw::core::CoreRc,
     name: &str,
@@ -483,9 +494,10 @@ fn open_sink(
     let mut props = properties(name, description);
     props.insert(*pw::keys::MEDIA_CLASS, "Audio/Sink");
     let stream = pw::stream::StreamRc::new(core.clone(), name, props).map_err(pw_error)?;
+    let samples = Vec::with_capacity(SAMPLES_PER_CYCLE);
     let listener = stream
-        .add_local_listener_with_user_data(on_sound)
-        .process(|stream, on_sound| {
+        .add_local_listener_with_user_data((on_sound, samples))
+        .process(|stream, (on_sound, samples)| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -495,13 +507,8 @@ fn open_sink(
             let (offset, size) = (data.chunk().offset() as usize, data.chunk().size() as usize);
             if let Some(bytes) = data.data() {
                 let end = (offset + size).min(bytes.len());
-                let samples: Vec<f32> = bytes[offset.min(end)..end]
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes(*b))
-                    .collect();
-                on_sound(&samples);
+                read_samples(&bytes[offset.min(end)..end], samples);
+                on_sound(samples);
             }
         })
         .register()
@@ -528,9 +535,10 @@ fn open_playback(
     props.insert(*pw::keys::MEDIA_TYPE, "Audio");
     props.insert(*pw::keys::MEDIA_CATEGORY, "Playback");
     let stream = pw::stream::StreamRc::new(core.clone(), name, props).map_err(pw_error)?;
+    let samples = vec![0.0f32; SAMPLES_PER_CYCLE];
     let listener = stream
-        .add_local_listener_with_user_data(jitter)
-        .process(|stream, jitter| {
+        .add_local_listener_with_user_data((jitter, samples))
+        .process(|stream, (jitter, samples)| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -540,14 +548,16 @@ fn open_playback(
             };
             let frames = match data.data() {
                 Some(bytes) => {
-                    let mut frames = bytes.len() / BYTES_PER_FRAME;
+                    let mut frames =
+                        (bytes.len() / BYTES_PER_FRAME).min(SAMPLES_PER_CYCLE / CHANNELS);
                     // Only what the graph asks for: a whole buffer would be latency.
                     if requested > 0 {
                         frames = frames.min(requested);
                     }
-                    let mut samples = vec![0.0f32; frames * CHANNELS];
-                    jitter.lock().unwrap().pull(&mut samples);
-                    for (out, sample) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(&samples) {
+                    let samples = &mut samples[..frames * CHANNELS];
+                    fill(jitter, samples);
+                    for (out, sample) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(samples.iter())
+                    {
                         out.copy_from_slice(&sample.to_le_bytes());
                     }
                     frames
@@ -645,6 +655,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             lock(&self.log).clone()
         }
+    }
+
+    #[test]
+    fn a_cycle_does_not_allocate_on_either_side() {
+        use crate::audio::allocations::during;
+
+        // What the callbacks hold from the start.
+        let mut samples = Vec::with_capacity(SAMPLES_PER_CYCLE);
+        let mut out = vec![0.0f32; SAMPLES_PER_CYCLE];
+        let jitter = Mutex::new(Jitter::new(4, SAMPLES_PER_CYCLE));
+        jitter.lock().unwrap().push(&[0.5; 4096]);
+
+        let bytes: Vec<u8> = [0.5f32; 2048]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+        for _ in 0..3 {
+            assert_eq!(during(|| read_samples(&bytes, &mut samples)), 0);
+            assert_eq!(samples.len(), 2048);
+            assert_eq!(during(|| fill(&jitter, &mut out[..2048])), 0);
+        }
+    }
+
+    #[test]
+    fn the_playback_still_plays_after_a_panic_poisoned_its_buffer() {
+        let jitter = Arc::new(Mutex::new(Jitter::new(1, 4)));
+        jitter.lock().unwrap().push(&[0.5]);
+        let poisoner = jitter.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.lock().unwrap();
+            panic!("poisons the buffer");
+        })
+        .join();
+        assert!(jitter.is_poisoned());
+        let mut out = [0.0];
+        fill(&jitter, &mut out);
+        assert_eq!(out, [0.5]);
     }
 
     fn sink(pipewire: &PipeWire) -> io::Result<Node> {
