@@ -1,7 +1,8 @@
 //! Home's surface on the reserved monitor (the kind chosen in #2): a layer-shell surface on the
 //! overlay layer, bound to that output, anchored on every edge, above the bar. A GPU picture is
 //! a dmabuf handed to the compositor as is (linux-dmabuf), with no copy; a CPU picture goes
-//! through shared memory. The newest picture wins: one is shown per frame callback, and an
+//! through shared memory, as does a GPU picture when the compositor does not take the decoder's
+//! linear dmabufs (Hyprland on an NVIDIA GPU lists only tiled ones). The newest picture wins: one is shown per frame callback, and an
 //! older one still waiting is dropped, which gives its image back to the decoder.
 //!
 //! The keyboard (focus, the shortcuts inhibitor) comes with the input issue (#7); the surface
@@ -41,11 +42,21 @@ use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 use super::decode::Picture;
 
+const XRGB8888: u32 = drm_fourcc::DrmFourcc::Xrgb8888 as u32;
+const LINEAR: u64 = 0;
+
+/// Whether the compositor's formats, as (fourcc, modifier), hold the decoder's linear XRGB8888.
+fn takes_linear_xrgb(formats: impl IntoIterator<Item = (u32, u64)>) -> bool {
+    formats.into_iter().any(|f| f == (XRGB8888, LINEAR))
+}
+
 /// The layer surface's namespace, for layer rules.
 pub const NAMESPACE: &str = "navette";
 
 /// The surface, on its own thread. Dropping it removes the surface.
 pub struct Surface {
+    /// The compositor takes a linear XRGB8888 dmabuf, the decoder's output.
+    linear_dmabuf: bool,
     pictures: Option<channel::Sender<Picture>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -63,18 +74,25 @@ impl Surface {
                     let _ = ready_tx.send(Err(e));
                 }
             })?;
-        let surface = Self {
+        let mut surface = Self {
+            linear_dmabuf: false,
             pictures: Some(pictures),
             thread: Some(thread),
         };
         match ready.recv() {
-            Ok(Ok(size)) => {
-                tracing::debug!(?size, "surface placed");
+            Ok(Ok((size, linear_dmabuf))) => {
+                tracing::debug!(?size, linear_dmabuf, "surface placed");
+                surface.linear_dmabuf = linear_dmabuf;
                 Ok(surface)
             }
             Ok(Err(e)) => Err(e),
             Err(_) => Err(io::Error::other("the surface thread ended")),
         }
+    }
+
+    /// Whether a GPU picture can be handed over as is; otherwise it is read back first.
+    pub fn takes_linear_dmabuf(&self) -> bool {
+        self.linear_dmabuf
     }
 
     /// Where the decoder sends its pictures.
@@ -95,6 +113,9 @@ impl Drop for Surface {
     }
 }
 
+/// The surface's size once placed, and whether the compositor takes linear dmabufs.
+type Ready = io::Result<((u32, u32), bool)>;
+
 fn wayland(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("wayland: {e}"))
 }
@@ -102,7 +123,7 @@ fn wayland(e: impl std::fmt::Display) -> io::Error {
 fn run(
     output_name: &str,
     pictures: Channel<Picture>,
-    ready: &std::sync::mpsc::Sender<io::Result<(u32, u32)>>,
+    ready: &std::sync::mpsc::Sender<Ready>,
 ) -> io::Result<()> {
     let conn = Connection::connect_to_env().map_err(wayland)?;
     let (globals, queue) = registry_queue_init::<State>(&conn).map_err(wayland)?;
@@ -124,6 +145,7 @@ fn run(
         transform: wl_output::Transform::Normal,
         size: None,
         ready: Some(ready.clone()),
+        linear_dmabuf: None,
         pending: None,
         waiting_frame: false,
         shown_shm: None,
@@ -132,6 +154,9 @@ fn run(
         qh: qh.clone(),
     };
 
+    if state.dmabuf.version().is_some_and(|v| v >= 4) {
+        let _ = state.dmabuf.get_default_feedback(&qh);
+    }
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
     WaylandSource::new(conn.clone(), queue)
         .insert(event_loop.handle())
@@ -140,6 +165,18 @@ fn run(
     event_loop.dispatch(Some(std::time::Duration::from_millis(100)), &mut state)?;
     conn.roundtrip().map_err(wayland)?;
     event_loop.dispatch(Some(std::time::Duration::from_millis(100)), &mut state)?;
+
+    // Before version 4, the formats came as a list.
+    if state.linear_dmabuf.is_none() {
+        let linear = takes_linear_xrgb(
+            state
+                .dmabuf
+                .modifiers()
+                .iter()
+                .map(|f| (f.format, f.modifier)),
+        );
+        state.linear_dmabuf = Some(linear);
+    }
 
     let output = state
         .outputs
@@ -198,7 +235,9 @@ struct State {
     transform: wl_output::Transform,
     /// The surface's size in logical pixels, once configured.
     size: Option<(u32, u32)>,
-    ready: Option<std::sync::mpsc::Sender<io::Result<(u32, u32)>>>,
+    ready: Option<std::sync::mpsc::Sender<Ready>>,
+    /// From the compositor's dmabuf feedback (version 4 and up).
+    linear_dmabuf: Option<bool>,
     pending: Option<Picture>,
     /// A picture was committed and its frame callback has not come yet.
     waiting_frame: bool,
@@ -382,7 +421,7 @@ impl LayerShellHandler for State {
                 self.shown_shm = Some(buffer);
             }
             if let Some(ready) = self.ready.take() {
-                let _ = ready.send(Ok(size));
+                let _ = ready.send(Ok((size, self.linear_dmabuf.unwrap_or(false))));
             }
         }
     }
@@ -398,8 +437,17 @@ impl DmabufHandler for State {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
-        _: DmabufFeedback,
+        feedback: DmabufFeedback,
     ) {
+        let table = feedback.format_table();
+        let linear = takes_linear_xrgb(feedback.tranches().iter().flat_map(|tranche| {
+            tranche
+                .formats
+                .iter()
+                .filter_map(|&i| table.get(i as usize))
+                .map(|f| (f.format, f.modifier))
+        }));
+        self.linear_dmabuf = Some(linear);
     }
 
     fn created(
@@ -460,3 +508,26 @@ delegate_layer!(State);
 delegate_registry!(State);
 delegate_noop!(State: wp_viewporter::WpViewporter);
 delegate_noop!(State: wp_viewport::WpViewport);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BLOCK_LINEAR: u64 = 0x0300_0000_0060_6015;
+
+    #[test]
+    fn a_compositor_with_only_tiled_dmabufs_gets_a_copy() {
+        assert!(!takes_linear_xrgb([
+            (XRGB8888, BLOCK_LINEAR),
+            (XRGB8888, 0x00ff_ffff_ffff_ffff)
+        ]));
+    }
+
+    #[test]
+    fn a_compositor_that_takes_linear_xrgb_gets_the_dmabuf() {
+        assert!(takes_linear_xrgb([
+            (XRGB8888, BLOCK_LINEAR),
+            (XRGB8888, LINEAR)
+        ]));
+    }
+}

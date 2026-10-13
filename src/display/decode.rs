@@ -79,15 +79,17 @@ pub struct Decoding {
 }
 
 impl Decoding {
+    /// `dmabuf`: the surface takes the GPU's pictures as dmabufs; otherwise they are read back.
     pub fn start(
         gpu: Option<Arc<Gpu>>,
+        dmabuf: bool,
         outbox: Outbox,
         show: Box<dyn FnMut(Picture) + Send>,
     ) -> std::io::Result<Self> {
         let (video, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("navette-decode".into())
-            .spawn(move || run(gpu, outbox, show, rx))?;
+            .spawn(move || run(gpu, dmabuf, outbox, show, rx))?;
         Ok(Self { video })
     }
 
@@ -126,11 +128,29 @@ impl VideoDecoder {
         }
     }
 
-    fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<Picture>, String> {
+    fn decode(
+        &mut self,
+        main: &[u8],
+        aux: &[u8],
+        dmabuf: bool,
+        (width, height): (u32, u32),
+    ) -> Result<Option<Picture>, String> {
         match self {
-            Self::Gpu(d) => d
+            Self::Gpu(d) if dmabuf => d
                 .decode(main, aux)
                 .map(|f| f.map(Picture::Dmabuf))
+                .map_err(|e| e.to_string()),
+            Self::Gpu(d) => d
+                .decode_to_bgra(main, aux)
+                .map(|f| {
+                    f.map(|pixels| {
+                        Picture::Bgra(gliff_sw::BgraFrame {
+                            width,
+                            height,
+                            pixels,
+                        })
+                    })
+                })
                 .map_err(|e| e.to_string()),
             Self::Cpu(d) => d
                 .decode(main, aux)
@@ -142,6 +162,7 @@ impl VideoDecoder {
 
 fn run(
     mut gpu: Option<Arc<Gpu>>,
+    dmabuf: bool,
     outbox: Outbox,
     mut show: Box<dyn FnMut(Picture) + Send>,
     rx: Receiver<Video>,
@@ -178,8 +199,12 @@ fn run(
                     config = (width, height, chroma);
                     decoder = VideoDecoder::new(&gpu, chroma, width, height);
                     if let Some(d) = &decoder {
+                        let handover = match d {
+                            VideoDecoder::Gpu(_) if dmabuf => "shown as a dmabuf",
+                            _ => "copied to the surface",
+                        };
                         eprintln!(
-                            "navette: decoding {width}x{height} {chroma:?} on the {}",
+                            "navette: decoding {width}x{height} {chroma:?} on the {}, {handover}",
                             d.label()
                         );
                     }
@@ -190,7 +215,7 @@ fn run(
             } => {
                 let Some(d) = &mut decoder else { continue };
                 let t0 = Instant::now();
-                let decoded = d.decode(&video.main, &video.aux);
+                let decoded = d.decode(&video.main, &video.aux, dmabuf, (config.0, config.1));
                 let decode_ms = t0.elapsed().as_secs_f32() * 1000.0;
                 // Ack at once so the remote keeps pacing.
                 feedback(ClientMsg::FrameAck {
@@ -338,6 +363,7 @@ mod tests {
             let shown = shown.clone();
             Decoding::start(
                 None,
+                false,
                 outbox.clone(),
                 Box::new(move |p| {
                     if let Picture::Bgra(f) = p {

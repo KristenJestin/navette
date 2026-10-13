@@ -70,6 +70,8 @@ pub trait Screens: Send + Sync {
 
 pub trait Screen: Send {
     fn pictures(&self) -> Box<dyn FnMut(Picture) + Send>;
+    /// The GPU's pictures can be handed over as dmabufs, with no copy.
+    fn takes_dmabuf(&self) -> bool;
 }
 
 /// The real cover: a layer surface on the monitor.
@@ -84,6 +86,10 @@ impl Screens for LiveScreens {
 impl Screen for crate::display::surface::Surface {
     fn pictures(&self) -> Box<dyn FnMut(Picture) + Send> {
         crate::display::surface::Surface::pictures(self)
+    }
+
+    fn takes_dmabuf(&self) -> bool {
+        self.takes_linear_dmabuf()
     }
 }
 
@@ -290,7 +296,12 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
             return Err(e);
         }
     };
-    let decoding = Decoding::start(home.gpu.clone(), peer.outbox.clone(), screen.pictures())?;
+    let decoding = Decoding::start(
+        home.gpu.clone(),
+        screen.takes_dmabuf(),
+        peer.outbox.clone(),
+        screen.pictures(),
+    )?;
     let caps = decode::caps(&home.gpu, (3840, 2160));
     peer.outbox.send(
         Msg::Display(Display::Start { output: copy, caps }),
@@ -485,6 +496,10 @@ mod tests {
     impl Screen for FakeScreen {
         fn pictures(&self) -> Box<dyn FnMut(Picture) + Send> {
             Box::new(|_| {})
+        }
+
+        fn takes_dmabuf(&self) -> bool {
+            false
         }
     }
 
