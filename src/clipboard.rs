@@ -53,6 +53,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::LocalSet;
 
 use crate::link::Wire;
+use crate::wire::{MAX_MIME_LEN, MAX_MIME_TYPES};
 
 /// Longest `text/uri-list` read to build an offer.
 const URI_LIST_MAX: usize = 1024 * 1024;
@@ -253,7 +254,10 @@ impl<C: Compositor> Bridge<C> {
             local.mime_types = mime_types.clone();
             local.files = LocalFiles::default();
         }
-        let offered = forwardable_mimes(&mime_types);
+        let mut offered = forwardable_mimes(&mime_types);
+        // What the peer would refuse; the text types come first, so text survives.
+        offered.retain(|m| m.len() <= MAX_MIME_LEN);
+        offered.truncate(MAX_MIME_TYPES);
         // Read the file list as whichever file-list type the selection advertises; the parser
         // handles both bodies.
         let uri_list = mime_types.iter().find(|m| is_file_mime(m)).cloned();

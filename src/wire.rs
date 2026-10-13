@@ -5,6 +5,7 @@
 //! so a newer peer can add some without breaking an older one.
 
 use bytes::Bytes;
+use gliff_proto::clipboard::validate_files;
 use gliff_proto::{ClipboardFile, ClipboardItem, ClipboardMsg};
 use minicbor::{Decode, Encode};
 
@@ -119,6 +120,34 @@ impl LinkMsg {
             Self::ClipboardAck { id, received } => ClipboardMsg::Ack { id, received },
             Self::ClipboardAbort { id } => ClipboardMsg::Abort { id },
         })
+    }
+}
+
+/// The most mime types an offer carries, and the longest one: what one copy needs, so that a
+/// 1 MiB frame cannot decode into many times its size of strings waiting in a queue.
+pub const MAX_MIME_TYPES: usize = 64;
+pub const MAX_MIME_LEN: usize = 255;
+
+/// The peer's message, with an offer this machine will not hold (too many or too long mime
+/// types, or files `validate_files` refuses: a path out of the spool, too many entries) made
+/// empty. The bridge then withdraws the peer's previous copy rather than keep offering it.
+pub fn checked(msg: ClipboardMsg) -> ClipboardMsg {
+    match msg {
+        ClipboardMsg::Offer {
+            serial,
+            mime_types,
+            files,
+        } if mime_types.len() > MAX_MIME_TYPES
+            || mime_types.iter().any(|m| m.len() > MAX_MIME_LEN)
+            || validate_files(&files).is_err() =>
+        {
+            ClipboardMsg::Offer {
+                serial,
+                mime_types: Vec::new(),
+                files: Vec::new(),
+            }
+        }
+        msg => msg,
     }
 }
 

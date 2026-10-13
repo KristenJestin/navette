@@ -27,7 +27,7 @@ use tokio::task::JoinSet;
 use crate::frame::{read_frame, write_frame};
 use crate::store::{Role, Store};
 use crate::transport::{Accept, Dial, Stream, TlsAcceptor, TlsDialer};
-use crate::wire::{Clip, LinkMsg};
+use crate::wire::{Clip, LinkMsg, checked};
 
 /// The version of the link's messages; peers of another version refuse each other.
 pub const VERSION: u8 = 2;
@@ -36,8 +36,10 @@ const HELLO: u8 = 1;
 
 /// Clipboard messages read from the peer and not yet taken by the bridge. The reader never
 /// waits on a service: past this many, a message for it is dropped, so a stuck service cannot
-/// stall the heartbeats (or another service) nor grow its memory.
-const INBOUND: usize = 64;
+/// stall the heartbeats (or another service) nor grow its memory. With offers checked on
+/// arrival, a message holds at most about 1 MiB (a chunk, 256 KiB): a few MiB at worst, while
+/// a bridge that drains has a handful queued at most (gliff's window is 4 chunks).
+const INBOUND: usize = 16;
 
 /// What a connection's service gets: the clipboard messages of the peer, and where to put its own.
 pub struct Wire {
@@ -196,7 +198,7 @@ async fn receive<R: AsyncRead + Unpin>(
             .await
             .map_err(|_| silent())?
             .map_err(io_error)?;
-        let Some(clip) = msg.into_clipboard() else {
+        let Some(clip) = msg.into_clipboard().map(checked) else {
             continue;
         };
         let payload = match &clip {
@@ -343,6 +345,7 @@ fn paired_as(store: &Store, role: Role) -> io::Result<crate::store::Pairing> {
 
 #[cfg(test)]
 mod tests {
+    use gliff_proto::ClipboardFile;
     use tokio::sync::mpsc;
 
     use super::*;
@@ -485,6 +488,79 @@ mod tests {
             .await
             .expect("the reader must keep reading past a service that does not");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// What the service gets when the peer sends `offer`.
+    async fn offered_to_the_service(offer: LinkMsg) -> Clip {
+        let (a, b) = tokio::io::duplex(1024 * 1024);
+        let mut peer = Framed::new(b);
+        peer.write_msg(&offer).await.unwrap();
+        let (got, mut seen) = mpsc::unbounded_channel();
+        let service = |mut wire: Wire| async move {
+            let _ = got.send(wire.from_peer.recv().await.unwrap());
+        };
+        tokio::select! {
+            _ = run(a, fast(), service) => panic!("the link ended"),
+            clip = seen.recv() => clip.unwrap(),
+        }
+    }
+
+    fn file(path: String) -> ClipboardFile {
+        ClipboardFile {
+            path,
+            size: 1,
+            dir: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_offer_reaches_the_service_empty() {
+        let empty = ClipboardMsg::Offer {
+            serial: 7,
+            mime_types: Vec::new(),
+            files: Vec::new(),
+        };
+        let too_many_files = LinkMsg::ClipboardOffer {
+            serial: 7,
+            mime_types: vec!["text/plain".into()],
+            files: (0..20_000).map(|n| file(format!("f{n}"))).collect(),
+        };
+        assert!(
+            offered_to_the_service(too_many_files).await.0 == empty,
+            "passed on: too_many_files"
+        );
+        let too_many_types = LinkMsg::ClipboardOffer {
+            serial: 7,
+            mime_types: (0..10_000).map(|n| format!("x/{n}")).collect(),
+            files: Vec::new(),
+        };
+        assert!(
+            offered_to_the_service(too_many_types).await.0 == empty,
+            "passed on: too_many_types"
+        );
+        let too_long_a_type = LinkMsg::ClipboardOffer {
+            serial: 7,
+            mime_types: vec!["x".repeat(100_000)],
+            files: Vec::new(),
+        };
+        assert!(
+            offered_to_the_service(too_long_a_type).await.0 == empty,
+            "passed on: too_long_a_type"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_traversal_path_in_an_offer_is_refused() {
+        let traversal = LinkMsg::ClipboardOffer {
+            serial: 7,
+            mime_types: Vec::new(),
+            files: vec![file("../outside".into())],
+        };
+        let (offer, _) = offered_to_the_service(traversal).await;
+        assert!(
+            matches!(&offer, ClipboardMsg::Offer { files, .. } if files.is_empty()),
+            "{offer:?}"
+        );
     }
 
     #[test]
