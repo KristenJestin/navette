@@ -254,6 +254,7 @@ pub async fn serve_peer(
     let mut input_open = true;
     loop {
         let retry_at = active.as_ref().and_then(Active::retry_at);
+        let had_mode = active.is_some();
         tokio::select! {
             msg = peer.inbox.recv() => match msg {
                 None => break,
@@ -381,6 +382,11 @@ pub async fn serve_peer(
                     mode.bring_up(index, ports, &home, &peer.outbox);
                 }
             }
+        }
+        // However it ended, the sizes said were its surfaces'. The next mode's are said before
+        // its start, so they are kept until a mode ends.
+        if had_mode && active.is_none() {
+            home.areas = Default::default();
         }
     }
     stop(&mut active, hypr).await;
@@ -1542,5 +1548,29 @@ mod tests {
         // The first is the stream whose output went away; the stop's come after.
         let dropped = agent.streams.dropped.lock().unwrap();
         assert!(dropped[1..].iter().all(|d| d.output_there), "{dropped:?}");
+    }
+
+    #[tokio::test]
+    async fn the_size_of_a_surface_of_the_last_mode_is_not_given_to_the_next() {
+        let agent = agent();
+        let area = |width| input::Event::Area { width, height: 720 };
+        agent.input.push(area(1280));
+        agent.input.on(1).push(area(1600));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        two(&agent).await;
+        until(|| agent.injected(1).is_some_and(|i| i.2 == [area(1600)])).await;
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        until(|| agent.hypr.monitor(FIRST).is_none()).await;
+        // The next mode's first surface says its size; its second has not yet.
+        agent.input.push(area(1920));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        two(&agent).await;
+        until(|| agent.streams.started_on(SECOND) == 2).await;
+        until(|| agent.injected(3).is_some()).await;
+        assert_eq!(agent.injected(2).unwrap().2, [area(1920)]);
+        assert_eq!(agent.injected(3).unwrap().2, []);
     }
 }
