@@ -66,6 +66,10 @@ other monitor they stay home.
   release = ctrl+alt+q     # or: release = none
   ```
 
+  With `RUST_LOG=navette=info`, `navette serve` says each time the hotkey gives the keyboard
+  back; with `RUST_LOG=navette=debug`, it also says when the hotkey's key came with other
+  modifiers, and which (no other key typed is ever logged).
+
 - **Keys held** when the pointer leaves the monitor, when the hotkey is typed, when the mode
   stops or when the link drops are all released on the remote machine: none stays down.
 - **Typing** uses home's keymap, sent to the remote machine (and sent again when home's layout
