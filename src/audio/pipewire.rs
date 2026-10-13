@@ -6,6 +6,11 @@
 //! PipeWire's own loopback module makes a virtual sink: the session manager lists it among the
 //! outputs and links the apps to it. The default output is the `default.configured.audio.sink`
 //! key of the `default` metadata, the one `wpctl set-default` writes.
+//!
+//! Like any sink, it applies its volume and mute to what it receives, which is the remote's
+//! mixer acting on it. The sound that goes home is read from its monitor instead, which carries
+//! it as the apps played it, and the volume and mute the sink holds are told to home by
+//! [`Mixer`], to be applied to home's playback once.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -23,7 +28,7 @@ use pw::types::ObjectType;
 
 use super::codec::{CHANNELS, RATE, SAMPLES_PER_CYCLE};
 use super::jitter::Jitter;
-use super::{DefaultNode, Device, Graph, OnSound, lock};
+use super::{DefaultNode, Device, Graph, Level, OnLevel, OnSound, lock};
 
 const CONFIGURED_SINK: &str = "default.configured.audio.sink";
 const CONFIGURED_SOURCE: &str = "default.configured.audio.source";
@@ -48,16 +53,24 @@ enum Command {
         reply: Reply<u64>,
     },
     Close(u64),
+    /// The volume and mute of a playback stream.
+    SetLevel(u64, Level),
     /// Ends a loop that stopped answering, and with it every stream it holds.
     Quit,
 }
 
 /// What a node of ours is.
 enum Opening {
-    Sink(OnSound),
+    Sink {
+        on_sound: OnSound,
+        on_level: OnLevel,
+    },
     Playback(Arc<Mutex<Jitter>>),
     Source(Arc<Mutex<Jitter>>),
-    Mic { mic: String, on_sound: OnSound },
+    Mic {
+        mic: String,
+        on_sound: OnSound,
+    },
 }
 
 /// The way to one PipeWire loop: its commands, and whether it still runs.
@@ -177,8 +190,20 @@ impl Graph for PipeWire {
             .map(drop)
     }
 
-    fn open_sink(&self, name: &str, description: &str, on_sound: OnSound) -> io::Result<Node> {
-        self.open(name, description, Opening::Sink(on_sound))
+    fn open_sink(
+        &self,
+        name: &str,
+        description: &str,
+        on_sound: OnSound,
+        on_level: OnLevel,
+    ) -> io::Result<Node> {
+        self.open(name, description, Opening::Sink { on_sound, on_level })
+    }
+
+    fn set_level(&self, node: &Node, level: Level) -> io::Result<()> {
+        node.on
+            .send(Command::SetLevel(node.id, level))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "PipeWire has ended"))
     }
 
     fn open_playback(
@@ -252,8 +277,10 @@ fn connect() -> io::Result<Loop> {
 /// module it records from, if any, last.
 struct Open {
     _listener: Box<dyn std::any::Any>,
-    _stream: pw::stream::StreamRc,
+    stream: pw::stream::StreamRc,
     _module: Option<Module>,
+    /// The sink's monitor, that its sound is read from.
+    _monitor: Option<Box<Open>>,
 }
 
 /// A module loaded into this process's own context: its nodes live here, and go when it is
@@ -429,7 +456,9 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
         } => {
             let id = next_id.replace(next_id.get() + 1);
             let opened = match what {
-                Opening::Sink(on_sound) => open_sink(&core, &name, &description, on_sound),
+                Opening::Sink { on_sound, on_level } => {
+                    open_sink(&core, &name, &description, on_sound, on_level)
+                }
                 Opening::Playback(jitter) => open_playback(&core, &name, &description, jitter),
                 Opening::Source(jitter) => open_source(&core, &name, &description, jitter),
                 Opening::Mic { mic, on_sound } => {
@@ -444,6 +473,11 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
         }
         Command::Close(id) => {
             streams.borrow_mut().remove(&id);
+        }
+        Command::SetLevel(id, level) => {
+            if let Some(open) = streams.borrow().get(&id) {
+                set_level(&open.stream, level);
+            }
         }
         Command::Quit => quit.quit(),
     });
@@ -603,22 +637,120 @@ fn fill(jitter: &Mutex<Jitter>, out: &mut [f32]) -> f64 {
     jitter.rate()
 }
 
+/// The sink's volume and mute as its controls say them, and the level they make. The sink
+/// multiplies the sound by the volume and by the gain of each channel, as the remote's mixer
+/// (`wpctl`, a volume key, a slider) sets them.
+struct Mixer {
+    volume: f32,
+    channels: [f32; 2],
+    muted: bool,
+}
+
+impl Mixer {
+    fn new() -> Self {
+        Self {
+            volume: 1.0,
+            channels: [1.0; 2],
+            muted: false,
+        }
+    }
+
+    /// The level once the control `id` of the sink took `values`, or `None` for a control that
+    /// is not part of it.
+    fn follow(&mut self, id: u32, values: &[f32]) -> Option<Level> {
+        match id {
+            spa::sys::SPA_PROP_volume => self.volume = values.first().copied().unwrap_or(1.0),
+            spa::sys::SPA_PROP_mute => self.muted = values.first().is_some_and(|mute| *mute > 0.5),
+            // Empty until the sink has its format: no gain is no change of the sound.
+            spa::sys::SPA_PROP_channelVolumes => {
+                let left = values.first().copied().unwrap_or(1.0);
+                self.channels = [left, values.get(1).copied().unwrap_or(left)];
+            }
+            _ => return None,
+        }
+        Some(Level {
+            left: self.volume * self.channels[0],
+            right: self.volume * self.channels[1],
+            muted: self.muted,
+        })
+    }
+}
+
+/// The remote's sink: a virtual output whose sound is read from its monitor, with the volume
+/// and mute that the sink itself applies told to `on_level`.
 fn open_sink(
     core: &pw::core::CoreRc,
     name: &str,
     description: &str,
     on_sound: OnSound,
+    on_level: OnLevel,
 ) -> io::Result<Open> {
     let mut props = properties(name, description);
     props.insert(*pw::keys::MEDIA_CLASS, "Audio/Sink");
     // Not autoconnected: the session manager links the apps to it, as to any sink.
-    recording(
-        core,
-        name,
-        props,
+    let stream = pw::stream::StreamRc::new(core.clone(), name, props).map_err(pw_error)?;
+    let listener = stream
+        .add_local_listener_with_user_data((Mixer::new(), on_level))
+        .control_info(|_stream, (mixer, on_level), id, control| {
+            // SAFETY: PipeWire hands over a control that lives for the call; a null one is
+            // skipped, and `values` holds `n_values` floats.
+            let values = unsafe {
+                control.as_ref().map(|control| {
+                    std::slice::from_raw_parts(control.values, control.n_values as usize)
+                })
+            };
+            if let Some(level) = values.and_then(|values| mixer.follow(id, values)) {
+                on_level(level);
+            }
+        })
+        // What it receives is scaled by the mixer: left unread, for the monitor has it whole.
+        .process(|stream, _| drop(stream.dequeue_buffer()))
+        .register()
+        .map_err(pw_error)?;
+    connect_stream(
+        &stream,
+        spa::utils::Direction::Input,
         pw::stream::StreamFlags::empty(),
+    )?;
+
+    let mut capture = properties(&format!("{name}-monitor"), description);
+    capture.insert(*pw::keys::MEDIA_TYPE, "Audio");
+    capture.insert(*pw::keys::MEDIA_CATEGORY, "Capture");
+    // The monitor of the sink, not a mic, and never anything else if the sink is not there yet.
+    capture.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
+    capture.insert(*pw::keys::TARGET_OBJECT, name);
+    capture.insert(*pw::keys::NODE_DONT_RECONNECT, "true");
+    capture.insert("node.dont-fallback", "true");
+    // The sink idles while nothing plays into it, as without the monitor.
+    capture.insert(*pw::keys::NODE_PASSIVE, "true");
+    let monitor = recording(
+        core,
+        &format!("{name}-monitor"),
+        capture,
+        pw::stream::StreamFlags::AUTOCONNECT,
         on_sound,
-    )
+    )?;
+    Ok(Open {
+        _listener: Box::new(listener),
+        stream,
+        _module: None,
+        _monitor: Some(Box::new(monitor)),
+    })
+}
+
+/// Sets the volume and mute of a stream of ours, as a mixer would.
+fn set_level(stream: &pw::stream::StreamRc, level: Level) {
+    let muted = if level.muted { 1.0 } else { 0.0 };
+    if stream
+        .set_control(
+            spa::sys::SPA_PROP_channelVolumes,
+            &[level.left, level.right],
+        )
+        .and_then(|()| stream.set_control(spa::sys::SPA_PROP_mute, &[muted]))
+        .is_err()
+    {
+        eprintln!("navette: audio: could not set the volume of the remote's sound");
+    }
 }
 
 fn open_playback(
@@ -630,6 +762,9 @@ fn open_playback(
     let mut props = properties(name, description);
     props.insert(*pw::keys::MEDIA_TYPE, "Audio");
     props.insert(*pw::keys::MEDIA_CATEGORY, "Playback");
+    // The volume is the remote's to say: WirePlumber would put back one it kept from an
+    // earlier run.
+    props.insert("state.restore-props", "false");
     playing(
         core,
         name,
@@ -741,8 +876,9 @@ fn recording(
     connect_stream(&stream, spa::utils::Direction::Input, flags)?;
     Ok(Open {
         _listener: Box::new(listener),
-        _stream: stream,
+        stream,
         _module: None,
+        _monitor: None,
     })
 }
 
@@ -802,8 +938,9 @@ fn playing(
     connect_stream(&stream, spa::utils::Direction::Output, flags)?;
     Ok(Open {
         _listener: Box::new(listener),
-        _stream: stream,
+        stream,
         _module: None,
+        _monitor: None,
     })
 }
 
@@ -863,6 +1000,9 @@ mod tests {
                             format!("open {}", next_id - 1)
                         }
                         Command::Close(id) => format!("close {id}"),
+                        Command::SetLevel(id, level) => {
+                            format!("level {id} {} {} {}", level.left, level.right, level.muted)
+                        }
                         Command::Quit => "quit".to_owned(),
                     };
                     lock(&log).push(format!("{n}: {entry}"));
@@ -929,7 +1069,7 @@ mod tests {
     }
 
     fn sink(pipewire: &PipeWire) -> io::Result<Node> {
-        pipewire.open_sink("navette-test", "Test", Box::new(|_| {}))
+        pipewire.open_sink("navette-test", "Test", Box::new(|_| {}), Box::new(|_| {}))
     }
 
     #[test]
@@ -981,6 +1121,105 @@ mod tests {
         let pipewire = loops.pipewire();
         assert!(pipewire.set_default_node(Device::Sink, None).is_err());
         assert!(loops.log().contains(&"0: quit".to_owned()));
+    }
+
+    #[test]
+    fn the_level_is_the_volume_times_the_gain_of_each_channel() {
+        use spa::sys::{SPA_PROP_channelVolumes, SPA_PROP_mute, SPA_PROP_volume};
+
+        let mut mixer = Mixer::new();
+        // `wpctl set-volume 0.5` writes the gains, cubed: 0.125.
+        assert_eq!(
+            mixer.follow(SPA_PROP_channelVolumes, &[0.125, 0.5]),
+            Some(Level {
+                left: 0.125,
+                right: 0.5,
+                muted: false
+            })
+        );
+        assert_eq!(
+            mixer.follow(SPA_PROP_volume, &[0.5]),
+            Some(Level {
+                left: 0.0625,
+                right: 0.25,
+                muted: false
+            })
+        );
+        assert_eq!(
+            mixer.follow(SPA_PROP_mute, &[1.0]),
+            Some(Level {
+                left: 0.0625,
+                right: 0.25,
+                muted: true
+            })
+        );
+        assert_eq!(
+            mixer.follow(SPA_PROP_mute, &[0.0]).map(|l| l.muted),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn a_sink_that_has_not_its_format_yet_is_at_unity() {
+        use spa::sys::SPA_PROP_channelVolumes;
+
+        let mut mixer = Mixer::new();
+        // PipeWire reports the gains with no value before the sink has channels.
+        assert_eq!(
+            mixer.follow(SPA_PROP_channelVolumes, &[]),
+            Some(Level::UNITY)
+        );
+        // One channel's gain is both channels'.
+        assert_eq!(
+            mixer
+                .follow(SPA_PROP_channelVolumes, &[0.25])
+                .map(|l| (l.left, l.right)),
+            Some((0.25, 0.25))
+        );
+    }
+
+    #[test]
+    fn a_control_that_is_not_the_volume_says_nothing() {
+        let mut mixer = Mixer::new();
+        // The sink's soft volumes, monitor volumes and the like: not what it does to the sound.
+        for id in [
+            spa::sys::SPA_PROP_softMute,
+            spa::sys::SPA_PROP_softVolumes,
+            spa::sys::SPA_PROP_monitorMute,
+            spa::sys::SPA_PROP_monitorVolumes,
+        ] {
+            assert_eq!(mixer.follow(id, &[0.3, 0.3]), None);
+        }
+    }
+
+    #[test]
+    fn the_level_of_a_playback_reaches_its_stream_on_the_loop_that_holds_it() {
+        let loops = FakeLoops::default();
+        let pipewire = loops.pipewire();
+        let node = pipewire
+            .open_playback(
+                "navette-test",
+                "Test",
+                Arc::new(Mutex::new(Jitter::new(1, 4))),
+            )
+            .unwrap();
+        let level = Level {
+            left: 0.125,
+            right: 0.125,
+            muted: true,
+        };
+        pipewire.set_level(&node, level).unwrap();
+        assert!(
+            loops
+                .log()
+                .contains(&"0: level 0 0.125 0.125 true".to_owned()),
+            "{:?}",
+            loops.log()
+        );
+
+        // The loop is gone with PipeWire: nothing to set it on.
+        loops.end(0);
+        assert!(pipewire.set_level(&node, level).is_err());
     }
 
     const SPEAKERS: &str = "{ \"name\": \"invented-speakers\" }";

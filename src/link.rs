@@ -292,7 +292,8 @@ async fn receive<R: AsyncRead + Unpin>(
             | LinkMsg::AudioFrame { .. }
             | LinkMsg::MicStart { .. }
             | LinkMsg::MicStop
-            | LinkMsg::MicFrame { .. } => {
+            | LinkMsg::MicFrame { .. }
+            | LinkMsg::AudioVolume { .. } => {
                 let sound_msg = audio_received(&mut reader, timeout, msg).await?;
                 // Like the clipboard's, a frame the audio thread is not ready for is dropped; an
                 // order is not.
@@ -432,6 +433,15 @@ async fn audio_received<R: AsyncRead + Unpin>(
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the peer went silent"))?
                 .map_err(io_error)?,
+        },
+        LinkMsg::AudioVolume {
+            session,
+            left,
+            right,
+            muted,
+        } => audio::Message::Volume {
+            session,
+            level: audio::Level { left, right, muted },
         },
         LinkMsg::MicStart { session } => audio::Message::MicStart { session },
         LinkMsg::MicFrame {
