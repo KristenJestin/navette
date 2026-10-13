@@ -564,11 +564,14 @@ fn connect_stream(
 ) -> io::Result<()> {
     let format = format();
     let mut params = [spa::pod::Pod::from_bytes(&format).expect("a serialized pod")];
+    // The callbacks run on PipeWire's realtime thread, not this loop's: they neither block nor
+    // allocate, and a loop that is late by a cycle, the desk busy with a build, would cost the
+    // graph that cycle, heard as a crackle that no buffer can absorb.
     stream
         .connect(
             direction,
             None,
-            flags | pw::stream::StreamFlags::MAP_BUFFERS,
+            flags | pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
             &mut params,
         )
         .map_err(pw_error)
