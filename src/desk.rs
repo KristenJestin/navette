@@ -42,6 +42,26 @@ impl Change {
         Self::named_rule("hl.layer_rule", name, fields)
     }
 
+    /// A key bind that runs `command`, and fires even while a surface inhibits the shortcuts
+    /// (`dont_inhibit`). Hyprland 0.56.2 removes a bind only with every other bind on the same
+    /// keys, the user's included: so the bind is kept in a Lua global under `name`, and undoing
+    /// it disables that one. A config reload drops both, the bind and the global.
+    pub fn bind(name: &str, keys: &str, command: &str, description: &str) -> Self {
+        let slot = format!("navette_binds[{}]", lua_string(name));
+        Self {
+            apply: format!(
+                "navette_binds = navette_binds or {{}} {slot} = hl.bind({}, hl.dsp.exec_cmd({}), \
+                 {{ dont_inhibit = true, description = {} }})",
+                lua_string(keys),
+                lua_string(command),
+                lua_string(description)
+            ),
+            undo: format!(
+                "if navette_binds and {slot} then {slot}:set_enabled(false) {slot} = nil end"
+            ),
+        }
+    }
+
     fn named_rule(function: &str, name: &str, fields: &str) -> Self {
         let name = lua_string(name);
         Self {
@@ -387,6 +407,25 @@ mod tests {
             state.rules.insert(name, !undo);
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_bind_fires_under_the_shortcuts_inhibitor_and_its_undo_disables_only_it() {
+        let change = Change::bind(
+            "navette-mic-1",
+            "SUPER + CTRL + M",
+            "'/opt/invented/navette' mic toggle",
+            "Navette: switch the mic",
+        );
+        assert_eq!(
+            change.apply,
+            r#"navette_binds = navette_binds or {} navette_binds["navette-mic-1"] = hl.bind("SUPER + CTRL + M", hl.dsp.exec_cmd("'/opt/invented/navette' mic toggle"), { dont_inhibit = true, description = "Navette: switch the mic" })"#
+        );
+        // `remove` and `hl.unbind` would take the user's binds on the same keys with it.
+        assert_eq!(
+            change.undo,
+            r#"if navette_binds and navette_binds["navette-mic-1"] then navette_binds["navette-mic-1"]:set_enabled(false) navette_binds["navette-mic-1"] = nil end"#
+        );
     }
 
     fn keep_home_off(desk: &Desk<FakeHyprland>, base: &str) -> Change {
