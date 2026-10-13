@@ -74,10 +74,11 @@ pub struct HyprIpc {
     dir: PathBuf,
 }
 
-/// Hyprland 0.56.2 reads a request 1023 bytes at a time and takes a shorter read as its end
-/// (`hyprCtlFDTick` in `src/debug/HyprCtl.cpp`): a longer request can be cut, or hang when its
-/// length is a multiple of 1023. It also stops at a NUL byte.
-const MAX_REQUEST: usize = 1023;
+/// Hyprland 0.56.2 reads a request 1023 bytes at a time, on its main thread, and takes a shorter
+/// read as the end (`hyprCtlFDTick` in `src/debug/HyprCtl.cpp`). A request of 1023 bytes or more
+/// can be cut, and one whose length is a multiple of 1023 blocks the compositor until the client
+/// gives up (measured: no answer in 8 s at 1023 and 2046 bytes). It also stops at a NUL byte.
+const MAX_REQUEST: usize = 1022;
 
 /// Long enough for a busy compositor, short enough that a hung one does not hang Navette.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -251,10 +252,13 @@ mod tests {
     }
 
     #[test]
-    fn a_request_longer_than_hyprland_reads_is_refused_before_sending() {
+    fn a_request_hyprland_cannot_read_in_one_go_is_refused_before_sending() {
         let dir = tempfile::tempdir().unwrap();
         let long = format!("hl.window_rule({{ name = \"{}\" }})", "x".repeat(1100));
         let err = HyprIpc::new(dir.path()).request(&format!("eval {long}"));
+        assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        // Exactly one full read: Hyprland waits for a next read that never comes.
+        let err = HyprIpc::new(dir.path()).request(&"x".repeat(1023));
         assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidInput);
         let err = HyprIpc::new(dir.path()).request("eval nul\0byte");
         assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidInput);
