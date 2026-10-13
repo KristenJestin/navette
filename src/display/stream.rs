@@ -1117,6 +1117,98 @@ mod tests {
         }
     }
 
+    /// The headless measure behind the numbers in the pull request: a page left still, then
+    /// scrolling followed by a still page. `NAVETTE_PAGE` names a binary PPM to use as the page
+    /// (`tools/still-text-page.sh` renders one); without it a synthetic page is used.
+    /// `cargo test --release --lib still_text_measure -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a measure, not a check: minutes of CPU encoding"]
+    fn still_text_measure() {
+        let (width, height, page) = match std::env::var_os("NAVETTE_PAGE") {
+            Some(path) => read_ppm(&std::fs::read(path).expect("read the page")),
+            None => (2560, 1440, text_page(2560, 1440, 1)),
+        };
+        let page = Arc::new(page);
+        let shown = page.clone();
+        let still = measure(width, height, Lan::HOME, |scene| async move {
+            scene.show(shown);
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        println!("still page from the start:\n{}", timeline(&still));
+
+        let scroll = Duration::from_secs(4);
+        let arrivals = measure(width, height, Lan::HOME, move |scene| async move {
+            let start = Instant::now();
+            let mut row = 0;
+            while start.elapsed() < scroll {
+                scene.show_moving(Arc::new(scrolled(&page, width, height, row)));
+                row += 3;
+                tokio::time::sleep(Duration::from_millis(16)).await;
+            }
+            scene.show(Arc::new(scrolled(&page, width, height, row)));
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let moving: Vec<_> = arrivals.iter().filter(|a| a.moving).collect();
+        let mut latency: Vec<_> = moving.iter().map(|a| a.latency).collect();
+        latency.sort();
+        let span = moving.last().unwrap().at - moving.first().unwrap().at;
+        println!(
+            "scrolling: {} frames, {:.1} fps, latency p50 {:?} p95 {:?}",
+            moving.len(),
+            moving.len() as f64 / span.as_secs_f64(),
+            latency[latency.len() / 2],
+            latency[latency.len() * 95 / 100],
+        );
+        let settled: Vec<_> = arrivals.into_iter().filter(|a| !a.moving).collect();
+        println!("still page after scrolling:\n{}", timeline(&settled));
+    }
+
+    /// A LAN between the two machines, in one direction.
+    #[derive(Clone, Copy)]
+    struct Lan {
+        bits_per_second: f64,
+        one_way: Duration,
+    }
+
+    impl Lan {
+        const HOME: Lan = Lan {
+            bits_per_second: 300e6,
+            one_way: Duration::from_millis(1),
+        };
+
+        fn transmit(&self, bytes: usize) -> Duration {
+            Duration::from_secs_f64(bytes as f64 * 8.0 / self.bits_per_second)
+        }
+    }
+
+    /// One frame decoded at home.
+    struct Arrival {
+        at: Instant,
+        /// Since the picture last changed, when the frame arrived.
+        since_change: Duration,
+        /// The picture was still changing when the frame arrived.
+        moving: bool,
+        bytes: usize,
+        latency: Duration,
+        /// Against the picture shown last, RGB.
+        psnr: f64,
+    }
+
+    fn timeline(arrivals: &[Arrival]) -> String {
+        arrivals
+            .iter()
+            .map(|a| {
+                format!(
+                    "  +{:>4} ms  {:>6.1} dB  {:>7} B",
+                    a.since_change.as_millis(),
+                    a.psnr,
+                    a.bytes
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// The pictures a fake capture delivers, as `hypr-capture` does: one frame per request,
     /// once the picture has changed since the last one.
     #[derive(Clone)]
@@ -1126,6 +1218,8 @@ mod tests {
         tx: UnboundedSender<Incoming>,
         size: (u32, u32),
         picture: Arc<Vec<u8>>,
+        changed_at: Instant,
+        changing: bool,
         asked: bool,
         damaged: bool,
     }
@@ -1148,18 +1242,37 @@ mod tests {
                 tx,
                 size,
                 picture: Arc::new(vec![0; size.0 as usize * size.1 as usize * 4]),
+                changed_at: Instant::now(),
+                changing: false,
                 asked: false,
                 damaged: false,
             })))
         }
 
+        /// Shows `picture`, to stay.
         fn show(&self, picture: Arc<Vec<u8>>) {
+            self.change(picture, false);
+        }
+
+        /// Shows `picture`, one of a motion.
+        fn show_moving(&self, picture: Arc<Vec<u8>>) {
+            self.change(picture, true);
+        }
+
+        fn change(&self, picture: Arc<Vec<u8>>, changing: bool) {
             let mut state = self.0.lock().unwrap();
             state.picture = picture;
+            state.changing = changing;
+            state.changed_at = Instant::now();
             state.damaged = true;
             if state.asked {
                 state.deliver();
             }
+        }
+
+        fn last_change(&self) -> (Arc<Vec<u8>>, Instant, bool) {
+            let state = self.0.lock().unwrap();
+            (state.picture.clone(), state.changed_at, state.changing)
         }
     }
 
@@ -1175,6 +1288,144 @@ mod tests {
         fn recapture(&mut self) {
             self.0.lock().unwrap().deliver();
         }
+    }
+
+    /// Runs a real session on the CPU tier against a fake capture driven by `script`, over a
+    /// simulated `lan` to a home that decodes on the CPU and acks every frame. Returns every
+    /// frame decoded while the script ran. Dual420, as the remote's GPU tier encodes.
+    fn measure<S, F>(width: u32, height: u32, lan: Lan, script: S) -> Vec<Arrival>
+    where
+        S: FnOnce(Scene) -> F,
+        F: std::future::Future<Output = ()>,
+    {
+        let outbox = Outbox::default();
+        let (cap_tx, captures) = mpsc::unbounded_channel();
+        let scene = Scene::new(cap_tx, (width, height));
+        let (feedback_tx, feedback) = mpsc::unbounded_channel();
+        let (stop_tx, stop) = tokio::sync::oneshot::channel();
+        let session_outbox = outbox.clone();
+        let capture = scene.clone();
+        let session = std::thread::spawn(move || {
+            let source = Source {
+                output: "NAVETTE-1".into(),
+                scale: 1.0,
+            };
+            let session = Session::new(
+                source,
+                dual_caps(),
+                session_outbox,
+                (width, height),
+                VideoTier::Cpu,
+                Box::new(capture),
+            )
+            .expect("the CPU session starts");
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(session.run(captures, feedback, stop))
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime.block_on(async {
+            let home = home(
+                outbox.clone(),
+                feedback_tx,
+                scene.clone(),
+                lan,
+                arrivals.clone(),
+            );
+            let script = async {
+                script(scene.clone()).await;
+            };
+            tokio::select! {
+                _ = script => {}
+                _ = home => unreachable!("home runs until the script ends"),
+            }
+        });
+        let _ = stop_tx.send(());
+        session.join().unwrap().expect("the session ran");
+        std::mem::take(&mut *arrivals.lock().unwrap())
+    }
+
+    /// Home: writes each frame at the link's rate, decodes it and acks it.
+    async fn home(
+        outbox: Outbox,
+        feedback: UnboundedSender<ClientMsg>,
+        scene: Scene,
+        lan: Lan,
+        arrivals: Arc<std::sync::Mutex<Vec<Arrival>>>,
+    ) {
+        let mut decoder = None;
+        let mut config = None;
+        loop {
+            let (msg, payloads) = outbox.next().await;
+            match msg {
+                Msg::Video(ServerMsg::Ping { t }) => {
+                    tokio::time::sleep(2 * lan.one_way).await;
+                    let _ = feedback.send(ClientMsg::Pong { t });
+                }
+                Msg::Video(ServerMsg::StreamConfig {
+                    chroma,
+                    width,
+                    height,
+                    ..
+                }) => {
+                    // As home does: a pace-only change keeps the decoder.
+                    if config != Some((chroma, width, height)) {
+                        config = Some((chroma, width, height));
+                        decoder =
+                            Some(gliff_sw::Decoder::new(chroma == ChromaMode::Dual420).unwrap());
+                    }
+                }
+                Msg::Video(ServerMsg::VideoFrame {
+                    frame_id, pts_us, ..
+                }) => {
+                    let bytes = payloads.iter().map(Vec::len).sum();
+                    let took = lan.transmit(bytes);
+                    tokio::time::sleep(took).await;
+                    outbox.report_write(took);
+                    tokio::time::sleep(lan.one_way).await;
+                    let decoded = decoder
+                        .as_mut()
+                        .expect("a config before the frames")
+                        .decode(&payloads[0], &payloads[1])
+                        .expect("home decodes the frame")
+                        .expect("no picture held back");
+                    let at = Instant::now();
+                    let (picture, changed_at, changing) = scene.last_change();
+                    arrivals.lock().unwrap().push(Arrival {
+                        at,
+                        since_change: at - changed_at,
+                        moving: changing,
+                        bytes,
+                        latency: Duration::from_micros(now_us().saturating_sub(pts_us)),
+                        psnr: gliff_proto::color::psnr(&rgb(&picture), &rgb(&decoded.pixels)),
+                    });
+                    let feedback = feedback.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(lan.one_way).await;
+                        let _ = feedback.send(ClientMsg::FrameAck {
+                            frame_id,
+                            decoded_at_ms: now_us() / 1000,
+                        });
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn rgb(bgra: &[u8]) -> Vec<u8> {
+        bgra.as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect()
     }
 
     /// A deterministic page of small text: glyph-like antialiased strokes, coloured code on a
@@ -1290,5 +1541,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The page scrolled up by `rows`, wrapping.
+    fn scrolled(page: &[u8], width: u32, height: u32, rows: usize) -> Vec<u8> {
+        let stride = width as usize * 4;
+        let shift = (rows % height as usize) * stride;
+        [&page[shift..], &page[..shift]].concat()
+    }
+
+    /// A binary PPM (P6, 8-bit), as BGRA.
+    fn read_ppm(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+        let mut fields = bytes.splitn(4, |b| b.is_ascii_whitespace());
+        assert_eq!(fields.next(), Some(&b"P6"[..]), "a binary PPM");
+        let mut number = || -> usize {
+            std::str::from_utf8(fields.next().unwrap())
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let (width, height) = (number(), number());
+        let rest = fields.next().unwrap();
+        let mut rest = rest.splitn(2, |b| b.is_ascii_whitespace());
+        assert_eq!(rest.next(), Some(&b"255"[..]), "8-bit");
+        let rgb = rest.next().unwrap();
+        let (w, h) = (width & !1, height & !1);
+        let mut bgra = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for p in rgb[y * width * 3..][..w * 3].as_chunks::<3>().0 {
+                bgra.extend_from_slice(&[p[2], p[1], p[0], 255]);
+            }
+        }
+        (w as u32, h as u32, bgra)
     }
 }
