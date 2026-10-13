@@ -1,15 +1,18 @@
 //! `navette`: the work-from-home mode. The machine with the monitors ("home") pairs once with
 //! the work laptop ("remote"), then `navette serve` at home and `navette agent` on the laptop
-//! keep an authenticated link between them. The modes come with the next issues.
+//! keep an authenticated link between them. The modes come with the next issues; until then,
+//! `navette serve --audio` brings the remote machine's sound home while the link is up.
 
 use std::io::BufRead;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
 use gliff_transport::clipboard::Side;
 use hypr_input::Target;
+use navette::audio::{self, pipewire::PipeWire};
 use navette::clipboard;
 use navette::link::{self, Backoff, Event, Heartbeat};
 use navette::pair::{self, Pin, Timeouts};
@@ -55,6 +58,10 @@ enum Command {
         /// The LAN address and port to listen on [default: the one used to pair].
         #[arg(long, value_name = "ADDR:PORT")]
         listen: Option<SocketAddr>,
+        /// Play the remote machine's sound here, mixed with home sound, while the link is up
+        /// (until the modes take this over).
+        #[arg(long)]
+        audio: bool,
     },
     /// Remote: dial the paired home machine and keep the link up (a systemd user service).
     Agent,
@@ -110,7 +117,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             Ok(())
         }
         Command::Pair { .. } => unreachable!("clap requires --listen or the home address"),
-        Command::Serve { listen } => {
+        Command::Serve { listen, audio } => {
             let acceptor = link::home_acceptor(&store, listen).await?;
             eprintln!(
                 "navette: waiting for the paired remote machine on {}",
@@ -118,9 +125,18 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             );
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
+            // Without `--audio`, home never reaches PipeWire.
+            let graph = audio.then(PipeWire::default);
             // The clipboard bridge is not `Send`: it runs on this thread, in a local set.
-            let attach =
-                |wire| clipboard::attach(Side::Client, clipboard::hypr(Target::default()), wire);
+            let attach = move |mut wire: link::Wire| {
+                if let Some(graph) = &graph
+                    && let Some(sound) = wire.audio.take()
+                    && let Err(e) = audio::home(graph.clone(), sound)
+                {
+                    eprintln!("navette: audio: {e}");
+                }
+                clipboard::attach(Side::Client, clipboard::hypr(Target::default()), wire)
+            };
             tokio::task::LocalSet::new()
                 .run_until(link::serve(acceptor, Heartbeat::default(), events, attach))
                 .await;
@@ -130,19 +146,55 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let dialer = link::remote_dialer(&store)?;
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
-            let attach =
-                |wire| clipboard::attach(Side::Server, clipboard::hypr(Target::default()), wire);
-            tokio::task::LocalSet::new()
-                .run_until(link::agent(
-                    dialer,
-                    Heartbeat::default(),
-                    Backoff::default(),
-                    events,
-                    attach,
-                ))
-                .await;
+            let graph = PipeWire::default();
+            let saved = audio::Saved::in_dir(audio::Saved::default_dir()?);
+            // The latest link's audio thread; each one joins the one before it.
+            let audio_thread = Arc::new(Mutex::new(None));
+            let attach = {
+                let audio_thread = audio_thread.clone();
+                move |mut wire: link::Wire| {
+                    if let Some(sound) = wire.audio.take() {
+                        let mut latest = audio_thread.lock().unwrap();
+                        match audio::remote(graph.clone(), saved.clone(), sound, latest.take()) {
+                            Ok(thread) => *latest = Some(thread),
+                            Err(e) => eprintln!("navette: audio: {e}"),
+                        }
+                    }
+                    clipboard::attach(Side::Server, clipboard::hypr(Target::default()), wire)
+                }
+            };
+            let agent = link::agent(
+                dialer,
+                Heartbeat::default(),
+                Backoff::default(),
+                events,
+                attach,
+            );
+            let local = tokio::task::LocalSet::new();
+            tokio::select! {
+                () = local.run_until(agent) => {}
+                result = stopped() => result?,
+            }
+            // The link is dropped: the audio thread removes its sink and puts the previous
+            // default output back, and the process waits for that before it exits.
+            let latest = audio_thread.lock().unwrap().take();
+            tokio::task::spawn_blocking(move || {
+                if let Some(thread) = latest {
+                    let _ = thread.join();
+                }
+            })
+            .await?;
             Ok(())
         }
+    }
+}
+
+/// SIGTERM (`systemctl --user stop`) or Ctrl-C.
+async fn stopped() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = terminate.recv() => Ok(()),
+        result = tokio::signal::ctrl_c() => result,
     }
 }
 

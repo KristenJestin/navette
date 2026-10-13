@@ -1189,6 +1189,7 @@ mod tests {
                 let mut wire = Wire {
                     from_peer: inbound,
                     to_peer,
+                    audio: None,
                 };
                 let serials = Rc::default();
                 let clipboard = Arc::new(Fake::default());

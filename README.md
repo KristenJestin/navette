@@ -26,10 +26,16 @@ Agents read `AGENTS.md`. Work in progress: see the issues.
 
 ## Build
 
+Building needs the PipeWire development files, clang and cmake (Arch: `pipewire clang cmake`;
+Debian and Ubuntu: `libpipewire-0.3-dev libclang-dev cmake`).
+
 ```
 cargo build
 cargo test
 ```
+
+How the link works: [docs/link.md](docs/link.md); the remote machine's sound:
+[docs/audio.md](docs/audio.md).
 
 ## Install
 

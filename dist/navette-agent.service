@@ -10,6 +10,10 @@
 
 [Unit]
 Description=Navette agent: keeps the link to the paired home machine
+# Stopped before PipeWire, so it can put the previous default output back. Ordered only, not
+# wanted: `Wants=` would start PipeWire with the agent, which needs it only once home asks for
+# the sound, and connects then.
+After=pipewire.service wireplumber.service
 
 [Service]
 ExecStart=%h/.local/bin/navette agent

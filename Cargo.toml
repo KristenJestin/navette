@@ -18,6 +18,8 @@ hkdf = "0.12"
 hmac = "0.12"
 hypr-input = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
 minicbor = { version = "2", features = ["derive", "alloc"] }
+opus = "0.4"
+pipewire = { version = "0.10", features = ["v0_3_49"] }
 rand = "0.8"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
