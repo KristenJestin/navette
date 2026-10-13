@@ -23,11 +23,13 @@ use gliff_transport::Framed;
 use gliff_transport::clipboard::{Outbound, outbound_channel};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use crate::audio::{self, codec::MAX_PACKET};
-use crate::display::wire::{Incoming, Outbox, Peer};
+use crate::display::wire::{Cursor, Incoming, MAX_CURSOR, Outbox, Peer, Pointer};
 use crate::frame::{read_frame, write_frame};
+use crate::input;
 use crate::store::{Role, Store};
 use crate::transport::{Accept, Dial, TlsAcceptor, TlsDialer};
 use crate::wire::{Clip, LinkMsg, checked};
@@ -160,9 +162,13 @@ where
     let (to_peer, outbound_rx) = outbound_channel();
     let outbox = Outbox::default();
     let (display_tx, display_rx) = mpsc::channel(DISPLAY_INBOUND);
+    let (pointer_tx, pointer) = watch::channel(Pointer::default());
+    let input = input::Wire::default();
     let display = Peer {
         outbox: outbox.clone(),
         inbox: display_rx,
+        pointer,
+        input: input.clone(),
     };
     let (sound, sound_end) = audio::wire();
     let service = async {
@@ -182,18 +188,21 @@ where
             outbound_rx,
             sound_end.from_audio,
             &outbox,
+            &input.to_peer,
         ) => result,
         result = receive(
             Framed::new(reader),
             heartbeat.timeout,
             inbound_tx,
             sound_end.to_audio,
-            display_tx,
+            (display_tx, pointer_tx),
             &outbox,
+            &input.from_peer,
         ) => result,
         never = service => match never {},
     };
     outbox.close();
+    input.close();
     match result {
         Ok(never) => match never {},
         Err(e) => e,
@@ -214,6 +223,7 @@ async fn send<W: AsyncWrite + Unpin>(
     mut outbound: mpsc::Receiver<Clip>,
     mut sound: mpsc::Receiver<audio::Message>,
     display: &Outbox,
+    input: &input::Queue,
 ) -> io::Result<Infallible> {
     let mut tick = tokio::time::interval(interval);
     // A long chunk write must not be followed by a burst of heartbeats.
@@ -222,6 +232,11 @@ async fn send<W: AsyncWrite + Unpin>(
     let mut sound_open = true;
     loop {
         tokio::select! {
+            // Input first: a key must not wait behind a video frame already queued.
+            biased;
+            Some(event) = input.next() => {
+                writer.write_msg(&LinkMsg::Input(event)).await.map_err(io_error)?
+            }
             msg = sound.recv(), if sound_open => match msg {
                 Some(msg) => {
                     let packet = match &msg {
@@ -262,8 +277,9 @@ async fn receive<R: AsyncRead + Unpin>(
     timeout: Duration,
     inbound: mpsc::Sender<Clip>,
     sound: SyncSender<audio::Message>,
-    display: mpsc::Sender<Incoming>,
+    (display, pointer): (mpsc::Sender<Incoming>, watch::Sender<Pointer>),
     outbox: &Outbox,
+    input: &input::Queue,
 ) -> io::Result<Infallible> {
     let silent = || io::Error::new(io::ErrorKind::TimedOut, "the peer went silent");
     loop {
@@ -298,12 +314,15 @@ async fn receive<R: AsyncRead + Unpin>(
                     ServerMsg::VideoFrame {
                         data_len, aux_len, ..
                     } => (*data_len, *aux_len),
+                    ServerMsg::CursorShape { argb_len, .. } => (*argb_len, 0),
                     _ => (0, 0),
                 };
-                if main.max(aux) > MAX_VIDEO_PAYLOAD {
+                const MAX_CURSOR_BYTES: u32 = MAX_CURSOR * MAX_CURSOR * 4;
+                let cursor = matches!(msg, ServerMsg::CursorShape { .. });
+                if main.max(aux) > MAX_VIDEO_PAYLOAD || (cursor && main > MAX_CURSOR_BYTES) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "a video frame larger than any screen's",
+                        "a video frame or a cursor larger than any screen's",
                     ));
                 }
                 // The whole frame, payloads included, within one timeout: a peer gone in the
@@ -317,6 +336,30 @@ async fn receive<R: AsyncRead + Unpin>(
                 .await
                 .map_err(|_| silent())?
                 .map_err(io_error)?;
+                if let ServerMsg::CursorPos { visible, .. } = msg {
+                    pointer.send_if_modified(|pointer| {
+                        std::mem::replace(&mut pointer.visible, visible) != visible
+                    });
+                    continue;
+                }
+                if let ServerMsg::CursorShape {
+                    width,
+                    height,
+                    hot_x,
+                    hot_y,
+                    ..
+                } = msg
+                {
+                    let shape = Cursor {
+                        width,
+                        height,
+                        hot_x,
+                        hot_y,
+                        argb: main,
+                    };
+                    pointer.send_modify(|pointer| pointer.shape = Some(shape));
+                    continue;
+                }
                 let video = Incoming::Video { msg, main, aux };
                 if let Err(mpsc::error::TrySendError::Full(Incoming::Video { msg, .. })) =
                     display.try_send(video)
@@ -325,8 +368,23 @@ async fn receive<R: AsyncRead + Unpin>(
                 }
                 continue;
             }
+            LinkMsg::Input(input::Event::Keymap(text)) if text.len() > input::MAX_KEYMAP => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "a keymap larger than any keyboard's",
+                ));
+            }
+            // Never waits: the queue's own policy keeps it bounded and no key held.
+            LinkMsg::Input(event) => {
+                input.push(event);
+                continue;
+            }
             LinkMsg::Feedback(msg) => {
                 let _ = display.try_send(Incoming::Feedback(msg));
+                continue;
+            }
+            LinkMsg::NoInput { reason } => {
+                let _ = display.try_send(Incoming::NoInput(reason));
                 continue;
             }
             msg => msg,
@@ -1104,6 +1162,111 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn the_remote_cursor_s_image_crosses_the_link() {
+        let mut ends = display_link(64 * 1024).await;
+        let shape = ServerMsg::CursorShape {
+            id: 1,
+            width: 2,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            argb_len: 8,
+        };
+        ends.remote
+            .outbox
+            .send(DisplayMsg::Video(shape), vec![vec![5; 8]]);
+        let cursor = newest_cursor(&mut ends.home).await;
+        assert_eq!((cursor.width, cursor.height), (2, 1));
+        assert_eq!(&cursor.argb[..], &[5; 8]);
+    }
+
+    /// The remote pointer's image, once one has come.
+    async fn newest_cursor(peer: &mut Peer) -> Cursor {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            peer.pointer.wait_for(|pointer| pointer.shape.is_some()),
+        )
+        .await
+        .expect("a cursor in time")
+        .expect("the link is up")
+        .shape
+        .clone()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_remote_hiding_its_cursor_is_heard_at_home() {
+        let mut ends = display_link(64 * 1024).await;
+        let seen = |visible| {
+            DisplayMsg::Video(ServerMsg::CursorPos {
+                x: 0.0,
+                y: 0.0,
+                shape_id: 0,
+                visible,
+            })
+        };
+        for visible in [false, true] {
+            ends.remote.outbox.send(seen(visible), Vec::new());
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                ends.home
+                    .pointer
+                    .wait_for(|pointer| pointer.visible == visible),
+            )
+            .await
+            .expect("the cursor's visibility in time")
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_remote_cursor_is_never_lost_behind_a_full_display_queue() {
+        let mut ends = display_link(1 << 20).await;
+        // Home's display reads nothing: its queue fills.
+        for id in 0..DISPLAY_INBOUND as u64 + 20 {
+            let (msg, payloads) = video_frame(id, 16);
+            ends.remote.outbox.send(msg, payloads);
+        }
+        let shape = |id| ServerMsg::CursorShape {
+            id,
+            width: 1,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            argb_len: 4,
+        };
+        ends.remote
+            .outbox
+            .send(DisplayMsg::Video(shape(1)), vec![vec![1; 4]]);
+        assert_eq!(&newest_cursor(&mut ends.home).await.argb[..], &[1; 4]);
+        ends.remote
+            .outbox
+            .send(DisplayMsg::Video(shape(2)), vec![vec![2; 4]]);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ends.home
+                .pointer
+                .wait_for(|pointer| pointer.shape.as_ref().is_some_and(|c| c.argb[..] == [2; 4])),
+        )
+        .await
+        .expect("the newer cursor in time")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_remote_s_no_input_notice_crosses_the_link() {
+        let mut ends = display_link(64 * 1024).await;
+        ends.remote.outbox.send(
+            DisplayMsg::NoInput("no virtual keyboard".into()),
+            Vec::new(),
+        );
+        match incoming(&mut ends.home).await {
+            Incoming::NoInput(reason) => assert_eq!(reason, "no virtual keyboard"),
+            other => panic!("expected the notice, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn a_peer_gone_in_the_middle_of_a_frame_ends_the_link_in_time() {
         let (a, mut b) = tokio::io::duplex(64 * 1024);
         // The frame's header says 100 kB follow; the peer sends 10 and is heard no more.
@@ -1120,6 +1283,102 @@ pub(crate) mod tests {
             .await
             .expect("the link ends within its timeout");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn home_s_input_reaches_the_remote_in_order() {
+        let ends = display_link(64 * 1024).await;
+        let events = [
+            input::Event::Key {
+                code: 125,
+                pressed: true,
+            },
+            input::Event::Motion { x: 10.0, y: 20.0 },
+            input::Event::ReleaseAll,
+        ];
+        for event in events.clone() {
+            ends.home.input.to_peer.push(event);
+        }
+        for event in events {
+            let got =
+                tokio::time::timeout(Duration::from_secs(5), ends.remote.input.from_peer.next())
+                    .await
+                    .expect("an event in time");
+            assert_eq!(got, Some(event));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_ends_the_remote_s_input() {
+        let ends = display_link(64 * 1024).await;
+        ends.home_ended.abort();
+        let _ = ends.home_ended.await;
+        let got = tokio::time::timeout(Duration::from_secs(5), ends.remote.input.from_peer.next())
+            .await
+            .expect("the input ends with the link");
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn an_input_queue_nobody_reads_does_not_stop_the_reader() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut peer = Framed::new(b);
+        for code in 0..(4 * input::QUEUE as u32) {
+            peer.write_msg(&LinkMsg::Input(input::Event::Key {
+                code,
+                pressed: true,
+            }))
+            .await
+            .unwrap();
+        }
+        let deaf = |wire: Wire| async move {
+            let _wire = wire;
+            std::future::pending::<()>().await
+        };
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), deaf))
+            .await
+            .expect("the reader must keep reading past an input nobody takes");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn a_keymap_larger_than_any_keyboard_s_ends_the_link() {
+        let (a, b) = tokio::io::duplex(2 * input::MAX_KEYMAP);
+        let mut peer = Framed::new(b);
+        let keymap = input::Event::Keymap("x".repeat(input::MAX_KEYMAP + 1));
+        peer.write_msg(&LinkMsg::Input(keymap)).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), nothing))
+            .await
+            .expect("the link must give up on an oversized keymap");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn a_cursor_larger_than_any_cursor_ends_the_link() {
+        let side = MAX_CURSOR;
+        let argb_len = side * side * 4 + 4;
+        let (a, mut b) = tokio::io::duplex(argb_len as usize + 1024);
+        let shape = ServerMsg::CursorShape {
+            id: 1,
+            width: side,
+            height: side + 1,
+            hot_x: 0,
+            hot_y: 0,
+            argb_len,
+        };
+        // The image comes whole: only its size is wrong.
+        let body = minicbor::to_vec(LinkMsg::Video(shape)).unwrap();
+        let mut bytes = (body.len() as u32).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&argb_len.to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.resize(bytes.len() + argb_len as usize, 255);
+        tokio::io::AsyncWriteExt::write_all(&mut b, &bytes)
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), run(a, fast(), nothing))
+            .await
+            .expect("the link must give up on an oversized cursor");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

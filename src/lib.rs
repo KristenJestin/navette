@@ -8,6 +8,7 @@ pub mod display;
 pub mod frame;
 pub mod hypr;
 pub mod identity;
+pub mod input;
 pub mod link;
 pub mod mic;
 pub mod mode;
