@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use gliff_transport::clipboard::Side;
+use hypr_input::Target;
+use navette::clipboard;
 use navette::link::{self, Backoff, Event, Heartbeat};
 use navette::pair::{self, Pin, Timeouts};
 use navette::store::Store;
@@ -116,7 +119,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
             // The clipboard bridge is not `Send`: it runs on this thread, in a local set.
-            let attach = |_wire| async {};
+            let attach = |wire| clipboard::attach(Side::Client, Target::default(), wire);
             tokio::task::LocalSet::new()
                 .run_until(link::serve(acceptor, Heartbeat::default(), events, attach))
                 .await;
@@ -126,7 +129,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let dialer = link::remote_dialer(&store)?;
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
-            let attach = |_wire| async {};
+            let attach = |wire| clipboard::attach(Side::Server, Target::default(), wire);
             tokio::task::LocalSet::new()
                 .run_until(link::agent(
                     dialer,
