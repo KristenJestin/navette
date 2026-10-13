@@ -1,0 +1,10 @@
+{
+  "name": "navette-release-tooling",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Only the tooling that tags a release from the merged commits (.github/workflows/release.yml); Navette itself is Rust.",
+  "devDependencies": {
+    "@semantic-release/github": "12.0.10",
+    "semantic-release": "25.0.9"
+  }
+}

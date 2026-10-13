@@ -1,0 +1,60 @@
+# The beta of Navette: every push to `dev` builds it and publishes it as a GitHub pre-release,
+# tagged and titled by its version like every other release (`v0.2.4-beta.21`): the patch after
+# the last released version, numbered by the run of this workflow, so that it sorts after the
+# release it was built on (`tools/beta-version.sh`). The previous betas, their tags too, are
+# deleted first: there is one beta at a time, and the released versions are never touched.
+#
+# semantic-release reads the `v*` tags but looks only for the last release of `main`, and a
+# pre-release is never one; a pre-release is never the latest release either. Nothing here
+# writes a commit, and the only secret is the GITHUB_TOKEN of the run.
+
+name: beta
+
+on:
+  push:
+    branches: [dev]
+
+# One beta at a time, in the order of the pushes. Never cancelled: a run killed between the
+# deletion of the old beta and the creation of the new one would leave no beta at all. A run
+# still waiting is replaced by the newer push.
+concurrency:
+  group: beta-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  beta:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The one list of system libraries, shared with the other builds.
+      - name: Install the system libraries
+        run: tools/install-build-libraries.sh
+      - name: Build, which takes its version from the run
+        id: build
+        run: |
+          version=$(tools/beta-version.sh "$GITHUB_RUN_NUMBER")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          NAVETTE_VERSION="$version" cargo build --locked --release
+          tools/package.sh "$version" target/release/navette "$RUNNER_TEMP/dist"
+      # The previous betas are deleted with their tags, then this one is made on this commit, so
+      # that the releases hold the newest beta and no other. A pre-release is never marked latest.
+      - name: Replace the pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.build.outputs.version }}
+        run: |
+          printf 'Navette %s, built from `%s` on `dev`. It is replaced at each push to `dev`; see docs/install.md to install it.\n' "$VERSION" "${GITHUB_SHA::7}" > "$RUNNER_TEMP/notes.md"
+          for tag in $(git tag --list 'v*-beta.*'); do
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release delete "$tag" --cleanup-tag --yes
+            else
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$tag"
+            fi
+          done
+          gh release create "v$VERSION" "$RUNNER_TEMP"/dist/navette-*.tar.gz "$RUNNER_TEMP"/dist/navette-*.tar.gz.sha256 --prerelease --latest=false --target "$GITHUB_SHA" --title "v$VERSION" --notes-file "$RUNNER_TEMP/notes.md"
