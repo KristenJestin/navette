@@ -176,16 +176,16 @@ fn cursor(output: &str, outbox: Outbox) -> io::Result<hypr_capture::Capturer> {
             };
             outbox.send(Msg::Video(shape), vec![argb]);
         }
-        hypr_capture::CaptureEvent::CursorPos { visible, .. } => {
-            if shown.replace(visible) != Some(visible) {
-                let seen = ServerMsg::CursorPos {
-                    x: 0.0,
-                    y: 0.0,
-                    shape_id: id,
-                    visible,
-                };
-                outbox.send(Msg::Video(seen), Vec::new());
-            }
+        hypr_capture::CaptureEvent::CursorPos { visible, .. }
+            if shown.replace(visible) != Some(visible) =>
+        {
+            let seen = ServerMsg::CursorPos {
+                x: 0.0,
+                y: 0.0,
+                shape_id: id,
+                visible,
+            };
+            outbox.send(Msg::Video(seen), Vec::new());
         }
         _ => {}
     });
