@@ -606,7 +606,7 @@ impl Session {
                 tracing::warn!(error = %e, "the first GPU encode failed; falling back to the CPU pipeline");
                 eprintln!("navette: the GPU encode failed ({e}); encoding on the CPU");
                 self.video = VideoTier::Cpu;
-                self.encoder_max = gliff_sw::Encoder::MAX_SIZE;
+                self.encoder_max = within_home(gliff_sw::Encoder::MAX_SIZE, &self.caps);
                 self.encoder = VideoEncoder::new(
                     &self.video,
                     &self.settings,
@@ -715,7 +715,7 @@ impl VideoStart {
         } else {
             ChromaMode::Dual420
         };
-        let encoder_max = video.encoder_max()?;
+        let encoder_max = within_home(video.encoder_max()?, caps);
         let stream = EncoderSettings::fit_extent(output.0, output.1, encoder_max);
         let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
         let ctl = RateController::new(stream.0 as u64 * stream.1 as u64, streams, MAX_FPS, None);
@@ -842,6 +842,11 @@ impl VideoEncoder {
     }
 }
 
+/// The encoder's largest picture, no larger than home said it decodes.
+fn within_home(max: (u32, u32), caps: &ClientCaps) -> (u32, u32) {
+    (max.0.min(caps.max_width), max.1.min(caps.max_height))
+}
+
 fn start_capture(
     output: &str,
     render_node: &std::path::Path,
@@ -869,4 +874,25 @@ fn start_capture(
         let _ = tx.send(msg);
     });
     Capturer::start(config, sink).map_err(|e| other("capture", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps(max_width: u32, max_height: u32) -> ClientCaps {
+        ClientCaps {
+            codecs: vec![Codec::H264],
+            max_width,
+            max_height,
+            chroma: vec![ChromaMode::Single420],
+            features: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_largest_picture_home_decodes_bounds_the_stream() {
+        assert_eq!(within_home((4096, 4096), &caps(3840, 2160)), (3840, 2160));
+        assert_eq!(within_home((1920, 1088), &caps(3840, 2160)), (1920, 1088));
+    }
 }
