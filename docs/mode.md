@@ -66,11 +66,18 @@ other monitor they stay home.
 - **Keys held** when the pointer leaves the monitor, when the hotkey is typed, when the mode
   stops or when the link drops are all released on the remote machine: none stays down.
 - **Typing** uses home's keymap, sent to the remote machine (and sent again when home's layout
-  changes), so every key types there what it types at home.
+  changes), so every key types there what it types at home. Caps Lock and Num Lock follow
+  home's: as they are at home when the keyboard crosses, so they are on the remote machine.
+  A keymap that includes files is refused there, and the one before it stays.
+- **The remote machine's virtual keyboard and pointer** are seat-wide there: on the remote
+  machine, Hyprland sends what they type to the window its own focus rules pick, as for its
+  own keyboard. With `input:follow_mouse = 1` (Hyprland's default) on the remote machine, keys
+  go to the window under the pointer on `NAVETTE-1`; with another setting, to the window that
+  had the focus there.
 - **The pointer** lands at the same place on `NAVETTE-1` whatever scale either machine uses. Its
   image over the monitor is the remote machine's cursor (a text cursor over text, say), drawn by
   home's compositor at home's pointer, so it never lags; until the remote has one to show, it is
-  the default arrow.
+  the default arrow. When the remote machine hides its cursor, it is hidden at home too.
 - **On the link**, input has a queue of its own that never blocks: a key goes ahead of a
   picture waiting to be sent, and if the link stalls long enough to fill it, everything held
   is released rather than a release being lost.
