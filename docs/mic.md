@@ -20,7 +20,9 @@ machine's sound at home ([the sound](audio.md)).
   changed, and the canceller's source is no default. What it hears is Opus-encoded (48 kHz
   stereo, 10 ms frames, in-band FEC) and sent while the mic goes to the remote machine. The
   capture stays open for the whole mode, the mic home included: the canceller takes some six
-  seconds to adapt, and would start over at each switch.
+  seconds to adapt, and would start over at each switch. When home's PipeWire restarts, the
+  capture, its canceller and the silent source below are opened again within a quarter of a
+  second; while they cannot be, the mic says `failed`, and `navette mic toggle` says why.
 - **Home apps do not hear the mic while it is remote.** Home's default mic is then a silent
   source of Navette's, *Mic away (Navette)* (`navette-mic-away`): the apps that follow the
   default (most do, a call included) move to it and hear silence, and move back when the mic
@@ -36,11 +38,12 @@ machine's sound at home ([the sound](audio.md)).
 navette mic toggle       # to the other machine
 navette mic remote       # to the remote machine
 navette mic home         # home
-navette mic status       # remote, home, or off when no mode runs
+navette mic status       # remote, home, failed, or off when no mode runs
 ```
 
 Each prints where the mic goes once it is done. With no mode running there is nothing to
-switch: the command says so and the mic stays home.
+switch: the command says so and the mic stays home. While the mic says `failed`, switching it
+says why instead.
 
 The mode binds a hotkey, `SUPER + CTRL + M` unless `mode.conf` names other keys:
 
@@ -76,7 +79,7 @@ A bar runs `navette mic watch --json` for as long as it lives, shows the state, 
   "exec": "navette mic watch --json",
   "return-type": "json",
   "format": "{icon}",
-  "format-icons": { "remote": "mic → work", "home": "mic · home", "off": "" },
+  "format-icons": { "remote": "mic → work", "home": "mic · home", "failed": "mic ✗", "off": "" },
   "on-click": "navette mic toggle"
 }
 ```

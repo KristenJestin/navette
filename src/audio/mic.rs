@@ -87,18 +87,30 @@ const AWAY_DESCRIPTION: &str = "Mic away (Navette)";
 pub struct HomeMic<G: Graph> {
     // Field order is drop order: the apps get their mic back first.
     away: Option<Away<G>>,
-    _capture: G::Node,
+    capture: G::Node,
     graph: G,
     saved: Saved,
-    remote: Arc<AtomicBool>,
+    /// The mic captured, by name.
+    mic: String,
+    sending: Sending,
+}
+
+/// Where the capture's frames go, and their numbering, kept across a PipeWire restart.
+#[derive(Clone)]
+struct Sending {
+    remote_machine: mpsc::Sender<Message>,
+    session: u32,
+    seq: Arc<AtomicU32>,
     failures: Arc<AtomicU64>,
+    /// Read by the capture's callback, on PipeWire's thread.
+    remote: Arc<AtomicBool>,
 }
 
 /// Home's default mic switched to the silent source, put back when dropped.
 struct Away<G: Graph> {
     // Field order is drop order, as for the remote's source.
-    _switch: Switch<G>,
-    _node: G::Node,
+    switch: Switch<G>,
+    node: G::Node,
 }
 
 impl<G: Graph> HomeMic<G> {
@@ -114,38 +126,21 @@ impl<G: Graph> HomeMic<G> {
         let mic = graph
             .mic_in_use()?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home has no mic"))?;
-        let failures = Arc::new(AtomicU64::new(0));
-        let remote = Arc::new(AtomicBool::new(false));
-        let mut send = encoding(
+        let sending = Sending {
             remote_machine,
             session,
-            Arc::new(AtomicU32::new(0)),
-            failures.clone(),
-            |session, seq, packet| Message::MicFrame {
-                session,
-                seq,
-                packet,
-            },
-        )?;
-        let gate = remote.clone();
-        let capture = graph.open_mic(
-            MIC,
-            MIC_DESCRIPTION,
-            &mic,
-            Box::new(move |pcm| {
-                // The mic home is nothing sent: the remote's source plays silence.
-                if gate.load(Ordering::Relaxed) {
-                    send(pcm);
-                }
-            }),
-        )?;
+            seq: Arc::default(),
+            failures: Arc::default(),
+            remote: Arc::default(),
+        };
+        let capture = open_capture(&graph, &mic, &sending)?;
         let mut home_mic = Self {
             away: None,
-            _capture: capture,
+            capture,
             graph,
             saved,
-            remote,
-            failures,
+            mic,
+            sending,
         };
         home_mic.send_to(true)?;
         Ok(home_mic)
@@ -155,34 +150,77 @@ impl<G: Graph> HomeMic<G> {
     /// home.
     pub fn send_to(&mut self, remote: bool) -> io::Result<()> {
         if !remote {
-            self.remote.store(false, Ordering::Relaxed);
+            self.sending.remote.store(false, Ordering::Relaxed);
             self.away = None;
             return Ok(());
         }
         if self.away.is_none() {
             let switch =
                 Switch::save(self.graph.clone(), self.saved.clone(), Device::Source, AWAY)?;
-            let silence = Arc::new(Mutex::new(Jitter::new(JITTER_TARGET, JITTER_MAX)));
-            let node = self.graph.open_source(AWAY, AWAY_DESCRIPTION, silence)?;
+            let node = open_away(&self.graph)?;
             switch.switch()?;
-            self.away = Some(Away {
-                _switch: switch,
-                _node: node,
-            });
+            self.away = Some(Away { switch, node });
         }
-        self.remote.store(true, Ordering::Relaxed);
+        self.sending.remote.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     /// Whether the mic goes to the remote machine.
     pub fn remote(&self) -> bool {
-        self.remote.load(Ordering::Relaxed)
+        self.sending.remote.load(Ordering::Relaxed)
     }
+
+    /// Opens again what went with PipeWire when it restarted: the capture, with its echo
+    /// canceller, and the silent source, made the default again.
+    pub fn recover(&mut self) -> io::Result<()> {
+        if self.graph.is_gone(&self.capture) {
+            self.capture = open_capture(&self.graph, &self.mic, &self.sending)?;
+        }
+        if let Some(away) = &mut self.away
+            && self.graph.is_gone(&away.node)
+        {
+            away.node = open_away(&self.graph)?;
+            away.switch.switch()?;
+        }
+        Ok(())
+    }
+}
+
+fn open_capture<G: Graph>(graph: &G, mic: &str, sending: &Sending) -> io::Result<G::Node> {
+    let mut send = encoding(
+        sending.remote_machine.clone(),
+        sending.session,
+        sending.seq.clone(),
+        sending.failures.clone(),
+        |session, seq, packet| Message::MicFrame {
+            session,
+            seq,
+            packet,
+        },
+    )?;
+    let remote = sending.remote.clone();
+    graph.open_mic(
+        MIC,
+        MIC_DESCRIPTION,
+        mic,
+        Box::new(move |pcm| {
+            // The mic home is nothing sent: the remote's source plays silence.
+            if remote.load(Ordering::Relaxed) {
+                send(pcm);
+            }
+        }),
+    )
+}
+
+/// A source that nothing plays into: silence.
+fn open_away<G: Graph>(graph: &G) -> io::Result<G::Node> {
+    let silence = Arc::new(Mutex::new(Jitter::new(JITTER_TARGET, JITTER_MAX)));
+    graph.open_source(AWAY, AWAY_DESCRIPTION, silence)
 }
 
 impl<G: Graph> Drop for HomeMic<G> {
     fn drop(&mut self) {
-        let failures = self.failures.load(Ordering::Relaxed);
+        let failures = self.sending.failures.load(Ordering::Relaxed);
         if failures > 0 {
             eprintln!("navette: mic: {failures} cycles of sound could not be encoded");
         }
@@ -416,6 +454,51 @@ mod tests {
             Some(DefaultNode::named("desk-mic"))
         );
         assert_eq!(saved.load(Device::Source).unwrap(), None);
+    }
+
+    /// The sequence numbers of the frames sent so far.
+    fn sent(frames: &mut mpsc::Receiver<Message>) -> Vec<u32> {
+        std::iter::from_fn(|| frames.try_recv().ok())
+            .filter_map(|m| match m {
+                Message::MicFrame { seq, .. } => Some(seq),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_home_mic_comes_back_after_pipewire_restarts() {
+        let (graph, _tmp, _saved, mut mic, mut frames) = home_mic();
+        speak(&graph, 4);
+        let before = *sent(&mut frames).last().unwrap();
+        mic.recover().unwrap();
+        let opened = graph.state().log.len();
+        assert_eq!(opened, 3, "nothing to open again while nothing is gone");
+
+        graph.restart();
+        mic.recover().unwrap();
+        assert_eq!(
+            graph.state().log[opened + 1..],
+            [
+                format!("mic {MIC} <- desk-mic"),
+                format!("source {AWAY}"),
+                format!("default source {}", DefaultNode::named(AWAY).0),
+            ]
+        );
+        speak(&graph, 4);
+        // Numbered on, or the remote's decoder would take them for late ones.
+        assert!(sent(&mut frames).first().unwrap() > &before);
+    }
+
+    #[test]
+    fn with_the_mic_home_a_restart_opens_only_the_capture_again() {
+        let (graph, _tmp, _saved, mut mic, _frames) = home_mic();
+        mic.send_to(false).unwrap();
+        graph.restart();
+        mic.recover().unwrap();
+        let state = graph.state();
+        assert_eq!(state.log.last().unwrap(), &format!("mic {MIC} <- desk-mic"));
+        assert!(state.sources.is_empty());
     }
 
     #[test]

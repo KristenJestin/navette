@@ -10,7 +10,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -27,6 +27,8 @@ pub enum Status {
     Off,
     Home,
     Remote,
+    /// A mode runs, but the mic cannot go where it should: `navette mic toggle` says why.
+    Failed,
 }
 
 impl Status {
@@ -35,11 +37,12 @@ impl Status {
             Status::Off => "off",
             Status::Home => "home",
             Status::Remote => "remote",
+            Status::Failed => "failed",
         }
     }
 
     fn parse(word: &str) -> Option<Self> {
-        [Status::Off, Status::Home, Status::Remote]
+        [Status::Off, Status::Home, Status::Remote, Status::Failed]
             .into_iter()
             .find(|s| s.word() == word)
     }
@@ -51,6 +54,9 @@ impl Status {
             Status::Off => "No mode is running: the mic is home",
             Status::Home => "The mic is home",
             Status::Remote => "The mic goes to the remote machine",
+            Status::Failed => {
+                "The mic cannot go to the remote machine: `navette mic toggle` says why"
+            }
         };
         let word = self.word();
         format!(r#"{{"text":"{word}","alt":"{word}","class":"{word}","tooltip":"{tooltip}"}}"#)
@@ -92,45 +98,65 @@ pub trait Routing: Send + Sync {
 
 /// The home mic, at home.
 pub struct Mic<G: Graph> {
+    shared: Arc<Shared<G>>,
+    toggle_command: String,
+}
+
+/// What the mic's own thread shares with it: it opens the mic again when PipeWire restarts.
+struct Shared<G: Graph> {
     graph: G,
     /// Where home's default mic is kept while the mic is away.
     saved: Saved,
     state: Mutex<State<G>>,
     status: watch::Sender<Status>,
-    toggle_command: String,
 }
 
 struct State<G: Graph> {
     /// The audio queue of the current link.
     link: Option<mpsc::Sender<Message>>,
-    running: Option<HomeMic<G>>,
+    running: Option<Running<G>>,
     sessions: u32,
 }
 
-impl<G: Graph> Mic<G> {
+/// The mic while a mode runs.
+struct Running<G: Graph> {
+    mic: HomeMic<G>,
+    /// Why the mic does not go where it should, while it cannot.
+    failure: Option<String>,
+    /// Dropped when the mode stops, which ends the checks.
+    _checks: std_mpsc::Sender<()>,
+}
+
+/// How often the mic looks for a PipeWire that restarted under it.
+const CHECK: Duration = Duration::from_millis(250);
+
+impl<G: Graph + Sync> Mic<G> {
     /// `toggle_command` is what the hotkey runs ([`toggle_command`]).
     pub fn new(graph: G, saved: Saved, toggle_command: String) -> Self {
         Self {
-            graph,
-            saved,
-            state: Mutex::new(State {
-                link: None,
-                running: None,
-                sessions: 0,
+            shared: Arc::new(Shared {
+                graph,
+                saved,
+                state: Mutex::new(State {
+                    link: None,
+                    running: None,
+                    sessions: 0,
+                }),
+                status: watch::Sender::new(Status::Off),
             }),
-            status: watch::Sender::new(Status::Off),
             toggle_command,
         }
     }
 
     /// A link came up: the mic goes over it from the next mode on.
     pub fn attach(&self, link: mpsc::Sender<Message>) {
-        lock(&self.state).link = Some(link);
+        lock(&self.shared.state).link = Some(link);
     }
 
     /// A mode started: the remote's source becomes its default mic, and the mic goes there.
     pub fn start(&self) -> io::Result<()> {
-        let mut state = lock(&self.state);
+        let shared = &self.shared;
+        let mut state = lock(&shared.state);
         if state.running.is_some() {
             return Ok(());
         }
@@ -143,35 +169,89 @@ impl<G: Graph> Mic<G> {
         let session = state.sessions;
         send(&link, Message::MicStart { session })?;
         let started = HomeMic::start(
-            self.graph.clone(),
-            self.saved.clone(),
+            shared.graph.clone(),
+            shared.saved.clone(),
             link.clone(),
             session,
         );
-        match started {
-            Ok(mic) => state.running = Some(mic),
+        let mic = match started {
+            Ok(mic) => mic,
             Err(e) => {
                 let _ = send(&link, Message::MicStop);
                 return Err(e);
             }
-        }
-        self.status.send_replace(Status::Remote);
+        };
+        let (checks, ended) = std_mpsc::channel();
+        let checked = shared.clone();
+        std::thread::Builder::new()
+            .name("navette-mic".into())
+            .spawn(move || checked.check(&ended))?;
+        state.running = Some(Running {
+            mic,
+            failure: None,
+            _checks: checks,
+        });
+        shared.publish(&state);
         Ok(())
     }
 
     /// The mode stopped: the mic comes home, and the remote puts its default mic back.
     pub fn stop(&self) {
-        let mut state = lock(&self.state);
-        let Some(mic) = state.running.take() else {
+        let shared = &self.shared;
+        let mut state = lock(&shared.state);
+        let Some(running) = state.running.take() else {
             return;
         };
         // Closed first, so that no frame follows the stop.
-        drop(mic);
+        drop(running);
         if let Some(link) = &state.link {
             // A link already down took the remote's source with it.
             let _ = send(link, Message::MicStop);
         }
-        self.status.send_replace(Status::Off);
+        shared.publish(&state);
+    }
+}
+
+impl<G: Graph> Shared<G> {
+    /// Tells the watchers where the mic goes, if that changed.
+    fn publish(&self, state: &State<G>) {
+        let now = match &state.running {
+            None => Status::Off,
+            Some(running) if running.failure.is_some() => Status::Failed,
+            Some(running) if running.mic.remote() => Status::Remote,
+            Some(_) => Status::Home,
+        };
+        self.status.send_if_modified(|status| {
+            let changed = *status != now;
+            *status = now;
+            changed
+        });
+    }
+
+    /// Opens the mic again whenever PipeWire restarted, until the mode stops.
+    fn check(&self, ended: &std_mpsc::Receiver<()>) {
+        while let Err(std_mpsc::RecvTimeoutError::Timeout) = ended.recv_timeout(CHECK) {
+            let mut state = lock(&self.state);
+            let Some(running) = &mut state.running else {
+                return;
+            };
+            match running.mic.recover() {
+                Ok(()) => {
+                    if running.failure.take().is_some() {
+                        eprintln!("navette: mic: opened again");
+                    }
+                }
+                Err(e) => {
+                    if running.failure.is_none() {
+                        eprintln!("navette: mic: could not open it again: {e}");
+                    }
+                    running.failure = Some(format!(
+                        "the mic went with PipeWire and could not be opened again: {e}"
+                    ));
+                }
+            }
+            self.publish(&state);
+        }
     }
 }
 
@@ -183,9 +263,10 @@ fn send(link: &mpsc::Sender<Message>, message: Message) -> io::Result<()> {
 
 impl<G: Graph + Sync> Routing for Mic<G> {
     fn order(&self, order: Order) -> io::Result<Status> {
-        let mut state = lock(&self.state);
-        let current = *self.status.borrow();
-        let Some(mic) = &mut state.running else {
+        let shared = &self.shared;
+        let mut state = lock(&shared.state);
+        let current = *shared.status.borrow();
+        let Some(running) = &mut state.running else {
             return match order {
                 Order::Status => Ok(current),
                 _ => Err(io::Error::other(
@@ -193,18 +274,23 @@ impl<G: Graph + Sync> Routing for Mic<G> {
                 )),
             };
         };
+        if let Some(failure) = &running.failure
+            && order != Order::Status
+        {
+            return Err(io::Error::other(failure.clone()));
+        }
         let to = match (order, current) {
             (Order::Status, _) => return Ok(current),
             (Order::Remote, _) | (Order::Toggle, Status::Home) => Status::Remote,
             (Order::Home, _) | (Order::Toggle, _) => Status::Home,
         };
-        mic.send_to(to == Status::Remote)?;
-        self.status.send_replace(to);
+        running.mic.send_to(to == Status::Remote)?;
+        shared.publish(&state);
         Ok(to)
     }
 
     fn watch(&self) -> watch::Receiver<Status> {
-        self.status.subscribe()
+        self.shared.status.subscribe()
     }
 }
 
@@ -549,6 +635,49 @@ mod tests {
         assert!(graph.state().mics.is_empty());
     }
 
+    /// Waits for the mic to say `status`.
+    async fn until_status(mic: &Mic<FakeGraph>, status: Status) {
+        let mut changes = mic.watch();
+        tokio::time::timeout(Duration::from_secs(5), changes.wait_for(|s| *s == status))
+            .await
+            .expect("the status in time")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_home_pipewire_restart_opens_the_mic_again() {
+        let (graph, mic, mut remote, _tmp) = mic();
+        let started = mic.clone();
+        blocking(move || started.start()).await.unwrap();
+        graph.restart();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while graph.state().mics.is_empty() || graph.state().sources.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the mic opened again in time");
+        assert_eq!(home_default(&graph), AWAY);
+        assert!(sends(&graph, &mut remote));
+        assert_eq!(mic.order(Order::Status).unwrap(), Status::Remote);
+    }
+
+    #[tokio::test]
+    async fn a_mic_that_cannot_open_again_says_so_until_it_can() {
+        let (graph, mic, _remote, _tmp) = mic();
+        let started = mic.clone();
+        blocking(move || started.start()).await.unwrap();
+        graph.state().refuse_mics = true;
+        graph.restart();
+        until_status(&mic, Status::Failed).await;
+        let error = mic.order(Order::Toggle).unwrap_err();
+        assert!(error.to_string().contains("no echo canceller"), "{error}");
+
+        graph.state().refuse_mics = false;
+        until_status(&mic, Status::Remote).await;
+        assert_eq!(mic.order(Order::Toggle).unwrap(), Status::Home);
+    }
+
     #[tokio::test]
     async fn without_a_link_the_mic_cannot_start() {
         let tmp = tempfile::tempdir().unwrap();
@@ -577,7 +706,8 @@ mod tests {
             Status::Home.json(),
             r#"{"text":"home","alt":"home","class":"home","tooltip":"The mic is home"}"#
         );
-        for status in [Status::Off, Status::Home, Status::Remote] {
+        assert_eq!(Status::Failed.word(), "failed");
+        for status in [Status::Off, Status::Home, Status::Remote, Status::Failed] {
             let json: serde_json::Value = serde_json::from_str(&status.json()).unwrap();
             assert_eq!(json["alt"], status.word());
         }
