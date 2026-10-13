@@ -1,14 +1,20 @@
 //! `navette`: the work-from-home mode. The machine with the monitors ("home") pairs once with
 //! the work laptop ("remote"), then `navette serve` at home and `navette agent` on the laptop
-//! keep an authenticated link between them. The modes come with the next issues.
+//! keep an authenticated link between them. `navette mode start` gives one home monitor to the
+//! remote machine, `navette mode stop` gives it back.
 
 use std::io::BufRead;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use navette::desk::Desk;
+use navette::display::{decode, remote};
+use navette::hypr::{self, Eval};
 use navette::link::{self, Backoff, Event, Heartbeat};
+use navette::mode::{self, Home};
 use navette::pair::{self, Pin, Timeouts};
 use navette::store::Store;
 use navette::transport::bind_lan;
@@ -55,11 +61,35 @@ enum Command {
     },
     /// Remote: dial the paired home machine and keep the link up (a systemd user service).
     Agent,
+    /// Home: give the configured monitor to the remote machine, or take it back.
+    ///
+    /// The monitor is named in `mode.conf` in the config directory: `monitor = <output name>`.
+    /// `navette serve` must be running.
+    Mode {
+        #[command(subcommand)]
+        action: ModeAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModeAction {
+    /// The remote machine takes the monitor.
+    Start,
+    /// The monitor comes back home.
+    Stop,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    // gliff's crates log through `tracing`: their warnings (a GPU fallback) reach the journal.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -115,23 +145,66 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             );
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
-            let (peers, _) = mpsc::unbounded_channel();
-            link::serve(acceptor, Heartbeat::default(), events, peers).await;
+            let control = mode::listen(&mode::control_path()?)?;
+            let gpu = tokio::task::spawn_blocking(decode::open_gpu)
+                .await
+                .map_err(std::io::Error::other)?;
+            let home = Home {
+                config_dir: store.dir().to_path_buf(),
+                hypr: Arc::new(hypr::Live),
+                screens: Arc::new(mode::LiveScreens),
+                gpu,
+                desk_record: Desk::<Eval>::default_record()?,
+            };
+            let (peers, peers_rx) = mpsc::unbounded_channel();
+            let (orders, orders_rx) = mpsc::unbounded_channel();
+            let (hypr_events, hypr_events_rx) = mpsc::unbounded_channel();
+            hypr::watch_events(hypr_events);
+            let modes = tokio::spawn(mode::serve(home, peers_rx, orders_rx, hypr_events_rx));
+            let control = tokio::spawn(mode::accept_orders(control, orders));
+            tokio::select! {
+                () = link::serve(acceptor, Heartbeat::default(), events, peers) => {}
+                () = stopped() => {}
+            }
+            // Closing every way in ends the mode, which gives the monitor back.
+            control.abort();
+            let _ = control.await;
+            let _ = modes.await;
             Ok(())
         }
         Command::Agent => {
             let dialer = link::remote_dialer(&store)?;
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
-            let (peers, _) = mpsc::unbounded_channel();
-            link::agent(
-                dialer,
-                Heartbeat::default(),
-                Backoff::default(),
-                events,
-                peers,
-            )
-            .await;
+            let (peers, peers_rx) = mpsc::unbounded_channel();
+            let (hypr_events, hypr_events_rx) = mpsc::unbounded_channel();
+            hypr::watch_events(hypr_events);
+            let display = tokio::spawn(remote::serve(
+                peers_rx,
+                Arc::new(hypr::Live),
+                Arc::new(remote::LiveStreams),
+                hypr_events_rx,
+            ));
+            tokio::select! {
+                () = link::agent(
+                    dialer,
+                    Heartbeat::default(),
+                    Backoff::default(),
+                    events,
+                    peers,
+                ) => {}
+                () = stopped() => {}
+            }
+            // The link task is gone with its peers: the display removes its output.
+            let _ = display.await;
+            Ok(())
+        }
+        Command::Mode { action } => {
+            let order = match action {
+                ModeAction::Start => "start",
+                ModeAction::Stop => "stop",
+            };
+            println!("{}", mode::order(&mode::control_path()?, order).await?);
             Ok(())
         }
     }
@@ -148,5 +221,15 @@ async fn print_events(mut events: mpsc::UnboundedReceiver<Event>) {
                 eprintln!("navette: dialing again in {} s", delay.as_secs_f32())
             }
         }
+    }
+}
+
+/// Ctrl-C or the service manager's SIGTERM.
+async fn stopped() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("a SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
     }
 }
