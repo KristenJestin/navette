@@ -43,6 +43,40 @@ While the mode runs:
   and made again after a config reload. The mode also ends if the surface goes away (the monitor
   unplugged, Hyprland restarted at home) or home cannot decode the picture.
 
+## Keyboard and pointer
+
+Focus follows the pointer, with nothing to click. Over the reserved monitor, the keyboard,
+the pointer, the wheel and every shortcut, Super included, go to the remote machine; over any
+other monitor they stay home.
+
+- **Shortcuts.** While the pointer is over the reserved monitor, home's surface holds the
+  keyboard and a shortcuts inhibitor, so home's binds do not fire. A bind flagged
+  `dont_inhibit` (the mic toggle, say) still fires at home, everywhere; its key does not reach
+  the remote machine.
+- **The release hotkey** gives the keyboard back to home without moving the pointer:
+  `Shift+Escape` by default (Escape alone still goes to the remote). Moving the pointer off
+  the monitor and back captures it again. Choose another chord, or none, in `mode.conf`:
+
+  ```
+  release = ctrl+alt+q     # or: release = none
+  ```
+
+- **Keys held** when the pointer leaves the monitor, when the hotkey is typed, when the mode
+  stops or when the link drops are all released on the remote machine: none stays down.
+- **Typing** uses home's keymap, sent to the remote machine (and sent again when home's layout
+  changes), so every key types there what it types at home.
+- **The pointer** lands at the same place on `NAVETTE-1` whatever scale either machine uses. Its
+  image over the monitor is the remote machine's cursor (a text cursor over text, say), drawn by
+  home's compositor at home's pointer, so it never lags; until the remote has one to show, it is
+  the default arrow.
+- **On the link**, input has a queue of its own that never blocks: a key goes ahead of a
+  picture waiting to be sent, and if the link stalls long enough to fill it, everything held
+  is released rather than a release being lost.
+
+Hyprland hands the keyboard over at the pointer's first movement once it has crossed onto the
+monitor, and takes it back home as soon as the pointer leaves, even onto a home monitor with no
+window.
+
 ## Decoding at home
 
 Home decodes on its GPU (Vulkan Video) and hands the picture to the compositor as a dmabuf, with

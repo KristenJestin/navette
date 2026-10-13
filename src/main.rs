@@ -74,7 +74,9 @@ enum Command {
     /// Home: give the configured monitor to the remote machine, or take it back.
     ///
     /// The monitor is named in `mode.conf` in the config directory: `monitor = <output name>`.
-    /// `navette serve` must be running.
+    /// Over it, the keyboard and every shortcut go to the remote machine; `release = <chord>`
+    /// (default `shift+escape`, or `none`) gives the keyboard back. `navette serve` must be
+    /// running.
     Mode {
         #[command(subcommand)]
         action: ModeAction,
