@@ -135,10 +135,15 @@ pub async fn serve_peer(
     stop(&mut active, &hypr).await;
 }
 
-/// The reason a running stream stopped on its own; pending forever when none runs.
+/// Why a running stream stopped on its own; pending forever when none runs. A stream that
+/// ended without a word ended all the same.
 async fn ended(active: &mut Option<Active>) -> Option<io::Error> {
     match active.as_mut().and_then(|a| a.running.as_mut()) {
-        Some(running) => (&mut running.ended).await.ok(),
+        Some(running) => Some(
+            (&mut running.ended)
+                .await
+                .unwrap_or_else(|_| io::Error::other("the stream ended")),
+        ),
         None => std::future::pending().await,
     }
 }
@@ -240,7 +245,11 @@ mod tests {
     }
 
     impl FakeStreams {
-        fn end_last(&self) {
+        fn drop_last(&self) {
+        drop(self.ends.lock().unwrap().pop().unwrap());
+    }
+
+    fn end_last(&self) {
             let end = self.ends.lock().unwrap().pop().unwrap();
             let _ = end.send(io::Error::other("capture stopped"));
         }
@@ -393,6 +402,16 @@ mod tests {
             .set_down(false, vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
         until(|| agent.streams.started.lock().unwrap().len() == 2).await;
         assert_eq!(agent.hypr.monitor(output::NAME).unwrap().width, 1920);
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_without_a_reason_is_started_again() {
+        let agent = agent();
+        agent.inbox.send(start()).unwrap();
+        until(|| agent.streams.started.lock().unwrap().len() == 1).await;
+        agent.streams.drop_last();
+        until(|| agent.streams.started.lock().unwrap().len() == 2).await;
+        assert!(!agent.task.is_finished());
     }
 
     #[tokio::test]
