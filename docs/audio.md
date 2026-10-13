@@ -65,14 +65,18 @@ finds a cycle's worth less. Without it, the buffer ran dry every few minutes eve
 
 ## Trying it
 
-The modes will start and stop the sound (#6). Until then, `--audio` makes home ask for it as
-long as the link is up:
+The sound starts and stops with the mode, as the mic does: `navette mode start` brings the
+remote's sound home, `navette mode stop` sends it back to the remote's own output, and so does
+the link dropping. `--audio` only says that home may play it (and reach PipeWire at all):
 
 ```
 navette serve --audio          # at home
+navette mode start             # the remote's sound comes home
+navette mode stop              # it plays on the remote machine again
 ```
 
-The agent on the remote machine needs nothing more: it follows home.
+Without a mode, nothing of the remote machine plays at home. The agent on the remote machine
+needs nothing more: it follows home.
 
 The default output is the one `wpctl set-default` writes (`default.configured.audio.sink` in
 PipeWire's `default` metadata), so WirePlumber moves the playing apps to the Navette sink and
@@ -135,16 +139,19 @@ them as concealed or lost.
 
 1. Install the build on both machines, then on the laptop
    `systemctl --user restart navette-agent`.
-2. At home: `navette serve --audio`.
-3. On the laptop, `wpctl status` shows *Home speakers (Navette)* as the default sink (`*`).
+2. At home: `navette serve --audio`. Before any mode, music on the laptop plays on the
+   laptop's own speakers, and `wpctl status` there shows its own default sink.
+3. `navette mode start`. On the laptop, `wpctl status` shows *Home speakers (Navette)* as the
+   default sink (`*`).
 4. Play a video on the laptop and music at home: both are heard on the home speakers.
-5. Stop `navette serve` (Ctrl-C): on the laptop, `wpctl status` shows its previous default sink
-   again. Start it again, then `systemctl --user stop navette-agent` on the laptop: the previous
-   default comes back too.
-6. With `navette serve --audio` running and a video playing on the laptop, restart its sound
+5. `navette mode stop` with music playing on the laptop: silence at home, and the music goes
+   back to the laptop's own speakers, which `wpctl status` shows as the default again. Start
+   the mode again, then stop `navette serve` (Ctrl-C): the previous default comes back too.
+   Start both again, then `systemctl --user stop navette-agent` on the laptop: the same.
+6. With a mode running and a video playing on the laptop, restart its sound
    server: `systemctl --user restart pipewire wireplumber`. Within a few seconds, the video is
    heard at home again and `wpctl status` shows *Home speakers (Navette)* as the default; stop
-   `navette serve`, and the previous default sink comes back.
+   the mode, and the previous default sink comes back.
 7. Latency, a click test: put the laptop next to a home microphone. On the laptop, make a click
    (`sox -n -r 48000 -c 2 click.wav synth 0.005 sine 2000 pad 0.5 1.5`) and play it to the
    laptop's own speakers and to Navette at once:
@@ -153,7 +160,8 @@ them as concealed or lost.
    laptop's click and the one from the home speakers, read in Audacity, is Navette's latency.
    Repeat five times and report the values.
 
-8. Crackles: with `navette serve --audio` in a terminal and the laptop on Wi-Fi, play music on
+8. Crackles: with `navette serve --audio` in a terminal, a mode running and the laptop on
+   Wi-Fi, play music on
    the laptop for ten minutes or more. Listen for crackles, and note the last
    `navette: audio:` line home printed: each counter says which kind of event a crackle was.
    Also run `journalctl --user -u navette-agent | grep 'frames dropped'` on the laptop.
