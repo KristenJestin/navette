@@ -1,10 +1,10 @@
 //! The remote's picture path for one output: capture it (`hypr-capture`), encode it (gliff-vk
 //! and VA-API on the GPU, Dual420 as gliff does; gliff-sw on the CPU when the GPU cannot),
-//! pace it and adapt the rate to the link, and send it home.
+//! pace it and adapt the rate to the link, and send it home, with the cursor's image apart.
 //!
 //! Adapted from gliff-server's `session.rs` (gliff, MIT, see `LICENSES/gliff-MIT.txt`): the
 //! capture, pacing, refinement, ladder and fallback logic is gliff's. What Navette drops: the
-//! handshake (the display's `Start` order replaces it), input and clipboard (their own issues),
+//! handshake (the display's `Start` order replaces it), input and clipboard (their own modules),
 //! resizing to a client window and mirroring (the output copies a home monitor, fixed).
 
 use std::io;
@@ -129,6 +129,14 @@ fn now_us() -> u64 {
 /// Events from the capture thread.
 enum Incoming {
     Frame(CapturedFrame),
+    /// The cursor's new image, little-endian ARGB8888.
+    Cursor {
+        width: u32,
+        height: u32,
+        hot_x: i32,
+        hot_y: i32,
+        argb: Vec<u8>,
+    },
     Stopped,
     Error(String),
 }
@@ -157,6 +165,8 @@ struct Session {
     /// The pending frame has already counted as blocked for the rate controller.
     blocked_noted: bool,
     frame_id: u64,
+    /// The id of the last cursor image sent.
+    cursor_shape_id: u32,
     want_keyframe: bool,
     /// The one commanded cadence: the pace timer and the encoder's frame rate both use it.
     fps_cmd: u32,
@@ -243,6 +253,7 @@ impl Session {
             capture_asked: false,
             blocked_noted: false,
             frame_id: 0,
+            cursor_shape_id: 0,
             want_keyframe: true,
             fps_cmd,
             encode_us: 0.0,
@@ -285,6 +296,18 @@ impl Session {
                 },
                 ev = captures.recv() => match ev {
                     Some(Incoming::Frame(frame)) => self.on_frame(frame)?,
+                    Some(Incoming::Cursor { width, height, hot_x, hot_y, argb }) => {
+                        self.cursor_shape_id += 1;
+                        let shape = ServerMsg::CursorShape {
+                            id: self.cursor_shape_id,
+                            width,
+                            height,
+                            hot_x,
+                            hot_y,
+                            argb_len: argb.len() as u32,
+                        };
+                        self.outbox.send(Msg::Video(shape), vec![argb]);
+                    }
                     Some(Incoming::Stopped) | None => {
                         return Err(io::Error::other("the capture stopped"));
                     }
@@ -860,13 +883,27 @@ fn start_capture(
             .map_err(|e| other("capture", e))?,
     );
     config.render_node = render_node.to_path_buf();
-    // The pointer is home's own, drawn by home's compositor.
-    config.cursor = false;
+    // The cursor's image goes home on its own, for home's compositor to draw at home's pointer,
+    // as gliff does: with no delay, and never in the picture.
+    config.cursor = true;
     // One extra ring slot: the session pins the last sent frame for refinement.
     config.buffers = 4;
     let sink = Box::new(move |ev: CaptureEvent| {
         let msg = match ev {
             CaptureEvent::Frame(frame) => Incoming::Frame(frame),
+            CaptureEvent::CursorShape {
+                width,
+                height,
+                hot_x,
+                hot_y,
+                argb,
+            } => Incoming::Cursor {
+                width,
+                height,
+                hot_x,
+                hot_y,
+                argb,
+            },
             CaptureEvent::Stopped => Incoming::Stopped,
             CaptureEvent::Error(e) => Incoming::Error(e),
             _ => return,

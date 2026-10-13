@@ -17,7 +17,10 @@
 //!   pointer moves onto a monitor with no window.
 //! - Not `exclusive`: Hyprland then keeps the pointer on the surface wherever it goes.
 //!
-//! The pointer and keyboard events go to [`crate::input::Capture`].
+//! The pointer and keyboard events go to [`crate::input::Capture`]. The remote cursor's image is
+//! the surface's pointer image, so home's compositor draws it at home's pointer with no delay,
+//! as gliff's client does (gliff, MIT, see `LICENSES/gliff-MIT.txt`); before the first one, or
+//! for one with nothing to show, the pointer is the default arrow.
 
 use std::collections::HashMap;
 use std::io;
@@ -51,6 +54,10 @@ use wayland_client::protocol::{
     wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop};
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1::{self, WpCursorShapeDeviceV1},
+    wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+};
 use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::{
     zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
     zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
@@ -99,11 +106,54 @@ fn same_gpu(main_device: u64, render_node: &Path) -> bool {
     hardware(main_device).is_some_and(|main| hardware(node.rdev()) == Some(main))
 }
 
+/// The remote cursor's image: little-endian ARGB8888 in the output's pixels, its hotspot in
+/// them too.
+#[derive(Debug)]
+pub struct Cursor {
+    pub width: u32,
+    pub height: u32,
+    pub hot_x: i32,
+    pub hot_y: i32,
+    pub argb: bytes::Bytes,
+}
+
+/// The largest cursor taken, as gliff's client.
+const MAX_CURSOR: u32 = 1024;
+
+impl Cursor {
+    /// Whether it can be shown: a sane size, its pixels all there, and a visible shape (not
+    /// fully transparent, nor one flat colour as Hyprland sends when it has no image to share).
+    fn shows(&self) -> bool {
+        let needed = self.width as u64 * self.height as u64 * 4;
+        if self.width == 0
+            || self.height == 0
+            || self.width > MAX_CURSOR
+            || self.height > MAX_CURSOR
+            || (self.argb.len() as u64) < needed
+        {
+            return false;
+        }
+        let mut pixels = self.argb[..needed as usize].as_chunks::<4>().0.iter();
+        let Some(first) = pixels.next() else {
+            return false;
+        };
+        let opaque = first[3] != 0 || pixels.clone().any(|p| p[3] != 0);
+        let uniform = pixels.all(|p| p == first);
+        opaque && !uniform
+    }
+}
+
+/// What the surface is given to show.
+enum Show {
+    Picture(Picture),
+    Cursor(Cursor),
+}
+
 /// The surface, on its own thread. Dropping it removes the surface.
 pub struct Surface {
     /// The compositor takes the decoder's linear XRGB8888 dmabuf.
     linear_dmabuf: bool,
-    pictures: Option<channel::Sender<Picture>>,
+    pictures: Option<channel::Sender<Show>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -186,8 +236,15 @@ impl Surface {
     pub fn pictures(&self) -> Box<dyn FnMut(Picture) + Send> {
         let pictures = self.pictures.clone().expect("open until dropped");
         Box::new(move |picture| {
-            let _ = pictures.send(picture);
+            let _ = pictures.send(Show::Picture(picture));
         })
+    }
+
+    /// The remote cursor's new image.
+    pub fn cursor(&self, cursor: Cursor) {
+        if let Some(pictures) = &self.pictures {
+            let _ = pictures.send(Show::Cursor(cursor));
+        }
     }
 }
 
@@ -232,7 +289,7 @@ fn wayland(e: impl std::fmt::Display) -> io::Error {
 fn run(
     conn: Connection,
     output_name: &str,
-    pictures: Channel<Picture>,
+    pictures: Channel<Show>,
     capture: Capture,
     ready: &std::sync::mpsc::Sender<Ready>,
 ) -> io::Result<Option<String>> {
@@ -249,6 +306,7 @@ fn run(
         .bind(&qh, 1..=7, ())
         .map_err(|_| io::Error::other("the compositor has no seat"))?;
     let inhibit: Option<ZwpKeyboardShortcutsInhibitManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+    let shapes: Option<WpCursorShapeManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
     if inhibit.is_none() {
         eprintln!(
             "navette: the compositor cannot inhibit its shortcuts: they stay home over the \
@@ -281,7 +339,16 @@ fn run(
         pointer: None,
         keyboard: None,
         discrete: None,
+        shapes,
+        shape: None,
+        cursor_surface: compositor.create_surface(&qh),
+        cursor_viewport: None,
+        cursor_buffer: None,
+        hotspot: None,
+        entered: None,
+        physical_width: None,
     };
+    state.cursor_viewport = Some(viewporter.get_viewport(&state.cursor_surface, &qh, ()));
 
     if state.dmabuf.version().is_some_and(|v| v >= 4) {
         let _ = state.dmabuf.get_default_feedback(&qh);
@@ -325,6 +392,18 @@ fn run(
         .info(&output)
         .map(|i| i.transform)
         .unwrap_or(wl_output::Transform::Normal);
+    // The monitor's width in pixels as laid out: with the surface's logical width, its scale.
+    state.physical_width = state.outputs.info(&output).and_then(|info| {
+        let (width, height) = info.modes.iter().find(|m| m.current)?.dimensions;
+        let turned = matches!(
+            info.transform,
+            wl_output::Transform::_90
+                | wl_output::Transform::_270
+                | wl_output::Transform::Flipped90
+                | wl_output::Transform::Flipped270
+        );
+        Some(if turned { height } else { width } as f64)
+    });
 
     let surface = compositor.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(
@@ -346,11 +425,12 @@ fn run(
     event_loop
         .handle()
         .insert_source(pictures, |event, _, state| match event {
-            ChannelEvent::Msg(picture) => {
+            ChannelEvent::Msg(Show::Picture(picture)) => {
                 // An older picture still waiting is dropped here.
                 state.pending = Some(picture);
                 state.present();
             }
+            ChannelEvent::Msg(Show::Cursor(cursor)) => state.remote_cursor(cursor),
             ChannelEvent::Closed => state.exit = Some(None),
         })
         .map_err(|e| wayland(e.error))?;
@@ -398,6 +478,18 @@ struct State {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     /// The wheel's step, sent with the axis event that follows it.
     discrete: Option<i32>,
+    /// For the default arrow, when the compositor has cursor shapes.
+    shapes: Option<WpCursorShapeManagerV1>,
+    shape: Option<WpCursorShapeDeviceV1>,
+    /// The remote cursor's image, and its hotspot in logical pixels once there is one to show.
+    cursor_surface: wl_surface::WlSurface,
+    cursor_viewport: Option<wp_viewport::WpViewport>,
+    cursor_buffer: Option<Buffer>,
+    hotspot: Option<(i32, i32)>,
+    /// The serial of the pointer's entry, while it is over the surface.
+    entered: Option<u32>,
+    /// The monitor's width in pixels, turned as laid out.
+    physical_width: Option<f64>,
 }
 
 impl State {
@@ -433,6 +525,65 @@ impl State {
 
     fn ours(&self, surface: &wl_surface::WlSurface) -> bool {
         self.surface() == Some(surface)
+    }
+
+    /// The monitor's scale: its pixels per logical pixel.
+    fn scale(&self) -> f64 {
+        match (self.physical_width, self.size) {
+            (Some(pixels), Some((width, _))) if width > 0 => pixels / width as f64,
+            _ => 1.0,
+        }
+    }
+
+    /// Draws the remote cursor's new image, and shows it if the pointer is over the surface.
+    fn remote_cursor(&mut self, cursor: Cursor) {
+        tracing::debug!(
+            width = cursor.width,
+            height = cursor.height,
+            shows = cursor.shows(),
+            "remote cursor"
+        );
+        if !cursor.shows() {
+            self.hotspot = None;
+            self.set_cursor();
+            return;
+        }
+        let len = (cursor.width * cursor.height * 4) as usize;
+        let Some(buffer) = self.shm_buffer_argb(cursor.width, cursor.height, |canvas| {
+            canvas.copy_from_slice(&cursor.argb[..len])
+        }) else {
+            return;
+        };
+        // The image is in the remote output's pixels, which are this monitor's: shown at its
+        // scale, it is the size the remote shows.
+        let scale = self.scale();
+        let logical = |v: f64| ((v / scale).round() as i32).max(1);
+        let _ = buffer.attach_to(&self.cursor_surface);
+        if let Some(viewport) = &self.cursor_viewport {
+            viewport.set_destination(logical(cursor.width as f64), logical(cursor.height as f64));
+        }
+        self.cursor_surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+        self.cursor_surface.commit();
+        self.cursor_buffer = Some(buffer);
+        self.hotspot = Some((
+            (cursor.hot_x as f64 / scale).round() as i32,
+            (cursor.hot_y as f64 / scale).round() as i32,
+        ));
+        self.set_cursor();
+    }
+
+    /// The pointer's image over the surface: the remote cursor's, else the default arrow.
+    fn set_cursor(&self) {
+        let (Some(serial), Some(pointer)) = (self.entered, &self.pointer) else {
+            return;
+        };
+        match (self.hotspot, &self.shape) {
+            (Some((x, y)), _) => pointer.set_cursor(serial, Some(&self.cursor_surface), x, y),
+            (None, Some(shape)) => {
+                shape.set_shape(serial, wp_cursor_shape_device_v1::Shape::Default)
+            }
+            (None, None) => {}
+        }
     }
 
     /// Shows the waiting picture if the compositor is ready for one.
@@ -501,18 +652,32 @@ impl State {
         height: u32,
         draw: impl FnOnce(&mut [u8]),
     ) -> Option<Buffer> {
+        self.shm_buffer_in(width, height, wl_shm::Format::Xrgb8888, draw)
+    }
+
+    fn shm_buffer_argb(
+        &mut self,
+        width: u32,
+        height: u32,
+        draw: impl FnOnce(&mut [u8]),
+    ) -> Option<Buffer> {
+        self.shm_buffer_in(width, height, wl_shm::Format::Argb8888, draw)
+    }
+
+    fn shm_buffer_in(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: wl_shm::Format,
+        draw: impl FnOnce(&mut [u8]),
+    ) -> Option<Buffer> {
         let len = (width * height * 4) as usize;
         if self.pool.is_none() {
             self.pool = SlotPool::new(len * 2, &self.shm).ok();
         }
         let pool = self.pool.as_mut()?;
         let (buffer, canvas) = pool
-            .create_buffer(
-                width as i32,
-                height as i32,
-                width as i32 * 4,
-                wl_shm::Format::Xrgb8888,
-            )
+            .create_buffer(width as i32, height as i32, width as i32 * 4, format)
             .ok()?;
         draw(&mut canvas[..len]);
         Some(buffer)
@@ -684,6 +849,8 @@ delegate_layer!(State);
 delegate_registry!(State);
 delegate_noop!(State: wp_viewporter::WpViewporter);
 delegate_noop!(State: ZwpKeyboardShortcutsInhibitManagerV1);
+delegate_noop!(State: WpCursorShapeManagerV1);
+delegate_noop!(State: WpCursorShapeDeviceV1);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
 
 impl Dispatch<wl_seat::WlSeat, ()> for State {
@@ -702,7 +869,12 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
             return;
         };
         if caps.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
-            state.pointer = Some(seat.get_pointer(qh, ()));
+            let pointer = seat.get_pointer(qh, ());
+            state.shape = state
+                .shapes
+                .as_ref()
+                .map(|shapes| shapes.get_pointer(&pointer, qh, ()));
+            state.pointer = Some(pointer);
         }
         if caps.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
             state.keyboard = Some(seat.get_keyboard(qh, ()));
@@ -722,15 +894,18 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         use wl_pointer::Event;
         match event {
             Event::Enter {
+                serial,
                 surface,
                 surface_x,
                 surface_y,
-                ..
             } if state.ours(&surface) => {
+                state.entered = Some(serial);
+                state.set_cursor();
                 let focus = state.capture.enter(surface_x, surface_y);
                 state.focus(focus);
             }
             Event::Leave { surface, .. } if state.ours(&surface) => {
+                state.entered = None;
                 let focus = state.capture.leave();
                 state.focus(focus);
             }
@@ -843,6 +1018,32 @@ mod tests {
         .expect("no surface");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(begin.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    fn cursor(width: u32, height: u32, argb: Vec<u8>) -> Cursor {
+        Cursor {
+            width,
+            height,
+            hot_x: 0,
+            hot_y: 0,
+            argb: argb.into(),
+        }
+    }
+
+    #[test]
+    fn a_remote_cursor_with_a_shape_is_shown() {
+        let mut argb = vec![0; 16];
+        argb[3] = 255;
+        assert!(cursor(2, 2, argb).shows());
+    }
+
+    #[test]
+    fn a_remote_cursor_with_nothing_to_show_leaves_the_default_arrow() {
+        // Fully transparent; one flat colour (Hyprland's "no image"); pixels missing; too large.
+        assert!(!cursor(2, 2, vec![0; 16]).shows());
+        assert!(!cursor(2, 2, [9, 9, 9, 255].repeat(4)).shows());
+        assert!(!cursor(2, 2, vec![255; 8]).shows());
+        assert!(!cursor(MAX_CURSOR + 1, 1, vec![255; 4 * 1025]).shows());
     }
 
     #[test]

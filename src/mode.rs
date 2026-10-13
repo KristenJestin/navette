@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use gliff_proto::ServerMsg;
 use gliff_vk::Gpu;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -24,6 +25,7 @@ use tokio::sync::oneshot;
 use crate::desk::{Change, Desk, DeskError};
 use crate::display::Ended;
 use crate::display::decode::{self, Decoding, Picture, Video};
+use crate::display::surface::Cursor;
 use crate::display::wire::{Display, Incoming, Msg, OutputCopy, Peer};
 use crate::hypr::{self, Eval, Hypr, lua_string};
 use crate::input::{self, Hotkey};
@@ -106,6 +108,8 @@ pub trait Screens: Send + Sync {
 
 pub trait Screen: Send {
     fn pictures(&self) -> Box<dyn FnMut(Picture) + Send>;
+    /// The remote cursor's image, shown at home's pointer over the cover.
+    fn cursor(&self, cursor: Cursor);
     /// The GPU's pictures can be handed over as dmabufs, with no copy.
     fn takes_dmabuf(&self) -> bool;
 }
@@ -130,6 +134,10 @@ impl Screens for LiveScreens {
 impl Screen for crate::display::surface::Surface {
     fn pictures(&self) -> Box<dyn FnMut(Picture) + Send> {
         crate::display::surface::Surface::pictures(self)
+    }
+
+    fn cursor(&self, cursor: Cursor) {
+        crate::display::surface::Surface::cursor(self, cursor)
     }
 
     fn takes_dmabuf(&self) -> bool {
@@ -158,7 +166,7 @@ struct Active {
     monitor: String,
     // Field order is drop order: the decoder stops before the surface goes.
     decoding: Decoding,
-    _screen: Box<dyn Screen>,
+    screen: Box<dyn Screen>,
     desk: Arc<Mutex<Desk<Eval>>>,
     /// Why the surface or the decoder cannot go on.
     ended: UnboundedReceiver<String>,
@@ -223,6 +231,15 @@ pub async fn serve(
                             ),
                         }
                         release(a).await;
+                    }
+                }
+                Some(Incoming::Video {
+                    msg: ServerMsg::CursorShape { width, height, hot_x, hot_y, .. },
+                    main,
+                    ..
+                }) => {
+                    if let Some(a) = &active {
+                        a.screen.cursor(Cursor { width, height, hot_x, hot_y, argb: main });
                     }
                 }
                 Some(Incoming::Video { msg, main, aux }) => {
@@ -385,7 +402,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
     *active = Some(Active {
         monitor,
         decoding,
-        _screen: screen,
+        screen,
         desk: Arc::new(Mutex::new(desk)),
         ended,
         starting: None,
@@ -573,11 +590,14 @@ mod tests {
         ends: Arc<Mutex<Vec<Ended>>>,
         /// The release hotkey each screen was given.
         hotkeys: Arc<Mutex<Vec<Option<Hotkey>>>>,
+        /// The cursors the screens were given.
+        cursors: Arc<Mutex<Vec<Cursor>>>,
     }
 
     struct FakeScreen {
         monitor: String,
         covered: Arc<Mutex<Vec<String>>>,
+        cursors: Arc<Mutex<Vec<Cursor>>>,
     }
 
     impl Screens for FakeScreens {
@@ -594,6 +614,7 @@ mod tests {
             Ok(Box::new(FakeScreen {
                 monitor: monitor.to_string(),
                 covered: self.covered.clone(),
+                cursors: self.cursors.clone(),
             }))
         }
     }
@@ -605,6 +626,10 @@ mod tests {
 
         fn takes_dmabuf(&self) -> bool {
             false
+        }
+
+        fn cursor(&self, cursor: Cursor) {
+            self.cursors.lock().unwrap().push(cursor);
         }
     }
 
@@ -620,6 +645,7 @@ mod tests {
         covered: Arc<Mutex<Vec<String>>>,
         ends: Arc<Mutex<Vec<Ended>>>,
         hotkeys: Arc<Mutex<Vec<Option<Hotkey>>>>,
+        cursors: Arc<Mutex<Vec<Cursor>>>,
         peers: UnboundedSender<Peer>,
         orders: UnboundedSender<Order>,
         events: UnboundedSender<hypr::Event>,
@@ -640,6 +666,7 @@ mod tests {
         let covered = screens.covered.clone();
         let ends = screens.ends.clone();
         let hotkeys = screens.hotkeys.clone();
+        let cursors = screens.cursors.clone();
         let (peers, peers_rx) = mpsc::unbounded_channel();
         let (orders, orders_rx) = mpsc::unbounded_channel();
         let (events, events_rx) = mpsc::unbounded_channel();
@@ -657,6 +684,7 @@ mod tests {
             covered,
             ends,
             hotkeys,
+            cursors,
             peers,
             orders,
             events,
@@ -825,6 +853,30 @@ mod tests {
         until(|| desk.hypr.window_rules().len() == 2).await;
         let rules = desk.hypr.window_rules();
         assert_eq!(rules[0], rules[1]);
+    }
+
+    #[tokio::test]
+    async fn the_remote_cursor_is_drawn_on_the_cover() {
+        let desk = desk("DP-2");
+        let remote = started(&desk).await;
+        let shape = ServerMsg::CursorShape {
+            id: 1,
+            width: 1,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            argb_len: 4,
+        };
+        remote
+            .to_home
+            .try_send(Incoming::Video {
+                msg: shape,
+                main: bytes::Bytes::from_static(&[1, 2, 3, 255]),
+                aux: bytes::Bytes::new(),
+            })
+            .unwrap();
+        until(|| !desk.cursors.lock().unwrap().is_empty()).await;
+        assert_eq!(&desk.cursors.lock().unwrap()[0].argb[..], &[1, 2, 3, 255]);
     }
 
     #[tokio::test]

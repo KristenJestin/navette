@@ -1,5 +1,6 @@
 //! `navette agent` with a synthetic picture: the real link, the real headless output on the
-//! remote's Hyprland, but a moving pattern encoded on the CPU instead of the captured output.
+//! remote's Hyprland, its real input and cursor, but a moving pattern encoded on the CPU instead
+//! of the captured output.
 //! For a test machine whose capture cannot be read (an NVIDIA GPU, whose headless Hyprland
 //! offers only tiled buffers, and has no VA-API encoder), to check home's side end to end.
 //!
@@ -25,9 +26,10 @@ const FPS: u64 = 60;
 
 struct Synthetic;
 
-/// Stops the pattern thread when dropped.
+/// Stops the pattern thread when dropped, and the cursor's capture.
 struct Running {
     stop: Arc<std::sync::atomic::AtomicBool>,
+    _cursor: std::sync::Mutex<hypr_capture::Capturer>,
 }
 
 impl Drop for Running {
@@ -60,6 +62,7 @@ impl Streams for Synthetic {
             false,
         )
         .map_err(io::Error::other)?;
+        let cursor = std::sync::Mutex::new(cursor(&source.output, outbox.clone())?);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopped = stop.clone();
         let output = source.output.clone();
@@ -137,8 +140,45 @@ impl Streams for Synthetic {
             }
             eprintln!("synthetic agent: the pattern stopped after {frame_id} frames");
         });
-        Ok(Box::new(Running { stop }))
+        Ok(Box::new(Running {
+            stop,
+            _cursor: cursor,
+        }))
     }
+}
+
+/// The cursor's image, captured as `navette agent` does, with no frame ever asked for.
+fn cursor(output: &str, outbox: Outbox) -> io::Result<hypr_capture::Capturer> {
+    let mut config = hypr_capture::CaptureConfig::new(output.to_string());
+    config.target.display = Some(
+        hypr::instance()?
+            .wayland_display()
+            .map_err(io::Error::other)?,
+    );
+    config.cursor = true;
+    let mut id = 0;
+    let sink = Box::new(move |event| {
+        if let hypr_capture::CaptureEvent::CursorShape {
+            width,
+            height,
+            hot_x,
+            hot_y,
+            argb,
+        } = event
+        {
+            id += 1;
+            let shape = ServerMsg::CursorShape {
+                id,
+                width,
+                height,
+                hot_x,
+                hot_y,
+                argb_len: argb.len() as u32,
+            };
+            outbox.send(Msg::Video(shape), vec![argb]);
+        }
+    });
+    hypr_capture::Capturer::start(config, sink).map_err(io::Error::other)
 }
 
 /// Grey bars, and a bright square that crosses the screen in two seconds.

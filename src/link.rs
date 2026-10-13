@@ -305,12 +305,13 @@ async fn receive<R: AsyncRead + Unpin>(
                     ServerMsg::VideoFrame {
                         data_len, aux_len, ..
                     } => (*data_len, *aux_len),
+                    ServerMsg::CursorShape { argb_len, .. } => (*argb_len, 0),
                     _ => (0, 0),
                 };
                 if main.max(aux) > MAX_VIDEO_PAYLOAD {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "a video frame larger than any screen's",
+                        "a video frame or a cursor larger than any screen's",
                     ));
                 }
                 // The whole frame, payloads included, within one timeout: a peer gone in the
@@ -1083,6 +1084,29 @@ pub(crate) mod tests {
                 assert_eq!(&aux[..], &[9, 9, 9]);
             }
             other => panic!("expected a video frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_remote_cursor_s_image_crosses_the_link() {
+        let mut ends = display_link(64 * 1024).await;
+        let shape = ServerMsg::CursorShape {
+            id: 1,
+            width: 2,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            argb_len: 8,
+        };
+        ends.remote
+            .outbox
+            .send(DisplayMsg::Video(shape.clone()), vec![vec![5; 8]]);
+        match incoming(&mut ends.home).await {
+            Incoming::Video { msg, main, .. } => {
+                assert_eq!(msg, shape);
+                assert_eq!(&main[..], &[5; 8]);
+            }
+            other => panic!("expected the cursor, got {other:?}"),
         }
     }
 
