@@ -35,7 +35,7 @@ cargo test
 ```
 
 How the link works: [docs/link.md](docs/link.md); the remote machine's sound:
-[docs/audio.md](docs/audio.md).
+[docs/audio.md](docs/audio.md); the home mic: [docs/mic.md](docs/mic.md).
 
 ## Install
 

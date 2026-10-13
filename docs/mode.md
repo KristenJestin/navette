@@ -37,11 +37,14 @@ While the mode runs:
   in a row the output is removed and the mode ends at home with the reason. Its monitor rule
   comes back after a config reload, and it is removed when the mode stops or the link drops. One
   left by an agent that crashed is removed when the agent starts again.
-- **At home**, the one change to the desk is a window rule: windows that would open on any
-  workspace of the reserved monitor open on another home monitor instead of under the surface.
-  It is undone when the mode stops, when the link drops, and at the next start after a crash,
-  and made again after a config reload. The mode also ends if the surface goes away (the monitor
-  unplugged, Hyprland restarted at home) or home cannot decode the picture.
+- **At home**, the changes to the desk are a window rule and, with `navette serve --audio`,
+  the mic's hotkey: windows that would open on any workspace of the reserved monitor open on
+  another home monitor instead of under the surface. Both are undone when the mode stops, when
+  the link drops, and at the next start after a crash, and made again after a config reload.
+  The mode also ends if the surface goes away (the monitor unplugged, Hyprland restarted at
+  home) or home cannot decode the picture.
+- **The home mic**, with `navette serve --audio`, goes to the remote machine while the mode runs,
+  and the hotkey switches it either way ([the mic](mic.md)).
 
 ## Decoding at home
 

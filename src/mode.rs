@@ -2,10 +2,11 @@
 //! mode start` checks everything first (the config, the monitor, the link) and changes nothing
 //! when a check fails; then home covers the monitor with its surface, asks the remote for its
 //! output, and shows its stream. `navette mode stop`, or the link dropping, gives the monitor
-//! back. Home monitors are never moved or reconfigured: the one change to the home desk is a
+//! back. Home monitors are never moved or reconfigured: the changes to the home desk are a
 //! window rule that opens home windows on another home monitor rather than hidden under the
-//! surface (#2), made through the desk recorder so it is undone on stop, on a dropped link and
-//! after a crash, and made again after a config reload.
+//! surface (#2) and, with a mic, the hotkey that switches it, made through the desk recorder
+//! so they are undone on stop, on a dropped link and after a crash, and made again after a
+//! config reload. The home mic goes to the remote machine for as long as the mode runs.
 //!
 //! `navette serve` owns the link and the surface, so the two commands reach it over a Unix
 //! socket in `$XDG_RUNTIME_DIR/navette`, private to the user.
