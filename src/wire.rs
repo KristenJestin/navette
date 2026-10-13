@@ -3,6 +3,12 @@
 //! alive; the clipboard messages are the five of gliff's transfer engine, so its rules (chunk
 //! size, ack window, serials) apply unchanged. A message this build does not know is skipped,
 //! so a newer peer can add some without breaking an older one.
+//!
+//! To extend the link without a new [`VERSION`](crate::link::VERSION), add a top-level variant
+//! to [`LinkMsg`] with a number never used before, or an optional field (`Option`, a new `#[n]`)
+//! at the end of an existing one: an older peer skips the first and ignores the second. Any
+//! other change is malformed to an older peer and ends the link, a new variant of a nested enum
+//! (`ClipboardItem`, say) included: change the version instead.
 
 use bytes::Bytes;
 use gliff_proto::clipboard::validate_files;

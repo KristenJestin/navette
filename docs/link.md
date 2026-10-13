@@ -45,13 +45,19 @@ refuses a request against an offer that a newer copy has replaced.
 - **Both machines use `ext-data-control`** (Hyprland has it), through gliff's `hypr-input`.
   The display is `$WAYLAND_DISPLAY`, else the running Hyprland session. If it is not there
   yet (the agent starting before the session) the link stays up, and the bridge looks again
-  every 5 s.
+  every 5 s; meanwhile a paste from the other machine is refused at once. The calls to the
+  compositor that can block run beside the link, never in its way: a slow compositor does not
+  stop the heartbeats.
 - **Limits** are gliff's: 32 MiB for a pasted item that is not a file, 4 GiB and 10,000
-  entries for a set of files.
+  entries for a set of files. An offer of the other machine beyond them, with a path out of
+  the spool folder, or with more than 64 mime types (or one longer than 255 bytes) is
+  refused: it withdraws that machine's previous copy, and nothing is offered.
+- **When the link drops**, every paste and transfer in flight ends at once, and the pasted
+  files are removed.
 - **Pasted files** are spooled under `$XDG_CACHE_HOME/navette/clipboard` (else
-  `~/.cache/navette/clipboard`), in a 0700 folder per offer, removed when the offer is
-  replaced (after five minutes' grace for the application that was just handed the paths) or
-  the link ends. A paste that fails is written to the journal ("a paste failed: ..."), with no
+  `~/.cache/navette/clipboard`, never the shared temporary folder), in a 0700 folder per
+  offer, removed when the offer is replaced (after five minutes' grace for the application
+  that was just handed the paths) or the link ends. A paste that fails is written to the journal ("a paste failed: ..."), with no
   file name or content; there is no desktop notification yet.
 
 ## The home firewall
