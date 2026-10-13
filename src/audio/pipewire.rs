@@ -16,7 +16,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -278,9 +278,44 @@ fn connect() -> io::Result<Loop> {
 struct Open {
     _listener: Box<dyn std::any::Any>,
     stream: pw::stream::StreamRc,
+    /// For a stream that plays: the rate its callback asks for, and the one applied.
+    rate: Option<(Arc<Rate>, Cell<f32>)>,
     _module: Option<Module>,
     /// The sink's monitor, that its sound is read from.
     _monitor: Option<Box<Open>>,
+}
+
+/// How often the loop applies the rate the playing streams ask for: the rate follows a level
+/// smoothed over seconds.
+const RATE_EVERY: Duration = Duration::from_millis(100);
+
+/// The rate a playing stream's callback asks for, which the loop applies. A stream's controls
+/// are set on the loop: from the realtime thread, PipeWire warns of the wrong context at each
+/// call and writes to the server from a thread that is not the connection's.
+struct Rate {
+    /// The bits of an `f32`, for the realtime thread neither locks nor waits.
+    asked: AtomicU32,
+}
+
+impl Default for Rate {
+    fn default() -> Self {
+        Self {
+            asked: AtomicU32::new(1.0f32.to_bits()),
+        }
+    }
+}
+
+impl Rate {
+    fn ask(&self, rate: f32) {
+        self.asked.store(rate.to_bits(), Ordering::Relaxed);
+    }
+
+    /// The rate to apply now that `applied` is: none within 10 ppm of it, a fraction of a ms
+    /// over a minute.
+    fn due(&self, applied: f32) -> Option<f32> {
+        let asked = f32::from_bits(self.asked.load(Ordering::Relaxed));
+        ((asked - applied).abs() >= 1e-5).then_some(asked)
+    }
 }
 
 /// A module loaded into this process's own context: its nodes live here, and go when it is
@@ -411,6 +446,7 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
     let streams: Rc<RefCell<HashMap<u64, Open>>> = Rc::default();
     let quit = mainloop.clone();
     let next_id = Cell::new(0u64);
+    let playing = streams.clone();
     let _commands = commands.attach(mainloop.loop_(), move |command| match command {
         Command::DefaultNode(device, reply) => {
             let value = configured.borrow_mut().of(device).clone();
@@ -481,6 +517,20 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
         }
         Command::Quit => quit.quit(),
     });
+    let rates = mainloop.loop_().add_timer(move |_| {
+        for open in playing.borrow().values() {
+            if let Some((rate, applied)) = &open.rate
+                && let Some(asked) = rate.due(applied.get())
+                && open
+                    .stream
+                    .set_control(spa::sys::SPA_PROP_rate, &[asked])
+                    .is_ok()
+            {
+                applied.set(asked);
+            }
+        }
+    });
+    let _ = rates.update_timer(Some(RATE_EVERY), Some(RATE_EVERY));
     if !failed.get() {
         mainloop.run();
     }
@@ -733,6 +783,7 @@ fn open_sink(
     Ok(Open {
         _listener: Box::new(listener),
         stream,
+        rate: None,
         _module: None,
         _monitor: Some(Box::new(monitor)),
     })
@@ -877,6 +928,7 @@ fn recording(
     Ok(Open {
         _listener: Box::new(listener),
         stream,
+        rate: None,
         _module: None,
         _monitor: None,
     })
@@ -892,9 +944,10 @@ fn playing(
 ) -> io::Result<Open> {
     let stream = pw::stream::StreamRc::new(core.clone(), name, props).map_err(pw_error)?;
     let samples = vec![0.0f32; SAMPLES_PER_CYCLE];
+    let rate = Arc::new(Rate::default());
     let listener = stream
-        .add_local_listener_with_user_data((jitter, samples, 1.0f32))
-        .process(|stream, (jitter, samples, applied)| {
+        .add_local_listener_with_user_data((jitter, samples, rate.clone()))
+        .process(|stream, (jitter, samples, rate)| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -911,15 +964,9 @@ fn playing(
                         frames = frames.min(requested);
                     }
                     let samples = &mut samples[..frames * CHANNELS];
-                    let rate = fill(jitter, samples) as f32;
                     // The stream's resampler takes the sound at this rate, which keeps the
                     // buffer on its target while the two machines' clocks drift.
-                    // Within 10 ppm, nothing is told: a fraction of a ms over a minute.
-                    if (rate - *applied).abs() >= 1e-5
-                        && stream.set_control(spa::sys::SPA_PROP_rate, &[rate]).is_ok()
-                    {
-                        *applied = rate;
-                    }
+                    rate.ask(fill(jitter, samples) as f32);
                     for (out, sample) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(samples.iter())
                     {
                         out.copy_from_slice(&sample.to_le_bytes());
@@ -939,6 +986,7 @@ fn playing(
     Ok(Open {
         _listener: Box::new(listener),
         stream,
+        rate: Some((rate, Cell::new(1.0))),
         _module: None,
         _monitor: None,
     })
@@ -1050,6 +1098,32 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn the_callback_asks_for_a_rate_without_allocating() {
+        use crate::audio::allocations::during;
+
+        let rate = Rate::default();
+        assert_eq!(during(|| rate.ask(1.002)), 0);
+    }
+
+    #[test]
+    fn a_rate_the_callback_asks_for_is_applied_by_the_loop() {
+        let rate = Rate::default();
+        assert_eq!(rate.due(1.0), None);
+        rate.ask(1.002);
+        assert_eq!(rate.due(1.0), Some(1.002));
+        assert_eq!(rate.due(1.002), None);
+    }
+
+    #[test]
+    fn a_rate_within_10_ppm_of_the_applied_one_is_not_applied_again() {
+        let rate = Rate::default();
+        rate.ask(1.000_005);
+        assert_eq!(rate.due(1.0), None);
+        rate.ask(0.999_98);
+        assert_eq!(rate.due(1.0), Some(0.999_98));
     }
 
     #[test]
