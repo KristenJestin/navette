@@ -1186,7 +1186,7 @@ mod tests {
 
         fn next_frame(&self) -> Option<u64> {
             while !self.outbox.queued().is_empty() {
-                if let (Msg::Video(ServerMsg::VideoFrame { frame_id, .. }), _) =
+                if let (_, Msg::Video(ServerMsg::VideoFrame { frame_id, .. }), _) =
                     self.runtime.block_on(self.outbox.next())
                 {
                     return Some(frame_id);
@@ -1449,7 +1449,7 @@ mod tests {
         let mut decoder = None;
         let mut config = None;
         loop {
-            let (msg, payloads) = outbox.next().await;
+            let (_, msg, payloads) = outbox.next().await;
             match msg {
                 Msg::Video(ServerMsg::Ping { t }) => {
                     tokio::time::sleep(2 * lan.one_way).await;
@@ -1474,7 +1474,7 @@ mod tests {
                     let bytes = payloads.iter().map(Vec::len).sum();
                     let took = lan.transmit(bytes);
                     tokio::time::sleep(took).await;
-                    outbox.report_write(took);
+                    outbox.report_write(0, took);
                     tokio::time::sleep(lan.one_way).await;
                     let decoded = decoder
                         .as_mut()
