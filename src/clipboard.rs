@@ -1178,4 +1178,51 @@ mod tests {
             })
             .await;
     }
+
+    #[tokio::test]
+    async fn a_new_bridge_on_the_same_link_never_reuses_a_serial() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (_from_peer, inbound) = mpsc::channel(1);
+                let (to_peer, mut sent) = outbound_channel();
+                let mut wire = Wire {
+                    from_peer: inbound,
+                    to_peer,
+                };
+                let serials = Rc::default();
+                let clipboard = Arc::new(Fake::default());
+                let mut seen = Vec::new();
+                // The compositor goes away after one copy, then a new bridge picks the link up.
+                for _ in 0..2 {
+                    let (events, selected) = mpsc::unbounded_channel();
+                    let mime_types = clipboard.select(&[(TEXT, b"note")]);
+                    events.send(Selected::Selection { mime_types }).unwrap();
+                    let bridge = super::run(
+                        Side::Client,
+                        &mut wire,
+                        clipboard.clone(),
+                        selected,
+                        Some(tmp.path().into()),
+                        Rc::clone(&serials),
+                    );
+                    tokio::pin!(bridge);
+                    let serial = loop {
+                        tokio::select! {
+                            _ = &mut bridge => panic!("the bridge ended before its offer"),
+                            sent = sent.recv() => {
+                                if let (ClipboardMsg::Offer { serial, .. }, _) = sent.unwrap() {
+                                    break serial;
+                                }
+                            }
+                        }
+                    };
+                    drop(events);
+                    assert!(!bridge.await, "the compositor went, not the link");
+                    seen.push(serial);
+                }
+                assert_ne!(seen[0], seen[1], "the peer may still request the first");
+            })
+            .await;
+    }
 }
