@@ -10,9 +10,14 @@ name = "navette"
 path = "src/main.rs"
 
 [dependencies]
+bytes = "1"
 clap = { version = "4.6", features = ["derive", "env"] }
+gliff-proto = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
+gliff-transport = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
 hkdf = "0.12"
 hmac = "0.12"
+hypr-input = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
+minicbor = { version = "2", features = ["derive", "alloc"] }
 opus = "0.4"
 pipewire = { version = "0.10", features = ["v0_3_49"] }
 rand = "0.8"
