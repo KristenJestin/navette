@@ -79,6 +79,12 @@ pub enum LinkMsg {
     // Input (`crate::input`), home to remote, a block of numbers of its own.
     #[n(30)]
     Input(#[n(0)] input::Event),
+    /// Remote to home, once a mode: the picture runs without input.
+    #[n(31)]
+    NoInput {
+        #[n(0)]
+        reason: String,
+    },
     // The remote machine's sound (`crate::audio`), a block of numbers of its own.
     #[n(48)]
     AudioStart {
@@ -105,6 +111,7 @@ impl From<Msg> for LinkMsg {
             Msg::Display(display) => Self::Display(display),
             Msg::Video(msg) => Self::Video(msg),
             Msg::Feedback(msg) => Self::Feedback(msg),
+            Msg::NoInput(reason) => Self::NoInput { reason },
         }
     }
 }
@@ -169,6 +176,7 @@ impl LinkMsg {
             | Self::Video(_)
             | Self::Feedback(_)
             | Self::Input(_)
+            | Self::NoInput { .. }
             | Self::AudioStart { .. }
             | Self::AudioStop
             | Self::AudioFrame { .. } => return None,

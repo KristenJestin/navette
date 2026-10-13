@@ -348,6 +348,10 @@ async fn receive<R: AsyncRead + Unpin>(
                 let _ = display.try_send(Incoming::Feedback(msg));
                 continue;
             }
+            LinkMsg::NoInput { reason } => {
+                let _ = display.try_send(Incoming::NoInput(reason));
+                continue;
+            }
             msg => msg,
         };
         let Some(clip) = clip.into_clipboard().map(checked) else {
@@ -1107,6 +1111,19 @@ pub(crate) mod tests {
                 assert_eq!(&main[..], &[5; 8]);
             }
             other => panic!("expected the cursor, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_remote_s_no_input_notice_crosses_the_link() {
+        let mut ends = display_link(64 * 1024).await;
+        ends.remote.outbox.send(
+            DisplayMsg::NoInput("no virtual keyboard".into()),
+            Vec::new(),
+        );
+        match incoming(&mut ends.home).await {
+            Incoming::NoInput(reason) => assert_eq!(reason, "no virtual keyboard"),
+            other => panic!("expected the notice, got {other:?}"),
         }
     }
 

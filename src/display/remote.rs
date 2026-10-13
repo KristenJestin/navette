@@ -115,7 +115,20 @@ struct Active {
     caps: ClientCaps,
     /// Failures in a row: streams that would not start, or stopped before [`STEADY`].
     failures: u32,
+    told_no_input: bool,
     stream: Stream,
+}
+
+impl Active {
+    fn run(&mut self, running: Running, outbox: &Outbox) {
+        if let Err(reason) = &running.input
+            && !self.told_no_input
+        {
+            self.told_no_input = true;
+            outbox.send(Msg::NoInput(reason.clone()), Vec::new());
+        }
+        self.stream = Stream::Running(running);
+    }
 }
 
 enum Stream {
@@ -128,7 +141,8 @@ struct Running {
     // Field order is drop order: the capture, then the injector, both before the output goes
     // (Hyprland 0.56 aborts when a cursor capture outlives its monitor).
     _stream: Box<dyn Send + Sync>,
-    input: Box<dyn Inject>,
+    /// Without input, the picture still runs: home is told why, once a mode.
+    input: Result<Box<dyn Inject>, String>,
     feedback: UnboundedSender<ClientMsg>,
     ended: oneshot::Receiver<io::Error>,
     since: tokio::time::Instant,
@@ -161,12 +175,15 @@ pub async fn serve_peer(
                     let started = bring_up(&output, &caps, ports, &home, &peer.outbox).await;
                     let reply = match started {
                         Ok(running) => {
-                            active = Some(Active {
+                            let mut mode = Active {
                                 copy: output,
                                 caps,
                                 failures: 0,
-                                stream: Stream::Running(running),
-                            });
+                                told_no_input: false,
+                                stream: Stream::Lost(tokio::time::Instant::now()),
+                            };
+                            mode.run(running, &peer.outbox);
+                            active = Some(mode);
                             Display::Started { output: output::NAME.into() }
                         }
                         Err(e) => {
@@ -191,8 +208,10 @@ pub async fn serve_peer(
                         input::Event::Area { .. } => home.area = Some(event.clone()),
                         _ => {}
                     }
-                    if let Some(Active { stream: Stream::Running(running), .. }) = &active {
-                        running.input.send(&event);
+                    if let Some(Active { stream: Stream::Running(running), .. }) = &active
+                        && let Ok(input) = &running.input
+                    {
+                        input.send(&event);
                     }
                 }
                 None => input_open = false,
@@ -223,7 +242,7 @@ pub async fn serve_peer(
             () = sleep_until(retry_at), if retry_at.is_some() => {
                 let Some(mode) = &mut active else { continue };
                 match bring_up(&mode.copy, &mode.caps, ports, &home, &peer.outbox).await {
-                    Ok(running) => mode.stream = Stream::Running(running),
+                    Ok(running) => mode.run(running, &peer.outbox),
                     Err(e) => {
                         eprintln!("navette: the stream could not start again ({e})");
                         failed(&mut active, e, hypr, &peer.outbox).await;
@@ -327,10 +346,20 @@ fn start_blocking(
     let stream = ports
         .streams
         .start(source, caps, outbox, feedback_rx, ended_tx)?;
-    let input = ports.injectors.start(output::NAME, keymap)?;
-    if let Some(area) = &area {
-        input.send(area);
-    }
+    let input = ports
+        .injectors
+        .start(output::NAME, keymap)
+        .inspect(|input| {
+            if let Some(area) = &area {
+                input.send(area);
+            }
+        })
+        .map_err(|e| {
+            eprintln!(
+                "navette: home's input cannot be injected, the picture goes on without it: {e}"
+            );
+            e.to_string()
+        });
     Ok(Running {
         _stream: stream,
         input,
@@ -486,6 +515,8 @@ mod tests {
     struct FakeInjectors {
         hypr: Arc<FakeHypr>,
         started: Arc<Mutex<Vec<Injected>>>,
+        /// No virtual keyboard to be had.
+        refuse: Arc<Mutex<bool>>,
     }
 
     #[derive(Debug, Default)]
@@ -505,6 +536,9 @@ mod tests {
 
     impl Injectors for FakeInjectors {
         fn start(&self, output: &str, keymap: Option<&str>) -> io::Result<Box<dyn Inject>> {
+            if *self.refuse.lock().unwrap() {
+                return Err(io::Error::other("no virtual keyboard"));
+            }
             let mut started = self.started.lock().unwrap();
             started.push(Injected {
                 output: output.into(),
@@ -542,6 +576,7 @@ mod tests {
         hypr: Arc<FakeHypr>,
         streams: Arc<FakeStreams>,
         injected: Arc<Mutex<Vec<Injected>>>,
+        refuse_input: Arc<Mutex<bool>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -551,6 +586,7 @@ mod tests {
         )]));
         let streams = Arc::new(FakeStreams::new(hypr.clone()));
         let injected = Arc::new(Mutex::new(Vec::new()));
+        let refuse_input = Arc::new(Mutex::new(false));
         let (inbox, inbox_rx) = mpsc::channel(64);
         let (events, mut events_rx) = mpsc::unbounded_channel();
         let outbox = Outbox::default();
@@ -566,6 +602,7 @@ mod tests {
             injectors: Arc::new(FakeInjectors {
                 hypr: hypr.clone(),
                 started: injected.clone(),
+                refuse: refuse_input.clone(),
             }),
         };
         let task = tokio::spawn(async move {
@@ -579,6 +616,7 @@ mod tests {
             hypr,
             streams,
             injected,
+            refuse_input,
             task,
         }
     }
@@ -658,6 +696,41 @@ mod tests {
             .unwrap();
         until(|| agent.dropped(0).is_some()).await;
         assert_eq!(agent.dropped(0), Some(true));
+    }
+
+    fn no_input(outbox: &Outbox) -> Vec<String> {
+        outbox
+            .queued()
+            .into_iter()
+            .filter_map(|msg| match msg {
+                Msg::NoInput(reason) => Some(reason),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_injector_that_cannot_start_leaves_the_picture_and_tells_home_once() {
+        let agent = agent();
+        *agent.refuse_input.lock().unwrap() = true;
+        agent.inbox.try_send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+        until(|| no_input(&agent.outbox).len() == 1).await;
+        assert!(no_input(&agent.outbox)[0].contains("no virtual keyboard"));
+        assert!(
+            agent
+                .outbox
+                .queued()
+                .contains(&Msg::Display(Display::Started {
+                    output: output::NAME.into()
+                }))
+        );
+        // The stream starts again after a stop of its own: still a picture, no second word.
+        agent.streams.end_last();
+        until(|| agent.streams.count() == 2).await;
+        assert!(failed(&agent.outbox).is_none());
+        assert_eq!(no_input(&agent.outbox).len(), 1);
+        assert!(agent.hypr.monitor(output::NAME).is_some());
     }
 
     #[tokio::test]
@@ -851,6 +924,7 @@ mod tests {
         let injectors = Arc::new(FakeInjectors {
             hypr: hypr.clone(),
             started: Arc::default(),
+            refuse: Arc::default(),
         });
         tokio::spawn(serve(peers_rx, hypr.clone(), streams, injectors, events_rx));
         until(|| hypr.monitor(output::NAME).is_none()).await;

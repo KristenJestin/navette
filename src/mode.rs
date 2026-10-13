@@ -236,6 +236,10 @@ pub async fn serve(
                         release(a).await;
                     }
                 }
+                Some(Incoming::NoInput(reason)) => eprintln!(
+                    "navette: the remote machine shows its picture but cannot take home's \
+                     keyboard and pointer: {reason}"
+                ),
                 Some(Incoming::Video {
                     msg: ServerMsg::CursorShape { width, height, hot_x, hot_y, .. },
                     main,

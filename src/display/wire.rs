@@ -25,6 +25,8 @@ pub enum Msg {
     Video(ServerMsg),
     /// Home to remote: gliff's answers to them (frame acks, keyframe requests, pongs).
     Feedback(ClientMsg),
+    /// Remote to home: the picture goes on, but home's input cannot be injected (the reason).
+    NoInput(String),
 }
 
 /// The display's orders and their answers.
@@ -85,6 +87,7 @@ pub enum Incoming {
         aux: Bytes,
     },
     Feedback(ClientMsg),
+    NoInput(String),
 }
 
 /// One live connection, as the display and its input see it. `inbox` ends when the link drops.
