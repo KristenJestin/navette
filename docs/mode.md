@@ -126,7 +126,8 @@ no copy. When the compositor does not take the decoder's linear dmabufs (Hyprlan
 GPU lists only tiled ones), the GPU still decodes and the picture is read back and shown through
 shared memory: one copy; so it is too when the decoder's GPU is not the one the compositor
 draws with. With several outputs, each one decodes on a device of its own, opened on the
-same GPU, never shared between two decoders; one that cannot be opened decodes on the CPU.
+same GPU, never shared between two decoders; when one cannot be opened, `navette mode start`
+fails and names its monitor: the CPU does not decode the streams offered for a GPU.
 Without a usable GPU, or with `GLIFF_VIDEO=cpu`, home decodes on the CPU (OpenH264). `navette serve` says which path it took, and every ten seconds prints, for each remote
 output, the frames, the frame rate, the decode time and the time from capture to decoded
 picture, on stderr.

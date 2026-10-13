@@ -507,7 +507,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
     );
     let covered = names.clone();
     let (shown, desk, mic) = blocking(move || {
-        let gpus = decoding_gpus(gpu, covered.len(), decode::open_gpu);
+        let gpus = decoding_gpus(gpu, &covered, decode::open_gpu)?;
         let mut shown = Vec::new();
         for ((index, name), gpu) in covered.iter().enumerate().zip(gpus) {
             let output = index as u8;
@@ -556,17 +556,30 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
 
 /// One decoding GPU per output, none shared: a `Gpu` is not thread-safe (one Vulkan queue,
 /// one VA-API display), and two decoders submitting on one at once lost the device on an
-/// NVIDIA GPU. The first output takes home's; each other one opens its own, and decodes on the
-/// CPU when it cannot. Without a GPU at home, every output decodes on the CPU.
+/// NVIDIA GPU. The first output takes home's; each other one opens its own. Without a GPU at
+/// home, every output decodes on the CPU. With one, an output that cannot have its own fails
+/// the start: the remote is offered streams the CPU does not decode.
 fn decoding_gpus<T>(
     first: Option<T>,
-    count: usize,
+    given: &[String],
     mut open: impl FnMut() -> Option<T>,
-) -> Vec<Option<T>> {
+) -> io::Result<Vec<Option<T>>> {
     let on_gpu = first.is_some();
     let mut gpus = vec![first];
-    gpus.extend((1..count).map(|_| if on_gpu { open() } else { None }));
-    gpus
+    for name in given.iter().skip(1) {
+        if !on_gpu {
+            gpus.push(None);
+            continue;
+        }
+        let gpu = open().ok_or_else(|| {
+            io::Error::other(format!(
+                "no GPU could be opened to decode {name} (home decodes on the GPU, each \
+                 monitor on a device of its own); nothing was changed"
+            ))
+        })?;
+        gpus.push(Some(gpu));
+    }
+    Ok(gpus)
 }
 
 /// Opens the desk (undoing what a previous run left) and keeps home windows off the `given`
@@ -1660,7 +1673,7 @@ mod tests {
             Some(Arc::new(opened.get()))
         };
         let home = Arc::new(0);
-        let gpus = decoding_gpus(Some(home.clone()), 3, open);
+        let gpus = decoding_gpus(Some(home.clone()), &names(3), open).unwrap();
         assert!(Arc::ptr_eq(gpus[0].as_ref().unwrap(), &home));
         let distinct: std::collections::HashSet<_> = gpus
             .iter()
@@ -1668,8 +1681,28 @@ mod tests {
             .collect();
         assert_eq!(distinct.len(), 3);
         // On the CPU at home, no GPU is opened for the others.
-        let gpus = decoding_gpus(None, 2, open);
+        let gpus = decoding_gpus(None, &names(2), open).unwrap();
         assert_eq!(gpus, [None, None]);
         assert_eq!(opened.get(), 2);
+    }
+
+    fn names(count: usize) -> Vec<String> {
+        (1..=count).map(|i| format!("DP-{i}")).collect()
+    }
+
+    #[test]
+    fn a_gpu_home_that_cannot_open_a_device_for_an_output_says_which() {
+        // Home's GPU offered the remote a stream the CPU does not decode.
+        let opened = std::cell::Cell::new(0);
+        let open = || {
+            opened.set(opened.get() + 1);
+            (opened.get() == 1).then_some(1)
+        };
+        let e = decoding_gpus(Some(0), &names(3), open).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "no GPU could be opened to decode DP-3 (home decodes on the GPU, each monitor on \
+             a device of its own); nothing was changed"
+        );
     }
 }
