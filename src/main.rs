@@ -136,10 +136,11 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
             let graph = PipeWire::default();
+            let saved = audio::Saved::in_dir(audio::Saved::default_dir()?);
             let threads = Arc::new(Mutex::new(Vec::new()));
             let agent = link::agent(dialer, Heartbeat::default(), Backoff::default(), events, {
                 let threads = threads.clone();
-                move |peer| match audio::remote(graph.clone(), peer) {
+                move |peer| match audio::remote(graph.clone(), saved.clone(), peer) {
                     Ok(thread) => {
                         let mut threads = threads.lock().unwrap();
                         threads.retain(|t: &std::thread::JoinHandle<()>| !t.is_finished());

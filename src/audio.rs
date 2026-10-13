@@ -20,6 +20,7 @@ pub mod jitter;
 pub mod pipewire;
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -91,6 +92,76 @@ impl DefaultSink {
     pub fn named(node: &str) -> Self {
         Self(format!("{{ \"name\": \"{node}\" }}"))
     }
+
+    /// The node it names. The value is JSON (`{ "name": "x" }`) or the relaxed SPA-JSON that
+    /// PipeWire's own config writes (`{ name = x }`).
+    pub fn name(&self) -> Option<&str> {
+        let after_key = &self.0[self.0.find("name")? + "name".len()..];
+        let after_key = after_key
+            .strip_prefix('"')
+            .unwrap_or(after_key)
+            .trim_start();
+        let value = after_key
+            .strip_prefix(':')
+            .or_else(|| after_key.strip_prefix('='))?
+            .trim_start();
+        let name = match value.strip_prefix('"') {
+            Some(quoted) => quoted.split('"').next()?,
+            None => value
+                .split(|c: char| c.is_whitespace() || c == ',' || c == '}')
+                .next()?,
+        };
+        Some(name).filter(|name| !name.is_empty())
+    }
+}
+
+/// The file where the remote keeps the default it replaced until it is put back, so that an
+/// agent that died before putting it back finds it on its next start.
+#[derive(Clone, Debug)]
+pub struct Saved {
+    dir: PathBuf,
+}
+
+const SAVED_FILE: &str = "previous-default-sink";
+
+impl Saved {
+    pub fn in_dir(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    /// `$XDG_STATE_HOME/navette`, or `~/.local/state/navette`.
+    pub fn default_dir() -> io::Result<PathBuf> {
+        let base = match std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+            Some(dir) => PathBuf::from(dir),
+            None => std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".local/state"))
+                .ok_or_else(|| io::Error::other("neither XDG_STATE_HOME nor HOME is set"))?,
+        };
+        Ok(base.join("navette"))
+    }
+
+    /// What was saved: nothing, or the default then (`None` when there was none, an empty
+    /// file).
+    fn load(&self) -> io::Result<Option<Option<DefaultSink>>> {
+        match std::fs::read_to_string(self.dir.join(SAVED_FILE)) {
+            Ok(value) if value.is_empty() => Ok(Some(None)),
+            Ok(value) => Ok(Some(Some(DefaultSink(value)))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn save(&self, previous: Option<&DefaultSink>) -> io::Result<()> {
+        let value = previous.map_or("", |sink| sink.0.as_str());
+        crate::store::write_private(&self.dir, SAVED_FILE, value.as_bytes())
+    }
+
+    fn clear(&self) -> io::Result<()> {
+        match std::fs::remove_file(self.dir.join(SAVED_FILE)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// What a sink does with the sound played into it: interleaved stereo at 48 kHz, in blocks of
@@ -123,18 +194,25 @@ pub trait Graph: Clone + Send + 'static {
 /// back, then removes the sink.
 pub struct RemoteSink<G: Graph> {
     graph: G,
+    saved: Saved,
     previous: Option<DefaultSink>,
     _node: G::Node,
 }
 
 impl<G: Graph> RemoteSink<G> {
-    pub fn start(graph: G, on_sound: OnSound) -> io::Result<Self> {
+    pub fn start(graph: G, saved: Saved, on_sound: OnSound) -> io::Result<Self> {
         let ours = DefaultSink::named(SINK);
-        // Left on our own sink by an agent that did not end cleanly: nothing to put back.
-        let previous = graph.default_sink()?.filter(|sink| *sink != ours);
+        let previous = match graph.default_sink()? {
+            // Left on our own sink by an agent that died: the user's choice is the one it saved.
+            Some(current) if current.name() == Some(SINK) => saved.load()?.flatten(),
+            current => current,
+        };
+        // Saved before switching, so that a crash from here on still knows what to put back.
+        saved.save(previous.as_ref())?;
         let node = graph.open_sink(SINK, SINK_DESCRIPTION, on_sound)?;
         let sink = Self {
             graph,
+            saved,
             previous,
             _node: node,
         };
@@ -145,8 +223,16 @@ impl<G: Graph> RemoteSink<G> {
 
 impl<G: Graph> Drop for RemoteSink<G> {
     fn drop(&mut self) {
-        if let Err(e) = self.graph.set_default_sink(self.previous.as_ref()) {
-            eprintln!("navette: audio: could not put the previous default sink back: {e}");
+        // Kept saved when it fails, for the next start to put back.
+        match self.graph.set_default_sink(self.previous.as_ref()) {
+            Ok(()) => {
+                if let Err(e) = self.saved.clear() {
+                    eprintln!("navette: audio: could not remove the saved default sink: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("navette: audio: could not put the previous default sink back: {e}")
+            }
         }
     }
 }
@@ -171,7 +257,7 @@ fn sender(home: mpsc::Sender<Vec<u8>>) -> io::Result<OnSound> {
 
 /// The remote's side of one link, on a thread of its own: follows home's orders until the
 /// link drops, then puts the previous default sink back. Joining the thread waits for that.
-pub fn remote<G: Graph>(graph: G, mut peer: Peer) -> io::Result<JoinHandle<()>> {
+pub fn remote<G: Graph>(graph: G, saved: Saved, mut peer: Peer) -> io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("navette-audio".into())
         .spawn(move || {
@@ -179,9 +265,9 @@ pub fn remote<G: Graph>(graph: G, mut peer: Peer) -> io::Result<JoinHandle<()>> 
             while let Some(frame) = peer.received.blocking_recv() {
                 match Message::decode(&frame) {
                     Ok(Message::Start) if sink.is_none() => {
-                        match sender(peer.send.clone())
-                            .and_then(|on_sound| RemoteSink::start(graph.clone(), on_sound))
-                        {
+                        match sender(peer.send.clone()).and_then(|on_sound| {
+                            RemoteSink::start(graph.clone(), saved.clone(), on_sound)
+                        }) {
                             Ok(started) => sink = Some(started),
                             Err(e) => eprintln!("navette: audio: could not start the sink: {e}"),
                         }
@@ -338,10 +424,39 @@ mod tests {
         assert!(Message::decode(&[0x02]).is_err());
     }
 
+    /// A saved-default file of its own, in a temporary directory.
+    fn saved() -> (tempfile::TempDir, Saved) {
+        let tmp = tempfile::tempdir().unwrap();
+        let saved = Saved::in_dir(tmp.path().join("state"));
+        (tmp, saved)
+    }
+
+    fn start(graph: &FakeGraph, saved: &Saved) -> RemoteSink<FakeGraph> {
+        RemoteSink::start(graph.clone(), saved.clone(), Box::new(|_| {})).unwrap()
+    }
+
+    #[test]
+    fn a_default_sink_gives_its_name_in_json_or_spa_json() {
+        for value in [
+            r#"{ "name": "invented-speakers" }"#,
+            r#"{"name":"invented-speakers"}"#,
+            r#"{ name = "invented-speakers" }"#,
+            r#"{ name = invented-speakers }"#,
+        ] {
+            assert_eq!(
+                DefaultSink(value.to_owned()).name(),
+                Some("invented-speakers"),
+                "{value}"
+            );
+        }
+        assert_eq!(DefaultSink("{}".to_owned()).name(), None);
+    }
+
     #[test]
     fn start_sets_the_default_sink_and_stop_restores_it() {
         let graph = FakeGraph::with_default("speakers");
-        let sink = RemoteSink::start(graph.clone(), Box::new(|_| {})).unwrap();
+        let (_tmp, saved) = saved();
+        let sink = start(&graph, &saved);
         assert_eq!(graph.state().default, Some(DefaultSink::named(SINK)));
         drop(sink);
         let state = graph.state();
@@ -361,23 +476,72 @@ mod tests {
     #[test]
     fn with_no_default_before_stop_clears_it() {
         let graph = FakeGraph::default();
-        drop(RemoteSink::start(graph.clone(), Box::new(|_| {})).unwrap());
+        let (_tmp, saved) = saved();
+        drop(start(&graph, &saved));
         assert_eq!(graph.state().default, None);
     }
 
     #[test]
-    fn a_default_left_on_the_navette_sink_is_not_restored() {
-        let graph = FakeGraph::with_default(SINK);
-        drop(RemoteSink::start(graph.clone(), Box::new(|_| {})).unwrap());
+    fn a_default_left_on_the_navette_sink_with_nothing_saved_is_cleared() {
+        // Written by the session manager in its own form, not ours.
+        let graph = FakeGraph::default();
+        graph.state().default = Some(DefaultSink(format!(r#"{{"name":"{SINK}"}}"#)));
+        let (_tmp, saved) = saved();
+        drop(start(&graph, &saved));
         assert_eq!(graph.state().default, None);
+    }
+
+    #[test]
+    fn the_previous_default_is_saved_until_it_is_put_back() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let graph = FakeGraph::with_default("speakers");
+        let (_tmp, saved) = saved();
+        let sink = start(&graph, &saved);
+        let file = saved.dir.join(SAVED_FILE);
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(
+            saved.load().unwrap(),
+            Some(Some(DefaultSink::named("speakers")))
+        );
+        drop(sink);
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn after_a_crash_the_saved_default_is_put_back() {
+        let graph = FakeGraph::with_default("speakers");
+        let (_tmp, saved) = saved();
+        // An agent that died while switched: the default is still ours.
+        std::mem::forget(start(&graph, &saved));
+        assert_eq!(graph.state().default, Some(DefaultSink::named(SINK)));
+
+        drop(start(&graph, &saved));
+        assert_eq!(graph.state().default, Some(DefaultSink::named("speakers")));
+        assert_eq!(saved.load().unwrap(), None);
+    }
+
+    #[test]
+    fn a_default_that_could_not_be_put_back_stays_saved() {
+        let graph = FakeGraph::with_default("speakers");
+        let (_tmp, saved) = saved();
+        let sink = start(&graph, &saved);
+        graph.state().refuse_defaults = true;
+        drop(sink);
+        assert_eq!(
+            saved.load().unwrap(),
+            Some(Some(DefaultSink::named("speakers")))
+        );
     }
 
     #[tokio::test]
     async fn the_remote_sound_plays_at_home() {
         let home_graph = FakeGraph::with_default("home-speakers");
         let remote_graph = FakeGraph::with_default("laptop-speakers");
+        let (_tmp, saved) = saved();
         let (home_peer, remote_peer, _link) = linked();
-        remote(remote_graph.clone(), remote_peer).unwrap();
+        remote(remote_graph.clone(), saved.clone(), remote_peer).unwrap();
         home(home_graph.clone(), home_peer, true).unwrap();
 
         until(&remote_graph, |s| !s.sinks.is_empty()).await;
@@ -413,8 +577,9 @@ mod tests {
     async fn stopping_at_home_restores_the_remote_default() {
         let home_graph = FakeGraph::default();
         let remote_graph = FakeGraph::with_default("laptop-speakers");
+        let (_tmp, saved) = saved();
         let (home_peer, remote_peer, _link) = linked();
-        remote(remote_graph.clone(), remote_peer).unwrap();
+        remote(remote_graph.clone(), saved.clone(), remote_peer).unwrap();
         let mut home = Home::new(home_graph.clone(), home_peer.send);
         // Home's calls block: off the runtime, as in `home`.
         let mut home = blocking(move || {
@@ -444,8 +609,9 @@ mod tests {
     #[tokio::test]
     async fn the_link_dropping_restores_the_remote_default() {
         let remote_graph = FakeGraph::with_default("laptop-speakers");
+        let (_tmp, saved) = saved();
         let (home_peer, remote_peer, link) = linked();
-        let audio = remote(remote_graph.clone(), remote_peer).unwrap();
+        let audio = remote(remote_graph.clone(), saved.clone(), remote_peer).unwrap();
         home_peer.send.send(Message::Start.encode()).await.unwrap();
         until(&remote_graph, |s| !s.sinks.is_empty()).await;
 

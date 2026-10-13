@@ -13,6 +13,8 @@ pub struct State {
     pub playbacks: Vec<(String, Arc<Mutex<Jitter>>)>,
     /// What was done, in order.
     pub log: Vec<String>,
+    /// Changes of the default fail, as when PipeWire is gone.
+    pub refuse_defaults: bool,
 }
 
 #[derive(Clone, Default)]
@@ -53,6 +55,12 @@ impl Graph for FakeGraph {
 
     fn set_default_sink(&self, sink: Option<&DefaultSink>) -> io::Result<()> {
         let mut state = self.state();
+        if state.refuse_defaults {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "PipeWire is gone",
+            ));
+        }
         state.default = sink.cloned();
         state.log.push(match sink {
             Some(sink) => format!("default {}", sink.0),

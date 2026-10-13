@@ -26,9 +26,11 @@ The agent on the remote machine needs nothing more: it follows home.
 
 The default output is the one `wpctl set-default` writes (`default.configured.audio.sink` in
 PipeWire's `default` metadata), so WirePlumber moves the playing apps to the Navette sink and
+back. Before switching, the agent saves the default it replaces in
+`$XDG_STATE_HOME/navette/previous-default-sink` (0600), and removes the file once it is put
 back. If the agent is killed without a chance to clean up (`SIGKILL`, a crash), the Navette sink
 disappears with it and WirePlumber falls back to another output on its own; the next start
-does not take the stale setting for the user's choice.
+finds the default still on the Navette sink, and puts back the saved one when it stops.
 
 ## The messages
 
