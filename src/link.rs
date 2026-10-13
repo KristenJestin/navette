@@ -1,7 +1,7 @@
 //! The link once paired: the remote's agent dials home and keeps a connection, home serves it.
 //! Over it, a hello (the link's version), then gliff's framing carrying a heartbeat each way
-//! and whatever service the connection is given (the clipboard bridge today, the orders with
-//! the next issues), over the same authenticated stream.
+//! and the connection's services (the clipboard bridge, the display), over the same
+//! authenticated stream.
 //!
 //! The agent reconnects with an exponential backoff whenever the link drops; home keeps the
 //! newest connection of its one paired remote and drops the older one, which a laptop that
@@ -14,11 +14,11 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::mpsc::SyncSender;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use gliff_proto::ClipboardMsg;
 use gliff_proto::clipboard::CHUNK;
+use gliff_proto::{ClipboardMsg, ServerMsg};
 use gliff_transport::Framed;
 use gliff_transport::clipboard::{Outbound, outbound_channel};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -26,6 +26,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinSet;
 
 use crate::audio::{self, codec::MAX_PACKET};
+use crate::display::wire::{Incoming, Outbox, Peer};
 use crate::frame::{read_frame, write_frame};
 use crate::store::{Role, Store};
 use crate::transport::{Accept, Dial, TlsAcceptor, TlsDialer};
@@ -43,10 +44,22 @@ const HELLO: u8 = 1;
 /// a bridge that drains has a handful queued at most (gliff's window is 4 chunks).
 const INBOUND: usize = 16;
 
-/// What a connection's service gets: the clipboard messages of the peer, and where to put its own.
+/// The display's messages read from the peer and not yet taken. Its service routes them at once
+/// (frames to the decoder, which has its own bounded queue), so this fills only while it waits
+/// on Hyprland or a thread, a second or two: past this, a frame is acked and dropped (a
+/// keyframe asked for), feedback is dropped (acks are cumulative), and an order, which must not
+/// be lost, ends the link, so both sides give the monitor back.
+const DISPLAY_INBOUND: usize = 256;
+
+/// The largest video frame stream: a 4K keyframe is a few MiB.
+const MAX_VIDEO_PAYLOAD: u32 = 32 << 20;
+
+/// What a connection's services get: the clipboard messages of the peer and where to put its
+/// own; the display's, both ways, for the display service to take.
 pub struct Wire {
     pub from_peer: mpsc::Receiver<Clip>,
     pub to_peer: Outbound,
+    pub display: Option<Peer>,
     /// The sound's own queues, for whoever takes them.
     pub audio: Option<audio::Wire>,
 }
@@ -145,11 +158,18 @@ where
     let (reader, writer) = tokio::io::split(stream);
     let (inbound_tx, from_peer) = mpsc::channel(INBOUND);
     let (to_peer, outbound_rx) = outbound_channel();
+    let outbox = Outbox::default();
+    let (display_tx, display_rx) = mpsc::channel(DISPLAY_INBOUND);
+    let display = Peer {
+        outbox: outbox.clone(),
+        inbox: display_rx,
+    };
     let (sound, sound_end) = audio::wire();
     let service = async {
         attach(Wire {
             from_peer,
             to_peer,
+            display: Some(display),
             audio: Some(sound),
         })
         .await;
@@ -161,15 +181,19 @@ where
             heartbeat.interval,
             outbound_rx,
             sound_end.from_audio,
+            &outbox,
         ) => result,
         result = receive(
             Framed::new(reader),
             heartbeat.timeout,
             inbound_tx,
             sound_end.to_audio,
+            display_tx,
+            &outbox,
         ) => result,
         never = service => match never {},
     };
+    outbox.close();
     match result {
         Ok(never) => match never {},
         Err(e) => e,
@@ -189,6 +213,7 @@ async fn send<W: AsyncWrite + Unpin>(
     interval: Duration,
     mut outbound: mpsc::Receiver<Clip>,
     mut sound: mpsc::Receiver<audio::Message>,
+    display: &Outbox,
 ) -> io::Result<Infallible> {
     let mut tick = tokio::time::interval(interval);
     // A long chunk write must not be followed by a burst of heartbeats.
@@ -218,6 +243,15 @@ async fn send<W: AsyncWrite + Unpin>(
                     .map_err(io_error)?,
                 None => open = false,
             },
+            (msg, payloads) = display.next() => {
+                let parts: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+                let begin = Instant::now();
+                writer
+                    .write_msg_with_payloads(&LinkMsg::from(msg), &parts)
+                    .await
+                    .map_err(io_error)?;
+                display.report_write(begin.elapsed());
+            }
         }
     }
 }
@@ -227,6 +261,8 @@ async fn receive<R: AsyncRead + Unpin>(
     timeout: Duration,
     inbound: mpsc::Sender<Clip>,
     sound: SyncSender<audio::Message>,
+    display: mpsc::Sender<Incoming>,
+    outbox: &Outbox,
 ) -> io::Result<Infallible> {
     let silent = || io::Error::new(io::ErrorKind::TimedOut, "the peer went silent");
     loop {
@@ -234,16 +270,62 @@ async fn receive<R: AsyncRead + Unpin>(
             .await
             .map_err(|_| silent())?
             .map_err(io_error)?;
-        let msg = match msg {
+        let clip = match msg {
             LinkMsg::AudioStart { .. } | LinkMsg::AudioStop | LinkMsg::AudioFrame { .. } => {
                 let sound_msg = audio_received(&mut reader, timeout, msg).await?;
                 // Like the clipboard's, a sound the audio thread is not ready for is dropped.
                 let _ = sound.try_send(sound_msg);
                 continue;
             }
+            LinkMsg::Display(order) => {
+                if let Err(mpsc::error::TrySendError::Full(_)) =
+                    display.try_send(Incoming::Display(order))
+                {
+                    return Err(io::Error::other(
+                        "the display fell behind with an order waiting",
+                    ));
+                }
+                continue;
+            }
+            LinkMsg::Video(msg) => {
+                let (main, aux) = match &msg {
+                    ServerMsg::VideoFrame {
+                        data_len, aux_len, ..
+                    } => (*data_len, *aux_len),
+                    _ => (0, 0),
+                };
+                if main.max(aux) > MAX_VIDEO_PAYLOAD {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "a video frame larger than any screen's",
+                    ));
+                }
+                // The whole frame, payloads included, within one timeout: a peer gone in the
+                // middle of it must not hold the link until TCP gives up.
+                let (main, aux) = tokio::time::timeout(timeout, async {
+                    Ok::<_, gliff_transport::Error>((
+                        reader.read_payload(main).await?,
+                        reader.read_payload(aux).await?,
+                    ))
+                })
+                .await
+                .map_err(|_| silent())?
+                .map_err(io_error)?;
+                let video = Incoming::Video { msg, main, aux };
+                if let Err(mpsc::error::TrySendError::Full(Incoming::Video { msg, .. })) =
+                    display.try_send(video)
+                {
+                    outbox.refuse_frame(&msg);
+                }
+                continue;
+            }
+            LinkMsg::Feedback(msg) => {
+                let _ = display.try_send(Incoming::Feedback(msg));
+                continue;
+            }
             msg => msg,
         };
-        let Some(clip) = msg.into_clipboard().map(checked) else {
+        let Some(clip) = clip.into_clipboard().map(checked) else {
             continue;
         };
         let payload = match &clip {
@@ -434,10 +516,11 @@ fn paired_as(store: &Store, role: Role) -> io::Result<crate::store::Pairing> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use gliff_proto::ClipboardFile;
+    use gliff_proto::{ClientMsg, ClipboardFile};
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::display::wire::{Display, Msg as DisplayMsg};
     use crate::identity::Identity;
     use crate::pair::{self, Pin, Timeouts};
     use crate::transport::bind_lan;
@@ -908,5 +991,121 @@ pub(crate) mod tests {
                 remote.abort();
             })
             .await;
+    }
+
+    /// Two ends of a link, each running; their display parts, and what ended each.
+    struct Ends {
+        home: Peer,
+        remote: Peer,
+        home_ended: tokio::task::JoinHandle<io::Error>,
+    }
+
+    async fn display_link(capacity: usize) -> Ends {
+        let (a, b) = tokio::io::duplex(capacity);
+        let attach = |peers: mpsc::UnboundedSender<Peer>| {
+            move |mut wire: Wire| {
+                let _ = peers.send(wire.display.take().unwrap());
+                std::future::ready(())
+            }
+        };
+        let (home_tx, mut home) = mpsc::unbounded_channel();
+        let (remote_tx, mut remote) = mpsc::unbounded_channel();
+        let home_ended = tokio::spawn(run(a, fast(), attach(home_tx)));
+        tokio::spawn(run(b, fast(), attach(remote_tx)));
+        Ends {
+            home: home.recv().await.unwrap(),
+            remote: remote.recv().await.unwrap(),
+            home_ended,
+        }
+    }
+
+    fn video_frame(id: u64, len: usize) -> (DisplayMsg, Vec<Vec<u8>>) {
+        (
+            DisplayMsg::Video(ServerMsg::VideoFrame {
+                frame_id: id,
+                pts_us: 0,
+                keyframe: id == 0,
+                damage: Vec::new(),
+                data_len: len as u32,
+                aux_len: 3,
+            }),
+            vec![vec![7; len], vec![9; 3]],
+        )
+    }
+
+    async fn incoming(peer: &mut Peer) -> Incoming {
+        tokio::time::timeout(Duration::from_secs(5), peer.inbox.recv())
+            .await
+            .expect("a message in time")
+            .expect("the link is up")
+    }
+
+    #[tokio::test]
+    async fn the_display_s_orders_and_a_large_video_frame_cross_the_link() {
+        let mut ends = display_link(64 * 1024).await;
+        let stop = DisplayMsg::Display(Display::Stop);
+        ends.home.outbox.send(stop, Vec::new());
+        // Two megabytes: far above the pairing frames' limit, one keyframe of a busy screen.
+        let (msg, payloads) = video_frame(0, 2 << 20);
+        ends.home.outbox.send(msg, payloads);
+        assert!(matches!(
+            incoming(&mut ends.remote).await,
+            Incoming::Display(Display::Stop)
+        ));
+        match incoming(&mut ends.remote).await {
+            Incoming::Video { main, aux, .. } => {
+                assert_eq!(main.len(), 2 << 20);
+                assert!(main.iter().all(|&b| b == 7));
+                assert_eq!(&aux[..], &[9, 9, 9]);
+            }
+            other => panic!("expected a video frame, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_gone_in_the_middle_of_a_frame_ends_the_link_in_time() {
+        let (a, mut b) = tokio::io::duplex(64 * 1024);
+        // The frame's header says 100 kB follow; the peer sends 10 and is heard no more.
+        let (msg, _) = video_frame(0, 100_000);
+        let body = minicbor::to_vec(LinkMsg::from(msg)).unwrap();
+        let mut bytes = (body.len() as u32).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&100_003u32.to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&[7; 10]);
+        tokio::io::AsyncWriteExt::write_all(&mut b, &bytes)
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), run(a, fast(), nothing))
+            .await
+            .expect("the link ends within its timeout");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn frames_the_display_cannot_take_are_acked_and_a_keyframe_asked_for() {
+        let mut ends = display_link(1 << 20).await;
+        // Home's display reads nothing: its queue fills.
+        for id in 0..DISPLAY_INBOUND as u64 + 20 {
+            let (msg, payloads) = video_frame(id, 16);
+            ends.remote.outbox.send(msg, payloads);
+        }
+        loop {
+            match incoming(&mut ends.remote).await {
+                Incoming::Feedback(ClientMsg::RequestKeyframe) => break,
+                Incoming::Feedback(ClientMsg::FrameAck { .. }) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // The link stays up for frames; an order that cannot wait ends it.
+        assert!(!ends.home_ended.is_finished());
+        ends.remote
+            .outbox
+            .send(DisplayMsg::Display(Display::Stop), Vec::new());
+        let error = tokio::time::timeout(Duration::from_secs(2), ends.home_ended)
+            .await
+            .expect("the link ends")
+            .unwrap();
+        assert!(error.to_string().contains("fell behind"), "{error}");
+        drop(ends.home);
     }
 }

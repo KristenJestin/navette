@@ -26,6 +26,12 @@ impl Navette {
             .arg("--config-dir")
             .arg(config)
             .args(args)
+            // Its own runtime dir (control socket, desk record), no compositor and no GPU: the
+            // tests never reach the real desk.
+            .env("XDG_RUNTIME_DIR", config.join("run"))
+            .env("GLIFF_VIDEO", "cpu")
+            .env_remove("HYPRLAND_INSTANCE_SIGNATURE")
+            .env_remove("WAYLAND_DISPLAY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -214,4 +220,24 @@ fn version_comes_from_the_build_not_from_cargo_toml() {
         String::from_utf8(output.stdout).unwrap(),
         format!("navette {expected}\n")
     );
+}
+
+#[test]
+fn mode_start_without_serve_says_to_start_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Navette::start(tmp.path(), &["mode", "start"]).finish();
+    assert!(
+        output.contains("`navette serve` is not running"),
+        "{output}"
+    );
+}
+
+#[test]
+fn mode_start_with_no_mode_configured_says_where_to_write_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (_serve, _agent, _) = paired_link(&home, &remote);
+    let output = Navette::start(&home, &["mode", "start"]).finish();
+    assert!(output.contains("monitor = <output name>"), "{output}");
+    assert!(output.contains("mode.conf"), "{output}");
 }

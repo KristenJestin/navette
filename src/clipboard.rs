@@ -1189,6 +1189,7 @@ mod tests {
                 let mut wire = Wire {
                     from_peer: inbound,
                     to_peer,
+                    display: None,
                     audio: None,
                 };
                 let serials = Rc::default();

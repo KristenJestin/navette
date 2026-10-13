@@ -1,7 +1,8 @@
 //! What the link says once both sides have said hello: gliff's framing (a CBOR message, then
 //! the raw bytes it declares) carrying Navette's own messages. A heartbeat shows the sender
 //! alive; the clipboard messages are the five of gliff's transfer engine, so its rules (chunk
-//! size, ack window, serials) apply unchanged. A message this build does not know is skipped,
+//! size, ack window, serials) apply unchanged; the display's are its orders, gliff's stream
+//! messages (a video frame's bytes follow it) and their feedback. A message this build does not know is skipped,
 //! so a newer peer can add some without breaking an older one.
 //!
 //! To extend the link without a new [`VERSION`](crate::link::VERSION), add a top-level variant
@@ -12,12 +13,13 @@
 
 use bytes::Bytes;
 use gliff_proto::clipboard::validate_files;
-use gliff_proto::{ClipboardFile, ClipboardItem, ClipboardMsg};
+use gliff_proto::{ClientMsg, ClipboardFile, ClipboardItem, ClipboardMsg, ServerMsg};
 use minicbor::{Decode, Encode};
 
 use crate::audio;
+use crate::display::wire::{Display, Msg};
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum LinkMsg {
     #[n(0)]
     Heartbeat,
@@ -63,6 +65,15 @@ pub enum LinkMsg {
         #[n(0)]
         id: u32,
     },
+    // The display's (`crate::display`), a block of numbers of its own.
+    #[n(20)]
+    Display(#[n(0)] Display),
+    /// Remote to home; a video frame's two streams (`data_len`, then `aux_len` bytes) follow.
+    #[n(21)]
+    Video(#[n(0)] ServerMsg),
+    /// Home to remote.
+    #[n(22)]
+    Feedback(#[n(0)] ClientMsg),
     // The remote machine's sound (`crate::audio`), a block of numbers of its own.
     #[n(48)]
     AudioStart {
@@ -81,6 +92,16 @@ pub enum LinkMsg {
         #[n(2)]
         data_len: u32,
     },
+}
+
+impl From<Msg> for LinkMsg {
+    fn from(msg: Msg) -> Self {
+        match msg {
+            Msg::Display(display) => Self::Display(display),
+            Msg::Video(msg) => Self::Video(msg),
+            Msg::Feedback(msg) => Self::Feedback(msg),
+        }
+    }
 }
 
 impl From<ClipboardMsg> for LinkMsg {
@@ -135,10 +156,13 @@ impl From<&audio::Message> for LinkMsg {
 }
 
 impl LinkMsg {
-    /// The clipboard message this carries, or `None` for a heartbeat.
+    /// The clipboard message this carries, or `None` for another.
     pub fn into_clipboard(self) -> Option<ClipboardMsg> {
         Some(match self {
             Self::Heartbeat
+            | Self::Display(_)
+            | Self::Video(_)
+            | Self::Feedback(_)
             | Self::AudioStart { .. }
             | Self::AudioStop
             | Self::AudioFrame { .. } => return None,

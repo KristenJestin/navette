@@ -4,10 +4,12 @@
 pub mod audio;
 pub mod clipboard;
 pub mod desk;
+pub mod display;
 pub mod frame;
 pub mod hypr;
 pub mod identity;
 pub mod link;
+pub mod mode;
 pub mod pair;
 pub mod store;
 pub mod transport;
