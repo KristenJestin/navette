@@ -60,6 +60,15 @@ While the mode runs:
   are undone when the mode stops, when the link drops, and at the next start after a crash, and
   made again after a config reload. The mode also ends if any one surface goes away (its
   monitor unplugged, Hyprland restarted at home) or home cannot decode a picture.
+- **No home window stays under a surface.** A home window that lands on a reserved monitor
+  anyway (moved to one of its workspaces, dragged onto it, opened with an explicit
+  `[workspace N silent]`, or there when the mode starts) goes to that same home monitor, on
+  the workspace it shows; it takes the focus only if it had it, and then brings the pointer
+  home too. A workspace moved whole onto a reserved
+  monitor goes back to the home monitor whole, and shows there; a workspace of a reserved
+  monitor that it does not show goes too, and stays out of sight. Special workspaces stay
+  where they are. These moves are not undone when the mode stops: the windows are left home,
+  and the monitor takes windows again as usual.
 - **The home mic**, with `navette serve --audio`, goes to the remote machine while the mode runs,
   and the hotkey switches it either way ([the mic](mic.md)).
 

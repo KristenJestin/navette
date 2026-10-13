@@ -7,7 +7,9 @@
 //! home desk are a window rule per monitor that opens home windows on another home monitor
 //! rather than hidden under a surface (#2) and, with a mic, the hotkey that switches it, made
 //! through the desk recorder so they are undone on stop, on a dropped link and after a crash,
-//! and made again after a config reload. The home mic goes to the remote machine for as long as the mode runs.
+//! and made again after a config reload. A home window that lands on a given monitor all the
+//! same (moved, dragged, opened on an explicit workspace) is sent back to a home monitor as
+//! Hyprland reports it (#31). The home mic goes to the remote machine for as long as the mode runs.
 //!
 //! `navette serve` owns the link and the surface, so the two commands reach it over a Unix
 //! socket in `$XDG_RUNTIME_DIR/navette`, private to the user.
@@ -252,11 +254,18 @@ pub struct Home {
     pub mic: Option<Arc<dyn Mic>>,
 }
 
+/// The workspace each given monitor showed when home windows were last sent home.
+type Seen = Vec<(String, i64)>;
+
 struct Active {
     /// Home first, before the rest goes.
     _mic: Option<MicSent>,
     /// The monitors given, left to right: monitor `i` shows output `i`.
     monitors: Vec<String>,
+    /// The home monitor that takes the home windows the cover would hide; none when every
+    /// monitor is given.
+    home_monitor: Option<String>,
+    seen: Arc<Mutex<Seen>>,
     shown: Vec<Shown>,
     desk: Arc<Mutex<Desk<Eval>>>,
     /// Why a surface or a decoder cannot go on.
@@ -428,11 +437,17 @@ pub async fn serve(
             Some(event) = events.recv() => {
                 if let Some(a) = &active {
                     let desk = a.desk.clone();
+                    // A reload may put a workspace back where the user's rules want it.
+                    let sweep = matches!(event, hypr::Event::Placed | hypr::Event::ConfigReloaded);
+                    let sending = (a.monitors.clone(), a.home_monitor.clone(), a.seen.clone());
                     let handled =
                         blocking(move || desk.lock().unwrap().handle(&event).map_err(desk_error))
                             .await;
                     if let Err(e) = handled {
                         eprintln!("navette: the home desk could not be restored after a reload: {e}");
+                    }
+                    if sweep {
+                        send_home(&home, sending).await;
                     }
                 }
             }
@@ -569,7 +584,12 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
     let first = copies.next().expect("one monitor at least");
     let others: Vec<_> = copies.collect();
     let names: Vec<String> = given.into_iter().map(|m| m.name).collect();
-    let desk = open_desk(home, &names, &monitors).await?;
+    let home_monitor = monitors
+        .iter()
+        .filter(|m| !names.contains(&m.name) && !m.disabled)
+        .min_by_key(|m| (m.x, m.y))
+        .map(|m| m.name.clone());
+    let desk = open_desk(home, &names, home_monitor.clone()).await?;
     // Off the executor, and so is the undo when one fails: the desk drops with the closure.
     let (ended_tx, ended) = tokio::sync::mpsc::unbounded_channel();
     let (released_tx, released) = tokio::sync::mpsc::unbounded_channel();
@@ -624,9 +644,13 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
         }),
         Vec::new(),
     );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sending = (names.clone(), home_monitor.clone(), seen.clone());
     *active = Some(Active {
         _mic: mic,
         monitors: names,
+        home_monitor,
+        seen,
         shown,
         desk: Arc::new(Mutex::new(desk)),
         ended,
@@ -634,6 +658,8 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
         starting: None,
         closed_lid,
     });
+    // What was already under the monitors comes out from under the covers.
+    send_home(home, sending).await;
     Ok(())
 }
 
@@ -666,18 +692,9 @@ fn decoding_gpus<T>(
 }
 
 /// Opens the desk (undoing what a previous run left) and keeps home windows off the `given`
-/// monitors: those that would open on any of their workspaces go to the leftmost home monitor
-/// kept home. With a mic, binds its hotkey.
-async fn open_desk(
-    home: &Home,
-    given: &[String],
-    monitors: &[hypr::Monitor],
-) -> io::Result<Desk<Eval>> {
-    let other = monitors
-        .iter()
-        .filter(|m| !given.contains(&m.name) && !m.disabled)
-        .min_by_key(|m| (m.x, m.y))
-        .map(|m| m.name.clone());
+/// monitors: those that would open on any of their workspaces go to `other`, the leftmost
+/// home monitor kept home. With a mic, binds its hotkey.
+async fn open_desk(home: &Home, given: &[String], other: Option<String>) -> io::Result<Desk<Eval>> {
     let (hypr, record, given) = (home.hypr.clone(), home.desk_record.clone(), given.to_vec());
     let mic_bind = home
         .mic
@@ -714,6 +731,26 @@ async fn open_desk(
         Ok(desk)
     })
     .await
+}
+
+/// Moves to the home monitor the home windows that landed on the given ones, where a cover
+/// hides them (#31). These moves are not desk changes: nothing puts a window back under a cover,
+/// so a stop leaves them home. A failure is said, and the next event tries again.
+/// `sending` is the mode's given monitors, home monitor and workspaces seen.
+async fn send_home(home: &Home, sending: (Vec<String>, Option<String>, Arc<Mutex<Seen>>)) {
+    let (given, Some(to), seen) = sending else {
+        return;
+    };
+    let hypr = home.hypr.clone();
+    let sent =
+        blocking(move || hypr::send_home(&*hypr, &given, &to, &mut seen.lock().unwrap())).await;
+    match sent {
+        Ok(sent) if !sent.is_empty() => {
+            tracing::info!(?sent, "home windows taken from under the cover")
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("navette: a home window may be left under the cover: {e}"),
+    }
 }
 
 fn desk_error(e: DeskError) -> io::Error {
@@ -1134,7 +1171,10 @@ mod tests {
     #[tokio::test]
     async fn with_no_home_window_the_release_hotkey_changes_no_focus() {
         let desk = desk("DP-2");
-        desk.hypr.add_window(FakeWindow::new("0xc3", "DP-2", 0));
+        desk.hypr.add_window(FakeWindow {
+            hidden_workspace: true,
+            ..FakeWindow::new("0xc3", "DP-1", 0)
+        });
         let _remote = started(&desk).await;
         let released = desk.releases.lock().unwrap()[0].clone();
         released.send(()).unwrap();
@@ -1290,6 +1330,100 @@ mod tests {
             }))
             .unwrap();
         answer(pending).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_home_window_under_the_monitor_when_the_mode_starts_goes_home() {
+        let desk = desk("DP-2");
+        desk.hypr.add_window(FakeWindow::new("0xe5", "DP-2", 0));
+        let _remote = started(&desk).await;
+        until(|| desk.hypr.place("0xe5").0 == "DP-1").await;
+    }
+
+    #[tokio::test]
+    async fn a_home_window_moved_onto_the_monitor_goes_home() {
+        let desk = desk("DP-2");
+        desk.hypr.add_window(FakeWindow::new("0xa1", "DP-1", 0));
+        let _remote = started(&desk).await;
+        // `movewindowv2`, after a move to a workspace of DP-2 or a drag onto it.
+        desk.hypr.add_window(FakeWindow::new("0xe5", "DP-2", 1));
+        desk.events.send(hypr::Event::Placed).unwrap();
+        until(|| desk.hypr.place("0xe5") == ("DP-1".to_string(), 1)).await;
+    }
+
+    #[tokio::test]
+    async fn a_workspace_moved_onto_the_monitor_goes_back_home_whole() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        desk.hypr.add_workspace(5, "5", "DP-2");
+        desk.hypr.show("DP-2", 5);
+        desk.hypr
+            .add_window(FakeWindow::new("0xa1", "DP-2", 0).on_workspace(5));
+        desk.events.send(hypr::Event::Placed).unwrap();
+        until(|| desk.hypr.place("0xa1") == ("DP-1".to_string(), 5)).await;
+        assert_eq!(desk.hypr.shown("DP-1"), 5);
+    }
+
+    #[tokio::test]
+    async fn a_window_opened_silently_on_a_workspace_of_the_monitor_goes_home() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        // `[workspace 7 silent]`: the window rule does not catch it.
+        desk.hypr.add_workspace(7, "7", "DP-2");
+        desk.hypr
+            .add_window(FakeWindow::new("0xc3", "DP-2", 0).on_workspace(7));
+        desk.events.send(hypr::Event::Placed).unwrap();
+        until(|| desk.hypr.place("0xc3") == ("DP-1".to_string(), 7)).await;
+        assert_eq!(desk.hypr.shown("DP-1"), 1);
+    }
+
+    #[tokio::test]
+    async fn windows_landing_on_any_of_the_monitors_go_home() {
+        let monitors = vec![
+            FakeMonitor::new("DP-1", 1920, 1080, 0),
+            FakeMonitor::new("DP-2", 2560, 1440, 1920),
+            FakeMonitor::new("DP-3", 1920, 1080, 4480),
+        ];
+        let desk = desk_on("monitor = DP-2, DP-3\n", monitors, FakeMic::default());
+        let remote = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        remote
+            .to_home
+            .try_send(Incoming::Display(Display::Started {
+                output: "NAVETTE-1".into(),
+                others: Some(vec!["NAVETTE-2".into()]),
+                closed_lid: None,
+            }))
+            .unwrap();
+        answer(pending).await.unwrap();
+        desk.hypr.add_window(FakeWindow::new("0xe5", "DP-2", 0));
+        desk.hypr.add_window(FakeWindow::new("0xf6", "DP-3", 1));
+        desk.events.send(hypr::Event::Placed).unwrap();
+        until(|| desk.hypr.place("0xe5").0 == "DP-1" && desk.hypr.place("0xf6").0 == "DP-1").await;
+    }
+
+    #[tokio::test]
+    async fn a_reload_sends_home_what_it_put_under_the_monitor() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        // The user's workspace rules may put a workspace back on DP-2.
+        desk.hypr.add_workspace(4, "4", "DP-2");
+        desk.hypr
+            .add_window(FakeWindow::new("0xa1", "DP-2", 0).on_workspace(4));
+        desk.events.send(hypr::Event::ConfigReloaded).unwrap();
+        until(|| desk.hypr.place("0xa1").0 == "DP-1").await;
+    }
+
+    #[tokio::test]
+    async fn once_stopped_the_monitor_takes_home_windows_again() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        answer(ask(&desk, false).await).await.unwrap();
+        desk.hypr.add_window(FakeWindow::new("0xe5", "DP-2", 0));
+        desk.events.send(hypr::Event::Placed).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(desk.hypr.place("0xe5").0, "DP-2");
     }
 
     #[tokio::test]

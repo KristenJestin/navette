@@ -54,6 +54,9 @@ pub enum Event {
     ConfigReloaded,
     MonitorAdded(String),
     MonitorRemoved(String),
+    /// A window opened or moved, a workspace moved, or a monitor shows another workspace: a
+    /// window may now be on a covered monitor.
+    Placed,
     /// Anything else, ignored.
     Other,
 }
@@ -66,6 +69,7 @@ impl Event {
             "configreloaded" => Event::ConfigReloaded,
             "monitoradded" => Event::MonitorAdded(data.to_owned()),
             "monitorremoved" => Event::MonitorRemoved(data.to_owned()),
+            "openwindow" | "movewindowv2" | "moveworkspacev2" | "workspacev2" => Event::Placed,
             _ => Event::Other,
         }
     }
@@ -268,6 +272,105 @@ pub fn focus_last_window(hypr: &dyn Hypr, covered: &[String]) -> io::Result<Opti
     Ok(Some(address.to_string()))
 }
 
+/// Sends to the `home` monitor every home window that is on a workspace of a `covered` monitor,
+/// where the cover would hide it; says what it moved (`window <address>`, `workspace <name>`).
+///
+/// A workspace the covered monitor does not show goes home whole, and so does the one it shows
+/// when it is not the one `seen` there at the previous call: a workspace moved there whole.
+/// (Hyprland says the monitor shows it before it says it moved, so the events cannot tell.)
+/// The user's grouping is kept, and a workspace not shown stays out of sight. The
+/// windows of the workspace it shows go home one by one, to the workspace `home` shows: moving
+/// that workspace would make `home` switch to it and take the focus (measured on Hyprland
+/// 0.56.2), hiding what it showed for one window dragged or opened there. Only the window that
+/// has the keyboard keeps it, and brings the pointer home. Special workspaces stay: Hyprland
+/// shows them over whichever monitor asks.
+pub fn send_home(
+    hypr: &dyn Hypr,
+    covered: &[String],
+    home: &str,
+    seen: &mut Vec<(String, i64)>,
+) -> io::Result<Vec<String>> {
+    let json = |request: &str| -> io::Result<serde_json::Value> {
+        serde_json::from_str(&hypr.request(request)?).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Hyprland's `{request}`: {e}"),
+            )
+        })
+    };
+    let monitors = json("j/monitors all")?;
+    let workspaces = json("j/workspaces")?;
+    let windows = json("j/clients")?;
+    let list = |v: &serde_json::Value| v.as_array().cloned().unwrap_or_default();
+    let is_covered = |name: &serde_json::Value| covered.iter().any(|c| name == c.as_str());
+    let shown: Vec<(String, i64)> = list(&monitors)
+        .iter()
+        .filter(|m| is_covered(&m["name"]))
+        .filter_map(|m| {
+            let name = m["name"].as_str()?.to_owned();
+            Some((name, m["activeWorkspace"]["id"].as_i64()?))
+        })
+        .collect();
+    let shows = |id: i64| shown.iter().find(|(_, shows)| *shows == id);
+    // Nothing seen yet, on the first call: what the monitors show is taken as seen.
+    let moved_there =
+        |(monitor, id): &(String, i64)| seen.iter().any(|(m, was)| m == monitor && was != id);
+    let mut sent = Vec::new();
+    for workspace in list(&workspaces) {
+        let (Some(id), Some(name)) = (workspace["id"].as_i64(), workspace["name"].as_str()) else {
+            continue;
+        };
+        if !is_covered(&workspace["monitor"]) || name.starts_with("special:") {
+            continue;
+        }
+        let on_it: Vec<(String, bool)> = list(&windows)
+            .iter()
+            .filter(|w| w["workspace"]["id"] == id)
+            .filter_map(|w| {
+                let address = w["address"].as_str()?.to_owned();
+                Some((address, w["focusHistoryID"] == 0))
+            })
+            .collect();
+        if on_it.is_empty() {
+            continue;
+        }
+        if shows(id).is_none_or(moved_there) {
+            dispatch(
+                hypr,
+                &format!(
+                    "eval hl.dispatch(hl.dsp.workspace.move({{ workspace = {}, monitor = {} }}))",
+                    lua_string(&format!("name:{name}")),
+                    lua_string(home)
+                ),
+            )?;
+            sent.push(format!("workspace {name}"));
+            continue;
+        }
+        for (address, has_keyboard) in on_it {
+            let window = lua_string(&format!("address:{address}"));
+            dispatch(
+                hypr,
+                &format!(
+                    "eval hl.dispatch(hl.dsp.window.move({{ monitor = {}, follow = false, \
+                     window = {window} }}))",
+                    lua_string(home)
+                ),
+            )?;
+            // Hyprland put the pointer on the covered monitor with the window that has the
+            // keyboard (a move it followed, a drag): the focus warps it back home with it.
+            if has_keyboard {
+                dispatch(
+                    hypr,
+                    &format!("eval hl.dispatch(hl.dsp.focus({{ window = {window} }}))"),
+                )?;
+            }
+            sent.push(format!("window {address}"));
+        }
+    }
+    *seen = shown;
+    Ok(sent)
+}
+
 /// The running Hyprland: the one this process was started in while it answers, else the
 /// newest that does. `hypr_ipc::Instance::discover` keeps to the inherited signature, which
 /// names a dead instance once Hyprland has restarted.
@@ -396,6 +499,46 @@ pub mod fake {
         no_warps: bool,
         /// The windows focused by a dispatch, and whether the pointer was warped onto each.
         focused: Vec<(String, bool)>,
+        /// Workspaces beyond the one each monitor shows: id, name, monitor.
+        workspaces: Vec<(i64, String, String)>,
+        /// The workspace a monitor shows, when not its index + 1.
+        shown: Vec<(String, i64)>,
+    }
+
+    impl State {
+        fn shown(&self, monitor: &str) -> i64 {
+            let index = self.monitors.iter().position(|m| m.name == monitor);
+            self.shown
+                .iter()
+                .find(|(m, _)| m == monitor)
+                .map(|(_, id)| *id)
+                .unwrap_or_else(|| index.map_or(0, |i| i as i64 + 1))
+        }
+
+        fn workspace_of(&self, window: &FakeWindow) -> i64 {
+            match window.workspace {
+                Some(id) => id,
+                // A hidden workspace's id is past every monitor's shown one.
+                None if window.hidden_workspace => 100,
+                None => self.shown(&window.monitor),
+            }
+        }
+
+        /// Every workspace: id, name, monitor.
+        fn all_workspaces(&self) -> Vec<(i64, String, String)> {
+            let mut all = self.workspaces.clone();
+            let shown = self.monitors.iter().map(|m| (self.shown(&m.name), &m.name));
+            let of_windows = self
+                .windows
+                .iter()
+                .map(|w| (self.workspace_of(w), &w.monitor));
+            for (id, monitor) in shown.chain(of_windows) {
+                if !all.iter().any(|(i, _, _)| *i == id) {
+                    all.push((id, id.to_string(), monitor.clone()));
+                }
+            }
+            all
+        }
     }
 
     /// A window, on the active workspace of its monitor unless `hidden_workspace`.
@@ -406,6 +549,8 @@ pub mod fake {
         /// 0 for the window that had the keyboard last, then 1, 2…
         pub focus_history: i64,
         pub hidden_workspace: bool,
+        /// Its workspace, when not one its monitor's shown or hidden one.
+        pub workspace: Option<i64>,
     }
 
     impl FakeWindow {
@@ -415,6 +560,14 @@ pub mod fake {
                 monitor: monitor.into(),
                 focus_history,
                 hidden_workspace: false,
+                workspace: None,
+            }
+        }
+
+        pub fn on_workspace(self, id: i64) -> Self {
+            Self {
+                workspace: Some(id),
+                ..self
             }
         }
     }
@@ -453,6 +606,29 @@ pub mod fake {
 
         pub fn add_window(&self, window: FakeWindow) {
             self.state.lock().unwrap().windows.push(window);
+        }
+
+        pub fn add_workspace(&self, id: i64, name: &str, monitor: &str) {
+            let mut state = self.state.lock().unwrap();
+            state.workspaces.push((id, name.into(), monitor.into()));
+        }
+
+        /// `monitor` shows workspace `id`.
+        pub fn show(&self, monitor: &str, id: i64) {
+            let mut state = self.state.lock().unwrap();
+            state.shown.retain(|(m, _)| m != monitor);
+            state.shown.push((monitor.into(), id));
+        }
+
+        pub fn shown(&self, monitor: &str) -> i64 {
+            self.state.lock().unwrap().shown(monitor)
+        }
+
+        /// The monitor and workspace a window is on.
+        pub fn place(&self, address: &str) -> (String, i64) {
+            let state = self.state.lock().unwrap();
+            let window = state.windows.iter().find(|w| w.address == address).unwrap();
+            (window.monitor.clone(), state.workspace_of(window))
         }
 
         pub fn set_no_warps(&self, on: bool) {
@@ -518,6 +694,13 @@ pub mod fake {
         }
     }
 
+    /// The string `key = "..."` holds in a Lua table, as Navette writes it.
+    fn quoted(lua: &str, key: &str) -> Option<String> {
+        let start = lua.find(&format!("{key} = \""))? + key.len() + 4;
+        let rest = &lua[start..];
+        Some(rest[..rest.find('"')?].to_string())
+    }
+
     /// The fields of `hl.monitor({ output = "X", mode = "WxH@R", position = "XxY", scale = S,
     /// transform = T })`, as Navette writes it.
     fn parse_rule(lua: &str) -> Option<FakeMonitor> {
@@ -563,7 +746,8 @@ pub mod fake {
                     .map(|(id, m)| {
                         format!(
                             r#"{{"id":{id},"name":"{}","width":{},"height":{},"refreshRate":{},"x":{},"y":{},"scale":{},"transform":{},"focused":false,"disabled":{},"activeWorkspace":{{"id":{},"name":"{}"}}}}"#,
-                            m.name, m.width, m.height, m.refresh, m.x, m.y, m.scale, m.transform, m.disabled, id + 1, id + 1
+                            m.name, m.width, m.height, m.refresh, m.x, m.y, m.scale, m.transform,
+                            m.disabled, state.shown(&m.name), state.shown(&m.name)
                         )
                     })
                     .collect();
@@ -585,6 +769,16 @@ pub mod fake {
                 state.binds.push(lua.to_string());
                 return Ok("ok".into());
             }
+            if command == "j/workspaces" {
+                let list: Vec<String> = state
+                    .all_workspaces()
+                    .iter()
+                    .map(|(id, name, monitor)| {
+                        format!(r#"{{"id":{id},"name":"{name}","monitor":"{monitor}"}}"#)
+                    })
+                    .collect();
+                return Ok(format!("[{}]", list.join(",")));
+            }
             if command == "j/clients" {
                 let monitors = &state.monitors;
                 let list: Vec<String> = state
@@ -592,8 +786,7 @@ pub mod fake {
                     .iter()
                     .filter_map(|w| {
                         let id = monitors.iter().position(|m| m.name == w.monitor)?;
-                        // A hidden workspace's id is past every monitor's active one.
-                        let workspace = if w.hidden_workspace { 100 } else { id + 1 };
+                        let workspace = state.workspace_of(w);
                         Some(format!(
                             r#"{{"address":"{}","mapped":true,"hidden":false,"monitor":{id},"workspace":{{"id":{workspace},"name":"{workspace}"}},"focusHistoryID":{}}}"#,
                             w.address, w.focus_history
@@ -624,6 +817,49 @@ pub mod fake {
                     return Ok("error: hl.focus: window not found".into());
                 }
                 state.focused.push((address, warped));
+                return Ok("ok".into());
+            }
+            if let Some(lua) = command.strip_prefix("eval hl.dispatch(hl.dsp.window.move(") {
+                let (Some(monitor), Some(address)) =
+                    (quoted(lua, "monitor"), quoted(lua, "window"))
+                else {
+                    return Ok("error: hl.window.move: expected a table".into());
+                };
+                let address = address.trim_start_matches("address:");
+                let shown = state.shown(&monitor);
+                let Some(window) = state.windows.iter_mut().find(|w| w.address == address) else {
+                    return Ok("error: hl.window.move: window not found".into());
+                };
+                window.monitor = monitor;
+                window.workspace = Some(shown);
+                return Ok("ok".into());
+            }
+            if let Some(lua) = command.strip_prefix("eval hl.dispatch(hl.dsp.workspace.move(") {
+                let (Some(name), Some(to)) = (quoted(lua, "workspace"), quoted(lua, "monitor"))
+                else {
+                    return Ok("error: hl.workspace.move: expected a table".into());
+                };
+                let name = name.trim_start_matches("name:");
+                let all = state.all_workspaces();
+                let Some((id, name, from)) = all.into_iter().find(|(_, n, _)| n == name) else {
+                    return Ok("warning: =[C]:-1: Workspace not found".into());
+                };
+                // Its windows stay on it, wherever it goes.
+                for w in 0..state.windows.len() {
+                    if state.workspace_of(&state.windows[w]) == id {
+                        state.windows[w].workspace = Some(id);
+                        state.windows[w].monitor = to.clone();
+                    }
+                }
+                state.workspaces.retain(|(i, _, _)| *i != id);
+                state.workspaces.push((id, name, to.clone()));
+                // A shown workspace is shown where it goes; where it was gets a new one.
+                if state.shown(&from) == id {
+                    let new = 1000 + state.workspaces.len() as i64;
+                    state.shown.retain(|(m, _)| *m != from && *m != to);
+                    state.shown.push((from, new));
+                    state.shown.push((to, id));
+                }
                 return Ok("ok".into());
             }
             if let Some(lua) = command.strip_prefix("eval hl.config({ cursor = { invisible = ") {
@@ -700,6 +936,24 @@ mod tests {
         assert_eq!(Event::parse("monitoraddedv2>>3,DP-2,desc"), Event::Other);
         assert_eq!(Event::parse("workspace>>2"), Event::Other);
         assert_eq!(Event::parse("garbage"), Event::Other);
+    }
+
+    #[test]
+    fn what_can_put_a_window_on_a_monitor_is_parsed() {
+        for line in [
+            "openwindow>>5a1,7,foot,a title",
+            "movewindowv2>>5a1,2,2",
+            "workspacev2>>4,4",
+        ] {
+            assert_eq!(Event::parse(line), Event::Placed, "{line}");
+        }
+        // Their first versions come with the same change: one sweep is enough.
+        assert_eq!(
+            Event::parse("moveworkspacev2>>-1337,mail, work,DP-2"),
+            Event::Placed
+        );
+        assert_eq!(Event::parse("movewindow>>5a1,2"), Event::Other);
+        assert_eq!(Event::parse("moveworkspace>>2,DP-2"), Event::Other);
     }
 
     #[test]
@@ -925,6 +1179,109 @@ mod port_tests {
         focus_last_window(&hypr, &["DP-2".to_string()]).unwrap();
         assert_eq!(hypr.focused(), [("0xa1".to_string(), false)]);
         assert!(hypr.no_warps());
+    }
+
+    fn dp2() -> Vec<String> {
+        vec!["DP-2".to_string()]
+    }
+
+    #[test]
+    fn a_window_on_the_workspace_a_covered_monitor_shows_goes_home_without_the_focus() {
+        let hypr = home_with_windows(&[
+            FakeWindow::new("0xa1", "DP-1", 0),
+            FakeWindow::new("0xe5", "DP-2", 1),
+        ]);
+        let sent = send_home(&hypr, &dp2(), "DP-1", &mut Vec::new()).unwrap();
+        assert_eq!(sent, ["window 0xe5"]);
+        // On the workspace DP-1 shows, which it still shows: the window is in sight.
+        assert_eq!(hypr.place("0xe5"), ("DP-1".to_string(), 1));
+        assert_eq!(hypr.shown("DP-1"), 1);
+        assert_eq!(hypr.place("0xa1"), ("DP-1".to_string(), 1));
+        let changes = hypr.changes();
+        assert!(changes[0].contains("follow = false"), "{changes:?}");
+    }
+
+    #[test]
+    fn the_window_with_the_keyboard_brings_it_home_with_the_pointer() {
+        // Moved with the focus following it, or dragged: Hyprland put the pointer on DP-2.
+        let hypr = home_with_windows(&[
+            FakeWindow::new("0xa1", "DP-1", 1),
+            FakeWindow::new("0xe5", "DP-2", 0),
+        ]);
+        send_home(&hypr, &dp2(), "DP-1", &mut Vec::new()).unwrap();
+        assert_eq!(hypr.place("0xe5").0, "DP-1");
+        assert_eq!(hypr.focused(), [("0xe5".to_string(), true)]);
+    }
+
+    #[test]
+    fn a_window_without_the_keyboard_goes_home_without_it() {
+        let hypr = home_with_windows(&[
+            FakeWindow::new("0xa1", "DP-1", 0),
+            FakeWindow::new("0xe5", "DP-2", 1),
+        ]);
+        send_home(&hypr, &dp2(), "DP-1", &mut Vec::new()).unwrap();
+        assert_eq!(hypr.place("0xe5").0, "DP-1");
+        assert_eq!(hypr.focused(), []);
+    }
+
+    #[test]
+    fn a_workspace_moved_whole_onto_a_covered_monitor_goes_home_whole() {
+        let hypr = home_with_windows(&[]);
+        let mut seen = Vec::new();
+        send_home(&hypr, &dp2(), "DP-1", &mut seen).unwrap();
+        assert_eq!(seen, [("DP-2".to_string(), 2)]);
+        hypr.add_workspace(-1337, "mail", "DP-2");
+        hypr.show("DP-2", -1337);
+        hypr.add_window(FakeWindow::new("0xa1", "DP-2", 0).on_workspace(-1337));
+        hypr.add_window(FakeWindow::new("0xb2", "DP-2", 1).on_workspace(-1337));
+        let sent = send_home(&hypr, &dp2(), "DP-1", &mut seen).unwrap();
+        assert_eq!(sent, ["workspace mail"]);
+        assert_eq!(hypr.place("0xa1"), ("DP-1".to_string(), -1337));
+        assert_eq!(hypr.place("0xb2"), ("DP-1".to_string(), -1337));
+        assert_eq!(hypr.shown("DP-1"), -1337);
+        assert_ne!(hypr.shown("DP-2"), -1337);
+    }
+
+    #[test]
+    fn a_window_opened_on_a_hidden_workspace_of_a_covered_monitor_goes_home_with_it() {
+        // `[workspace 7 silent]`, workspace 7 living on DP-2 but not shown there.
+        let hypr = home_with_windows(&[FakeWindow::new("0xa1", "DP-1", 1)]);
+        hypr.add_workspace(7, "7", "DP-2");
+        hypr.add_window(FakeWindow::new("0xc3", "DP-2", 0).on_workspace(7));
+        let sent = send_home(&hypr, &dp2(), "DP-1", &mut Vec::new()).unwrap();
+        assert_eq!(sent, ["workspace 7"]);
+        assert_eq!(hypr.place("0xc3"), ("DP-1".to_string(), 7));
+        // Silent it was, silent it stays: DP-1 still shows what it showed.
+        assert_eq!(hypr.shown("DP-1"), 1);
+    }
+
+    #[test]
+    fn home_windows_empty_and_special_workspaces_stay_where_they_are() {
+        let hypr = home_with_windows(&[
+            FakeWindow::new("0xa1", "DP-1", 1),
+            FakeWindow::new("0xf6", "DP-3", 0),
+        ]);
+        hypr.add_workspace(-98, "special:scratch", "DP-2");
+        hypr.add_window(FakeWindow::new("0xd4", "DP-2", 2).on_workspace(-98));
+        hypr.add_workspace(8, "8", "DP-2");
+        let sent = send_home(&hypr, &dp2(), "DP-1", &mut Vec::new()).unwrap();
+        assert!(sent.is_empty(), "{sent:?}");
+        assert_eq!(hypr.changes(), [] as [&str; 0]);
+        assert_eq!(hypr.place("0xd4"), ("DP-2".to_string(), -98));
+    }
+
+    #[test]
+    fn windows_under_any_of_the_covered_monitors_go_home() {
+        let hypr = home_with_windows(&[
+            FakeWindow::new("0xe5", "DP-2", 0),
+            FakeWindow::new("0xf6", "DP-3", 1),
+        ]);
+        let covered = ["DP-2".to_string(), "DP-3".to_string()];
+        let mut sent = send_home(&hypr, &covered, "DP-1", &mut Vec::new()).unwrap();
+        sent.sort();
+        assert_eq!(sent, ["window 0xe5", "window 0xf6"]);
+        assert_eq!(hypr.place("0xe5").0, "DP-1");
+        assert_eq!(hypr.place("0xf6").0, "DP-1");
     }
 
     #[test]

@@ -129,6 +129,19 @@ pub enum LinkMsg {
         #[n(2)]
         data_len: u32,
     },
+    /// The remote sink's volume and mute, remote to home, only when they change: the linear gain
+    /// of each channel, which home applies to its playback.
+    #[n(54)]
+    AudioVolume {
+        #[n(0)]
+        session: u32,
+        #[n(1)]
+        left: f32,
+        #[n(2)]
+        right: f32,
+        #[n(3)]
+        muted: bool,
+    },
 }
 
 /// An output id as the link writes it: none for output 0.
@@ -195,6 +208,12 @@ impl From<&audio::Message> for LinkMsg {
                 seq: *seq,
                 data_len: packet.len() as u32,
             },
+            audio::Message::Volume { session, level } => Self::AudioVolume {
+                session: *session,
+                left: level.left,
+                right: level.right,
+                muted: level.muted,
+            },
             audio::Message::MicStart { session } => Self::MicStart { session: *session },
             audio::Message::MicStop => Self::MicStop,
             audio::Message::MicFrame {
@@ -226,7 +245,8 @@ impl LinkMsg {
             | Self::AudioFrame { .. }
             | Self::MicStart { .. }
             | Self::MicStop
-            | Self::MicFrame { .. } => return None,
+            | Self::MicFrame { .. }
+            | Self::AudioVolume { .. } => return None,
             Self::ClipboardOffer {
                 serial,
                 mime_types,
