@@ -1,7 +1,8 @@
 // Copied from gliff (https://github.com/omacom/gliff), crates/gliff-server/src/rate.rs at
 // 58273cb (the fork's navette branch). Copyright (c) 2026 Kevin McConnell, MIT license: see
 // LICENSES/gliff-MIT.txt. Changed for Navette: `RateController::ceiling_bitrate` is added, for
-// still-picture refinement; gliff's logic is unchanged.
+// still-picture refinement, and a simulation of two streams sharing one link (one per remote
+// output); gliff's logic is unchanged.
 
 //! Link estimation and rate control for a frame-paced stream.
 //!
@@ -835,59 +836,75 @@ mod tests {
         /// added delay).
         fn run(&mut self, secs: f64, fps: u32, rtt_ms: f64, cap_bps: f64) -> f64 {
             let mut next_send = self.now;
-            let interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
             let mut acked = 0u64;
             let started = self.now;
             let mut link_free = self.now;
             while self.now < started + Duration::from_secs_f64(secs) {
                 self.now += MS;
-                while self
-                    .pending_acks
-                    .front()
-                    .is_some_and(|(t, _)| *t <= self.now)
-                {
-                    let (_, id) = self.pending_acks.pop_front().unwrap();
-                    self.link.on_ack(self.now, id);
-                    self.ctl.on_ack(self.now, &mut self.link);
-                    if let Some(level) = self.ladder.consider(
-                        self.now,
-                        &self.link,
-                        self.ctl.is_slow_start(),
-                        self.ctl.congested_recently(self.now),
-                        self.pixels,
-                        self.streams == 2,
-                        true,
-                        self.max_fps,
-                    ) {
-                        self.level_changes.push((self.now, level));
-                    }
-                    if fps == 0 && self.link.inflight_bytes() == 0 {
-                        self.ctl.note_idle(self.now);
-                    }
-                    acked += 1;
-                }
-                if fps == 0 || self.now < next_send {
-                    continue;
-                }
-                // One simulated frame carries every stream's share.
-                let bytes = (self.ctl.target() / (fps * 8)).max(500) as usize;
-                let room = self.link.inflight_bytes() + self.link.est_frame_bytes()
-                    <= self.link.cap_bytes(self.now, self.ctl.is_slow_start());
-                if !room {
-                    self.ctl.note_blocked_at_cap();
-                    continue;
-                }
-                // Serialization on the capacity plus the propagation delay.
-                let tx = Duration::from_secs_f64(bytes as f64 * 8.0 / cap_bps);
-                link_free = link_free.max(self.now) + tx;
-                let ack_at = link_free + Duration::from_secs_f64(rtt_ms / 1000.0);
-                self.ctl.note_frame_sent(self.now);
-                self.link.on_sent(self.now, self.frame_id, bytes, false);
-                self.pending_acks.push_back((ack_at, self.frame_id));
-                self.frame_id += 1;
-                next_send = self.now + interval;
+                acked += self.step(fps, rtt_ms, cap_bps, &mut next_send, &mut link_free);
             }
             acked as f64 / secs
+        }
+
+        /// One millisecond, `self.now` already moved: takes the acks due, sends a frame when
+        /// the pace and the cap allow it, on a link busy until `link_free` (shared with any
+        /// other stream on it). Returns the acks taken.
+        fn step(
+            &mut self,
+            fps: u32,
+            rtt_ms: f64,
+            cap_bps: f64,
+            next_send: &mut Instant,
+            link_free: &mut Instant,
+        ) -> u64 {
+            let interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+            let mut acked = 0;
+            while self
+                .pending_acks
+                .front()
+                .is_some_and(|(t, _)| *t <= self.now)
+            {
+                let (_, id) = self.pending_acks.pop_front().unwrap();
+                self.link.on_ack(self.now, id);
+                self.ctl.on_ack(self.now, &mut self.link);
+                if let Some(level) = self.ladder.consider(
+                    self.now,
+                    &self.link,
+                    self.ctl.is_slow_start(),
+                    self.ctl.congested_recently(self.now),
+                    self.pixels,
+                    self.streams == 2,
+                    true,
+                    self.max_fps,
+                ) {
+                    self.level_changes.push((self.now, level));
+                }
+                if fps == 0 && self.link.inflight_bytes() == 0 {
+                    self.ctl.note_idle(self.now);
+                }
+                acked += 1;
+            }
+            if fps == 0 || self.now < *next_send {
+                return acked;
+            }
+            // One simulated frame carries every stream's share.
+            let bytes = (self.ctl.target() / (fps * 8)).max(500) as usize;
+            let room = self.link.inflight_bytes() + self.link.est_frame_bytes()
+                <= self.link.cap_bytes(self.now, self.ctl.is_slow_start());
+            if !room {
+                self.ctl.note_blocked_at_cap();
+                return acked;
+            }
+            // Serialization on the capacity plus the propagation delay.
+            let tx = Duration::from_secs_f64(bytes as f64 * 8.0 / cap_bps);
+            *link_free = (*link_free).max(self.now) + tx;
+            let ack_at = *link_free + Duration::from_secs_f64(rtt_ms / 1000.0);
+            self.ctl.note_frame_sent(self.now);
+            self.link.on_sent(self.now, self.frame_id, bytes, false);
+            self.pending_acks.push_back((ack_at, self.frame_id));
+            self.frame_id += 1;
+            *next_send = self.now + interval;
+            acked
         }
     }
 
@@ -1235,5 +1252,67 @@ mod tests {
         let before = ctl.target();
         ctl.reconfigure(1280 * 720, 1, 15);
         assert_eq!(ctl.target(), before.clamp(ctl.min, ctl.effective_max()));
+    }
+
+    /// Two streams on one link, as two remote outputs share the LAN, each with its own
+    /// controller: the second starts while the first has the link to itself. Over the last
+    /// `measured` seconds, each one's delivered rate, second by second.
+    fn two_on_one_link(cap_bps: f64, rtt_ms: f64, measured: usize) -> [Vec<f64>; 2] {
+        let fps = 60;
+        let mut sims = [Sim::new(1920 * 1080, 2, fps), Sim::new(1920 * 1080, 2, fps)];
+        let start = sims[0].now;
+        for sim in &mut sims {
+            sim.now = start;
+        }
+        let mut next_send = [start; 2];
+        let mut link_free = start;
+        let mut rates = [Vec::new(), Vec::new()];
+        let alone = 10_000;
+        let total = alone + 40_000;
+        let mut delivered_at_second = [0u64; 2];
+        for ms in 1..=total {
+            for (i, sim) in sims.iter_mut().enumerate() {
+                sim.now = start + ms as u32 * MS;
+                if i == 1 && ms <= alone {
+                    continue;
+                }
+                sim.step(fps, rtt_ms, cap_bps, &mut next_send[i], &mut link_free);
+            }
+            if ms % 1000 == 0 && ms > total - measured as u64 * 1000 {
+                for (i, sim) in sims.iter().enumerate() {
+                    let delivered = sim.link.delivered;
+                    rates[i].push((delivered - delivered_at_second[i]) as f64 * 8.0);
+                }
+            }
+            if ms % 1000 == 0 {
+                for (i, sim) in sims.iter().enumerate() {
+                    delivered_at_second[i] = sim.link.delivered;
+                }
+            }
+        }
+        rates
+    }
+
+    fn mean(rates: &[f64]) -> f64 {
+        rates.iter().sum::<f64>() / rates.len() as f64
+    }
+
+    #[test]
+    fn two_streams_on_one_link_share_it_fairly_and_settle() {
+        // A LAN slower than the two streams want: each would take 25 Mbit/s.
+        let cap = 20e6;
+        let rates = two_on_one_link(cap, 2.0, 20);
+        let (first, second) = (mean(&rates[0]), mean(&rates[1]));
+        // Both together fill most of the link, and neither starves the other.
+        assert!(first + second > 0.7 * cap, "{first:.0} + {second:.0}");
+        let share = first.min(second) / first.max(second);
+        assert!(share > 0.6, "{first:.0} against {second:.0}: {rates:?}");
+        // No lasting swing: each second within half of the stream's mean.
+        for (stream, mean) in rates.iter().zip([first, second]) {
+            assert!(
+                stream.iter().all(|r| (r - mean).abs() < 0.5 * mean),
+                "{rates:?}"
+            );
+        }
     }
 }
