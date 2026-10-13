@@ -107,6 +107,9 @@ struct Shared<G: Graph> {
     graph: G,
     /// Where home's default mic is kept while the mic is away.
     saved: Saved,
+    /// Held through a start or a stop, which may wait for the link: they never overlap.
+    lifecycle: Mutex<()>,
+    /// Held only briefly, so that orders and the checks are answered while the link waits.
     state: Mutex<State<G>>,
     status: watch::Sender<Status>,
 }
@@ -130,8 +133,6 @@ struct Running<G: Graph> {
 
 /// How often the mic looks for a PipeWire that restarted under it.
 const CHECK: Duration = Duration::from_millis(250);
-/// How long an order to the remote waits for room on the link.
-const STALLED: Duration = Duration::from_secs(2);
 
 impl<G: Graph + Sync> Mic<G> {
     /// `toggle_command` is what the hotkey runs ([`toggle_command`]).
@@ -140,6 +141,7 @@ impl<G: Graph + Sync> Mic<G> {
             shared: Arc::new(Shared {
                 graph,
                 saved,
+                lifecycle: Mutex::new(()),
                 state: Mutex::new(State {
                     link: None,
                     running: None,
@@ -160,12 +162,17 @@ impl<G: Graph + Sync> Mic<G> {
     /// When it cannot, the mode runs without it, and the mic says why until the mode stops.
     pub fn start(&self) -> io::Result<()> {
         let shared = &self.shared;
-        let mut state = lock(&shared.state);
-        if state.running.is_some() {
-            return Ok(());
-        }
-        let started = self.open(&mut state);
-        let (running, result) = match started {
+        let _lifecycle = lock(&shared.lifecycle);
+        let started = {
+            let mut state = lock(&shared.state);
+            if state.running.is_some() {
+                return Ok(());
+            }
+            state.sessions = state.sessions.wrapping_add(1);
+            let link = state.link.clone().filter(|link| !link.is_closed());
+            link.map(|link| (link, state.sessions))
+        };
+        let (running, result) = match self.open(started) {
             Ok(running) => (running, Ok(())),
             Err(e) => {
                 let running = Running {
@@ -176,20 +183,18 @@ impl<G: Graph + Sync> Mic<G> {
                 (running, Err(e))
             }
         };
+        let mut state = lock(&shared.state);
         state.running = Some(running);
         shared.publish(&state);
         result
     }
 
-    fn open(&self, state: &mut State<G>) -> io::Result<Running<G>> {
+    /// Tells the remote and opens the mic, the state's lock not held: the link may make it
+    /// wait.
+    fn open(&self, link: Option<(mpsc::Sender<Message>, u32)>) -> io::Result<Running<G>> {
         let shared = &self.shared;
-        let link = state
-            .link
-            .clone()
-            .filter(|link| !link.is_closed())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "the link is down"))?;
-        state.sessions = state.sessions.wrapping_add(1);
-        let session = state.sessions;
+        let (link, session) =
+            link.ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "the link is down"))?;
         send(&link, Message::MicStart { session })?;
         let started = HomeMic::start(
             shared.graph.clone(),
@@ -219,22 +224,25 @@ impl<G: Graph + Sync> Mic<G> {
     /// The mode stopped: the mic comes home, and the remote puts its default mic back.
     pub fn stop(&self) {
         let shared = &self.shared;
-        let mut state = lock(&shared.state);
-        let Some(running) = state.running.take() else {
-            return;
+        let _lifecycle = lock(&shared.lifecycle);
+        let (running, link) = {
+            let mut state = lock(&shared.state);
+            let Some(running) = state.running.take() else {
+                return;
+            };
+            shared.publish(&state);
+            (running, state.link.clone())
         };
         // Closed first, so that no frame follows the stop.
         let Some(mic) = running.mic else {
             // It never went: the remote was told when it failed.
-            shared.publish(&state);
             return;
         };
         drop(mic);
-        if let Some(link) = &state.link {
+        if let Some(link) = link {
             // A link already down took the remote's source with it.
-            let _ = send(link, Message::MicStop);
+            let _ = send(&link, Message::MicStop);
         }
-        shared.publish(&state);
     }
 }
 
@@ -286,37 +294,16 @@ impl<G: Graph> Shared<G> {
     }
 }
 
-/// Waits for room on the link, an order must not be lost as a frame may be, but not for ever:
-/// the mic's lock is held meanwhile.
-fn send(link: &mpsc::Sender<Message>, mut message: Message) -> io::Result<()> {
-    let since = std::time::Instant::now();
-    loop {
-        match link.try_send(message) {
-            Ok(()) => return Ok(()),
-            Err(mpsc::error::TrySendError::Full(_)) if since.elapsed() >= STALLED => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "the link is stalled",
-                ));
-            }
-            Err(mpsc::error::TrySendError::Full(returned)) => {
-                message = returned;
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "the link is down",
-                ));
-            }
-        }
-    }
+/// Waits for room on the link: an order must not be lost, as a frame may be.
+fn send(link: &mpsc::Sender<Message>, message: Message) -> io::Result<()> {
+    link.blocking_send(message)
+        .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "the link is down"))
 }
 
 impl<G: Graph + Sync> Routing for Mic<G> {
     fn order(&self, order: Order) -> io::Result<Status> {
         let shared = &self.shared;
-        // Read without the lock, which a start or a stop holds while it waits.
+        // Read without a lock: it is all there.
         if order == Order::Status {
             return Ok(*shared.status.borrow());
         }
@@ -735,35 +722,55 @@ mod tests {
         assert_eq!(mic.order(Order::Toggle).unwrap(), Status::Home);
     }
 
-    /// Fills the link as a stalled one is: nothing more goes in.
+    /// Fills the link with frames, as a stalled one is: nothing more goes in.
     fn stall(remote: &mpsc::Receiver<Message>, mic: &Mic<FakeGraph>) {
         let link = lock(&mic.shared.state).link.clone().unwrap();
-        while link.try_send(Message::MicStop).is_ok() {}
+        let frame = || Message::MicFrame {
+            session: 0,
+            seq: 0,
+            packet: Default::default(),
+        };
+        while link.try_send(frame()).is_ok() {}
         assert_eq!(remote.len(), crate::audio::QUEUE);
     }
 
-    #[tokio::test]
-    async fn a_stalled_link_does_not_hold_the_mic_for_ever() {
-        let (_graph, mic, remote, _tmp) = mic();
-        stall(&remote, &mic);
-        let started = mic.clone();
-        let start =
-            tokio::time::timeout(Duration::from_secs(10), blocking(move || started.start()));
-        let error = start.await.expect("an answer in time").unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    /// The mic answers `order` within half a second.
+    async fn answers(mic: &Arc<Mic<FakeGraph>>, order: Order) -> io::Result<Status> {
+        let asked = mic.clone();
+        let answer = blocking(move || asked.order(order));
+        tokio::time::timeout(Duration::from_millis(500), answer)
+            .await
+            .expect("an answer in time")
     }
 
     #[tokio::test]
-    async fn the_status_answers_while_a_start_waits_for_the_link() {
+    async fn a_stop_waits_out_a_stalled_link_and_its_order_is_not_lost() {
+        let (_graph, mic, mut remote, _tmp) = mic();
+        let started = mic.clone();
+        blocking(move || started.start()).await.unwrap();
+        stall(&remote, &mic);
+        let stopped = mic.clone();
+        let stop = tokio::task::spawn_blocking(move || stopped.stop());
+        // Longer than any give-up, and meanwhile the mic still answers.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(answers(&mic, Order::Status).await.unwrap(), Status::Off);
+        assert!(answers(&mic, Order::Toggle).await.is_err());
+
+        let mut got = orders(&mut remote);
+        stop.await.unwrap();
+        got.extend(orders(&mut remote));
+        assert_eq!(got, [Message::MicStart { session: 1 }, Message::MicStop]);
+    }
+
+    #[tokio::test]
+    async fn the_mic_answers_while_a_start_waits_for_the_link() {
         let (_graph, mic, remote, _tmp) = mic();
         stall(&remote, &mic);
         let started = mic.clone();
         let start = tokio::task::spawn_blocking(move || started.start());
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let asked = mic.clone();
-        let status = blocking(move || asked.order(Order::Status));
-        let status = tokio::time::timeout(Duration::from_millis(500), status).await;
-        assert_eq!(status.expect("an answer in time").unwrap(), Status::Off);
+        assert_eq!(answers(&mic, Order::Status).await.unwrap(), Status::Off);
+        assert!(answers(&mic, Order::Toggle).await.is_err());
         drop(remote);
         let _ = start.await;
     }
