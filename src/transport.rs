@@ -9,7 +9,7 @@
 
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,13 +47,25 @@ pub trait Accept: Send {
     fn accept(&mut self) -> impl Future<Output = io::Result<Self::Stream>> + Send;
 }
 
-/// Refuses a wildcard address: home listens on its LAN address only.
+/// Refuses an address that is not one machine's own: a wildcard (home listens on its LAN
+/// address only), multicast or broadcast. An IPv4-mapped IPv6 address is judged as the IPv4 one
+/// it stands for, since `[::ffff:0.0.0.0]` binds every interface too.
 pub fn refuse_wildcard(address: SocketAddr) -> io::Result<()> {
-    if address.ip().is_unspecified() {
+    let ip = address.ip().to_canonical();
+    let broadcast = matches!(ip, IpAddr::V4(v4) if v4.is_broadcast());
+    if ip.is_unspecified() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "{address} listens on every interface: give the LAN address of this machine instead"
+            ),
+        ));
+    }
+    if ip.is_multicast() || broadcast {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{address} is a multicast or broadcast address: give the LAN address of this machine instead"
             ),
         ));
     }
@@ -298,7 +310,16 @@ mod tests {
 
     #[tokio::test]
     async fn home_refuses_to_bind_a_wildcard_address() {
-        for wildcard in ["0.0.0.0:0", "[::]:0"] {
+        for wildcard in [
+            "0.0.0.0:0",
+            "[::]:0",
+            "[::ffff:0.0.0.0]:0",
+            "224.0.0.1:0",
+            "[ff02::1]:0",
+            "[::ffff:224.0.0.1]:0",
+            "255.255.255.255:0",
+            "[::ffff:255.255.255.255]:0",
+        ] {
             let error = bind_lan(wildcard.parse().unwrap()).await.unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{wildcard}");
             assert!(error.to_string().contains("LAN address"));
