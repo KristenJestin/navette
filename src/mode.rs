@@ -408,8 +408,8 @@ pub async fn serve(
             Some(said) = said(&mut active) => match said {
                 Said::Released => {
                     if let Some(a) = &active {
-                        let (hypr, monitor) = (home.hypr.clone(), a.monitors[0].clone());
-                        let focus = move || hypr::focus_last_window(&*hypr, &monitor);
+                        let (hypr, given) = (home.hypr.clone(), a.monitors.clone());
+                        let focus = move || hypr::focus_last_window(&*hypr, &given);
                         match blocking(focus).await {
                             Ok(Some(window)) => {
                                 tracing::info!(window, "the keyboard went to a home window")
