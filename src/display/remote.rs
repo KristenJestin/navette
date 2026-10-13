@@ -204,6 +204,11 @@ pub async fn serve_peer(
                 Some(_) => {}
             },
             event = peer.input.from_peer.next(), if input_open => match event {
+                // A compositor's keymap is compiled whole; an `include` would have this
+                // machine's xkbcommon read files of its own for home.
+                Some(input::Event::Keymap(text)) if text.contains("include") => {
+                    eprintln!("navette: home's keymap includes files: refused, the last one stays");
+                }
                 Some(event) => {
                     match &event {
                         input::Event::Keymap(text) => home.keymap = Some(text.clone()),
@@ -760,6 +765,25 @@ mod tests {
         agent.input.push(key(false));
         until(|| agent.injected(1).unwrap().2 == [caps.clone(), key(false)]).await;
         assert!(!agent.injected(0).unwrap().2.contains(&key(false)));
+    }
+
+    #[tokio::test]
+    async fn a_keymap_that_includes_files_is_refused() {
+        let agent = agent();
+        let home = input::Event::Keymap("home keymap".into());
+        let including = r#"xkb_keymap { xkb_symbols { include "pc+us" }; };"#;
+        agent.inbox.try_send(start()).unwrap();
+        until(|| agent.injected(0).is_some()).await;
+        agent.input.push(home.clone());
+        // Queued together, the newer keymap would replace it before the agent reads it.
+        until(|| agent.injected(0).unwrap().2 == [home.clone()]).await;
+        agent.input.push(input::Event::Keymap(including.into()));
+        agent.input.push(key(true));
+        until(|| agent.injected(0).unwrap().2 == [home.clone(), key(true)]).await;
+        // Nor is it kept for the next injector.
+        agent.streams.end_last();
+        until(|| agent.injected(1).is_some()).await;
+        assert_eq!(agent.injected(1).unwrap().1.as_deref(), Some("home keymap"));
     }
 
     /// Lets the agent handle what was sent, then waits until `done` holds.
