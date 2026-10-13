@@ -63,6 +63,36 @@ While the mode runs:
 - **The home mic**, with `navette serve --audio`, goes to the remote machine while the mode runs,
   and the hotkey switches it either way ([the mic](mic.md)).
 
+## Closing the remote laptop
+
+The remote laptop can be closed while a mode runs, and opened again, if home's `mode.conf`
+says so (it is off by default):
+
+```
+closed_lid = on     # or off
+```
+
+- **Closed**, the laptop's own screen (the output named `eDP-…`, `LVDS-…` or `DSI-…`) is
+  disabled within a second, and Hyprland moves its workspaces to Navette's outputs. The
+  laptop does not suspend: the agent holds logind's `handle-lid-switch` inhibitor lock, which
+  needs no root, for as long as the mode runs.
+- **Opened**, the screen comes back with the mode, place, scale and orientation it had, beside
+  Navette's outputs, and Hyprland gives it back the workspaces it had.
+- **A config reload** or a script on the lid that turns the screen on while the lid is closed
+  is undone at once; after a Hyprland restart, the screen is disabled again once Navette's
+  outputs are back.
+- **Undone** when the mode stops, when the link drops and when the agent stops: the screen
+  comes back first, then the lock is released, and logind handles the lid as it always does.
+  An agent that crashed brings the screen back when it starts again (the rule that brings it
+  back is kept in `$XDG_RUNTIME_DIR/navette/lid` meanwhile); its lock went with it.
+- **When logind or the laptop's policy refuses the lock**, the mode runs without it, the lid
+  does what it always does, and the agent says why in its journal
+  (`journalctl --user -u navette-agent`). Nothing else is tried.
+
+Nothing else on the laptop changes: its idle lock works as usual, and so does a lock on
+closing the lid (Omarchy's lid bind locks the session when no physical monitor is plugged in;
+Navette's outputs do not count as one). It is unlocked from the home monitors.
+
 ## Keyboard and pointer
 
 Focus follows the pointer, with nothing to click. Over a reserved monitor, the keyboard,
