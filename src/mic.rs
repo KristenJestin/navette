@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::audio::mic::HomeMic;
 use crate::audio::{Graph, Message, Saved, lock};
+use crate::notify::Notifier;
 
 /// Where the mic goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,6 +113,8 @@ struct Shared<G: Graph> {
     /// Held only briefly, so that orders and the checks are answered while the link waits.
     state: Mutex<State<G>>,
     status: watch::Sender<Status>,
+    /// Says where the mic went, at each switch.
+    notifier: Arc<dyn Notifier>,
 }
 
 struct State<G: Graph> {
@@ -136,7 +139,12 @@ const CHECK: Duration = Duration::from_millis(250);
 
 impl<G: Graph + Sync> Mic<G> {
     /// `toggle_command` is what the hotkey runs ([`toggle_command`]).
-    pub fn new(graph: G, saved: Saved, toggle_command: String) -> Self {
+    pub fn new(
+        graph: G,
+        saved: Saved,
+        toggle_command: String,
+        notifier: Arc<dyn Notifier>,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 graph,
@@ -148,6 +156,7 @@ impl<G: Graph + Sync> Mic<G> {
                     sessions: 0,
                 }),
                 status: watch::Sender::new(Status::Off),
+                notifier,
             }),
             toggle_command,
         }
@@ -255,11 +264,40 @@ impl<G: Graph> Shared<G> {
             Some(running) if running.mic.as_ref().is_some_and(HomeMic::remote) => Status::Remote,
             Some(_) => Status::Home,
         };
+        let mut before = now;
         self.status.send_if_modified(|status| {
-            let changed = *status != now;
+            before = *status;
             *status = now;
-            changed
+            before != now
         });
+        // What the user sees is where the mic is: a mode starting with the mic home, or
+        // stopping with it home, moves nothing.
+        if Self::place(before) != Self::place(now) {
+            match now {
+                Status::Remote => self.notifier.show("Mic → remote", ""),
+                Status::Failed => {
+                    let failure = state.running.as_ref().and_then(|r| r.failure.as_deref());
+                    self.notifier
+                        .show("Mic failed", failure.unwrap_or_default());
+                }
+                Status::Home | Status::Off => self.notifier.show("Mic → home", ""),
+            }
+        }
+    }
+
+    /// A switch that did not happen: the user pressed a key and nothing on screen says why,
+    /// so the notification does.
+    fn refused(&self, why: io::Error) -> io::Error {
+        self.notifier.show("Mic not switched", &why.to_string());
+        why
+    }
+
+    /// Where the user would say the mic is: no mode means home.
+    fn place(status: Status) -> Status {
+        match status {
+            Status::Off => Status::Home,
+            other => other,
+        }
     }
 
     /// Opens the mic again whenever PipeWire restarted, until the mode stops.
@@ -310,12 +348,12 @@ impl<G: Graph + Sync> Routing for Mic<G> {
         let mut state = lock(&shared.state);
         let current = *shared.status.borrow();
         let Some(running) = &mut state.running else {
-            return Err(io::Error::other(
+            return Err(shared.refused(io::Error::other(
                 "no mode is running: the mic is home until one starts",
-            ));
+            )));
         };
         if let Some(failure) = &running.failure {
-            return Err(io::Error::other(failure.clone()));
+            return Err(shared.refused(io::Error::other(failure.clone())));
         }
         let to = match (order, current) {
             (Order::Status, _) => return Ok(current),
@@ -323,7 +361,8 @@ impl<G: Graph + Sync> Routing for Mic<G> {
             (Order::Home, _) | (Order::Toggle, _) => Status::Home,
         };
         if let Some(mic) = &mut running.mic {
-            mic.send_to(to == Status::Remote)?;
+            mic.send_to(to == Status::Remote)
+                .map_err(|e| shared.refused(e))?;
         }
         shared.publish(&state);
         Ok(to)
@@ -508,6 +547,7 @@ mod tests {
     use crate::audio::fake::FakeGraph;
     use crate::audio::mic::{AWAY, MIC};
     use crate::audio::{DefaultNode, Saved};
+    use crate::notify::Fake;
 
     /// A mic at home, `desk-mic`, and the remote's end of its link.
     fn mic() -> (
@@ -516,14 +556,33 @@ mod tests {
         mpsc::Receiver<Message>,
         tempfile::TempDir,
     ) {
+        let (graph, mic, remote, _notes, tmp) = noted();
+        (graph, mic, remote, tmp)
+    }
+
+    /// The same, and what it shows the user.
+    fn noted() -> (
+        FakeGraph,
+        Arc<Mic<FakeGraph>>,
+        mpsc::Receiver<Message>,
+        Arc<Fake>,
+        tempfile::TempDir,
+    ) {
         let graph = FakeGraph::default();
         graph.state().default_source = Some(DefaultNode::named("desk-mic"));
         let tmp = tempfile::tempdir().unwrap();
         let saved = Saved::in_dir(tmp.path().to_owned());
-        let mic = Arc::new(Mic::new(graph.clone(), saved, "navette mic toggle".into()));
+        let notes = Arc::new(Fake::default());
+        let mic = Mic::new(
+            graph.clone(),
+            saved,
+            "navette mic toggle".into(),
+            notes.clone(),
+        );
+        let mic = Arc::new(mic);
         let (link, remote) = mpsc::channel(crate::audio::QUEUE);
         mic.attach(link);
-        (graph, mic, remote, tmp)
+        (graph, mic, remote, notes, tmp)
     }
 
     /// The name of home's default mic.
@@ -679,6 +738,100 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn each_switch_shows_where_the_mic_went() {
+        let (_graph, mic, _remote, notes, _tmp) = noted();
+        // The mode starts: the mic goes to the remote machine.
+        let started = mic.clone();
+        blocking(move || started.start()).await.unwrap();
+        assert_eq!(notes.summaries(), ["Mic → remote"]);
+        mic.order(Order::Toggle).unwrap();
+        mic.order(Order::Toggle).unwrap();
+        mic.order(Order::Home).unwrap();
+        assert_eq!(
+            notes.summaries(),
+            ["Mic → remote", "Mic → home", "Mic → remote", "Mic → home"]
+        );
+        // The mode stops with the mic already home: nothing moved, nothing to say.
+        let stopped = mic.clone();
+        blocking(move || stopped.stop()).await;
+        assert_eq!(notes.summaries().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn stopping_the_mode_with_the_mic_remote_shows_it_came_home() {
+        let (_graph, mic, _remote, notes, _tmp) = noted();
+        let started = mic.clone();
+        blocking(move || started.start()).await.unwrap();
+        let stopped = mic.clone();
+        blocking(move || stopped.stop()).await;
+        assert_eq!(notes.summaries(), ["Mic → remote", "Mic → home"]);
+    }
+
+    #[tokio::test]
+    async fn an_order_that_changes_nothing_shows_nothing() {
+        let (_graph, mic, _remote, notes, _tmp) = noted();
+        let started = mic.clone();
+        blocking(move || started.start()).await.unwrap();
+        mic.order(Order::Remote).unwrap();
+        mic.order(Order::Status).unwrap();
+        assert_eq!(notes.summaries(), ["Mic → remote"]);
+    }
+
+    #[tokio::test]
+    async fn a_switch_that_fails_says_it_failed() {
+        let (graph, mic, _remote, notes, _tmp) = noted();
+        let started = mic.clone();
+        blocking(move || started.start()).await.unwrap();
+        mic.order(Order::Home).unwrap();
+        // Going back to the remote needs PipeWire: it refuses.
+        graph.state().refuse_defaults = true;
+        assert!(mic.order(Order::Remote).is_err());
+        let shown = notes.shown();
+        assert_eq!(shown.len(), 3, "{shown:?}");
+        assert_eq!(shown[2].0, "Mic not switched");
+        assert!(!shown[2].1.is_empty(), "{shown:?}");
+    }
+
+    #[tokio::test]
+    async fn a_mic_that_cannot_start_shows_why_and_a_switch_says_it_too() {
+        let (graph, mic, _remote, notes, _tmp) = noted();
+        graph.state().refuse_mics = true;
+        let started = mic.clone();
+        assert!(blocking(move || started.start()).await.is_err());
+        let shown = notes.shown();
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert_eq!(shown[0].0, "Mic failed");
+        assert!(shown[0].1.contains("no echo canceller"), "{shown:?}");
+        assert!(mic.order(Order::Toggle).is_err());
+        assert_eq!(notes.summaries(), ["Mic failed", "Mic not switched"]);
+        // The mode stops: the mic is home, and the failure is replaced.
+        let stopped = mic.clone();
+        blocking(move || stopped.stop()).await;
+        assert_eq!(notes.summaries().last().unwrap(), "Mic → home");
+    }
+
+    #[tokio::test]
+    async fn a_switch_with_no_mode_says_so() {
+        let (_graph, mic, _remote, notes, _tmp) = noted();
+        assert!(mic.order(Order::Toggle).is_err());
+        let shown = notes.shown();
+        assert_eq!(shown[0].0, "Mic not switched");
+        assert!(shown[0].1.contains("no mode is running"), "{shown:?}");
+        mic.order(Order::Status).unwrap();
+        assert_eq!(notes.shown().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pipewire_restart_that_the_mic_survives_shows_nothing_more() {
+        let (graph, mic, _remote, notes, _tmp) = noted();
+        let started = mic.clone();
+        blocking(move || started.start()).await.unwrap();
+        graph.restart();
+        tokio::time::sleep(CHECK * 4).await;
+        assert_eq!(notes.summaries(), ["Mic → remote"]);
+    }
+
     /// Waits for the mic to say `status`.
     async fn until_status(mic: &Mic<FakeGraph>, status: Status) {
         let mut changes = mic.watch();
@@ -779,7 +932,8 @@ mod tests {
     async fn without_a_link_the_mic_cannot_start() {
         let tmp = tempfile::tempdir().unwrap();
         let saved = Saved::in_dir(tmp.path().to_owned());
-        let mic = Arc::new(Mic::new(FakeGraph::default(), saved, String::new()));
+        let notes = Arc::new(Fake::default());
+        let mic = Arc::new(Mic::new(FakeGraph::default(), saved, String::new(), notes));
         let started = mic.clone();
         let error = blocking(move || started.start()).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);

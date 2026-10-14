@@ -24,6 +24,7 @@ use navette::lid;
 use navette::link::{self, Backoff, Event, Heartbeat, Wire};
 use navette::mic::{self, Mic, NoSound, Routing};
 use navette::mode::{self, Home};
+use navette::notify;
 use navette::pair::{self, Pin, Timeouts};
 use navette::single::{self, AgentLock};
 use navette::store::Store;
@@ -220,9 +221,10 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                     .await
                     .map_err(std::io::Error::other)?;
             }
-            let mic = graph
-                .clone()
-                .map(|graph| Arc::new(Mic::new(graph, saved, toggle)));
+            let mic = graph.clone().map(|graph| {
+                let notifier = Arc::new(notify::NotifySend::new(notify::Command));
+                Arc::new(Mic::new(graph, saved, toggle, notifier))
+            });
             let sound = graph
                 .is_some()
                 .then(|| Arc::new(audio::HomeSound::default()));
