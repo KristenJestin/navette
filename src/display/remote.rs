@@ -183,12 +183,19 @@ struct Output {
 
 impl Active {
     /// Gives output `index` its stream, its injector getting what home said of its surface
-    /// and its locks, up to now.
+    /// and its locks, up to now, and its keymap if it changed since the injector was made.
     fn run(&mut self, index: usize, running: Running, home: &Home, outbox: &Outbox) {
         match &running.input {
             Ok(input) => {
                 for event in [&home.areas[index], &home.locked].into_iter().flatten() {
                     input.send(event);
+                }
+                if let Some(text) = home
+                    .keymap
+                    .as_ref()
+                    .filter(|_| home.keymap != running.keymap)
+                {
+                    input.send(&input::Event::Keymap(text.clone()));
                 }
             }
             Err(reason) if !self.told_no_input => {
@@ -272,6 +279,8 @@ struct Running {
     _stream: Box<dyn Send + Sync>,
     /// Without input, the picture still runs: home is told why, once a mode.
     input: Result<Box<dyn Inject>, String>,
+    /// The keymap the injector was made with: one said while it started comes after.
+    keymap: Option<String>,
     feedback: UnboundedSender<ClientMsg>,
     ended: oneshot::Receiver<io::Error>,
     since: tokio::time::Instant,
@@ -630,6 +639,7 @@ fn start_blocking(
     Ok(Running {
         _stream: stream,
         input,
+        keymap: keymap.map(str::to_string),
         feedback,
         ended,
         since: tokio::time::Instant::now(),
@@ -1091,6 +1101,14 @@ mod tests {
         assert_eq!(agent.dropped(0), Some(true));
     }
 
+    /// Every output is running: only then does the injector get home's keys.
+    fn started(outbox: &Outbox) -> bool {
+        outbox
+            .queued()
+            .iter()
+            .any(|msg| matches!(msg, Msg::Display(Display::Started { .. })))
+    }
+
     fn no_input(outbox: &Outbox) -> Vec<String> {
         outbox
             .queued()
@@ -1166,6 +1184,21 @@ mod tests {
         agent.streams.end_last();
         until(|| agent.injected(1).is_some()).await;
         assert_eq!(agent.injected(1).unwrap().1.as_deref(), Some("home keymap"));
+    }
+
+    #[tokio::test]
+    async fn a_keymap_home_says_while_an_output_starts_reaches_its_injector() {
+        let agent = agent();
+        *agent.streams.slow_on.lock().unwrap() = Some((FIRST.into(), Duration::from_millis(600)));
+        agent.inbox.try_send(start()).unwrap();
+        // The output exists, its stream is still starting: its injector will be made without
+        // the keymap that is said now.
+        until(|| agent.hypr.monitor(FIRST).is_some()).await;
+        let keymap = input::Event::Keymap("home keymap".into());
+        agent.input.push(keymap.clone());
+        until(|| agent.input.queued().is_empty()).await;
+        until(|| started(&agent.outbox)).await;
+        assert_eq!(agent.injected(0).unwrap().2, [keymap]);
     }
 
     /// Lets the agent handle what was sent, then waits until `done` holds.
