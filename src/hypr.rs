@@ -371,6 +371,82 @@ pub fn send_home(
     Ok(sent)
 }
 
+/// A workspace with windows on a monitor a mode takes, as the mode starts.
+#[derive(Debug)]
+pub struct Held {
+    pub name: String,
+    pub monitor: String,
+    /// The monitor shows it.
+    pub shown: bool,
+}
+
+/// The workspaces with windows on the `given` monitors, those they show last; special
+/// workspaces left out, as Hyprland shows them over whichever monitor asks.
+pub fn held_workspaces(hypr: &dyn Hypr, given: &[String]) -> io::Result<Vec<Held>> {
+    let json = |request: &str| -> io::Result<serde_json::Value> {
+        serde_json::from_str(&hypr.request(request)?).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Hyprland's `{request}`: {e}"),
+            )
+        })
+    };
+    let monitors = json("j/monitors all")?;
+    let workspaces = json("j/workspaces")?;
+    let list = |v: &serde_json::Value| v.as_array().cloned().unwrap_or_default();
+    let shows = |monitor: &str, id: &serde_json::Value| {
+        list(&monitors)
+            .iter()
+            .any(|m| m["name"] == monitor && m["activeWorkspace"]["id"] == *id)
+    };
+    let mut held: Vec<Held> = list(&workspaces)
+        .iter()
+        .filter(|w| w["windows"].as_u64().is_some_and(|n| n > 0))
+        .filter_map(|w| {
+            let name = w["name"].as_str()?;
+            let monitor = w["monitor"].as_str()?;
+            (given.iter().any(|g| g == monitor) && !name.starts_with("special:")).then(|| Held {
+                name: name.to_owned(),
+                monitor: monitor.to_owned(),
+                shown: shows(monitor, &w["id"]),
+            })
+        })
+        .collect();
+    held.sort_by_key(|h| h.shown);
+    Ok(held)
+}
+
+/// The name of the workspace `monitor` shows.
+pub fn shown_workspace(hypr: &dyn Hypr, monitor: &str) -> io::Result<Option<String>> {
+    let reply = hypr.request("j/monitors all")?;
+    let monitors: serde_json::Value = serde_json::from_str(&reply).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Hyprland's monitor list: {e}"),
+        )
+    })?;
+    Ok(monitors
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|m| m["name"] == monitor)
+        .and_then(|m| m["activeWorkspace"]["name"].as_str())
+        .map(str::to_owned))
+}
+
+/// `monitor` shows the workspace `name`, without the focus: a runtime chunk for
+/// [`crate::desk`] and [`dispatch`]. Hyprland makes the workspace when it is missing, but one
+/// on another monitor must be moved first: it would be shown there while still on its own.
+/// `set_workspace` takes the bare name: `name:` makes it do nothing (both measured on
+/// Hyprland 0.56.2).
+pub fn show_workspace(monitor: &str, name: &str) -> String {
+    format!(
+        "local m = hl.get_monitor({}) if m then m:set_workspace({{ workspace = {} }}) end",
+        lua_string(monitor),
+        lua_string(name)
+    )
+}
+
 /// The running Hyprland: the one this process was started in while it answers, else the
 /// newest that does. `hypr_ipc::Instance::discover` keeps to the inherited signature, which
 /// names a dead instance once Hyprland has restarted.
@@ -503,6 +579,8 @@ pub mod fake {
         workspaces: Vec<(i64, String, String)>,
         /// The workspace a monitor shows, when not its index + 1.
         shown: Vec<(String, i64)>,
+        /// The user's workspace rules: workspace id, the monitor it is bound to.
+        bound: Vec<(i64, String)>,
     }
 
     impl State {
@@ -521,6 +599,25 @@ pub mod fake {
                 // A hidden workspace's id is past every monitor's shown one.
                 None if window.hidden_workspace => 100,
                 None => self.shown(&window.monitor),
+            }
+        }
+
+        /// Moves a workspace and its windows to `to`. A shown workspace is shown where it goes,
+        /// and where it was gets a new one: Hyprland does so when its monitor has the focus.
+        fn move_workspace(&mut self, id: i64, name: String, from: String, to: &str) {
+            for w in 0..self.windows.len() {
+                if self.workspace_of(&self.windows[w]) == id {
+                    self.windows[w].workspace = Some(id);
+                    self.windows[w].monitor = to.to_string();
+                }
+            }
+            self.workspaces.retain(|(i, _, _)| *i != id);
+            self.workspaces.push((id, name, to.to_string()));
+            if self.shown(&from) == id && from != to {
+                let new = 1000 + self.workspaces.len() as i64;
+                self.shown.retain(|(m, _)| *m != from && *m != to);
+                self.shown.push((from, new));
+                self.shown.push((to.to_string(), id));
             }
         }
 
@@ -624,6 +721,25 @@ pub mod fake {
             self.state.lock().unwrap().shown(monitor)
         }
 
+        /// A workspace rule of the user's: workspace `id` lives on `monitor`.
+        pub fn bind_workspace(&self, id: i64, monitor: &str) {
+            let mut state = self.state.lock().unwrap();
+            state.bound.push((id, monitor.into()));
+        }
+
+        /// Every workspace with windows, by name, with its monitor.
+        pub fn workspaces(&self) -> Vec<(String, String)> {
+            let state = self.state.lock().unwrap();
+            let mut all: Vec<(String, String)> = state
+                .all_workspaces()
+                .into_iter()
+                .filter(|(id, _, _)| state.windows.iter().any(|w| state.workspace_of(w) == *id))
+                .map(|(_, name, monitor)| (name, monitor))
+                .collect();
+            all.sort();
+            all
+        }
+
         /// The monitor and workspace a window is on.
         pub fn place(&self, address: &str) -> (String, i64) {
             let state = self.state.lock().unwrap();
@@ -671,6 +787,16 @@ pub mod fake {
         /// output disabled at runtime is on again.
         pub fn reload(&self) {
             let mut state = self.state.lock().unwrap();
+            // A workspace rule may take a workspace back to its monitor (Hyprland 0.56.2 was not
+            // seen doing it; the fake does, the worse case).
+            for (id, monitor) in state.bound.clone() {
+                let all = state.all_workspaces();
+                if let Some((_, name, from)) = all.into_iter().find(|(i, _, _)| *i == id)
+                    && from != monitor
+                {
+                    state.move_workspace(id, name, from, &monitor);
+                }
+            }
             state.rules.clear();
             state.cursor_invisible = false;
             for m in &mut state.monitors {
@@ -774,7 +900,14 @@ pub mod fake {
                     .all_workspaces()
                     .iter()
                     .map(|(id, name, monitor)| {
-                        format!(r#"{{"id":{id},"name":"{name}","monitor":"{monitor}"}}"#)
+                        let windows = state
+                            .windows
+                            .iter()
+                            .filter(|w| state.workspace_of(w) == *id)
+                            .count();
+                        format!(
+                            r#"{{"id":{id},"name":"{name}","monitor":"{monitor}","windows":{windows}}}"#
+                        )
                     })
                     .collect();
                 return Ok(format!("[{}]", list.join(",")));
@@ -834,32 +967,58 @@ pub mod fake {
                 window.workspace = Some(shown);
                 return Ok("ok".into());
             }
-            if let Some(lua) = command.strip_prefix("eval hl.dispatch(hl.dsp.workspace.move(") {
+            // Bare, or behind `if hl.get_workspace(...) then`, which skips a workspace not there.
+            if let Some(lua) = command.strip_prefix("eval ")
+                && let Some(at) = lua.find("hl.dispatch(hl.dsp.workspace.move(")
+            {
+                let guarded = lua.starts_with("if hl.get_workspace(");
+                let lua = &lua[at..];
                 let (Some(name), Some(to)) = (quoted(lua, "workspace"), quoted(lua, "monitor"))
                 else {
                     return Ok("error: hl.workspace.move: expected a table".into());
                 };
                 let name = name.trim_start_matches("name:");
                 let all = state.all_workspaces();
-                let Some((id, name, from)) = all.into_iter().find(|(_, n, _)| n == name) else {
-                    return Ok("warning: =[C]:-1: Workspace not found".into());
-                };
-                // Its windows stay on it, wherever it goes.
-                for w in 0..state.windows.len() {
-                    if state.workspace_of(&state.windows[w]) == id {
-                        state.windows[w].workspace = Some(id);
-                        state.windows[w].monitor = to.clone();
+                match all.into_iter().find(|(_, n, _)| n == name) {
+                    Some((id, name, from)) => state.move_workspace(id, name, from, &to),
+                    None if !guarded => {
+                        return Ok("warning: =[C]:-1: Workspace not found".into());
                     }
+                    None => {}
                 }
-                state.workspaces.retain(|(i, _, _)| *i != id);
-                state.workspaces.push((id, name, to.clone()));
-                // A shown workspace is shown where it goes; where it was gets a new one.
-                if state.shown(&from) == id {
-                    let new = 1000 + state.workspaces.len() as i64;
-                    state.shown.retain(|(m, _)| *m != from && *m != to);
-                    state.shown.push((from, new));
-                    state.shown.push((to, id));
+                // The rest of the chunk, if any, runs next.
+                if !lua.contains("local m = hl.get_monitor(") {
+                    return Ok("ok".into());
                 }
+            }
+            // `local m = hl.get_monitor("X") if m then m:set_workspace({ workspace = "N" }) end`,
+            // maybe after a move: the monitor shows workspace N, made when missing, without the
+            // focus. One on another monitor is not moved: shown there all the same, and still
+            // listed on its own (measured on Hyprland 0.56.2).
+            if let Some(lua) = command.strip_prefix("eval ")
+                && let Some(at) = lua.find("local m = hl.get_monitor(")
+            {
+                let lua = &lua[at..];
+                let (Some(monitor), Some(name)) = (
+                    lua.split('"').nth(1).map(str::to_string),
+                    quoted(lua, "workspace"),
+                ) else {
+                    return Ok("error: set_workspace: expected a table".into());
+                };
+                if !state.monitors.iter().any(|m| m.name == monitor) {
+                    return Ok("ok".into());
+                }
+                let all = state.all_workspaces();
+                let id = match all.into_iter().find(|(_, n, _)| *n == name) {
+                    Some((id, _, _)) => id,
+                    None => {
+                        let id = name.parse().unwrap_or(-2000);
+                        state.workspaces.push((id, name, monitor.clone()));
+                        id
+                    }
+                };
+                state.shown.retain(|(m, _)| *m != monitor);
+                state.shown.push((monitor, id));
                 return Ok("ok".into());
             }
             if let Some(lua) = command.strip_prefix("eval hl.config({ cursor = { invisible = ") {

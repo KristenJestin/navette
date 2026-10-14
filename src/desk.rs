@@ -20,7 +20,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::hypr::{Event, HyprError, Hyprland, lua_string};
+use crate::hypr::{Event, HyprError, Hyprland, lua_string, show_workspace};
 
 /// One change to the desk, and how to undo it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +59,29 @@ impl Change {
             undo: format!(
                 "if navette_binds and {slot} then {slot}:set_enabled(false) {slot} = nil end"
             ),
+        }
+    }
+
+    /// Moves the workspace `name`, windows and all, from `monitor` to `home`. Undoing it moves it
+    /// back, and when `monitor` showed it (`shown`), shows it there again. The moves do nothing
+    /// once the workspace is gone (its last window closed), so neither a reapply nor the undo
+    /// fails on it; a monitor that showed it shows it again all the same, empty.
+    pub fn move_workspace(name: &str, monitor: &str, home: &str, shown: bool) -> Self {
+        let workspace = lua_string(&format!("name:{name}"));
+        let to = |monitor: &str| {
+            format!(
+                "if hl.get_workspace({workspace}) then hl.dispatch(hl.dsp.workspace.move({{ \
+                 workspace = {workspace}, monitor = {} }})) end",
+                lua_string(monitor)
+            )
+        };
+        Self {
+            apply: to(home),
+            undo: if shown {
+                format!("{} {}", to(monitor), show_workspace(monitor, name))
+            } else {
+                to(monitor)
+            },
         }
     }
 
@@ -227,6 +250,15 @@ impl<H: Hyprland> Desk<H> {
     fn save(&self) -> Result<(), DeskError> {
         let undos: Vec<String> = self.changes.iter().map(|c| c.undo.clone()).collect();
         write_record(&self.record, &undos).map_err(DeskError::Record)
+    }
+}
+
+#[cfg(test)]
+impl<H: Hyprland> Desk<H> {
+    /// What a crash leaves: no stop, no Drop; the kernel releases the lock.
+    pub fn crash(self) {
+        let mut desk = std::mem::ManuallyDrop::new(self);
+        desk._lock.take();
     }
 }
 
@@ -435,10 +467,8 @@ mod tests {
         )
     }
 
-    /// What a crash leaves: no stop, no Drop; the kernel releases the lock.
     fn crash(desk: Desk<FakeHyprland>) {
-        let mut desk = std::mem::ManuallyDrop::new(desk);
-        desk._lock.take();
+        desk.crash();
     }
 
     fn record_in(dir: &tempfile::TempDir) -> PathBuf {

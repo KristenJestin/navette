@@ -4,8 +4,9 @@
 //! remote for one output per monitor, in home's left-to-right order, and shows each stream on
 //! its surface. `navette mode stop`, or the link dropping, gives the monitors back; so does any
 //! one surface going away. Home monitors are never moved or reconfigured: the changes to the
-//! home desk are a window rule per monitor that opens home windows on another home monitor
-//! rather than hidden under a surface (#2) and, with a mic, the hotkey that switches it, made
+//! home desk are the monitors' workspaces, moved whole to another home monitor and back (#48),
+//! a window rule per monitor that opens home windows on that home monitor rather than hidden
+//! under a surface (#2) and, with a mic, the hotkey that switches it, made
 //! through the desk recorder so they are undone on stop, on a dropped link and after a crash,
 //! and made again after a config reload. A home window that lands on a given monitor all the
 //! same (moved, dragged, opened on an explicit workspace) is sent back to a home monitor as
@@ -722,8 +723,8 @@ fn decoding_gpus<T>(
 }
 
 /// Opens the desk (undoing what a previous run left) and keeps home windows off the `given`
-/// monitors: those that would open on any of their workspaces go to `other`, the leftmost
-/// home monitor kept home. With a mic, binds its hotkey.
+/// monitors: their workspaces go to `other`, the leftmost home monitor kept home, and so do
+/// windows that would open on any of their workspaces. With a mic, binds its hotkey.
 async fn open_desk(home: &Home, given: &[String], other: Option<String>) -> io::Result<Desk<Eval>> {
     let (hypr, record, given) = (home.hypr.clone(), home.desk_record.clone(), given.to_vec());
     let mic_bind = home
@@ -738,6 +739,25 @@ async fn open_desk(home: &Home, given: &[String], other: Option<String>) -> io::
             )),
             other => desk_error(other),
         })?;
+        // Each workspace of a given monitor goes whole to `other`, so that the window rule
+        // and the sweep (#31) find nothing to scatter, and comes back on stop (#48).
+        if let Some(other) = &other {
+            let held = hypr::held_workspaces(&*hypr, &given)?;
+            let home_shows = hypr::shown_workspace(&*hypr, other)?;
+            for workspace in &held {
+                let (name, from) = (&workspace.name, &workspace.monitor);
+                let change = Change::move_workspace(name, from, other, workspace.shown);
+                desk.apply(change).map_err(desk_error)?;
+            }
+            // The workspace a monitor with the focus shows is shown where it goes (measured
+            // on Hyprland 0.56.2): home shows again what it showed.
+            if let Some(shows) = home_shows.filter(|_| held.iter().any(|w| w.shown)) {
+                let lua = hypr::show_workspace(other, &shows);
+                if let Err(e) = hypr::dispatch(&*hypr, &format!("eval {lua}")) {
+                    eprintln!("navette: {other} may show another workspace than it did: {e}");
+                }
+            }
+        }
         for (index, monitor) in given.iter().enumerate() {
             let Some(other) = &other else { break };
             let fields = format!(
@@ -1510,6 +1530,173 @@ mod tests {
         desk.events.send(hypr::Event::Placed).unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(desk.hypr.place("0xe5").0, "DP-2");
+    }
+
+    /// The issue's desk (#48): left to right DP-3, DP-1, DP-2, each showing the first of its
+    /// workspaces (1, 11, 21), with windows on several workspaces of each, and a workspace that
+    /// the user's config binds to its monitor (1-10, 11-20, 21-30).
+    fn per_monitor_desk(config_text: &str) -> Desk {
+        let monitors = vec![
+            FakeMonitor::new("DP-3", 1920, 1080, 0),
+            FakeMonitor::new("DP-1", 2560, 1440, 1920),
+            FakeMonitor::new("DP-2", 2560, 1440, 4480),
+        ];
+        let desk = desk_on(config_text, monitors, FakeMic::default());
+        let hypr = &desk.hypr;
+        for (monitor, shown, ids) in [
+            ("DP-3", 1, [1, 2, 3]),
+            ("DP-1", 11, [11, 12, 13]),
+            ("DP-2", 21, [21, 22, 23]),
+        ] {
+            for id in ids {
+                hypr.add_workspace(id, &id.to_string(), monitor);
+                hypr.bind_workspace(id, monitor);
+            }
+            hypr.show(monitor, shown);
+        }
+        for (address, monitor, workspace, focus) in [
+            ("0x1a", "DP-3", 1, 0),
+            ("0x2a", "DP-3", 2, 9),
+            ("0x11a", "DP-1", 11, 1),
+            ("0x11b", "DP-1", 11, 2),
+            ("0x12a", "DP-1", 12, 3),
+            ("0x13a", "DP-1", 13, 4),
+            ("0x21a", "DP-2", 21, 5),
+            ("0x22a", "DP-2", 22, 6),
+        ] {
+            hypr.add_window(FakeWindow::new(address, monitor, focus).on_workspace(workspace));
+        }
+        desk
+    }
+
+    /// Where each workspace with windows is, and what each monitor shows.
+    fn placement(desk: &Desk) -> (Vec<(String, String)>, [i64; 3]) {
+        let hypr = &desk.hypr;
+        (
+            hypr.workspaces(),
+            [hypr.shown("DP-3"), hypr.shown("DP-1"), hypr.shown("DP-2")],
+        )
+    }
+
+    fn on(monitor: &str, names: &[&str]) -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), monitor.to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_workspaces_of_a_reserved_monitor_move_whole_and_come_back_on_stop() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let before = placement(&desk);
+        let _remote = started(&desk).await;
+        let mut running = on("DP-3", &["1", "11", "12", "13", "2"]);
+        running.extend(on("DP-2", &["21", "22"]));
+        running.sort();
+        assert_eq!(desk.hypr.workspaces(), running);
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(placement(&desk), before);
+    }
+
+    #[tokio::test]
+    async fn a_reserved_monitor_shows_the_workspace_it_showed_before_once_the_mode_stops() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let _remote = started(&desk).await;
+        // Home still shows what it showed; the covered monitor something else.
+        assert_eq!(desk.hypr.shown("DP-3"), 1);
+        assert_ne!(desk.hypr.shown("DP-1"), 11);
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(placement(&desk).1, [1, 11, 21]);
+    }
+
+    #[tokio::test]
+    async fn windows_of_a_reserved_monitor_stay_on_their_own_workspace_while_the_mode_runs() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let _remote = started(&desk).await;
+        for (window, workspace) in [("0x11a", 11), ("0x11b", 11), ("0x12a", 12), ("0x13a", 13)] {
+            assert_eq!(desk.hypr.place(window), ("DP-3".to_string(), workspace));
+        }
+        assert_eq!(desk.hypr.place("0x1a"), ("DP-3".to_string(), 1));
+        // Nothing is merged into what home shows, and nothing is left under the cover.
+        let shown = desk.hypr.shown("DP-1");
+        assert!(desk.hypr.workspaces().iter().all(|(_, m)| m != "DP-1"));
+        assert!(shown != 11 && shown != 12 && shown != 13, "{shown}");
+    }
+
+    #[tokio::test]
+    async fn workspaces_bound_to_a_reserved_monitor_by_the_user_s_config_come_back_on_stop() {
+        // Every workspace of the fixture is bound by a rule of the user's.
+        let desk = per_monitor_desk("monitor = DP-2\n");
+        let before = placement(&desk);
+        let _remote = started(&desk).await;
+        assert_eq!(desk.hypr.place("0x22a"), ("DP-3".to_string(), 22));
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(placement(&desk), before);
+    }
+
+    #[tokio::test]
+    async fn a_crash_during_a_mode_gives_the_workspaces_back_at_the_next_start() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let before = placement(&desk);
+        // The first run moved the workspaces, then died without a word.
+        let crashed = Home {
+            config_dir: desk._config.path().to_path_buf(),
+            hypr: desk.hypr.clone(),
+            screens: Arc::new(FakeScreens::default()),
+            gpu: None,
+            desk_record: desk._config.path().join("desk"),
+            mic: None,
+            sound: None,
+        };
+        open_desk(&crashed, &["DP-1".to_string()], Some("DP-3".to_string()))
+            .await
+            .unwrap()
+            .crash();
+        assert_eq!(desk.hypr.place("0x12a").0, "DP-3");
+        let _remote = started(&desk).await;
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(placement(&desk), before);
+    }
+
+    #[tokio::test]
+    async fn a_config_reload_during_a_mode_leaves_the_workspaces_where_the_mode_put_them_and_stop_still_restores_them()
+     {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let before = placement(&desk);
+        let _remote = started(&desk).await;
+        let running = placement(&desk);
+        // The user's rules take 11, 12, 13 back under the cover.
+        desk.hypr.reload();
+        assert_eq!(desk.hypr.place("0x12a").0, "DP-1");
+        desk.events.send(hypr::Event::ConfigReloaded).unwrap();
+        until(|| placement(&desk).0 == running.0).await;
+        assert_eq!(desk.hypr.shown("DP-3"), 1);
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(placement(&desk), before);
+    }
+
+    #[tokio::test]
+    async fn two_reserved_monitors_each_get_their_own_workspaces_back() {
+        let desk = per_monitor_desk("monitor = DP-1, DP-2\n");
+        let before = placement(&desk);
+        let (_remote, text) = started_with(&desk, &["NAVETTE-1", "NAVETTE-2"]).await;
+        text.unwrap();
+        let mut running = on("DP-3", &["1", "11", "12", "13", "2", "21", "22"]);
+        running.sort();
+        assert_eq!(desk.hypr.workspaces(), running);
+        assert_eq!(desk.hypr.shown("DP-3"), 1);
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(placement(&desk), before);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_gives_the_workspaces_back() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let before = placement(&desk);
+        let remote = started(&desk).await;
+        drop(remote);
+        until(|| desk.covered.lock().unwrap().is_empty()).await;
+        until(|| placement(&desk) == before).await;
     }
 
     #[tokio::test]

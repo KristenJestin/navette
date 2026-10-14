@@ -54,15 +54,21 @@ While the mode runs:
   over the one link. Some GPUs encode fewer streams at once than there are outputs: when the
   remote machine cannot start one more, the mode does not start and `mode start` says which
   output could not stream.
-- **At home**, the changes to the desk are a window rule per reserved monitor and, with
-  `navette serve --audio`, the mic's hotkey: windows that would open on any workspace of a
-  reserved monitor open on the leftmost home monitor kept home instead of under a surface. They
-  are undone when the mode stops, when the link drops, and at the next start after a crash, and
-  made again after a config reload. The mode also ends if any one surface goes away (its
-  monitor unplugged, Hyprland restarted at home) or home cannot decode a picture.
+- **At home**, the changes to the desk are the reserved monitors' workspaces, a window rule
+  per reserved monitor and, with `navette serve --audio`, the mic's hotkey. Before the surfaces
+  open, every workspace with windows on a reserved monitor moves whole to the leftmost home
+  monitor kept home: each stays a workspace of its own, out of sight, and that monitor still
+  shows what it showed. Windows that would open on any workspace of a reserved monitor open
+  there too instead of under a surface. These changes are undone when the mode stops, when the
+  link drops, when `navette serve` stops, and at the next start after a crash: each workspace
+  goes back to its monitor, and each reserved monitor shows the workspace it showed, even with
+  workspace rules that bind workspaces to monitors. A workspace whose windows were all closed
+  meanwhile is not made again, except the one a monitor showed, which it shows again, empty.
+  After a config reload they are made again. The mode also ends if any one surface goes away
+  (its monitor unplugged, Hyprland restarted at home) or home cannot decode a picture.
 - **No home window stays under a surface.** A home window that lands on a reserved monitor
   anyway (moved to one of its workspaces, dragged onto it, opened with an explicit
-  `[workspace N silent]`, or there when the mode starts) goes to that same home monitor, on
+  `[workspace N silent]`) goes to that same home monitor, on
   the workspace it shows; it takes the focus only if it had it, and then brings the pointer
   home too. A workspace moved whole onto a reserved
   monitor goes back to the home monitor whole, and shows there; a workspace of a reserved
