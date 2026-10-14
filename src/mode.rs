@@ -333,9 +333,7 @@ pub async fn serve(
             biased;
             new = peers.recv() => match new {
                 Some(new) => {
-                    if active.is_some() {
-                        stop(&mut active, "the link was replaced").await;
-                    }
+                    link_lost(&mut active, "the link was replaced").await;
                     peer = Some(new);
                 }
                 None => break,
@@ -343,9 +341,7 @@ pub async fn serve(
             heard = next(&mut peer) => match heard {
                 Heard::Gone => {
                     peer = None;
-                    if active.is_some() {
-                        stop(&mut active, "the link to the remote machine dropped").await;
-                    }
+                    link_lost(&mut active, "the link to the remote machine dropped").await;
                 }
                 Heard::Msg(Incoming::Display(Display::Started { output, others, closed_lid })) => {
                     let mut outputs = vec![output];
@@ -818,6 +814,30 @@ async fn stop(active: &mut Option<Active>, why: &str) {
     }
 }
 
+/// The link went: a mode that is up is stopped as `stop` does. A start still waiting for the
+/// remote is answered with the drop itself, and with "nothing was changed" only once the desk
+/// is given back for real: the undo can fail with Hyprland unreachable.
+async fn link_lost(active: &mut Option<Active>, why: &str) {
+    let Some(a) = active else { return };
+    let Some((reply, _)) = a.starting.take() else {
+        return stop(active, why).await;
+    };
+    let a = active.take().expect("just seen");
+    eprintln!("navette: {} given back ({why})", a.label());
+    let desk = a.desk.clone();
+    // The covers and the rest go first, as in `release`; the undo is then ours to read.
+    release(a).await;
+    let undone = blocking(move || desk.lock().unwrap().stop().map_err(desk_error)).await;
+    let mut text = "the link to the remote machine dropped while the mode was starting".to_string();
+    match undone {
+        Ok(()) => text.push_str("; nothing was changed"),
+        Err(e) => text.push_str(&format!(
+            "; the home desk could not be given back ({e}): it is restored at the next start"
+        )),
+    }
+    let _ = reply.send(Err(io::Error::new(io::ErrorKind::ConnectionAborted, text)));
+}
+
 /// Drops a mode off the executor (the threads are joined, the desk undone), and waits for it.
 async fn release(active: Active) {
     let _ = tokio::task::spawn_blocking(move || drop(active)).await;
@@ -935,6 +955,9 @@ mod tests {
     use crate::display::wire::{Cursor, Outbox};
     use crate::hypr::fake::{FakeHypr, FakeMonitor, FakeWindow};
 
+    /// What a test makes happen as a screen opens.
+    type OnOpen = Option<Box<dyn Fn() + Send>>;
+
     #[derive(Default)]
     struct FakeScreens {
         /// Monitors covered right now.
@@ -949,6 +972,8 @@ mod tests {
         inputs: Arc<Mutex<Vec<(String, input::Queue)>>>,
         /// Where each screen says its hotkey gave the keyboard back.
         releases: Arc<Mutex<Vec<Released>>>,
+        /// Runs each time a screen opens: the link can drop while the covers go up.
+        on_open: Arc<Mutex<OnOpen>>,
     }
 
     struct FakeScreen {
@@ -973,6 +998,9 @@ mod tests {
             self.releases.lock().unwrap().push(released);
             self.covered.lock().unwrap().push(monitor.to_string());
             self.ends.lock().unwrap().push(ended);
+            if let Some(hook) = &*self.on_open.lock().unwrap() {
+                hook();
+            }
             Ok(Box::new(FakeScreen {
                 monitor: monitor.to_string(),
                 covered: self.covered.clone(),
@@ -1057,6 +1085,7 @@ mod tests {
         cursors: Arc<Mutex<Vec<(String, Pointer)>>>,
         inputs: Arc<Mutex<Vec<(String, input::Queue)>>>,
         releases: Arc<Mutex<Vec<Released>>>,
+        on_open: Arc<Mutex<OnOpen>>,
         peers: UnboundedSender<Peer>,
         orders: UnboundedSender<Order>,
         events: UnboundedSender<hypr::Event>,
@@ -1089,6 +1118,7 @@ mod tests {
         let ends = screens.ends.clone();
         let hotkeys = screens.hotkeys.clone();
         let releases = screens.releases.clone();
+        let on_open = screens.on_open.clone();
         let cursors = screens.cursors.clone();
         let inputs = screens.inputs.clone();
         let (peers, peers_rx) = mpsc::unbounded_channel();
@@ -1113,6 +1143,7 @@ mod tests {
             ends,
             hotkeys,
             releases,
+            on_open,
             cursors,
             inputs,
             peers,
@@ -1958,6 +1989,112 @@ mod tests {
         until(|| desk.covered.lock().unwrap().is_empty()).await;
         until(|| desk.hypr.window_rules().len() == 2).await;
         assert!(desk.hypr.window_rules()[1].contains("enabled = false"));
+    }
+
+    const DROPPED_WHILE_STARTING: &str = "the link to the remote machine dropped while the mode \
+                                          was starting; nothing was changed";
+
+    #[tokio::test]
+    async fn a_link_drop_during_start_rolls_back_and_says_so() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let before = placement(&desk);
+        let remote = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        drop(remote);
+        let error = answer(pending).await.unwrap_err();
+        assert_eq!(error.to_string(), DROPPED_WHILE_STARTING);
+        until(|| desk.covered.lock().unwrap().is_empty()).await;
+        assert_eq!(placement(&desk), before);
+        assert!(desk.hypr.window_rules()[1].contains("enabled = false"));
+        assert_eq!(desk.mic.log.lock().unwrap().last(), Some(&"stop"));
+        // Nothing runs any more: the next start is not refused.
+        let again = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&again).is_empty()).await;
+        drop(pending);
+    }
+
+    #[tokio::test]
+    async fn a_link_drop_while_the_covers_go_up_says_so_too() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let before = placement(&desk);
+        let Remote {
+            outbox,
+            to_home,
+            pointer,
+            input,
+        } = connect(&desk);
+        let _kept = (pointer, input);
+        // The link goes: its queue closes, and so does its inbox with the last sender.
+        let to_home = Mutex::new(Some(to_home));
+        *desk.on_open.lock().unwrap() = Some(Box::new(move || {
+            outbox.close();
+            to_home.lock().unwrap().take();
+        }));
+        let pending = ask(&desk, true).await;
+        let error = answer(pending).await.unwrap_err();
+        assert_eq!(error.to_string(), DROPPED_WHILE_STARTING);
+        until(|| desk.covered.lock().unwrap().is_empty()).await;
+        assert_eq!(placement(&desk), before);
+    }
+
+    #[tokio::test]
+    async fn a_link_replaced_during_start_says_the_same() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let before = placement(&desk);
+        let remote = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        let _new = connect(&desk);
+        let error = answer(pending).await.unwrap_err();
+        assert_eq!(error.to_string(), DROPPED_WHILE_STARTING);
+        until(|| desk.covered.lock().unwrap().is_empty()).await;
+        assert_eq!(placement(&desk), before);
+    }
+
+    #[tokio::test]
+    async fn a_desk_that_cannot_be_given_back_is_not_said_unchanged() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let remote = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        desk.hypr.set_down(true, Vec::new());
+        drop(remote);
+        let error = answer(pending).await.unwrap_err().to_string();
+        assert!(
+            error.starts_with(
+                "the link to the remote machine dropped while the mode was starting; "
+            ),
+            "{error}"
+        );
+        assert!(!error.contains("nothing was changed"), "{error}");
+        assert!(error.contains("next start"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_link_drop_after_the_mode_is_up_keeps_today_s_behaviour() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let before = placement(&desk);
+        let remote = started(&desk).await;
+        drop(remote);
+        until(|| desk.covered.lock().unwrap().is_empty()).await;
+        until(|| placement(&desk) == before).await;
+        // The start was answered long ago: the drop is only said by serve.
+        let answer = answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(answer, "no mode was running");
+    }
+
+    #[tokio::test]
+    async fn a_link_that_closed_before_the_start_keeps_the_not_connected_message() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let before = placement(&desk);
+        let remote = connect(&desk);
+        remote.outbox.close();
+        let error = answer(ask(&desk, true).await).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+        assert!(error.to_string().contains("nothing was changed"));
+        assert_eq!(placement(&desk), before);
     }
 
     #[tokio::test]
