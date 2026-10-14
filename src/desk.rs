@@ -20,7 +20,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::hypr::{Event, HyprError, Hyprland, lua_string, show_workspace};
+use crate::hypr::{Event, HyprError, Hyprland, lua_string, show_workspace, workspace_selector};
 
 /// One change to the desk, and how to undo it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,15 +62,15 @@ impl Change {
         }
     }
 
-    /// Moves the workspace `name`, windows and all, from `monitor` to `home`. Undoing it moves it
-    /// back, and when `monitor` showed it (`shown`), shows it there again. The moves do nothing
-    /// once the workspace is gone (its last window closed), so neither a reapply nor the undo
-    /// fails on it; a monitor that showed it shows it again all the same, empty.
-    pub fn move_workspace(name: &str, monitor: &str, home: &str, shown: bool) -> Self {
-        let workspace = lua_string(&format!("name:{name}"));
+    /// Moves the workspace `id`, named `name`, windows and all, from `monitor` to `home`.
+    /// Undoing it moves it back, and when `monitor` showed it (`shown`), shows it there again.
+    /// The moves do nothing once the workspace is gone (its last window closed), so neither a
+    /// reapply nor the undo fails on it, and neither does showing it.
+    pub fn move_workspace(id: i64, name: &str, monitor: &str, home: &str, shown: bool) -> Self {
+        let workspace = lua_string(&workspace_selector(id, name));
         let to = |monitor: &str| {
             format!(
-                "if hl.get_workspace({workspace}) then hl.dispatch(hl.dsp.workspace.move({{ \
+                "if hl.get_workspace({id}) then hl.dispatch(hl.dsp.workspace.move({{ \
                  workspace = {workspace}, monitor = {} }})) end",
                 lua_string(monitor)
             )
@@ -78,7 +78,7 @@ impl Change {
         Self {
             apply: to(home),
             undo: if shown {
-                format!("{} {}", to(monitor), show_workspace(monitor, name))
+                format!("{} {}", to(monitor), show_workspace(monitor, id))
             } else {
                 to(monitor)
             },
