@@ -2852,13 +2852,28 @@ mod tests {
             queue.push(input::Event::Motion {
                 x: if monitor == "DP-3" { 1919.0 } else { 0.0 },
                 y: 5.0,
+                delta: None,
             });
         }
         assert_eq!(
             remote.input.to_peer.queued_on(),
             [
-                (0, input::Event::Motion { x: 1919.0, y: 5.0 }),
-                (1, input::Event::Motion { x: 0.0, y: 5.0 }),
+                (
+                    0,
+                    input::Event::Motion {
+                        x: 1919.0,
+                        y: 5.0,
+                        delta: None
+                    }
+                ),
+                (
+                    1,
+                    input::Event::Motion {
+                        x: 0.0,
+                        y: 5.0,
+                        delta: None
+                    }
+                ),
             ]
         );
         let hidden = Pointer {
