@@ -71,6 +71,14 @@ refuses a request against an offer that a newer copy has replaced.
   cannot rename without replacing, a file is linked in then unlinked, a folder replaces an
   empty one made for it. The application that pasted gets their paths once they are all
   complete. A second paste of the same copy points at the same files.
+- **The same copy offered again** points at the same files too. An application that reads
+  every new selection fetches a copy of files as soon as it arrives, so each reconnect (the
+  lid closed and opened, a network blip), which offers each machine's copy again, would fetch
+  it again as `name (1)`. The machine that copied offers files unchanged since its last copy
+  of files (the same files, sizes and modification times) under the same offer number, kept
+  from one link to the next; the machine that fetched that copy answers with the files it
+  received, while they are all still in the `Navette` folder. A file changed since, or one
+  removed from the folder, is fetched again.
 - **A file manager that stops waiting.** A file manager reads the clipboard as soon as it
   changes, and gives up when the answer is slow: Omarchy's, flea, waits two seconds for each
   of the two file-list types, so about four seconds in all, which a large paste over the LAN

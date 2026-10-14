@@ -30,6 +30,7 @@ pub mod progress;
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
+use std::hash::BuildHasher;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -115,6 +116,73 @@ pub enum Selected {
     Paste { mime_type: String, fd: OwnedFd },
 }
 
+/// What a machine's bridges keep from one link to the next. A reconnect (the lid closed and
+/// opened, a network blip) offers each machine's copy again, and an application that reads
+/// every new selection would fetch its files again, next to the ones it already has: so the
+/// machine that copied offers an unchanged copy of files under the serial it had, and the
+/// machine that fetched it answers with the files it already has.
+#[derive(Clone)]
+pub struct Kept {
+    /// The serials of this machine's offers. From a random start, so that a restart does not
+    /// give a new copy the serial of one the peer kept.
+    serials: Rc<Cell<u64>>,
+    /// The last copy of files offered: its serial, its files, and when they last changed.
+    sent: Rc<RefCell<Option<(u32, Unchanged)>>>,
+    /// The last copy of files fetched: its serial, its files, and where they went.
+    fetched: Rc<RefCell<Option<(u32, Fetched)>>>,
+}
+
+type Fetched = (Vec<ClipboardFile>, Vec<PathBuf>);
+
+type Unchanged = (
+    Vec<PathBuf>,
+    Vec<ClipboardFile>,
+    Vec<Option<std::time::SystemTime>>,
+);
+
+impl Default for Kept {
+    fn default() -> Self {
+        let start = std::collections::hash_map::RandomState::new().hash_one(()) as u32;
+        Self {
+            serials: Rc::new(Cell::new(start.into())),
+            sent: Rc::default(),
+            fetched: Rc::default(),
+        }
+    }
+}
+
+impl Kept {
+    /// The serial to offer `copied` as: the one it had when it is the last copy of files
+    /// offered, unchanged; else `new`.
+    fn serial_of(&self, copied: &files::Copied, new: u32) -> u32 {
+        if copied.files.entries.is_empty() {
+            return new;
+        }
+        let this = (
+            copied.files.paths.clone(),
+            copied.files.entries.clone(),
+            copied.modified.clone(),
+        );
+        let mut sent = self.sent.borrow_mut();
+        match &*sent {
+            Some((serial, last)) if *last == this => *serial,
+            _ => {
+                *sent = Some((new, this));
+                new
+            }
+        }
+    }
+
+    /// Where the files of the peer's copy `serial` are, when this machine fetched it already
+    /// and they are all still there.
+    fn received(&self, serial: u32, files: &[ClipboardFile]) -> Option<Vec<PathBuf>> {
+        let fetched = self.fetched.borrow();
+        let (fetched_serial, (fetched_files, paths)) = fetched.as_ref()?;
+        let here = paths.iter().all(|p| p.symlink_metadata().is_ok());
+        (*fetched_serial == serial && fetched_files == files && here).then(|| paths.clone())
+    }
+}
+
 #[derive(Default)]
 struct LocalOffer {
     /// Serial of the offer this selection was (or will be) sent as; a request against a
@@ -154,9 +222,10 @@ pub struct Bridge<C: Compositor> {
     local: Rc<RefCell<LocalOffer>>,
     remote: Rc<RefCell<RemoteOffer>>,
     /// Bumped per selection so a slow offer build for a stale one is dropped. It is the
-    /// link's, not the bridge's: a later bridge on the same link never reuses a serial the
-    /// peer may still request.
+    /// machine's, not the bridge's: a later bridge never gives another copy a serial the peer
+    /// may still request.
     selection_gen: Rc<Cell<u64>>,
+    kept: Kept,
     progress: progress::Progress,
     notifier: Arc<dyn Notifier>,
     /// The number of the last paste of files on this machine.
@@ -171,7 +240,7 @@ impl<C: Compositor> Bridge<C> {
         jobs: Jobs,
         compositor: Arc<C>,
         inbox: Option<Inbox>,
-        serials: Rc<Cell<u64>>,
+        kept: Kept,
         shown: &Shown,
     ) -> Self {
         Self {
@@ -181,7 +250,8 @@ impl<C: Compositor> Bridge<C> {
             inbox,
             local: Rc::default(),
             remote: Rc::default(),
-            selection_gen: serials,
+            selection_gen: kept.serials.clone(),
+            kept,
             progress: progress::Progress::new(shown.bar.clone()),
             notifier: shown.notifier.clone(),
             pastes: Cell::new(0),
@@ -237,9 +307,16 @@ impl<C: Compositor> Bridge<C> {
                 "offer {replaced}: its paste stopped, offer {serial} replaced it"
             ));
         }
+        let received = self.kept.received(serial, &files);
+        if received.is_some() {
+            log(format_args!(
+                "offer {serial}: the copy fetched before, its files are here already"
+            ));
+        }
         *self.remote.borrow_mut() = RemoteOffer {
             serial,
             files,
+            received: Rc::new(OnceCell::new_with(received)),
             advertised: advertise.clone(),
             selected: true,
             ..RemoteOffer::default()
@@ -363,6 +440,7 @@ impl<C: Compositor> Bridge<C> {
         let transfers = self.transfers.clone();
         let local = self.local.clone();
         let selection_gen = self.selection_gen.clone();
+        let (kept, progress) = (self.kept.clone(), self.progress.clone());
         tokio::task::spawn_local(async move {
             let copied = match uri_list {
                 Some(mime) => match receive(compositor, mime).await {
@@ -377,21 +455,24 @@ impl<C: Compositor> Bridge<C> {
             if selection_gen.get() != generation {
                 return; // superseded while we were listing
             }
+            let serial = kept.serial_of(&copied, generation as u32);
+            // Copied again: what the user stopped of it may cross again.
+            progress.resume(serial);
             let entries = copied.files.entries.clone();
             log(format_args!(
-                "offer {} sent: {} files, {} types",
-                generation as u32,
+                "offer {serial} sent: {} files, {} types",
                 entries.len(),
                 offered.len()
             ));
             {
                 let mut local = local.borrow_mut();
+                local.serial = serial;
                 local.files = copied.files;
                 local.skipped = copied.skipped;
             }
             let _ = transfers
                 .send(ClipboardMsg::Offer {
-                    serial: generation as u32,
+                    serial,
                     mime_types: offered,
                     files: entries,
                 })
@@ -440,6 +521,7 @@ impl<C: Compositor> Bridge<C> {
             let (meter, progress, notifier) =
                 (done.clone(), self.progress.clone(), self.notifier.clone());
             let (remote, compositor) = (self.remote.clone(), self.compositor.get().clone());
+            let kept = self.kept.clone();
             // Filled before the task first runs: nothing runs before this call returns.
             let run = Rc::new(Cell::new(0));
             let its_run = run.clone();
@@ -461,6 +543,8 @@ impl<C: Compositor> Bridge<C> {
                 match result {
                     Ok(paths) => {
                         if fetched {
+                            *kept.fetched.borrow_mut() =
+                                Some((serial, (files.clone(), paths.clone())));
                             log(format_args!(
                                 "offer {serial}: {} files pasted in {} ms",
                                 files.len(),
@@ -628,7 +712,7 @@ async fn local_files_from_pipe(mut rx: pipe::Receiver) -> files::Copied {
 
 /// Runs one link's bridge until the link's clipboard channel closes (`true`) or the compositor
 /// side does (`false`). Takes the wire by reference so a new compositor connection can pick
-/// the same link up again; `serials` is the link's. Whatever the bridge started (pastes and
+/// the same link up again; `kept` is the machine's. Whatever the bridge started (pastes and
 /// transfers, their half-written files) ends with it, even when this future is dropped.
 pub async fn run<C: Compositor>(
     side: Side,
@@ -636,7 +720,7 @@ pub async fn run<C: Compositor>(
     compositor: Arc<C>,
     mut events: UnboundedReceiver<Selected>,
     inbox: Option<Inbox>,
-    serials: Rc<Cell<u64>>,
+    kept: Kept,
     shown: Shown,
 ) -> bool {
     // Every task the bridge and gliff's engine spawn lands in this set, and dies with it.
@@ -648,7 +732,7 @@ pub async fn run<C: Compositor>(
                 Jobs::new(report),
                 compositor,
                 inbox,
-                serials,
+                kept,
                 &shown,
             );
             let mut cancel = shown.cancel.clone();
@@ -722,13 +806,12 @@ pub fn hypr(
 /// connects to (on a blocking thread). It looks for the compositor again when it is not there
 /// yet or went away, since the agent can start before the session does; the link stays up
 /// meanwhile, and the peer's messages are drained: its requests refused, its offers dropped.
-/// Needs a `LocalSet`.
-pub async fn attach<C, S>(side: Side, start: S, mut wire: Wire, shown: Shown)
+/// `kept` is the machine's, from one link to the next. Needs a `LocalSet`.
+pub async fn attach<C, S>(side: Side, start: S, mut wire: Wire, kept: Kept, shown: Shown)
 where
     C: Compositor,
     S: Fn(UnboundedSender<Selected>) -> io::Result<C> + Clone + Send + 'static,
 {
-    let serials = Rc::new(Cell::new(0));
     let inbox = Inbox::of_this_user();
     let mut warned = false;
     loop {
@@ -752,7 +835,7 @@ where
                     compositor,
                     events,
                     inbox.clone(),
-                    serials.clone(),
+                    kept.clone(),
                     shown.clone(),
                 )
                 .await
@@ -936,7 +1019,8 @@ mod tests {
     /// One machine of a test desk: its clipboard and the way to act on it.
     struct Machine {
         clipboard: Arc<Fake>,
-        events: mpsc::UnboundedSender<Selected>,
+        /// The way to its bridge of the connection up now.
+        events: Rc<RefCell<mpsc::UnboundedSender<Selected>>>,
         seen: Seen,
         /// Its display's end of the link, once it is up.
         display: tokio::sync::Mutex<mpsc::UnboundedReceiver<crate::display::wire::Peer>>,
@@ -948,9 +1032,11 @@ mod tests {
         /// The user copies.
         fn copy(&self, items: &[(&str, &[u8])]) {
             let mime_types = self.clipboard.select(items);
-            self.events
-                .send(Selected::Selection { mime_types })
-                .unwrap();
+            self.send(Selected::Selection { mime_types });
+        }
+
+        fn send(&self, event: Selected) {
+            self.events.borrow().send(event).unwrap();
         }
 
         /// An application pastes `mime_type`; what it reads.
@@ -961,12 +1047,10 @@ mod tests {
         /// The same, within `limit`.
         async fn paste_for(&self, mime_type: &str, limit: Duration) -> Vec<u8> {
             let (reader, writer) = std::io::pipe().unwrap();
-            self.events
-                .send(Selected::Paste {
-                    mime_type: mime_type.into(),
-                    fd: writer.into(),
-                })
-                .unwrap();
+            self.send(Selected::Paste {
+                mime_type: mime_type.into(),
+                fd: writer.into(),
+            });
             let mut reader = pipe::Receiver::from_owned_fd(reader.into()).unwrap();
             let mut data = Vec::new();
             tokio::time::timeout(limit, reader.read_to_end(&mut data))
@@ -981,12 +1065,15 @@ mod tests {
         fn paste_and_give_up(&self, mime_type: &str) {
             let (reader, writer) = std::io::pipe().unwrap();
             drop(reader);
-            self.events
-                .send(Selected::Paste {
-                    mime_type: mime_type.into(),
-                    fd: writer.into(),
-                })
-                .unwrap();
+            self.send(Selected::Paste {
+                mime_type: mime_type.into(),
+                fd: writer.into(),
+            });
+        }
+
+        /// Its link is up, once more.
+        async fn connected(&self) {
+            within("the link", self.display.lock().await.recv()).await;
         }
 
         /// The bridge has offered the peer's copy on this machine `count` times.
@@ -1030,19 +1117,25 @@ mod tests {
         link: impl FnOnce(Service) -> tokio::task::JoinHandle<()>,
     ) -> Machine {
         let clipboard = Arc::new(Fake::default());
-        let (events, selected) = mpsc::unbounded_channel();
-        let selected = Rc::new(RefCell::new(Some(selected)));
+        // What the user does before the link is up waits for its first bridge.
+        let (events, first) = mpsc::unbounded_channel();
+        let (events, first) = (Rc::new(RefCell::new(events)), RefCell::new(Some(first)));
         let (displays, display) = mpsc::unbounded_channel();
         let seen = Seen::new();
-        let (bridge, shown) = (clipboard.clone(), seen.shown());
+        let kept = Kept::default();
+        let (bridge, shown, its_events) = (clipboard.clone(), seen.shown(), events.clone());
         let service: Service = Rc::new(move |mut wire: Wire| {
             let _ = displays.send(wire.display.take().unwrap());
-            let selected = selected.borrow_mut().take().expect("one connection");
+            let selected = first.borrow_mut().take().unwrap_or_else(|| {
+                let (to_bridge, selected) = mpsc::unbounded_channel();
+                *its_events.borrow_mut() = to_bridge;
+                selected
+            });
             let (bridge, inbox, shown) = (bridge.clone(), inbox.clone(), shown.clone());
+            let kept = kept.clone();
             Box::pin(async move {
-                let serials = Rc::default();
                 let inbox = Some(inbox);
-                super::run(side, &mut wire, bridge, selected, inbox, serials, shown).await;
+                super::run(side, &mut wire, bridge, selected, inbox, kept, shown).await;
             })
         });
         Machine {
@@ -1176,6 +1269,142 @@ mod tests {
             .await;
     }
 
+    /// A link between the two machines, cut when the cable is dropped.
+    struct Cable([tokio::task::JoinHandle<()>; 2]);
+
+    impl Drop for Cable {
+        fn drop(&mut self) {
+            self.0.iter().for_each(|carry| carry.abort());
+        }
+    }
+
+    /// Plugs a new cable between the ends each machine's link takes in turn.
+    fn plug(
+        home: &mpsc::UnboundedSender<tokio::io::DuplexStream>,
+        remote: &mpsc::UnboundedSender<tokio::io::DuplexStream>,
+    ) -> Cable {
+        let (home_end, home_line) = tokio::io::duplex(64 * 1024);
+        let (remote_line, remote_end) = tokio::io::duplex(64 * 1024);
+        let (home_read, home_write) = tokio::io::split(home_line);
+        let (remote_read, remote_write) = tokio::io::split(remote_line);
+        home.send(home_end).unwrap();
+        remote.send(remote_end).unwrap();
+        Cable([
+            tokio::task::spawn_local(carry(home_read, remote_write)),
+            tokio::task::spawn_local(carry(remote_read, home_write)),
+        ])
+    }
+
+    /// A machine whose link comes up again over each end it is given.
+    fn machine_over(
+        side: Side,
+        inbox: Inbox,
+        mut ends: mpsc::UnboundedReceiver<tokio::io::DuplexStream>,
+    ) -> Machine {
+        machine_on(side, inbox, |service| {
+            tokio::task::spawn_local(async move {
+                while let Some(end) = ends.recv().await {
+                    let service = service.clone();
+                    link::run(end, heartbeat(), move |wire| service(wire)).await;
+                }
+            })
+        })
+    }
+
+    /// Home and the remote machine, each keeping what it keeps from one link to the next, and
+    /// the way to plug a new link between them. Each machine's receiving folder is `home` or
+    /// `remote` in `folders`.
+    fn reconnecting_desk(folders: &std::path::Path) -> (Machine, Machine, impl Fn() -> Cable) {
+        let (home_ends, ends) = mpsc::unbounded_channel();
+        let home = machine_over(Side::Client, Inbox::new(folders.join("home")), ends);
+        let (remote_ends, ends) = mpsc::unbounded_channel();
+        let remote = machine_over(Side::Server, Inbox::new(folders.join("remote")), ends);
+        (home, remote, move || plug(&home_ends, &remote_ends))
+    }
+
+    /// The remote copies `list` again on a new link, and home pastes it; what it read.
+    async fn after_a_reconnect(
+        home: &Machine,
+        remote: &Machine,
+        cable: Cable,
+        plug: impl Fn() -> Cable,
+        list: &str,
+    ) -> String {
+        // The lid closes and opens: a new link, and the remote's compositor tells its new
+        // bridge the selection it still holds.
+        drop(cable);
+        let _cable = plug();
+        remote.connected().await;
+        remote.copy(&[(URI_LIST, list.as_bytes())]);
+        home.offered(2).await;
+        String::from_utf8(home.paste(URI_LIST).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_with_the_same_copy_fetches_nothing_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::write(copied.join("report.bin"), b"figures").unwrap();
+        let list = uri_list_of(&[copied.join("report.bin")]);
+        let folder = tmp.path().join("home");
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote, plug) = reconnecting_desk(tmp.path());
+                let cable = plug();
+                remote.connected().await;
+                remote.copy(&[(URI_LIST, list.as_bytes())]);
+                home.offered(1).await;
+                let pasted = String::from_utf8(home.paste(URI_LIST).await).unwrap();
+
+                let again = after_a_reconnect(&home, &remote, cable, plug, &list).await;
+                assert_eq!(again, pasted);
+                assert_eq!(
+                    tree(&folder),
+                    [("report.bin".into(), Some(b"figures".to_vec()))]
+                );
+                assert_eq!(home.seen.notes.summaries(), ["Files pasted"]);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_with_the_files_changed_since_fetches_them_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        let report = copied.join("report.bin");
+        std::fs::write(&report, b"figures").unwrap();
+        let list = uri_list_of(std::slice::from_ref(&report));
+        let folder = tmp.path().join("home");
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote, plug) = reconnecting_desk(tmp.path());
+                let cable = plug();
+                remote.connected().await;
+                remote.copy(&[(URI_LIST, list.as_bytes())]);
+                home.offered(1).await;
+                home.paste(URI_LIST).await;
+
+                // Edited while the link was down: the same name and size, a later time.
+                std::fs::write(&report, b"FIGURES").unwrap();
+                let later = std::time::SystemTime::now() + Duration::from_secs(60);
+                std::fs::File::options()
+                    .write(true)
+                    .open(&report)
+                    .unwrap()
+                    .set_modified(later)
+                    .unwrap();
+                let again = after_a_reconnect(&home, &remote, cable, plug, &list).await;
+                assert_eq!(parse_uri_list(&again), [folder.join("report (1).bin")]);
+                assert_eq!(
+                    std::fs::read(folder.join("report (1).bin")).unwrap(),
+                    b"FIGURES"
+                );
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn a_request_against_a_replaced_offer_is_refused_cleanly() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1188,7 +1417,7 @@ mod tests {
                     Jobs::new(|_, _| {}),
                     clipboard.clone(),
                     Some(Inbox::new(tmp.path().into())),
-                    Rc::default(),
+                    Kept::default(),
                     &quiet(),
                 );
                 let mut next = async || within("a message", sent.recv()).await.unwrap();
@@ -1319,7 +1548,9 @@ mod tests {
                     instance: None,
                 };
                 let ended = tokio::task::spawn_local(link::run(home_end, heartbeat(), {
-                    |wire| super::attach(Side::Client, hypr(missing), wire, quiet())
+                    |wire| {
+                        super::attach(Side::Client, hypr(missing), wire, Kept::default(), quiet())
+                    }
                 }));
                 let peer =
                     tokio::task::spawn_local(link::run(remote_end, heartbeat(), async |_| {}));
@@ -1373,14 +1604,14 @@ mod tests {
                 let bridge = clipboard.clone();
                 let inbox = Inbox::new(tmp.path().to_path_buf());
                 tokio::task::spawn_local(link::run(home_end, eager(), |mut wire| async move {
-                    let serials = Rc::default();
+                    let kept = Kept::default();
                     super::run(
                         Side::Client,
                         &mut wire,
                         bridge,
                         selected,
                         Some(inbox),
-                        serials,
+                        kept,
                         quiet(),
                     )
                     .await;
@@ -1403,7 +1634,7 @@ mod tests {
                     Err(io::Error::other("no compositor"))
                 };
                 tokio::task::spawn_local(link::run(home_end, eager(), move |wire| {
-                    super::attach(Side::Client, slow, wire, quiet())
+                    super::attach(Side::Client, slow, wire, Kept::default(), quiet())
                 }));
                 the_peer_stays(&end, Duration::from_millis(1500)).await;
             })
@@ -1440,7 +1671,7 @@ mod tests {
                     Ok(SlowToClose)
                 };
                 tokio::task::spawn_local(link::run(home_end, eager(), move |wire| {
-                    super::attach(Side::Client, gone, wire, quiet())
+                    super::attach(Side::Client, gone, wire, Kept::default(), quiet())
                 }));
                 the_peer_stays(&end, Duration::from_millis(1500)).await;
             })
@@ -1454,7 +1685,7 @@ mod tests {
                 let (home_end, remote_end) = tokio::io::duplex(64 * 1024);
                 let missing = |_| -> io::Result<Fake> { Err(io::Error::other("no compositor")) };
                 tokio::task::spawn_local(link::run(home_end, heartbeat(), move |wire| {
-                    super::attach(Side::Client, missing, wire, quiet())
+                    super::attach(Side::Client, missing, wire, Kept::default(), quiet())
                 }));
                 let mut peer = gliff_transport::Framed::new(remote_end);
                 let request = ClipboardMsg::Request {
@@ -1490,13 +1721,10 @@ mod tests {
                 home.copy(&[(TEXT, &vec![b'a'; CHUNK])]);
                 remote.offered(1).await;
                 let (reader, writer) = std::io::pipe().unwrap();
-                remote
-                    .events
-                    .send(Selected::Paste {
-                        mime_type: TEXT.into(),
-                        fd: writer.into(),
-                    })
-                    .unwrap();
+                remote.send(Selected::Paste {
+                    mime_type: TEXT.into(),
+                    fd: writer.into(),
+                });
                 let mut reader = pipe::Receiver::from_owned_fd(reader.into()).unwrap();
                 let mut first = vec![0u8; CHUNK];
                 within("the first chunk", reader.read_exact(&mut first))
@@ -1645,7 +1873,7 @@ mod tests {
                     Jobs::new(|_, _| {}),
                     clipboard.clone(),
                     Some(Inbox::new(folder.clone())),
-                    Rc::default(),
+                    Kept::default(),
                     &quiet(),
                 );
                 // What the link refuses on arrival, as a peer would send it past that check.
@@ -1691,7 +1919,7 @@ mod tests {
                     Jobs::new(|_, _| {}),
                     Arc::new(Fake::default()),
                     Some(Inbox::new(folder.clone())),
-                    Rc::default(),
+                    Kept::default(),
                     &seen.shown(),
                 );
                 // As a peer would send it past the link's check: two files of 2^63 bytes.
@@ -1892,14 +2120,14 @@ mod tests {
         let (shown, bridge, inbox) = (seen.shown(), clipboard.clone(), folder.to_path_buf());
         tokio::task::spawn_local(async move {
             let inbox = Some(Inbox::new(inbox));
-            let serials = Rc::default();
+            let kept = Kept::default();
             super::run(
                 Side::Server,
                 &mut wire,
                 bridge,
                 selected,
                 inbox,
-                serials,
+                kept,
                 shown,
             )
             .await;
@@ -2025,7 +2253,7 @@ mod tests {
                     Jobs::new(|_, _| {}),
                     clipboard.clone(),
                     None,
-                    Rc::default(),
+                    Kept::default(),
                     &seen.shown(),
                 );
                 let mime_types = clipboard.select(&[(URI_LIST, list.as_bytes())]);
@@ -2069,6 +2297,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_same_files_copied_again_after_a_cancel_are_served_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("report.bin");
+        std::fs::write(&copied, vec![9; 16 * CHUNK]).unwrap();
+        let list = uri_list_of(std::slice::from_ref(&copied));
+        LocalSet::new()
+            .run_until(async {
+                let (out, mut sent) = outbound_channel();
+                let clipboard = Arc::new(Fake::default());
+                let bridge = Bridge::new(
+                    Transfers::new(out, Side::Client),
+                    Jobs::new(|_, _| {}),
+                    clipboard.clone(),
+                    None,
+                    Kept::default(),
+                    &quiet(),
+                );
+                let copy = async |sent: &mut mpsc::Receiver<(ClipboardMsg, Bytes)>| {
+                    let mime_types = clipboard.select(&[(URI_LIST, list.as_bytes())]);
+                    bridge.on_compositor_event(Selected::Selection { mime_types });
+                    let offer = next_sent(sent, |m| matches!(m, ClipboardMsg::Offer { .. }));
+                    let ClipboardMsg::Offer { serial, .. } = offer.await else {
+                        unreachable!()
+                    };
+                    serial
+                };
+                let serial = copy(&mut sent).await;
+                let request = |id| ClipboardMsg::Request {
+                    id,
+                    serial,
+                    item: ClipboardItem::File(0),
+                };
+                bridge.on_peer_msg(request(2), Bytes::new());
+                next_sent(&mut sent, |m| matches!(m, ClipboardMsg::Data { .. })).await;
+                // The user stops it while it crosses, then copies the same files again.
+                bridge.cancel();
+                assert_eq!(copy(&mut sent).await, serial, "the same copy, unchanged");
+                bridge.on_peer_msg(request(4), Bytes::new());
+                let served = next_sent(&mut sent, |m| {
+                    matches!(
+                        m,
+                        ClipboardMsg::Data { id: 4, .. } | ClipboardMsg::Abort { id: 4 }
+                    )
+                })
+                .await;
+                assert!(
+                    matches!(served, ClipboardMsg::Data { id: 4, .. }),
+                    "{served:?}"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn a_cancel_between_two_files_refuses_the_next_one() {
         let tmp = tempfile::tempdir().unwrap();
         let (first, second) = (tmp.path().join("a.txt"), tmp.path().join("b.txt"));
@@ -2085,7 +2367,7 @@ mod tests {
                     Jobs::new(|_, _| {}),
                     clipboard.clone(),
                     None,
-                    Rc::default(),
+                    Kept::default(),
                     &seen.shown(),
                 );
                 let mime_types = clipboard.select(&[(URI_LIST, list.as_bytes())]);
@@ -2345,7 +2627,7 @@ mod tests {
                     display: None,
                     audio: None,
                 };
-                let serials = Rc::default();
+                let kept = Kept::default();
                 let clipboard = Arc::new(Fake::default());
                 let mut seen = Vec::new();
                 // The compositor goes away after one copy, then a new bridge picks the link up.
@@ -2359,7 +2641,7 @@ mod tests {
                         clipboard.clone(),
                         selected,
                         Some(Inbox::new(tmp.path().into())),
-                        Rc::clone(&serials),
+                        kept.clone(),
                         quiet(),
                     );
                     tokio::pin!(bridge);

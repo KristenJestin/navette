@@ -14,6 +14,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use gliff_proto::ClipboardFile;
 use gliff_proto::clipboard::{MAX_FILE_ENTRIES, MAX_FILE_PATH_BYTES, safe_relative_path};
@@ -25,6 +26,9 @@ pub struct Copied {
     pub files: LocalFiles,
     /// Links and special files (sockets, pipes, devices), by their path in the offer.
     pub skipped: Vec<String>,
+    /// When each entry last changed: with its path and size, what tells a copy made again of
+    /// the same files from a copy of files changed since.
+    pub modified: Vec<Option<SystemTime>>,
 }
 
 /// Walks the copied paths. Directories are listed recursively; a link is never followed, so a
@@ -65,6 +69,7 @@ fn walk(path: &Path, rel: &Path, out: &mut Copied) -> io::Result<()> {
         dir: kind.is_dir(),
     });
     out.files.paths.push(path.to_path_buf());
+    out.modified.push(meta.modified().ok());
     if kind.is_dir() {
         let mut children: Vec<_> = std::fs::read_dir(path)?
             .map(|entry| entry.map(|e| e.file_name()))

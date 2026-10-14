@@ -167,6 +167,11 @@ impl Progress {
         }
     }
 
+    /// The copy `serial` was made again: the peer may paste it again.
+    pub fn resume(&self, serial: u32) {
+        self.stopped.borrow_mut().remove(&serial);
+    }
+
     /// Stops the paste `crossing` if it still runs, as a click on the bar would but alone and
     /// without a word; whether it ran.
     pub fn stop(&self, crossing: Crossing) -> bool {
