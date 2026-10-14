@@ -129,8 +129,8 @@ pub enum LinkMsg {
         #[n(2)]
         data_len: u32,
     },
-    /// The remote sink's volume and mute, remote to home, only when they change: the linear gain
-    /// of each channel, which home applies to its playback.
+    /// The level the remote's sink and home's playback share, both ways, only when one side's
+    /// mixer moves it: the linear gain of each channel, which the other side applies.
     #[n(54)]
     AudioVolume {
         #[n(0)]

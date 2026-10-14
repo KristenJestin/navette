@@ -12,10 +12,13 @@ pub struct State {
     pub default: Option<DefaultNode>,
     pub default_source: Option<DefaultNode>,
     pub sinks: Vec<(String, Arc<Mutex<OnSound>>)>,
-    /// Where each sink's mixer tells its level.
-    pub sink_levels: Vec<(String, Arc<Mutex<OnLevel>>)>,
-    /// The levels set on the playbacks, in order, by the playback's name.
+    /// Where the mixer of each sink and playback tells its level.
+    pub mixers: Vec<(String, Arc<Mutex<OnLevel>>)>,
+    /// The levels set on the nodes, in order, by the node's name.
     pub levels: Vec<(String, Level)>,
+    /// A level set is told back by the node's mixer only when the test says so, as PipeWire
+    /// tells it a little later.
+    pub late_echo: bool,
     pub playbacks: Vec<(String, Arc<Mutex<Jitter>>)>,
     pub sources: Vec<(String, Arc<Mutex<Jitter>>)>,
     /// The echo-cancelled mics open, each with where its sound goes.
@@ -46,15 +49,15 @@ impl FakeGraph {
         self.0.lock().unwrap()
     }
 
-    /// The mixer of the sink `name` sets its level, as PipeWire tells the sink's owner.
+    /// The mixer of the node `name` sets its level, as PipeWire tells the node's owner.
     pub fn mixer_sets(&self, name: &str, level: Level) {
         let on_level = {
             let state = self.state();
             let (_, on_level) = state
-                .sink_levels
+                .mixers
                 .iter()
                 .find(|(n, _)| n == name)
-                .expect("the sink is open");
+                .expect("the node is open");
             on_level.clone()
         };
         (on_level.lock().unwrap())(level);
@@ -65,7 +68,7 @@ impl FakeGraph {
         let mut state = self.state();
         state.restarts += 1;
         state.sinks.clear();
-        state.sink_levels.clear();
+        state.mixers.clear();
         state.playbacks.clear();
         state.sources.clear();
         state.mics.clear();
@@ -87,7 +90,7 @@ impl Drop for FakeNode {
             return;
         }
         state.sinks.retain(|(name, _)| *name != self.name);
-        state.sink_levels.retain(|(name, _)| *name != self.name);
+        state.mixers.retain(|(name, _)| *name != self.name);
         state.playbacks.retain(|(name, _)| *name != self.name);
         state.sources.retain(|(name, _)| *name != self.name);
         state.mics.retain(|(name, _)| *name != self.name);
@@ -141,7 +144,7 @@ impl Graph for FakeGraph {
             .sinks
             .push((name.to_owned(), Arc::new(Mutex::new(on_sound))));
         state
-            .sink_levels
+            .mixers
             .push((name.to_owned(), Arc::new(Mutex::new(on_level))));
         state.log.push(format!("sink {name}"));
         Ok(FakeNode {
@@ -156,9 +159,13 @@ impl Graph for FakeGraph {
         name: &str,
         _description: &str,
         jitter: Arc<Mutex<Jitter>>,
+        on_level: OnLevel,
     ) -> io::Result<FakeNode> {
         let mut state = self.state();
         state.playbacks.push((name.to_owned(), jitter));
+        state
+            .mixers
+            .push((name.to_owned(), Arc::new(Mutex::new(on_level))));
         state.log.push(format!("playback {name}"));
         Ok(FakeNode {
             graph: self.clone(),
@@ -174,6 +181,12 @@ impl Graph for FakeGraph {
             "level {} {} {} {}",
             node.name, level.left, level.right, level.muted
         ));
+        let late = state.late_echo;
+        drop(state);
+        // The node's mixer now holds that level, and says so, as for any change.
+        if !late {
+            self.mixer_sets(&node.name, level);
+        }
         Ok(())
     }
 

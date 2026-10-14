@@ -5,7 +5,8 @@
 //! previous default comes back when home stops, when the link drops or when the agent ends. At
 //! home, a playback stream that PipeWire mixes like any other application plays it, through a
 //! small jitter buffer. The remote's volume and mute act once, there: the remote's sink sends
-//! its sound at full scale and tells home its level when it changes.
+//! its sound at full scale. The sink and the playback share one level: when either machine's
+//! mixer moves its side, the other side is told and follows, and does not tell it back.
 //!
 //! PipeWire is reached through [`Graph`]; tests drive a fake one.
 //!
@@ -15,8 +16,9 @@
 //! - `AudioStop` (home → remote): put the previous default back and stop sending.
 //! - `AudioFrame` (remote → home), with the session and a sequence number: one Opus packet
 //!   follows it.
-//! - `AudioVolume` (remote → home), with the session, the linear gain of each channel and the
-//!   mute: sent when the sink's volume or mute changes, applied to the playback.
+//! - `AudioVolume` (both ways), with the session, the linear gain of each channel and the
+//!   mute: sent when the sink's (or the playback's) volume or mute changes, applied to the
+//!   playback (or the sink).
 //!
 //! Home's mic goes the other way ([`mic`]): `MicStart` and `MicStop` (home → remote) open and
 //! close the remote's virtual source, the default mic while a mode runs, and `MicFrame` (home
@@ -61,8 +63,8 @@ const JITTER_CEILING: usize = 10 * FRAME_SAMPLES;
 /// How often the remote checks that its sink is still there: PipeWire may restart under it.
 const CHECK: Duration = Duration::from_millis(250);
 
-/// How often the remote looks for a change of its sink's volume while the sink runs: a held
-/// volume key moves it many times a second, and home follows within this.
+/// How often each side looks for a change of its mixer's level while the sound plays: a held
+/// volume key moves it many times a second, and the other side follows within this.
 const LEVEL_POLL: Duration = Duration::from_millis(50);
 
 /// How often each side tells how the remote's sound fares, beside the video's stats: which
@@ -105,8 +107,9 @@ pub enum Message {
         seq: u32,
         packet: Bytes,
     },
-    /// Remote → home: the sink's volume and mute as the remote's mixer has them, said when they
-    /// change; home applies them to its playback, which is the only place they act.
+    /// The level the sink and the playback share, said by the side whose mixer moved it: the
+    /// remote's sink (where it does not act on the sound sent) or home's playback (the only
+    /// place it acts). The other side applies it.
     Volume {
         session: u32,
         level: Level,
@@ -364,12 +367,14 @@ pub trait Graph: Clone + Send + 'static {
     ) -> io::Result<Self::Node>;
     /// Sets the volume and mute of a playback stream of ours, as an application's mixer would.
     fn set_level(&self, node: &Self::Node, level: Level) -> io::Result<()>;
-    /// A playback stream, mixed like any application's, that plays what `jitter` holds.
+    /// A playback stream, mixed like any application's, that plays what `jitter` holds; its
+    /// volume and mute, as the machine's mixer sets them, are told to `on_level`.
     fn open_playback(
         &self,
         name: &str,
         description: &str,
         jitter: Arc<Mutex<Jitter>>,
+        on_level: OnLevel,
     ) -> io::Result<Self::Node>;
     /// A virtual source, which the machine's apps record from as from a mic: it plays what
     /// `jitter` holds.
@@ -499,6 +504,10 @@ impl<G: Graph> RemoteSink<G> {
         self.switch.graph.is_gone(&self.node)
     }
 
+    fn set_level(&self, level: Level) -> io::Result<()> {
+        self.switch.graph.set_level(&self.node, level)
+    }
+
     /// The sink again, once PipeWire has restarted, and the default again.
     fn reopen(&mut self, on_sound: OnSound, on_level: OnLevel) -> io::Result<()> {
         self.node = self
@@ -587,6 +596,56 @@ impl Latest {
     }
 }
 
+/// The one level the remote's sink and home's playback share, as one side sees it: what its
+/// own mixer last said, and what the other side holds. A level applied from the other side is
+/// not sent back: neither while the mixer still says the level it had before (it tells the
+/// change a little later), nor once it says the level applied.
+struct Shared {
+    latest: Latest,
+    /// What the other side was last told, or told us.
+    peer: Option<Level>,
+    /// What the mixer said when the other side's level was applied, until it says something
+    /// else.
+    stale: Option<Level>,
+}
+
+impl Shared {
+    fn new(stale: Option<Level>) -> Self {
+        Self {
+            latest: Latest::default(),
+            peer: None,
+            stale,
+        }
+    }
+
+    /// The level to tell the other side: the mixer's, when the user moved it.
+    fn due(&mut self) -> Option<Level> {
+        let level = self.latest.get()?;
+        if self.stale == Some(level) {
+            return None;
+        }
+        self.stale = None;
+        (self.peer != Some(level)).then_some(level)
+    }
+
+    fn told(&mut self, level: Level) {
+        self.peer = Some(level);
+    }
+
+    /// The other side's level, about to be applied to the mixer.
+    fn applying(&mut self, level: Level) {
+        self.stale = self.latest.get().or(self.stale);
+        self.peer = Some(level);
+    }
+}
+
+/// A level as `wpctl` shows it, for the log: the cubic volume of its louder channel.
+fn shown(level: Level) -> String {
+    let volume = (level.left.max(level.right).cbrt() * 100.0).round();
+    let muted = if level.muted { ", muted" } else { "" };
+    format!("{volume} %{muted}")
+}
+
 /// The sink while it runs, and the cycles it could not encode.
 struct Capture<G: Graph> {
     sink: RemoteSink<G>,
@@ -599,10 +658,8 @@ struct Capture<G: Graph> {
     /// Frames the link had no room for, and how many of them were told already.
     dropped: Arc<AtomicU64>,
     told: u64,
-    /// The sink's level as its mixer last set it, written on PipeWire's loop; and the one home
-    /// was last told.
-    level: Latest,
-    told_level: Option<Level>,
+    /// The sink's level, shared with home's playback.
+    level: Shared,
 }
 
 impl<G: Graph> Capture<G> {
@@ -622,9 +679,10 @@ impl<G: Graph> Capture<G> {
             failures.clone(),
             dropped.clone(),
         )?;
-        let level = Latest::default();
+        // The remote's mixer leads: its first level is told home.
+        let level = Shared::new(None);
         Ok(Self {
-            sink: RemoteSink::start(graph, saved, on_sound, level.writer())?,
+            sink: RemoteSink::start(graph, saved, on_sound, level.latest.writer())?,
             home,
             session,
             seq,
@@ -632,7 +690,6 @@ impl<G: Graph> Capture<G> {
             dropped,
             told: 0,
             level,
-            told_level: None,
         })
     }
 
@@ -657,17 +714,13 @@ impl<G: Graph> Capture<G> {
             self.failures.clone(),
             self.dropped.clone(),
         )?;
-        self.sink.reopen(on_sound, self.level.writer())
+        self.sink.reopen(on_sound, self.level.latest.writer())
     }
 
     /// Tells home the sink's level if it changed since it was last told. Told again at the next
     /// call when the link has no room, and not before: an order is never dropped.
     fn tell_level(&mut self) {
-        let Some(level) = self
-            .level
-            .get()
-            .filter(|level| self.told_level != Some(*level))
-        else {
+        let Some(level) = self.level.due() else {
             return;
         };
         let volume = Message::Volume {
@@ -675,7 +728,20 @@ impl<G: Graph> Capture<G> {
             level,
         };
         if self.home.try_send(volume).is_ok() {
-            self.told_level = Some(level);
+            self.level.told(level);
+            eprintln!("navette: audio: the sink is at {}, told home", shown(level));
+        }
+    }
+
+    /// Home's playback moved: the sink follows, for the remote's mixer to show the level heard.
+    fn received_level(&mut self, session: u32, level: Level) {
+        if session != self.session {
+            return;
+        }
+        self.level.applying(level);
+        match self.sink.set_level(level) {
+            Ok(()) => eprintln!("navette: audio: home set the sink to {}", shown(level)),
+            Err(e) => eprintln!("navette: audio: could not set the sink's volume: {e}"),
         }
     }
 }
@@ -753,9 +819,13 @@ pub fn remote<G: Graph>(
                             eprintln!("navette: mic: {e}");
                         }
                     }
-                    // The volume only goes the other way.
-                    Ok(Message::Frame { .. } | Message::Volume { .. })
-                    | Err(RecvTimeoutError::Timeout) => {}
+                    Ok(Message::Volume { session, level }) => {
+                        if let Some(capture) = &mut sink {
+                            capture.received_level(session, level);
+                        }
+                    }
+                    // The sound only goes the other way.
+                    Ok(Message::Frame { .. }) | Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
                 if let Some(capture) = &mut sink {
@@ -798,6 +868,8 @@ pub fn remote<G: Graph>(
 struct Playback<G: Graph> {
     _node: G::Node,
     session: u32,
+    /// The playback's level, shared with the remote's sink.
+    level: Shared,
     jitter: Arc<Mutex<Jitter>>,
     decoder: Decoder,
     undecoded: Undecoded,
@@ -853,14 +925,20 @@ impl<G: Graph> Home<G> {
             return Ok(());
         }
         let jitter = Arc::new(Mutex::new(Jitter::new(JITTER_FLOOR, JITTER_CEILING)));
-        let node = self
-            .graph
-            .open_playback(PLAYBACK, PLAYBACK_DESCRIPTION, jitter.clone())?;
+        // A new stream is at unity until the remote's level comes: not the user moving it.
+        let level = Shared::new(Some(Level::UNITY));
+        let node = self.graph.open_playback(
+            PLAYBACK,
+            PLAYBACK_DESCRIPTION,
+            jitter.clone(),
+            level.latest.writer(),
+        )?;
         self.sessions = self.sessions.wrapping_add(1);
         let session = self.sessions;
         self.playback = Some(Playback {
             _node: node,
             session,
+            level,
             jitter,
             decoder: Decoder::new()?,
             undecoded: Undecoded::new("audio"),
@@ -871,6 +949,28 @@ impl<G: Graph> Home<G> {
     pub fn stop(&mut self) -> io::Result<()> {
         self.playback = None;
         self.order(Message::Stop)
+    }
+
+    /// Tells the remote the playback's level if the home mixer moved it; told again at the next
+    /// call when the link has no room.
+    fn tell_level(&mut self) {
+        let Some(playback) = &mut self.playback else {
+            return;
+        };
+        let Some(level) = playback.level.due() else {
+            return;
+        };
+        let volume = Message::Volume {
+            session: playback.session,
+            level,
+        };
+        if self.remote.try_send(volume).is_ok() {
+            playback.level.told(level);
+            eprintln!(
+                "navette: audio: the remote's sound is at {}, told the remote",
+                shown(level)
+            );
+        }
     }
 
     fn order(&self, message: Message) -> io::Result<()> {
@@ -904,10 +1004,16 @@ impl<G: Graph> Home<G> {
     /// when it belongs to the session home asked for last.
     pub fn received(&mut self, message: Message) -> io::Result<()> {
         if let Message::Volume { session, level } = message
-            && let Some(playback) = &self.playback
+            && let Some(playback) = &mut self.playback
             && session == playback.session
         {
-            return self.graph.set_level(&playback._node, level);
+            playback.level.applying(level);
+            self.graph.set_level(&playback._node, level)?;
+            eprintln!(
+                "navette: audio: the remote set its sound to {}",
+                shown(level)
+            );
+            return Ok(());
         }
         if let Message::Frame {
             session,
@@ -981,10 +1087,13 @@ pub fn home<G: Graph>(graph: G, wire: Wire, sound: &HomeSound<G>) -> io::Result<
         .spawn(move || {
             let mut due = Instant::now() + REPORT_EVERY;
             loop {
-                match wire
-                    .from_peer
-                    .recv_timeout(due.saturating_duration_since(Instant::now()))
-                {
+                let wait = due.saturating_duration_since(Instant::now());
+                let wait = if lock(&home).playback.is_some() {
+                    wait.min(LEVEL_POLL)
+                } else {
+                    wait
+                };
+                match wire.from_peer.recv_timeout(wait) {
                     Ok(message) => {
                         if let Err(e) = lock(&home).received(message) {
                             eprintln!("navette: audio: {e}");
@@ -993,6 +1102,7 @@ pub fn home<G: Graph>(graph: G, wire: Wire, sound: &HomeSound<G>) -> io::Result<
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
+                lock(&home).tell_level();
                 if Instant::now() >= due {
                     due = Instant::now() + REPORT_EVERY;
                     if let Some(stats) = lock(&home).stats(wire.from_peer.dropped()) {
@@ -1569,6 +1679,138 @@ mod tests {
 
         home.received(volume(session)).unwrap();
         assert_eq!(graph.state().levels, [(PLAYBACK.to_owned(), QUIET)]);
+    }
+
+    const HALF: Level = Level {
+        left: 0.5,
+        right: 0.5,
+        muted: false,
+    };
+
+    #[tokio::test]
+    async fn the_home_stream_moved_at_home_moves_the_remote_sink() {
+        let (home_graph, remote_graph, _tmp, _link) = playing().await;
+        remote_graph.mixer_sets(SINK, QUIET);
+        until(&home_graph, |s| !s.levels.is_empty()).await;
+
+        // The home mixer moves the remote's stream.
+        home_graph.mixer_sets(PLAYBACK, HALF);
+        until(&remote_graph, |s| !s.levels.is_empty()).await;
+        assert_eq!(remote_graph.state().levels, [(SINK.to_owned(), HALF)]);
+
+        let muted = Level {
+            muted: true,
+            ..HALF
+        };
+        home_graph.mixer_sets(PLAYBACK, muted);
+        until(&remote_graph, |s| s.levels.len() == 2).await;
+        assert_eq!(remote_graph.state().levels[1], (SINK.to_owned(), muted));
+    }
+
+    #[tokio::test]
+    async fn a_level_applied_from_the_other_side_is_not_sent_back() {
+        let (home_graph, remote_graph, _tmp, _link) = playing().await;
+
+        remote_graph.mixer_sets(SINK, QUIET);
+        until(&home_graph, |s| !s.levels.is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            remote_graph.state().levels,
+            [],
+            "the remote's own level came back"
+        );
+
+        home_graph.mixer_sets(PLAYBACK, HALF);
+        until(&remote_graph, |s| !s.levels.is_empty()).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(home_graph.state().levels, [(PLAYBACK.to_owned(), QUIET)]);
+        assert_eq!(remote_graph.state().levels, [(SINK.to_owned(), HALF)]);
+    }
+
+    #[tokio::test]
+    async fn the_home_stream_s_first_level_does_not_move_the_remote() {
+        let (home_graph, remote_graph, _tmp, _link) = playing().await;
+
+        // A new stream is at unity: that is not the user moving it.
+        home_graph.mixer_sets(PLAYBACK, Level::UNITY);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(remote_graph.state().levels, []);
+    }
+
+    #[test]
+    fn a_level_from_home_applies_to_the_sink_of_its_own_session_only() {
+        let graph = FakeGraph::with_default("laptop-speakers");
+        let (mut capture, _orders, _tmp) = capture_with_room(&graph, QUEUE);
+
+        capture.received_level(8, HALF);
+        assert_eq!(graph.state().levels, []);
+
+        capture.received_level(7, HALF);
+        assert_eq!(graph.state().levels, [(SINK.to_owned(), HALF)]);
+    }
+
+    #[test]
+    fn a_level_from_home_is_not_sent_back_before_the_mixer_tells_it() {
+        let graph = FakeGraph::with_default("laptop-speakers");
+        let (mut capture, mut orders, _tmp) = capture_with_room(&graph, QUEUE);
+        graph.mixer_sets(SINK, QUIET);
+        capture.tell_level();
+        assert_eq!(volumes(&mut orders).len(), 1);
+
+        graph.state().late_echo = true;
+        capture.received_level(7, HALF);
+        // The mixer still says the level it had: not a change of the user's.
+        capture.tell_level();
+        graph.mixer_sets(SINK, HALF);
+        capture.tell_level();
+        assert_eq!(volumes(&mut orders), []);
+    }
+
+    #[test]
+    fn the_level_the_mixer_had_before_home_s_is_told_when_the_user_goes_back_to_it() {
+        let graph = FakeGraph::with_default("laptop-speakers");
+        let (mut capture, mut orders, _tmp) = capture_with_room(&graph, QUEUE);
+        graph.mixer_sets(SINK, QUIET);
+        capture.tell_level();
+        capture.received_level(7, HALF);
+        capture.tell_level();
+        volumes(&mut orders);
+
+        graph.mixer_sets(SINK, QUIET);
+        capture.tell_level();
+        assert_eq!(
+            volumes(&mut orders),
+            [Message::Volume {
+                session: 7,
+                level: QUIET
+            }]
+        );
+    }
+
+    #[test]
+    fn a_home_level_that_found_the_link_full_is_told_when_there_is_room() {
+        let graph = FakeGraph::default();
+        let (to_remote, mut orders) = mpsc::channel(1);
+        let mut home = Home::new(graph.clone(), to_remote);
+        home.start().unwrap();
+        let Message::Start { session } = orders.try_recv().unwrap() else {
+            panic!("home asked for the sound");
+        };
+        home.remote.try_send(Message::Stop).unwrap();
+
+        graph.mixer_sets(PLAYBACK, HALF);
+        home.tell_level();
+        assert_eq!(volumes(&mut orders), [Message::Stop]);
+        home.tell_level();
+        assert_eq!(
+            volumes(&mut orders),
+            [Message::Volume {
+                session,
+                level: HALF
+            }]
+        );
+        home.tell_level();
+        assert_eq!(volumes(&mut orders), []);
     }
 
     #[tokio::test]

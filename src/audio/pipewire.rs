@@ -9,8 +9,9 @@
 //!
 //! Like any sink, it applies its volume and mute to what it receives, which is the remote's
 //! mixer acting on it. The sound that goes home is read from its monitor instead, which carries
-//! it as the apps played it, and the volume and mute the sink holds are told to home by
-//! [`Mixer`], to be applied to home's playback once.
+//! it as the apps played it. The volume and mute that the sink, and home's playback, hold are
+//! followed by [`Mixer`] and told by the loop, at most every [`LEVEL_EVERY`], so that the
+//! controls one change sets are told together.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -65,7 +66,10 @@ enum Opening {
         on_sound: OnSound,
         on_level: OnLevel,
     },
-    Playback(Arc<Mutex<Jitter>>),
+    Playback {
+        jitter: Arc<Mutex<Jitter>>,
+        on_level: OnLevel,
+    },
     Source(Arc<Mutex<Jitter>>),
     Mic {
         mic: String,
@@ -211,8 +215,9 @@ impl Graph for PipeWire {
         name: &str,
         description: &str,
         jitter: Arc<Mutex<Jitter>>,
+        on_level: OnLevel,
     ) -> io::Result<Node> {
-        self.open(name, description, Opening::Playback(jitter))
+        self.open(name, description, Opening::Playback { jitter, on_level })
     }
 
     fn open_source(
@@ -280,6 +285,8 @@ struct Open {
     stream: pw::stream::StreamRc,
     /// For a stream that plays: the rate its callback asks for, and the one applied.
     rate: Option<(Arc<Rate>, Cell<f32>)>,
+    /// For a stream whose level is followed: the level its controls make, and where to tell it.
+    level: Option<(Rc<Cell<Option<Level>>>, OnLevel)>,
     _module: Option<Module>,
     /// The sink's monitor, that its sound is read from.
     _monitor: Option<Box<Open>>,
@@ -288,6 +295,9 @@ struct Open {
 /// How often the loop applies the rate the playing streams ask for: the rate follows a level
 /// smoothed over seconds.
 const RATE_EVERY: Duration = Duration::from_millis(100);
+
+/// How often the loop tells the level of the streams whose controls changed.
+const LEVEL_EVERY: Duration = Duration::from_millis(50);
 
 /// The rate a playing stream's callback asks for, which the loop applies. A stream's controls
 /// are set on the loop: from the realtime thread, PipeWire warns of the wrong context at each
@@ -447,6 +457,7 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
     let quit = mainloop.clone();
     let next_id = Cell::new(0u64);
     let playing = streams.clone();
+    let mixed = streams.clone();
     let _commands = commands.attach(mainloop.loop_(), move |command| match command {
         Command::DefaultNode(device, reply) => {
             let value = configured.borrow_mut().of(device).clone();
@@ -495,7 +506,9 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
                 Opening::Sink { on_sound, on_level } => {
                     open_sink(&core, &name, &description, on_sound, on_level)
                 }
-                Opening::Playback(jitter) => open_playback(&core, &name, &description, jitter),
+                Opening::Playback { jitter, on_level } => {
+                    open_playback(&core, &name, &description, jitter, on_level)
+                }
                 Opening::Source(jitter) => open_source(&core, &name, &description, jitter),
                 Opening::Mic { mic, on_sound } => {
                     open_mic(&context, &core, &name, &description, &mic, on_sound)
@@ -528,6 +541,16 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
         }
     });
     let _ = rates.update_timer(Some(RATE_EVERY), Some(RATE_EVERY));
+    let levels = mainloop.loop_().add_timer(move |_| {
+        for open in mixed.borrow_mut().values_mut() {
+            if let Some((pending, on_level)) = &mut open.level
+                && let Some(level) = pending.take()
+            {
+                on_level(level);
+            }
+        }
+    });
+    let _ = levels.update_timer(Some(LEVEL_EVERY), Some(LEVEL_EVERY));
     if !failed.get() {
         mainloop.run();
     }
@@ -723,6 +746,26 @@ impl Mixer {
     }
 }
 
+/// Follows a control of a stream into `mixer`, and leaves the level it makes for the loop to
+/// tell.
+fn follow_control(
+    mixer: &mut Mixer,
+    pending: &Cell<Option<Level>>,
+    id: u32,
+    control: *const pw::sys::pw_stream_control,
+) {
+    // SAFETY: PipeWire hands over a control that lives for the call; a null one is skipped,
+    // and `values` holds `n_values` floats.
+    let values = unsafe {
+        control
+            .as_ref()
+            .map(|control| std::slice::from_raw_parts(control.values, control.n_values as usize))
+    };
+    if let Some(level) = values.and_then(|values| mixer.follow(id, values)) {
+        pending.set(Some(level));
+    }
+}
+
 /// The remote's sink: a virtual output whose sound is read from its monitor, with the volume
 /// and mute that the sink itself applies told to `on_level`.
 fn open_sink(
@@ -736,19 +779,11 @@ fn open_sink(
     props.insert(*pw::keys::MEDIA_CLASS, "Audio/Sink");
     // Not autoconnected: the session manager links the apps to it, as to any sink.
     let stream = pw::stream::StreamRc::new(core.clone(), name, props).map_err(pw_error)?;
+    let pending = Rc::new(Cell::new(None));
     let listener = stream
-        .add_local_listener_with_user_data((Mixer::new(), on_level))
-        .control_info(|_stream, (mixer, on_level), id, control| {
-            // SAFETY: PipeWire hands over a control that lives for the call; a null one is
-            // skipped, and `values` holds `n_values` floats.
-            let values = unsafe {
-                control.as_ref().map(|control| {
-                    std::slice::from_raw_parts(control.values, control.n_values as usize)
-                })
-            };
-            if let Some(level) = values.and_then(|values| mixer.follow(id, values)) {
-                on_level(level);
-            }
+        .add_local_listener_with_user_data((Mixer::new(), pending.clone()))
+        .control_info(|_stream, (mixer, pending), id, control| {
+            follow_control(mixer, pending, id, control);
         })
         // What it receives is scaled by the mixer: left unread, for the monitor has it whole.
         .process(|stream, _| drop(stream.dequeue_buffer()))
@@ -781,6 +816,7 @@ fn open_sink(
         _listener: Box::new(listener),
         stream,
         rate: None,
+        level: Some((pending, on_level)),
         _module: None,
         _monitor: Some(Box::new(monitor)),
     })
@@ -805,17 +841,31 @@ fn set_control(stream: &pw::stream::StreamRc, id: u32, value: f32) -> bool {
     result >= 0
 }
 
-/// Sets the volume and mute of a stream of ours, as a mixer would.
+/// Sets the volume and mute of a stream of ours, as a mixer would, in one change: told back
+/// by its controls all at once, never half of it. The level is all in the gains of the
+/// channels, the overall volume at unity, so that the level told back is the one set.
 fn set_level(stream: &pw::stream::StreamRc, level: Level) {
-    let muted = if level.muted { 1.0 } else { 0.0 };
-    if stream
-        .set_control(
+    let unity = [1.0f32];
+    let channels = [level.left, level.right];
+    let muted = [if level.muted { 1.0f32 } else { 0.0 }];
+    // SAFETY: a live stream, used on its loop's thread; the arrays outlive the call, which
+    // copies them, and the list of controls ends with an id of 0, as the variadic call needs.
+    let result = unsafe {
+        pw::sys::pw_stream_set_control(
+            stream.as_raw_ptr(),
+            spa::sys::SPA_PROP_volume,
+            1u32,
+            unity.as_ptr().cast_mut(),
             spa::sys::SPA_PROP_channelVolumes,
-            &[level.left, level.right],
+            2u32,
+            channels.as_ptr().cast_mut(),
+            spa::sys::SPA_PROP_mute,
+            1u32,
+            muted.as_ptr().cast_mut(),
+            0u32,
         )
-        .and_then(|()| stream.set_control(spa::sys::SPA_PROP_mute, &[muted]))
-        .is_err()
-    {
+    };
+    if result < 0 {
         eprintln!("navette: audio: could not set the volume of the remote's sound");
     }
 }
@@ -825,6 +875,7 @@ fn open_playback(
     name: &str,
     description: &str,
     jitter: Arc<Mutex<Jitter>>,
+    on_level: OnLevel,
 ) -> io::Result<Open> {
     let mut props = properties(name, description);
     props.insert(*pw::keys::MEDIA_TYPE, "Audio");
@@ -838,6 +889,7 @@ fn open_playback(
         props,
         pw::stream::StreamFlags::AUTOCONNECT,
         jitter,
+        Some(on_level),
     )
 }
 
@@ -851,7 +903,14 @@ fn open_source(
 ) -> io::Result<Open> {
     let mut props = properties(name, description);
     props.insert(*pw::keys::MEDIA_CLASS, "Audio/Source");
-    playing(core, name, props, pw::stream::StreamFlags::empty(), jitter)
+    playing(
+        core,
+        name,
+        props,
+        pw::stream::StreamFlags::empty(),
+        jitter,
+        None,
+    )
 }
 
 /// PipeWire's echo canceller (WebRTC), loaded here: it captures `mic`, named rather than the
@@ -945,25 +1004,32 @@ fn recording(
         _listener: Box::new(listener),
         stream,
         rate: None,
+        level: None,
         _module: None,
         _monitor: None,
     })
 }
 
-/// A stream that plays what `jitter` holds.
+/// A stream that plays what `jitter` holds, with its level told to `on_level`, if any.
 fn playing(
     core: &pw::core::CoreRc,
     name: &str,
     props: pw::properties::PropertiesBox,
     flags: pw::stream::StreamFlags,
     jitter: Arc<Mutex<Jitter>>,
+    on_level: Option<OnLevel>,
 ) -> io::Result<Open> {
     let stream = pw::stream::StreamRc::new(core.clone(), name, props).map_err(pw_error)?;
     let samples = vec![0.0f32; SAMPLES_PER_CYCLE];
     let rate = Arc::new(Rate::default());
+    let pending = Rc::new(Cell::new(None));
     let listener = stream
-        .add_local_listener_with_user_data((jitter, samples, rate.clone()))
-        .process(|stream, (jitter, samples, rate)| {
+        .add_local_listener_with_user_data((jitter, samples, rate.clone(), Mixer::new()))
+        .control_info({
+            let pending = pending.clone();
+            move |_stream, (.., mixer), id, control| follow_control(mixer, &pending, id, control)
+        })
+        .process(|stream, (jitter, samples, rate, _)| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -1003,6 +1069,7 @@ fn playing(
         _listener: Box::new(listener),
         stream,
         rate: Some((rate, Cell::new(1.0))),
+        level: on_level.map(|on_level| (pending, on_level)),
         _module: None,
         _monitor: None,
     })
@@ -1291,6 +1358,7 @@ mod tests {
                 "navette-test",
                 "Test",
                 Arc::new(Mutex::new(Jitter::new(1, 4))),
+                Box::new(|_| {}),
             )
             .unwrap();
         let level = Level {
