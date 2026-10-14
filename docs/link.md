@@ -82,8 +82,13 @@ refuses a request against an offer that a newer copy has replaced.
   how it ended in a desktop notification: `Files pasted` with their folder, `Paste failed`
   with why (no room, the other machine stopped it…), or `Paste cancelled`.
 - **When the link drops**, every paste and transfer in flight ends at once, and what it had
-  written is removed; the files already pasted stay. A paste of text or a picture that fails
-  is written to the journal ("a paste failed: ..."), with no content.
+  written is removed; the files already pasted stay.
+- **The journal** follows each copy by its offer number, one line per step and on both
+  machines: the offer sent and received with its file count, each paste asked and as what
+  type, the files fetched, pasted (with how long it took) or failed with why, the files
+  served, and each request refused with why ("this machine copied again"). It never holds
+  what was copied: a paste of text or a picture that fails says only "a paste failed: ...",
+  a paste of files names the file it failed on.
 
 ## The home firewall
 

@@ -252,6 +252,16 @@ impl<S: ChunkSource> ChunkSource for Served<S> {
 impl<S> Drop for Served<S> {
     fn drop(&mut self) {
         if !self.finished || self.read != self.size || self.done.get() >= self.total {
+            if let Crossing::Serve(serial) = self.crossing {
+                let how = if !self.finished {
+                    "stopped in the middle of a file"
+                } else if self.read != self.size {
+                    "ended, a file was not the size the copy said"
+                } else {
+                    "served whole"
+                };
+                eprintln!("navette: clipboard: offer {serial}: {how}");
+            }
             self.progress.end(self.crossing, self.run);
         } else {
             self.progress.idle(self.crossing, self.run);

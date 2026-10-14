@@ -153,6 +153,8 @@ pub struct Bridge<C: Compositor> {
     notifier: Arc<dyn Notifier>,
     /// The number of the last paste of files on this machine.
     pastes: Cell<u32>,
+    /// The copy whose files the peer last asked for: its crossing is logged once.
+    serving: Cell<Option<u32>>,
 }
 
 impl<C: Compositor> Bridge<C> {
@@ -175,6 +177,7 @@ impl<C: Compositor> Bridge<C> {
             progress: progress::Progress::new(shown.bar.clone()),
             notifier: shown.notifier.clone(),
             pastes: Cell::new(0),
+            serving: Cell::new(None),
         }
     }
 
@@ -207,6 +210,11 @@ impl<C: Compositor> Bridge<C> {
     }
 
     fn on_remote_offer(&self, serial: u32, mime_types: Vec<String>, files: Vec<ClipboardFile>) {
+        log(format_args!(
+            "offer {serial} received: {} files, {} types",
+            files.len(),
+            mime_types.len()
+        ));
         let advertise = local_mimes_for_offer(&mime_types, !files.is_empty());
         *self.remote.borrow_mut() = RemoteOffer {
             serial,
@@ -217,9 +225,13 @@ impl<C: Compositor> Bridge<C> {
     }
 
     fn on_request(&self, id: u32, serial: u32, item: ClipboardItem) {
-        if serial != self.local.borrow().serial {
+        let current = self.local.borrow().serial;
+        if serial != current {
             // The selection moved on since the peer saw the offer: refuse, so its paste fails
             // on its own, rather than serve data it did not ask for.
+            log(format_args!(
+                "offer {serial}: a request refused, this machine copied again (offer {current})"
+            ));
             self.transfers.refuse(id);
             return;
         }
@@ -227,6 +239,9 @@ impl<C: Compositor> Bridge<C> {
             ClipboardItem::Mime(requested) => {
                 let local = self.local.borrow();
                 let Some(actual) = resolve_mime(&requested, &local.mime_types) else {
+                    log(format_args!(
+                        "offer {serial}: {requested} refused, not in the copy"
+                    ));
                     self.transfers.refuse(id);
                     return;
                 };
@@ -246,6 +261,9 @@ impl<C: Compositor> Bridge<C> {
                 let (path, size, total, skipped) = {
                     let mut local = self.local.borrow_mut();
                     let Some(path) = local.files.path_for(&item).map(PathBuf::from) else {
+                        log(format_args!(
+                            "offer {serial}: file {index} refused, not in the copy"
+                        ));
                         self.transfers.refuse(id);
                         return;
                     };
@@ -260,9 +278,18 @@ impl<C: Compositor> Bridge<C> {
                 }
                 let Some((done, stopped, run)) = self.progress.serving(serial, total) else {
                     // The user stopped this copy's paste: its next files are not served.
+                    log(format_args!(
+                        "offer {serial}: file {index} refused, its paste was stopped"
+                    ));
                     self.transfers.refuse(id);
                     return;
                 };
+                if self.serving.replace(Some(serial)) != Some(serial) {
+                    log(format_args!(
+                        "offer {serial}: the peer pastes it, serving its files ({})",
+                        human_bytes(total)
+                    ));
+                }
                 let crossing = Crossing::Serve(serial);
                 match files::open_copied(&path) {
                     Ok(file) => self.transfers.serve(
@@ -326,6 +353,12 @@ impl<C: Compositor> Bridge<C> {
                 return; // superseded while we were listing
             }
             let entries = copied.files.entries.clone();
+            log(format_args!(
+                "offer {} sent: {} files, {} types",
+                generation as u32,
+                entries.len(),
+                offered.len()
+            ));
             {
                 let mut local = local.borrow_mut();
                 local.files = copied.files;
@@ -354,10 +387,15 @@ impl<C: Compositor> Bridge<C> {
             let (serial, files, received) = {
                 let remote = self.remote.borrow();
                 if remote.files.is_empty() {
+                    log(format_args!(
+                        "offer {}: {mime_type} asked, but it holds no files",
+                        remote.serial
+                    ));
                     return;
                 }
                 (remote.serial, remote.files.clone(), remote.received.clone())
             };
+            log(format_args!("offer {serial}: pasted as {mime_type}"));
             let Some(inbox) = self.inbox.clone() else {
                 log(format_args!("no folder for pasted files: $HOME is not set"));
                 return;
@@ -380,9 +418,15 @@ impl<C: Compositor> Bridge<C> {
             let its_run = run.clone();
             let task = tokio::task::spawn_local(async move {
                 let mut fetched = false;
+                let started = std::time::Instant::now();
                 let result = received
                     .get_or_try_init(|| {
                         fetched = true;
+                        log(format_args!(
+                            "offer {serial}: fetching {} files ({})",
+                            files.len(),
+                            human_bytes(total)
+                        ));
                         receive_files(&transfers, &files, serial, &inbox, &meter)
                     })
                     .await;
@@ -390,6 +434,11 @@ impl<C: Compositor> Bridge<C> {
                 match result {
                     Ok(paths) => {
                         if fetched {
+                            log(format_args!(
+                                "offer {serial}: {} files pasted in {} ms",
+                                files.len(),
+                                started.elapsed().as_millis()
+                            ));
                             notifier.show(
                                 "Files pasted",
                                 &format!(
@@ -404,7 +453,9 @@ impl<C: Compositor> Bridge<C> {
                         let _ = write_body(WriteSink(target), body).await;
                     }
                     Err(e) => {
-                        log(format_args!("a paste of files failed: {e}"));
+                        log(format_args!(
+                            "offer {serial}: the paste of its files failed: {e}"
+                        ));
                         notifier.show("Paste failed", &why(&e));
                     }
                 }
@@ -415,6 +466,7 @@ impl<C: Compositor> Bridge<C> {
             );
         } else {
             let serial = self.remote.borrow().serial;
+            log(format_args!("offer {serial}: pasted as {mime_type}"));
             self.jobs
                 .run(describe_mime(&mime_type), None, |meter| async move {
                     transfers
