@@ -1,12 +1,12 @@
 //! The corner (#69): while a mode runs, every home monitor shows, at its top left, what is
 //! linked and where the mic is, with a button that switches the mic.
 //!
-//! - **On each reserved monitor**, over the remote's picture and under the remote's bar: a warm
-//!   orange gradient, a `REMOTE` tag and the mic button. It is drawn at home and never sent: the
-//!   remote never captures it, and a click on it stays home.
+//! - **On each reserved monitor**, over the remote's picture: a warm orange gradient, a
+//!   `REMOTE` tag and the mic button. It is drawn at home and never sent: the remote never
+//!   captures it, and a click on it stays home.
 //! - **On each of home's own monitors**: the same corner, red with a `HOME` tag, wherever the
 //!   mic is.
-//! - **The tags and the bars' heights** are the mode's to set (`remote_label`, `home_label`,
+//! - **The tags and how far down the corners start** are the mode's to set (`remote_label`, `home_label`,
 //!   `remote_bar`, `home_bar`): see [`Look`].
 //! - **The mic button** is a mic and a round check: on the side that has the mic, the check draws
 //!   in and the button turns green; on the other, it wipes out. A click switches the mic, as the
@@ -195,9 +195,8 @@ pub struct Look {
     pub remote_label: String,
     /// The tag on home's own monitors.
     pub home_label: String,
-    /// How far below the top of a reserved monitor its corner starts, in logical pixels: the
-    /// height of the remote's bar, whose left end holds the menu and the workspaces. 26 is
-    /// one desktop's default bar; a remote without a top bar sets 0.
+    /// How far below the top of a reserved monitor its corner starts, in logical pixels, over
+    /// what the remote shows there.
     pub remote_bar: i32,
     /// How far below the top of each of home's own monitors its corner starts, in logical
     /// pixels, over home's bars; with none, the compositor places it below them.
@@ -209,8 +208,8 @@ impl Default for Look {
         Self {
             remote_label: "REMOTE".into(),
             home_label: "HOME".into(),
-            remote_bar: 26,
-            home_bar: None,
+            remote_bar: 0,
+            home_bar: Some(0),
         }
     }
 }

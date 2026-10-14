@@ -4,8 +4,8 @@
 //!
 //! On a reserved monitor it is a subsurface of the remote's picture ([`super::surface`]); on each
 //! of home's own monitors, a small layer surface of its own, [`HomeCorner`]: on the overlay
-//! layer, anchored top left, with no keyboard, placed by the compositor below the exclusive zones
-//! at the top (home's bar), or `home_bar` pixels from the top over them.
+//! layer, anchored top left, with no keyboard, `home_bar` pixels from the top over the exclusive
+//! zones there (home's bars), or placed by the compositor below them with `home_bar = auto`.
 
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -718,5 +718,17 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn with_no_home_bar_home_s_corner_sits_at_the_top_over_home_s_bars() {
+        assert_eq!(
+            place(crate::corner::Look::default().home_bar),
+            Place {
+                anchor: Anchor::TOP | Anchor::LEFT,
+                exclusive: -1,
+                top: 0
+            }
+        );
     }
 }

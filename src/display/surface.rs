@@ -24,7 +24,7 @@
 //! for one with nothing to show, the pointer is the default arrow. While
 //! [`super::REMOTE_CURSOR`] is off, it is always the default arrow.
 //!
-//! The corner (#69) is a subsurface at the top left, under the remote's bar: drawn at home over
+//! The corner (#69) is a subsurface at the top left, `remote_bar` pixels down: drawn at home over
 //! the picture, never part of it. Its input region is the mic button: the pointer over it is
 //! over the corner, not the picture, and what it does there stays home. Going from the picture
 //! to the button and back is no leave of the monitor: the keyboard, the shortcuts and what is
@@ -982,7 +982,7 @@ impl State {
         }
     }
 
-    /// Puts the corner over the picture, under the remote's bar, once the surface is placed.
+    /// Puts the corner over the picture, `remote_bar` pixels down, once the surface is placed.
     fn open_corner(&mut self) {
         let parent = match self.surface() {
             Some(surface) => surface.clone(),

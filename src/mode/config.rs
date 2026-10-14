@@ -215,7 +215,8 @@ impl File {
             })?,
         };
         let home_bar = match value("home_bar") {
-            None | Some("auto") => fallback.home_bar,
+            None => fallback.home_bar,
+            Some("auto") => None,
             Some(bar) => Some(bar.parse::<u16>().map(i32::from).map_err(|_| {
                 invalid(format!(
                     "{path}: `home_bar = {bar}`: `auto`, or a height in pixels, 0 or more; \
@@ -422,8 +423,13 @@ mod tests {
         assert_eq!(look, Look::default());
         assert_eq!(look.remote_label, "REMOTE");
         assert_eq!(look.home_label, "HOME");
-        assert_eq!(look.remote_bar, 26);
-        assert_eq!(look.home_bar, None);
+    }
+
+    #[test]
+    fn with_no_key_both_corners_sit_at_the_top() {
+        let look = mode("monitor = DP-2\n", None).unwrap().look;
+        assert_eq!(look.remote_bar, 0);
+        assert_eq!(look.home_bar, Some(0));
     }
 
     #[test]
@@ -482,14 +488,14 @@ mod tests {
     }
 
     #[test]
-    fn home_s_corner_sits_below_home_s_bar_unless_the_mode_sets_its_height() {
-        let text = "home_bar = 0\n[office]\nmonitor = DP-1\n\
-                    [travel]\nmonitor = DP-2\nhome_bar = auto\n\
+    fn remote_bar_26_home_bar_auto_and_home_bar_12_still_place_the_corners_as_before() {
+        let text = "home_bar = auto\nremote_bar = 26\n[office]\nmonitor = DP-1\n\
+                    [travel]\nmonitor = DP-2\nhome_bar = 0\n\
                     [desk]\nmonitor = DP-3\nhome_bar = 12\n";
-        assert_eq!(mode(text, Some("office")).unwrap().look.home_bar, Some(0));
-        assert_eq!(mode(text, Some("travel")).unwrap().look.home_bar, None);
+        let office = mode(text, Some("office")).unwrap().look;
+        assert_eq!((office.remote_bar, office.home_bar), (26, None));
+        assert_eq!(mode(text, Some("travel")).unwrap().look.home_bar, Some(0));
         assert_eq!(mode(text, Some("desk")).unwrap().look.home_bar, Some(12));
-        assert_eq!(mode("monitor = DP-2\n", None).unwrap().look.home_bar, None);
     }
 
     #[test]
