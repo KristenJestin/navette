@@ -153,7 +153,7 @@ While a mode runs, every home monitor shows, at its top left, what it is and whe
 (nothing of it with no mode):
 
 - **On each reserved monitor**, over the remote's picture: a warm orange glow from the corner,
-  a `PRO` tag and the mic button. It starts 26 pixels down, below the remote's bar (the height
+  a `REMOTE` tag and the mic button. It starts 26 pixels down, below the remote's bar (the height
   of Omarchy's bar), so that the bar's menu and workspaces stay in sight. It is drawn at home
   over the picture and never sent: the remote machine never sees it, and the pointer over its
   button is home's, so a click there stays home. Passing over the button is not leaving the
@@ -162,7 +162,7 @@ While a mode runs, every home monitor shows, at its top left, what it is and whe
   is back over the picture. A drag that passes over the button goes on to the remote machine.
   Anywhere else the pointer goes to the remote machine as before.
 - **On each of home's own monitors**, at the same place, below home's bar (the compositor places
-  it after the space the bar reserves): a red glow, a `MAISON` tag and the mic button while the
+  it after the space the bar reserves): a red glow, a `HOME` tag and the mic button while the
   mic is home; the mic button alone, dimmed, while the mic is on the remote machine.
 - **The mic button** shows a mic and a round check. On the side that has the mic the check
   draws in and the button turns green; on the other it wipes out (350 ms). A click switches the

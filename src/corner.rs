@@ -2,9 +2,9 @@
 //! linked and where the mic is, with a button that switches the mic.
 //!
 //! - **On each reserved monitor**, over the remote's picture and under the remote's bar: a warm
-//!   orange gradient, a `PRO` tag and the mic button. It is drawn at home and never sent: the
+//!   orange gradient, a `REMOTE` tag and the mic button. It is drawn at home and never sent: the
 //!   remote never captures it, and a click on it stays home.
-//! - **On each of home's own monitors**: the same corner, red with a `MAISON` tag while the mic
+//! - **On each of home's own monitors**: the same corner, red with a `HOME` tag while the mic
 //!   is home, shrunk to the mic button alone, dimmed, while it is on the remote.
 //! - **The mic button** is a mic and a round check: on the side that has the mic, the check draws
 //!   in and the button turns green; on the other, it wipes out. A click switches the mic, as the
@@ -400,8 +400,8 @@ impl Corner {
             return None;
         }
         let text = match self.side {
-            Side::Remote => "PRO",
-            Side::Home => "MAISON",
+            Side::Remote => "REMOTE",
+            Side::Home => "HOME",
         };
         let width = text_width(text) + 2.0 * 6.0;
         Some((
@@ -882,7 +882,7 @@ mod tests {
             "{:?}",
             (r, g, b)
         );
-        assert_eq!(pro.tag().unwrap().1, "PRO");
+        assert_eq!(pro.tag().unwrap().1, "REMOTE");
         assert!(is_green(color(&drawn, ring(&pro).0, ring(&pro).1)));
         // The mic home: the remote's corner stays whole, its check out.
         let home = corner(Side::Remote, Status::Home, now);
@@ -964,8 +964,8 @@ mod tests {
     fn a_monitor_at_twice_the_scale_has_twice_the_pixels() {
         let now = Instant::now();
         let pro = corner(Side::Remote, Status::Remote, now);
-        let drawn = pro.draw(now, 2.0);
-        assert_eq!((drawn.width, drawn.height), (300, 160));
+        let (one, two) = (pro.draw(now, 1.0), pro.draw(now, 2.0));
+        assert_eq!((two.width, two.height), (one.width * 2, one.height * 2));
     }
 
     /// Two corners listening to `board`, the updates each heard, as a corner would take them.
