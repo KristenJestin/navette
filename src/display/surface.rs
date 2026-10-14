@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
-use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::output::{OutputHandler, OutputInfo, OutputState};
 use smithay_client_toolkit::reexports::calloop::channel::{self, Channel, Event as ChannelEvent};
 use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
@@ -481,6 +481,7 @@ fn run(
         cursor_hidden: false,
         entered: None,
         physical_width: None,
+        monitor: None,
         corner: subcompositor.map(|sub| CornerSlot {
             subcompositor: sub,
             feed,
@@ -536,18 +537,8 @@ fn run(
         .info(&output)
         .map(|i| i.transform)
         .unwrap_or(wl_output::Transform::Normal);
-    // The monitor's width in pixels as laid out: with the surface's logical width, its scale.
-    state.physical_width = state.outputs.info(&output).and_then(|info| {
-        let (width, height) = info.modes.iter().find(|m| m.current)?.dimensions;
-        let turned = matches!(
-            info.transform,
-            wl_output::Transform::_90
-                | wl_output::Transform::_270
-                | wl_output::Transform::Flipped90
-                | wl_output::Transform::Flipped270
-        );
-        Some(if turned { height } else { width } as f64)
-    });
+    state.physical_width = state.outputs.info(&output).and_then(|i| pixels_wide(&i));
+    state.monitor = Some(output.clone());
     // Where the monitor stands in home's layout: a drag carried past the surface's edge goes on
     // to the work monitor beside it.
     if let Some(info) = state.outputs.info(&output) {
@@ -648,6 +639,8 @@ struct State {
     entered: Option<u32>,
     /// The monitor's width in pixels, turned as laid out.
     physical_width: Option<f64>,
+    /// The monitor the surface is on.
+    monitor: Option<wl_output::WlOutput>,
     /// None when the compositor has no subsurfaces.
     corner: Option<CornerSlot>,
     hover: Hover,
@@ -828,6 +821,32 @@ fn point(
     }
 }
 
+/// The monitor's width in pixels as laid out: with the surface's logical width, its scale.
+fn pixels_wide(info: &OutputInfo) -> Option<f64> {
+    let (width, height) = info.modes.iter().find(|m| m.current)?.dimensions;
+    let turned = matches!(
+        info.transform,
+        wl_output::Transform::_90
+            | wl_output::Transform::_270
+            | wl_output::Transform::Flipped90
+            | wl_output::Transform::Flipped270
+    );
+    Some(if turned { height } else { width } as f64)
+}
+
+/// Pixels per logical pixel, from the monitor's width in pixels and the surface's size.
+fn scale(physical_width: Option<f64>, size: Option<(u32, u32)>) -> f64 {
+    match (physical_width, size) {
+        (Some(pixels), Some((width, _))) if width > 0 => pixels / width as f64,
+        _ => 1.0,
+    }
+}
+
+/// Whether the corner, drawn at `drawn` (never, when `None`), must be drawn again at `scale`.
+fn again(drawn: Option<f64>, scale: f64) -> bool {
+    drawn.is_some_and(|drawn| drawn != scale)
+}
+
 /// The layer surface's hold on the keyboard; nothing before the surface is mapped.
 struct LayerGrab<'a> {
     layer: Option<&'a LayerSurface>,
@@ -963,9 +982,18 @@ impl State {
 
     /// The monitor's scale: its pixels per logical pixel.
     fn scale(&self) -> f64 {
-        match (self.physical_width, self.size) {
-            (Some(pixels), Some((width, _))) if width > 0 => pixels / width as f64,
-            _ => 1.0,
+        scale(self.physical_width, self.size)
+    }
+
+    /// The surface's size or its monitor changed: the corner is drawn again if its scale did.
+    fn rescale(&mut self) {
+        let scale = self.scale();
+        let drawn = self
+            .corner
+            .as_ref()
+            .and_then(|c| c.painter.as_ref()?.scale());
+        if again(drawn, scale) {
+            self.show_corner();
         }
     }
 
@@ -1206,6 +1234,9 @@ impl LayerShellHandler for State {
             self.capture.area(size.0, size.1);
         }
         self.size = Some(size);
+        if !first {
+            self.rescale();
+        }
         if first {
             // Before the surface's commit below, which places it.
             self.open_corner();
@@ -1344,7 +1375,17 @@ impl OutputHandler for State {
 
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        if self.monitor.as_ref() == Some(&output) {
+            self.physical_width = self.outputs.info(&output).and_then(|i| pixels_wide(&i));
+            self.rescale();
+        }
+    }
 
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
@@ -1941,6 +1982,20 @@ mod tests {
             y: 5.0,
         }]);
         assert_eq!(desk.holds.0, ["none", "uninhibit", "on_demand", "inhibit"]);
+    }
+
+    #[test]
+    fn the_remote_corner_is_drawn_again_when_the_scale_or_the_size_changes() {
+        // Drawn on a 3840 px monitor at scale 2.
+        let drawn = scale(Some(3840.0), Some((1920, 1080)));
+        assert_eq!(drawn, 2.0);
+        assert!(!again(Some(drawn), drawn), "nothing changed");
+        // Home's monitor set to scale 1.5: the surface is configured smaller.
+        assert!(again(Some(drawn), scale(Some(3840.0), Some((2560, 1440)))));
+        // Its mode changed, the surface's logical size not.
+        assert!(again(Some(drawn), scale(Some(2560.0), Some((1920, 1080)))));
+        // Not drawn yet: it is drawn when it opens.
+        assert!(!again(None, 1.5));
     }
 
     #[test]

@@ -55,6 +55,8 @@ pub(super) struct Painter {
     viewport: wp_viewport::WpViewport,
     pool: Option<SlotPool>,
     shown: Option<Buffer>,
+    /// The scale it was last drawn at.
+    scale: Option<f64>,
 }
 
 impl Painter {
@@ -69,11 +71,16 @@ impl Painter {
             viewport,
             pool: None,
             shown: None,
+            scale: None,
         }
     }
 
     pub fn surface(&self) -> &wl_surface::WlSurface {
         &self.surface
+    }
+
+    pub fn scale(&self) -> Option<f64> {
+        self.scale
     }
 
     /// Draws the corner at `now` and attaches it, with the button as its input region; the
@@ -111,6 +118,7 @@ impl Painter {
         self.surface.set_input_region(Some(region.wl_region()));
         self.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
         self.shown = Some(buffer);
+        self.scale = Some(scale);
         Some(size)
     }
 }
