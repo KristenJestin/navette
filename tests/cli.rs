@@ -4,7 +4,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -79,14 +79,21 @@ impl Navette {
         stdin.flush().unwrap();
     }
 
-    fn finish(mut self) -> String {
+    fn finish(self) -> String {
+        self.finish_with_status().1
+    }
+
+    fn finish_with_status(mut self) -> (ExitStatus, String) {
         let deadline = Instant::now() + WAIT;
-        while self.child.try_wait().unwrap().is_none() {
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
             assert!(Instant::now() < deadline, "navette did not exit in time");
             std::thread::sleep(Duration::from_millis(20));
-        }
+        };
         std::thread::sleep(Duration::from_millis(50));
-        self.output.lock().unwrap().clone()
+        (status, self.output.lock().unwrap().clone())
     }
 
     fn output(&self) -> String {
@@ -266,4 +273,57 @@ fn mic_toggle_without_audio_says_to_turn_it_on() {
     let (_serve, _agent, _) = paired_link(&home, &remote);
     let output = Navette::start(&home, &["mic", "toggle"]).finish();
     assert!(output.contains("navette serve --audio"), "{output}");
+}
+
+#[test]
+fn a_second_agent_refuses_to_start_while_one_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (_serve, _agent, _) = paired_link(&home, &remote);
+
+    let (status, output) = Navette::start(&remote, &["agent"]).finish_with_status();
+    assert!(!status.success(), "{output}");
+    assert!(
+        output.contains("another navette agent is already running"),
+        "{output}"
+    );
+    assert!(
+        output.contains("systemctl --user status navette-agent"),
+        "{output}"
+    );
+}
+
+#[test]
+fn the_first_agent_s_link_is_untouched_by_a_refused_second_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (serve, agent, _) = paired_link(&home, &remote);
+
+    let refused = Navette::start(&remote, &["agent"]).finish();
+    assert!(!refused.contains("link up"), "{refused}");
+
+    // Home keeps its newest connection: a second dial would have shown as a second `link up`
+    // at home and a `link down` at the first agent.
+    for (who, output) in [
+        ("home", serve.output()),
+        ("the first agent", agent.output()),
+    ] {
+        assert_eq!(output.matches("link up").count(), 1, "{who}:\n{output}");
+        assert!(!output.contains("link down"), "{who}:\n{output}");
+    }
+}
+
+#[test]
+fn an_agent_starts_after_the_previous_one_crashed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (serve, mut agent, _) = paired_link(&home, &remote);
+
+    // SIGKILL: no clean-up of any kind runs, so nothing but the kernel can free the lock.
+    agent.child.kill().unwrap();
+    agent.child.wait().unwrap();
+    serve.wait_for("link down");
+
+    let next = Navette::start(&remote, &["agent"]);
+    next.wait_for("link up");
 }
