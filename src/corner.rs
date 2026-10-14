@@ -4,10 +4,10 @@
 //! - **On each reserved monitor**, over the remote's picture and under the remote's bar: a warm
 //!   orange gradient, a `REMOTE` tag and the mic button. It is drawn at home and never sent: the
 //!   remote never captures it, and a click on it stays home.
-//! - **On each of home's own monitors**: the same corner, red with a `HOME` tag while the mic
-//!   is home, shrunk to the mic button alone, dimmed, while it is on the remote.
-//! - **The tags and the bar's height** are the mode's to set (`remote_label`, `home_label`,
-//!   `remote_bar`): see [`Look`].
+//! - **On each of home's own monitors**: the same corner, red with a `HOME` tag, wherever the
+//!   mic is.
+//! - **The tags and the bars' heights** are the mode's to set (`remote_label`, `home_label`,
+//!   `remote_bar`, `home_bar`): see [`Look`].
 //! - **The mic button** is a mic and a round check: on the side that has the mic, the check draws
 //!   in and the button turns green; on the other, it wipes out. A click switches the mic, as the
 //!   hotkey and `navette mic toggle` do; hovering it shows the hotkey.
@@ -199,6 +199,9 @@ pub struct Look {
     /// height of the remote's bar, whose left end holds the menu and the workspaces. 26 is
     /// one desktop's default bar; a remote without a top bar sets 0.
     pub remote_bar: i32,
+    /// How far below the top of each of home's own monitors its corner starts, in logical
+    /// pixels, over home's bars; with none, the compositor places it below them.
+    pub home_bar: Option<i32>,
 }
 
 impl Default for Look {
@@ -207,6 +210,7 @@ impl Default for Look {
             remote_label: "REMOTE".into(),
             home_label: "HOME".into(),
             remote_bar: 26,
+            home_bar: None,
         }
     }
 }
@@ -397,8 +401,6 @@ const DOT: f64 = 2.0;
 const LONGEST: usize = 64;
 /// The narrowest the bar of the files crossing is.
 const BAR_WIDTH: f64 = 160.0;
-/// How much a corner on a side without the mic is dimmed.
-const DIMMED: f64 = 0.5;
 
 /// One corner: what it shows, and how it is drawn.
 pub struct Corner {
@@ -506,20 +508,12 @@ impl Corner {
         (!left.is_zero()).then_some(Next::After(left))
     }
 
-    /// The home corner while the mic is on the remote: the button alone, dimmed.
-    fn shrunk(&self) -> bool {
-        self.side == Side::Home && self.mic == Status::Remote
-    }
-
     fn button_shown(&self) -> bool {
         self.mic != Status::Off
     }
 
     /// The tag's rectangle, when there is one.
     fn tag(&self) -> Option<(Rect, &str)> {
-        if self.shrunk() {
-            return None;
-        }
         let text = self.label.as_str();
         let width = text_width(text) + 2.0 * 6.0;
         Some((
@@ -605,31 +599,46 @@ impl Corner {
             right = right.max(PAD + text_width(&line) + 2.0 * 6.0);
             bottom = self.line_y() + ROW;
         }
-        let (mut width, mut height) = (right + PAD, bottom + PAD);
-        if !self.shrunk() {
-            width = width.max(GLOW.0);
-            height = height.max(GLOW.1);
-        }
+        let (width, height) = ((right + PAD).max(GLOW.0), (bottom + PAD).max(GLOW.1));
         (width.ceil() as u32, height.ceil() as u32)
+    }
+
+    /// The most room the corner takes whatever it shows, in logical pixels: its longest line,
+    /// under the bar of the files crossing.
+    pub fn room(&self) -> (u32, u32) {
+        let now = Instant::now();
+        let mut widest = Corner::new(self.side, None, self.label.clone());
+        widest.update(Update::Mic(Status::Home), now);
+        widest.update(
+            Update::Files(Some(Bar {
+                done: 0,
+                total: u64::MAX,
+            })),
+            now,
+        );
+        widest.update(Update::Say("M".repeat(LONGEST)), now);
+        widest.size(now)
     }
 
     /// The corner at `now`, at `scale` pixels per logical pixel.
     pub fn draw(&self, now: Instant, scale: f64) -> Canvas {
-        let (width, height) = self.size(now);
+        self.draw_in(now, scale, self.size(now))
+    }
+
+    /// The corner at `now` on a canvas of `size` logical pixels, at `scale`.
+    pub fn draw_in(&self, now: Instant, scale: f64, size: (u32, u32)) -> Canvas {
+        let (width, height) = size;
         let px = |v: u32| ((v as f64 * scale).ceil() as u32).max(1);
         let mut canvas = Canvas::new(px(width), px(height));
         let mut pen = Pen {
             canvas: &mut canvas,
             scale,
         };
-        let dim = if self.shrunk() { DIMMED } else { 1.0 };
-        if !self.shrunk() {
-            let glow = match self.side {
-                Side::Remote => PRO,
-                Side::Home => HOME,
-            };
-            pen.glow(glow);
-        }
+        let glow = match self.side {
+            Side::Remote => PRO,
+            Side::Home => HOME,
+        };
+        pen.glow(glow);
         if let Some((tag, text)) = self.tag() {
             let fill = match self.side {
                 Side::Remote => PRO,
@@ -640,8 +649,8 @@ impl Corner {
         }
         if let Some(button) = self.button() {
             let check = self.check_at(now);
-            let accent = OFF.towards(ON, check).faded(dim);
-            pen.rounded(button, ROW / 2.0, PILL.faded(dim));
+            let accent = OFF.towards(ON, check);
+            pen.rounded(button, ROW / 2.0, PILL);
             pen.rounded_outline(button, ROW / 2.0, BORDER.towards(accent.faded(0.6), check));
             pen.mic(button.x + 15.0, button.y + ROW / 2.0, accent);
             let (cx, cy) = (button.x + button.width - 15.0, button.y + ROW / 2.0);
@@ -1008,33 +1017,55 @@ mod tests {
     }
 
     #[test]
-    fn home_s_corner_is_red_while_the_mic_is_home_and_dimmed_while_it_is_on_the_remote() {
+    fn home_s_corner_keeps_its_glow_and_tag_whichever_side_has_the_mic() {
+        let now = Instant::now();
+        for mic in [Status::Home, Status::Remote] {
+            let home = corner(Side::Home, mic, now);
+            let drawn = home.draw(now, 1.0);
+            // The gradient, red, at the very corner.
+            let (r, g, b, a) = color(&drawn, 1, 1);
+            assert!(
+                a > 100 && r > 200 && g < 120 && b < 120,
+                "{mic:?}: {:?}",
+                (r, g, b, a)
+            );
+            assert_eq!(home.tag().unwrap().1, "HOME", "{mic:?}");
+            assert!(
+                drawn.width >= 150 && drawn.height >= 80,
+                "{mic:?}: the whole gradient"
+            );
+        }
+        // Only the button tells where the mic is.
+        let here = corner(Side::Home, Status::Home, now);
+        assert!(is_green(color(
+            &here.draw(now, 1.0),
+            ring(&here).0,
+            ring(&here).1
+        )));
+        let away = corner(Side::Home, Status::Remote, now);
+        assert!(!is_green(color(
+            &away.draw(now, 1.0),
+            ring(&away).0,
+            ring(&away).1
+        )));
+        assert_eq!(here.button(), away.button());
+    }
+
+    #[test]
+    fn a_corner_drawn_in_its_room_keeps_its_shapes_where_they_are() {
         let now = Instant::now();
         let home = corner(Side::Home, Status::Home, now);
-        let drawn = home.draw(now, 1.0);
-        // The gradient, red, at the very corner.
-        let (r, g, b, a) = color(&drawn, 1, 1);
-        assert!(
-            a > 100 && r > 200 && g < 120 && b < 120,
-            "{:?}",
-            (r, g, b, a)
-        );
-        assert!(is_green(color(&drawn, ring(&home).0, ring(&home).1)));
-        assert!(
-            drawn.width >= 150 && drawn.height >= 80,
-            "the whole gradient"
-        );
-
-        let away = corner(Side::Home, Status::Remote, now);
-        let drawn = away.draw(now, 1.0);
-        // No gradient, no tag: the button alone, half seen.
-        assert_eq!(drawn.at(1, 1).0, 0, "nothing at the corner");
-        assert!(away.tag().is_none());
-        let button = away.button().unwrap();
-        let (_, _, _, a) = color(&drawn, button.x as u32 + 24, button.y as u32 + 11);
-        assert!((100..150).contains(&a), "dimmed, alpha {a}");
-        assert!(!is_green(color(&drawn, ring(&away).0, ring(&away).1)));
-        assert!(drawn.width < 100 && drawn.height < 50, "shrunk");
+        let room = home.room();
+        let tight = home.draw(now, 2.0);
+        let roomy = home.draw_in(now, 2.0, room);
+        assert_eq!((roomy.width, roomy.height), (2 * room.0, 2 * room.1));
+        for y in 0..tight.height {
+            for x in 0..tight.width {
+                assert_eq!(tight.at(x, y), roomy.at(x, y), "({x}, {y})");
+            }
+        }
+        // Around it, nothing.
+        assert_eq!(roomy.at(roomy.width - 1, roomy.height - 1).0, 0);
     }
 
     #[test]

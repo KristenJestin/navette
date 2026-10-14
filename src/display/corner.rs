@@ -5,7 +5,7 @@
 //! On a reserved monitor it is a subsurface of the remote's picture ([`super::surface`]); on each
 //! of home's own monitors, a small layer surface of its own, [`HomeCorner`]: on the overlay
 //! layer, anchored top left, with no keyboard, placed by the compositor below the exclusive zones
-//! at the top (home's bar).
+//! at the top (home's bar), or `home_bar` pixels from the top over them.
 
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -57,6 +57,8 @@ pub(super) struct Painter {
     shown: Option<Buffer>,
     /// The scale it was last drawn at.
     scale: Option<f64>,
+    /// The size it is always drawn at, if it is: otherwise, the size of what it shows.
+    room: Option<(u32, u32)>,
     /// A frame was asked of the compositor and has not come yet.
     framing: bool,
 }
@@ -75,7 +77,14 @@ impl Painter {
             shown: None,
             scale: None,
             framing: false,
+            room: None,
         }
+    }
+
+    /// Always drawn at `room` logical pixels, what it shows at the top left.
+    pub fn in_room(mut self, room: (u32, u32)) -> Self {
+        self.room = Some(room);
+        self
     }
 
     pub fn surface(&self) -> &wl_surface::WlSurface {
@@ -116,8 +125,8 @@ impl Painter {
         shm: &Shm,
         compositor: &CompositorState,
     ) -> Option<(u32, u32)> {
-        let canvas = self.corner.draw(now, scale);
-        let size = self.corner.size(now);
+        let size = self.room.unwrap_or_else(|| self.corner.size(now));
+        let canvas = self.corner.draw_in(now, scale, size);
         let len = canvas.argb.len() * 4;
         if self.pool.is_none() {
             self.pool = SlotPool::new(len * 2, shm).ok();
@@ -214,6 +223,41 @@ pub(super) fn scale_of(info: &OutputInfo) -> f64 {
     }
 }
 
+/// Where home's corner sits on its monitor: its layer surface's anchor, exclusive zone and top
+/// margin.
+#[derive(Debug, PartialEq)]
+struct Place {
+    anchor: Anchor,
+    exclusive: i32,
+    top: i32,
+}
+
+/// Where home's corner sits with `home_bar` (see [`crate::corner::Look`]).
+fn place(home_bar: Option<i32>) -> Place {
+    let anchor = Anchor::TOP | Anchor::LEFT;
+    match home_bar {
+        // An exclusive zone of 0: the compositor places it after the space the bars reserve.
+        None => Place {
+            anchor,
+            exclusive: 0,
+            top: 0,
+        },
+        // -1: the space the bars reserve is ignored, the margin counts from the monitor's top.
+        Some(bar) => Place {
+            anchor,
+            exclusive: -1,
+            top: bar,
+        },
+    }
+}
+
+/// The size home's layer surface is given, in logical pixels, whatever the corner shows:
+/// Hyprland animates a layer surface's new size, and stretches the buffer already drawn at that
+/// size to the animated one, so a corner that grew with it looked squashed.
+fn layer_size(corner: &Corner) -> (u32, u32) {
+    corner.room()
+}
+
 /// The corner on one of home's own monitors, on its own thread. Dropping it removes it.
 pub struct HomeCorner {
     stop: Option<channel::Sender<()>>,
@@ -300,12 +344,15 @@ fn run(
         outputs: OutputState::new(&globals, &qh),
         shm: Shm::bind(&globals, &qh).map_err(wayland)?,
         compositor,
-        painter: Painter::new(feed.corner(Side::Home), surface.clone(), viewport),
+        painter: {
+            let corner = feed.corner(Side::Home);
+            let room = layer_size(&corner);
+            Painter::new(corner, surface.clone(), viewport).in_room(room)
+        },
         feed: feed.clone(),
         layer: None,
         configured: false,
         scale: 1.0,
-        size: None,
         handle: event_loop.handle(),
         qh: qh.clone(),
         timer: None,
@@ -339,8 +386,11 @@ fn run(
         Some(NAMESPACE),
         Some(&output),
     );
-    layer.set_anchor(Anchor::TOP | Anchor::LEFT);
-    let (width, height) = state.painter.corner.size(Instant::now());
+    let place = place(feed.look().home_bar);
+    layer.set_anchor(place.anchor);
+    layer.set_exclusive_zone(place.exclusive);
+    layer.set_margin(place.top, 0, 0, 0);
+    let (width, height) = layer_size(&state.painter.corner);
     layer.set_size(width, height);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.commit();
@@ -373,8 +423,6 @@ struct State {
     layer: Option<LayerSurface>,
     configured: bool,
     scale: f64,
-    /// The size last asked of the compositor.
-    size: Option<(u32, u32)>,
     handle: LoopHandle<'static, State>,
     qh: QueueHandle<State>,
     timer: Option<RegistrationToken>,
@@ -398,19 +446,16 @@ impl Shows for State {
             return;
         }
         let now = Instant::now();
-        let Some(size) = self
+        if self
             .painter
             .paint(now, self.scale, &self.shm, &self.compositor)
-        else {
+            .is_none()
+        {
             return;
-        };
+        }
         let next = self.painter.corner.next_draw(now);
         self.painter.ask_frame(next, &self.qh);
         if let Some(layer) = &self.layer {
-            if self.size != Some(size) {
-                layer.set_size(size.0, size.1);
-                self.size = Some(size);
-            }
             layer.commit();
         }
         draw_again(self, next);
@@ -477,10 +522,9 @@ impl LayerShellHandler for State {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &LayerSurface,
-        configure: LayerSurfaceConfigure,
+        _: LayerSurfaceConfigure,
         _: u32,
     ) {
-        self.size = Some(configure.new_size);
         if !self.configured {
             self.configured = true;
             self.show_corner();
@@ -610,5 +654,69 @@ mod tests {
         assert!(begin.elapsed() < Duration::from_millis(500));
         drop(corner);
         assert!(begin.elapsed() < Duration::from_secs(1), "nor its stop");
+    }
+
+    #[test]
+    fn home_s_layer_surface_keeps_one_size_while_the_corner_grows() {
+        use crate::clipboard::progress::Bar;
+        use crate::corner::Update;
+        use crate::mic::Status;
+
+        let now = Instant::now();
+        let feed = Feed::new(
+            Arc::default(),
+            Some("SUPER + CTRL + M".into()),
+            Default::default(),
+        );
+        let mut corner = feed.corner(Side::Home);
+        corner.update(Update::Mic(Status::Home), now);
+        let first = layer_size(&corner);
+        let mut sizes = vec![corner.size(now)];
+        // Hovered: the hint shows under the button.
+        corner.hover(true);
+        sizes.push(corner.size(now));
+        corner.update(Update::Mic(Status::Remote), now);
+        sizes.push(corner.size(now));
+        corner.update(Update::Say("x".repeat(200)), now);
+        sizes.push(corner.size(now));
+        corner.update(
+            Update::Files(Some(Bar {
+                done: 1,
+                total: u64::MAX,
+            })),
+            now,
+        );
+        sizes.push(corner.size(now));
+        assert!(sizes.windows(2).any(|w| w[0] != w[1]), "the corner grows");
+        assert_eq!(layer_size(&corner), first);
+        for (width, height) in sizes {
+            assert!(
+                width <= first.0 && height <= first.1,
+                "{width}x{height} in {first:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn home_s_corner_sits_below_home_s_bars_with_auto_and_over_them_with_a_height() {
+        let top_left = Anchor::TOP | Anchor::LEFT;
+        assert_eq!(
+            place(None),
+            Place {
+                anchor: top_left,
+                exclusive: 0,
+                top: 0
+            }
+        );
+        for bar in [0, 38] {
+            assert_eq!(
+                place(Some(bar)),
+                Place {
+                    anchor: top_left,
+                    exclusive: -1,
+                    top: bar
+                }
+            );
+        }
     }
 }

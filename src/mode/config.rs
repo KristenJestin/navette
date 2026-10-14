@@ -2,7 +2,8 @@
 //! remote machine takes. Keys before any `[section]` are the default of every mode, and a
 //! `monitor` among them is the one unnamed mode, so a file written before modes had names keeps
 //! working. A `[name]` section is a named mode: its `monitor`, and any of `release`,
-//! `mic_hotkey`, `remote_label`, `home_label`, `remote_bar` it wants other than the default.
+//! `mic_hotkey`, `remote_label`, `home_label`, `remote_bar`, `home_bar` it wants other than the
+//! default.
 //! `#` starts a comment.
 
 use std::io;
@@ -213,10 +214,20 @@ impl File {
                 ))
             })?,
         };
+        let home_bar = match value("home_bar") {
+            None | Some("auto") => fallback.home_bar,
+            Some(bar) => Some(bar.parse::<u16>().map(i32::from).map_err(|_| {
+                invalid(format!(
+                    "{path}: `home_bar = {bar}`: `auto`, or a height in pixels, 0 or more; \
+                     nothing was changed"
+                ))
+            })?),
+        };
         let look = Look {
             remote_label: label("remote_label", fallback.remote_label)?,
             home_label: label("home_label", fallback.home_label)?,
             remote_bar,
+            home_bar,
         };
         Ok(Mode {
             name: section.name.clone(),
@@ -412,6 +423,7 @@ mod tests {
         assert_eq!(look.remote_label, "REMOTE");
         assert_eq!(look.home_label, "HOME");
         assert_eq!(look.remote_bar, 26);
+        assert_eq!(look.home_bar, None);
     }
 
     #[test]
@@ -465,6 +477,29 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("remote_bar"), "{bad}: {error}");
+            assert!(error.contains("nothing was changed"), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn home_s_corner_sits_below_home_s_bar_unless_the_mode_sets_its_height() {
+        let text = "home_bar = 0\n[office]\nmonitor = DP-1\n\
+                    [travel]\nmonitor = DP-2\nhome_bar = auto\n\
+                    [desk]\nmonitor = DP-3\nhome_bar = 12\n";
+        assert_eq!(mode(text, Some("office")).unwrap().look.home_bar, Some(0));
+        assert_eq!(mode(text, Some("travel")).unwrap().look.home_bar, None);
+        assert_eq!(mode(text, Some("desk")).unwrap().look.home_bar, Some(12));
+        assert_eq!(mode("monitor = DP-2\n", None).unwrap().look.home_bar, None);
+    }
+
+    #[test]
+    fn a_home_bar_that_is_neither_auto_nor_pixels_fails_clearly() {
+        for bad in ["-1", "tall", "2.5", "Auto"] {
+            let error = mode(&format!("monitor = DP-2\nhome_bar = {bad}\n"), None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("home_bar"), "{bad}: {error}");
+            assert!(error.contains("auto"), "{bad}: {error}");
             assert!(error.contains("nothing was changed"), "{bad}: {error}");
         }
     }
