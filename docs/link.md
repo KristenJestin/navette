@@ -58,7 +58,10 @@ refuses a request against an offer that a newer copy has replaced.
   never followed and, with sockets, pipes and devices, are left out; the machine that copied
   names them in a notification when the other one pastes. A copied file is read only when the
   other machine pastes it, and only if it is still a regular file (not a link put in its
-  place).
+  place). Of the types the copy is on the clipboard as, only the standard ones cross: text
+  (`text/plain` and its charsets, `UTF8_STRING`, `STRING`, `TEXT`), `text/html`, `image/*`
+  and the file lists. The types an application keeps for its own instances (a token, a
+  process id) stay on their machine, where they mean something.
 - **Pasted files** go in a `Navette` folder of the download directory (`$XDG_DOWNLOAD_DIR`, as
   `user-dirs.dirs` names it, else `~/Downloads`), made if missing, and stay there. A paste
   first fills a hidden 0700 folder in it (`.navette-incoming-<pid>-<n>`), then moves each

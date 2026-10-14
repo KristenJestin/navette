@@ -337,8 +337,9 @@ impl<C: Compositor> Bridge<C> {
             local.skipped = Vec::new();
         }
         let mut offered = forwardable_mimes(&mime_types);
-        // What the peer would refuse; the text types come first, so text survives.
-        offered.retain(|m| m.len() <= MAX_MIME_LEN);
+        // What the peer would refuse, and what is no data but an application's own; the text
+        // types come first, so text survives.
+        offered.retain(|m| m.len() <= MAX_MIME_LEN && standard(m));
         offered.truncate(MAX_MIME_TYPES);
         // Read the file list as whichever file-list type the selection advertises; the parser
         // handles both bodies.
@@ -493,6 +494,18 @@ impl<C: Compositor> Bridge<C> {
                 });
         }
     }
+}
+
+/// Whether any application may read `mime_type`. An application can put types of its own on
+/// the clipboard for its other instances (a token, its process id): on the other machine they
+/// name nothing, or something else, so they stay on their machine. File lists cross as the
+/// offer's files.
+fn standard(mime_type: &str) -> bool {
+    matches!(
+        mime_type,
+        "text/plain" | "UTF8_STRING" | "STRING" | "TEXT" | "text/html"
+    ) || mime_type.starts_with("text/plain;")
+        || mime_type.starts_with("image/")
 }
 
 /// The application that pasted the peer's offer `serial` stopped waiting before its files were
@@ -1121,6 +1134,30 @@ mod tests {
     #[tokio::test]
     async fn a_file_copied_on_the_remote_is_pasted_at_home() {
         file_crosses(false).await;
+    }
+
+    #[tokio::test]
+    async fn an_application_s_private_types_stay_on_its_machine() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                home.copy(&[
+                    (TEXT, b"note"),
+                    ("text/html", b"<b>note</b>"),
+                    ("image/png", b"\x89PNG"),
+                    ("application/x-example-token", b"pid 4242"),
+                ]);
+                let offer = remote.offered(1).await;
+                for standard in [TEXT, "text/plain", "UTF8_STRING", "text/html", "image/png"] {
+                    assert!(offer.iter().any(|m| m == standard), "{standard}: {offer:?}");
+                }
+                assert!(
+                    !offer.iter().any(|m| m == "application/x-example-token"),
+                    "{offer:?}"
+                );
+            })
+            .await;
     }
 
     #[tokio::test]
