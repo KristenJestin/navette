@@ -50,8 +50,9 @@ refuses a request against an offer that a newer copy has replaced.
   stop the heartbeats.
 - **Limits.** 32 MiB for a pasted item that is not a file (gliff's), 10,000 entries for a set
   of files, and no limit on their size: the free space is checked before a byte is written. An
-  offer of the other machine beyond them, with a path that is absolute or holds `..`, or with
-  more than 64 mime types (or one longer than 255 bytes) is refused: it withdraws that
+  offer of the other machine beyond them, with a path that is absolute or holds `..`, a
+  top-level name starting with `.navette-incoming-`, sizes whose sum does not fit in 64 bits,
+  or more than 64 mime types (or one longer than 255 bytes) is refused: it withdraws that
   machine's previous copy, and nothing is offered.
 - **What a copy offers**: only the files and folders copied, folders walked whole. Links are
   never followed and, with sockets, pipes and devices, are left out; the machine that copied
@@ -63,14 +64,21 @@ refuses a request against an offer that a newer copy has replaced.
   first fills a hidden 0700 folder in it (`.navette-incoming-<pid>-<n>`), then moves each
   pasted file or folder in under its own name, or `name (1).ext`, `name (2).ext`… when one is
   already there: nothing is ever overwritten, and a name from the other machine never
-  reaches out of the folder. The application that pasted gets their paths once they are all
+  reaches out of the folder. They move in all together or not at all. On a filesystem that
+  cannot rename without replacing, a file is linked in then unlinked, a folder replaces an
+  empty one made for it. The application that pasted gets their paths once they are all
   complete. A second paste of the same copy points at the same files.
 - **On the link**, a file's chunks go after the picture, the sound and the input, and gliff's
   window (four chunks of 256 KiB in flight per transfer) keeps a transfer from piling up more:
-  a large file never holds a frame back for longer than the chunk already on the line.
+  a large file never holds a frame back for longer than the chunk already on the line. When
+  the picture keeps the link busy, the clipboard still gets one message in every eight frames,
+  so a paste never stalls into gliff's 30 s idle timeout.
 - **Progress and cancel.** While files cross, either way, home's corners show a bar with what
   is left ([the corner](mode.md#the-corner)); a click on it stops every transfer: the half
-  of a paste already written is removed, nothing is left behind. The machine that pasted says
+  of a paste already written is removed, nothing is left behind, and the copy whose paste was
+  stopped serves no more files (copy again to paste it). The bar loses a paste served from
+  here when its last byte goes, when a file is not the size the copy said, or when the other
+  machine asks for no next file within 30 s. The machine that pasted says
   how it ended in a desktop notification: `Files pasted` with their folder, `Paste failed`
   with why (no room, the other machine stopped it…), or `Paste cancelled`.
 - **When the link drops**, every paste and transfer in flight ends at once, and what it had
