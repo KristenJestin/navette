@@ -716,7 +716,7 @@ async fn launch(
     let desk = open_desk(home, &names, home_monitor.clone(), &mode.mic_hotkey).await?;
     // The hotkey is shown over the mic button; with no mic, there is no button.
     let hint = home.mic.as_ref().map(|_| mode.mic_hotkey.clone());
-    let feed = Feed::new(home.board.clone(), hint);
+    let feed = Feed::new(home.board.clone(), hint, mode.look.clone());
     let home_monitors: Vec<String> = monitors
         .iter()
         .filter(|m| !names.contains(&m.name) && !m.disabled)
@@ -1116,7 +1116,7 @@ mod tests {
 
     use super::config::CONFIG_FILE;
     use super::*;
-    use crate::corner::{Side, Update};
+    use crate::corner::{Look, Side, Update};
     use crate::display::wire::{Cursor, Outbox};
     use crate::hypr::fake::{FakeHypr, FakeMonitor, FakeWindow};
     use crate::mic::Status;
@@ -2338,6 +2338,71 @@ mod tests {
         assert!(desk.covered.lock().unwrap().is_empty());
         assert!(remote.outbox.queued().is_empty());
         assert!(desk.hypr.changes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_corner_tags_are_neutral_by_default() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        let feeds = desk.feeds.lock().unwrap().clone();
+        assert_eq!(feeds.len(), 2);
+        for (monitor, feed) in feeds {
+            assert_eq!(*feed.look(), Look::default(), "{monitor}");
+        }
+        let look = Look::default();
+        assert_eq!(
+            (look.remote_label.as_str(), look.home_label.as_str()),
+            ("REMOTE", "HOME")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mode_names_its_own_corner_labels() {
+        let desk = desk_with("remote_label = FAR\n[office]\nmonitor = DP-2\nhome_label = NEAR\n");
+        let _remote = started(&desk).await;
+        // The home corner and the reserved monitor's corner each carry their own tag.
+        let feeds = desk.feeds.lock().unwrap().clone();
+        let tags = |side| {
+            feeds
+                .iter()
+                .map(|(_, feed)| feed.corner(side).label().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tags(Side::Remote), ["FAR", "FAR"]);
+        assert_eq!(tags(Side::Home), ["NEAR", "NEAR"]);
+    }
+
+    #[tokio::test]
+    async fn a_label_the_corner_cannot_draw_fails_clearly_and_changes_nothing() {
+        for (label, why) in [
+            ("remote_label = Café", "remote_label"),
+            ("home_label = 1234567890123", "12 characters"),
+        ] {
+            let desk = desk_with(&format!("monitor = DP-2\n{label}\n"));
+            let remote = connect(&desk);
+            let error = answer(ask(&desk, true).await).await.unwrap_err();
+            assert!(error.to_string().contains(why), "{label}: {error}");
+            assert!(desk.covered.lock().unwrap().is_empty());
+            assert!(remote.outbox.queued().is_empty());
+            assert!(desk.hypr.changes().is_empty());
+            assert_eq!(corners(&desk), []);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_remote_corner_starts_below_the_bar_height_the_mode_sets() {
+        let tall = desk_with("monitor = DP-2\nremote_bar = 40\n");
+        let _remote = started(&tall).await;
+        let feeds = tall.feeds.lock().unwrap().clone();
+        assert!(!feeds.is_empty());
+        for (_, feed) in feeds {
+            assert_eq!(feed.look().remote_bar, 40);
+        }
+        let default = desk("DP-2");
+        let _remote = started(&default).await;
+        for (_, feed) in default.feeds.lock().unwrap().iter() {
+            assert_eq!(feed.look().remote_bar, 26);
+        }
     }
 
     #[tokio::test]

@@ -2,10 +2,12 @@
 //! linked and where the mic is, with a button that switches the mic.
 //!
 //! - **On each reserved monitor**, over the remote's picture and under the remote's bar: a warm
-//!   orange gradient, a `PRO` tag and the mic button. It is drawn at home and never sent: the
+//!   orange gradient, a `REMOTE` tag and the mic button. It is drawn at home and never sent: the
 //!   remote never captures it, and a click on it stays home.
-//! - **On each of home's own monitors**: the same corner, red with a `MAISON` tag while the mic
+//! - **On each of home's own monitors**: the same corner, red with a `HOME` tag while the mic
 //!   is home, shrunk to the mic button alone, dimmed, while it is on the remote.
+//! - **The tags and the bar's height** are the mode's to set (`remote_label`, `home_label`,
+//!   `remote_bar`): see [`Look`].
 //! - **The mic button** is a mic and a round check: on the side that has the mic, the check draws
 //!   in and the button turns green; on the other, it wipes out. A click switches the mic, as the
 //!   hotkey and `navette mic toggle` do; hovering it shows the hotkey.
@@ -28,10 +30,8 @@ use crate::notify::Notifier;
 pub const MESSAGE: Duration = Duration::from_secs(2);
 /// How long the check takes to draw in or wipe out.
 pub const CHECK: Duration = Duration::from_millis(350);
-/// How far below the top of a reserved monitor its corner starts: the height of the remote's
-/// bar, Omarchy's (its shell's default, 26 logical pixels), whose left end holds the menu and
-/// the workspaces.
-pub const REMOTE_BAR: i32 = 26;
+/// The most characters a tag holds.
+pub const LABEL_LONGEST: usize = 12;
 /// While the check moves, the corner is drawn again this often; otherwise only when it changes.
 pub const FRAME: Duration = Duration::from_millis(16);
 
@@ -145,22 +145,66 @@ pub async fn follow(board: Arc<Board>, mut status: watch::Receiver<Status>) {
     }
 }
 
+/// What the mode sets of how its corners look.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Look {
+    /// The tag on the reserved monitors.
+    pub remote_label: String,
+    /// The tag on home's own monitors.
+    pub home_label: String,
+    /// How far below the top of a reserved monitor its corner starts, in logical pixels: the
+    /// height of the remote's bar, whose left end holds the menu and the workspaces. 26 is
+    /// one desktop's default bar; a remote without a top bar sets 0.
+    pub remote_bar: i32,
+}
+
+impl Default for Look {
+    fn default() -> Self {
+        Self {
+            remote_label: "REMOTE".into(),
+            home_label: "HOME".into(),
+            remote_bar: 26,
+        }
+    }
+}
+
+/// Why `label` cannot be a tag, if it cannot: the font draws printable ASCII, and the corner
+/// stays small.
+pub fn check_label(label: &str) -> Result<(), String> {
+    if label.chars().count() > LABEL_LONGEST {
+        return Err(format!("{LABEL_LONGEST} characters at most"));
+    }
+    if !label.chars().all(|c| matches!(c, ' '..='~')) {
+        return Err("printable ASCII only".into());
+    }
+    Ok(())
+}
+
 /// What a running mode hands each of its corners.
 #[derive(Clone)]
 pub struct Feed {
     board: Arc<Board>,
     /// The mic's hotkey, shown when the button is hovered.
     hint: Option<String>,
+    look: Look,
 }
 
 impl Feed {
-    pub fn new(board: Arc<Board>, hint: Option<String>) -> Self {
-        Self { board, hint }
+    pub fn new(board: Arc<Board>, hint: Option<String>, look: Look) -> Self {
+        Self { board, hint, look }
+    }
+
+    pub fn look(&self) -> &Look {
+        &self.look
     }
 
     /// A corner on monitor of the given `side`.
     pub fn corner(&self, side: Side) -> Corner {
-        Corner::new(side, self.hint.clone())
+        let label = match side {
+            Side::Remote => &self.look.remote_label,
+            Side::Home => &self.look.home_label,
+        };
+        Corner::new(side, self.hint.clone(), label.clone())
     }
 
     pub fn listen(&self, listener: impl FnMut(&Update) -> bool + Send + 'static) {
@@ -309,6 +353,8 @@ const DIMMED: f64 = 0.5;
 /// One corner: what it shows, and how it is drawn.
 pub struct Corner {
     side: Side,
+    /// The text of the tag.
+    label: String,
     mic: Status,
     hint: Option<String>,
     /// The check's movement: from, to, since when.
@@ -318,9 +364,10 @@ pub struct Corner {
 }
 
 impl Corner {
-    pub fn new(side: Side, hint: Option<String>) -> Self {
+    pub fn new(side: Side, hint: Option<String>, label: String) -> Self {
         Self {
             side,
+            label,
             mic: Status::Off,
             hint,
             check: (0.0, 0.0, None),
@@ -350,6 +397,10 @@ impl Corner {
     /// The pointer is over the button, or not; true when that changes what is shown.
     pub fn hover(&mut self, over: bool) -> bool {
         std::mem::replace(&mut self.hover, over) != over
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Whether this corner's side has the mic.
@@ -395,14 +446,11 @@ impl Corner {
     }
 
     /// The tag's rectangle, when there is one.
-    fn tag(&self) -> Option<(Rect, &'static str)> {
+    fn tag(&self) -> Option<(Rect, &str)> {
         if self.shrunk() {
             return None;
         }
-        let text = match self.side {
-            Side::Remote => "PRO",
-            Side::Home => "MAISON",
-        };
+        let text = self.label.as_str();
         let width = text_width(text) + 2.0 * 6.0;
         Some((
             Rect {
@@ -818,7 +866,12 @@ mod tests {
     use super::*;
 
     fn corner(side: Side, mic: Status, now: Instant) -> Corner {
-        let mut corner = Corner::new(side, Some("SUPER + CTRL + M".into()));
+        let look = Look::default();
+        let label = match side {
+            Side::Remote => look.remote_label,
+            Side::Home => look.home_label,
+        };
+        let mut corner = Corner::new(side, Some("SUPER + CTRL + M".into()), label);
         corner.update(Update::Mic(mic), now);
         corner
     }
@@ -882,7 +935,7 @@ mod tests {
             "{:?}",
             (r, g, b)
         );
-        assert_eq!(pro.tag().unwrap().1, "PRO");
+        assert_eq!(pro.tag().unwrap().1, "REMOTE");
         assert!(is_green(color(&drawn, ring(&pro).0, ring(&pro).1)));
         // The mic home: the remote's corner stays whole, its check out.
         let home = corner(Side::Remote, Status::Home, now);
@@ -964,8 +1017,9 @@ mod tests {
     fn a_monitor_at_twice_the_scale_has_twice_the_pixels() {
         let now = Instant::now();
         let pro = corner(Side::Remote, Status::Remote, now);
-        let drawn = pro.draw(now, 2.0);
-        assert_eq!((drawn.width, drawn.height), (300, 160));
+        let (one, two) = (pro.draw(now, 1.0), pro.draw(now, 2.0));
+        // The corner grows with its tag: its size is compared with itself, not pinned.
+        assert_eq!((two.width, two.height), (one.width * 2, one.height * 2));
     }
 
     /// Two corners listening to `board`, the updates each heard, as a corner would take them.
