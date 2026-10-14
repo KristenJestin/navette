@@ -2,8 +2,8 @@
 //! remote machine takes. Keys before any `[section]` are the default of every mode, and a
 //! `monitor` among them is the one unnamed mode, so a file written before modes had names keeps
 //! working. A `[name]` section is a named mode: its `monitor`, and any of `release`,
-//! `closed_lid`, `mic_hotkey`, `remote_label`, `home_label`, `remote_bar` it wants other than
-//! the default. `#` starts a comment.
+//! `mic_hotkey`, `remote_label`, `home_label`, `remote_bar` it wants other than the default.
+//! `#` starts a comment.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -30,7 +30,8 @@ pub struct Mode {
     /// Each one an output name, or `desc:` and the start of a monitor's description, as written.
     pub monitors: Vec<String>,
     pub release: Option<Hotkey>,
-    pub closed_lid: bool,
+    /// What the file says that is no longer read, on one line.
+    pub notice: Option<String>,
     pub mic_hotkey: String,
     pub look: Look,
 }
@@ -181,15 +182,13 @@ impl File {
         let spec = value("release").unwrap_or(input::DEFAULT_HOTKEY);
         let release =
             Hotkey::parse(spec).map_err(|e| invalid(format!("{path}: `release = {spec}`: {e}")))?;
-        let closed_lid = match value("closed_lid") {
-            None | Some("off") => false,
-            Some("on") => true,
-            Some(other) => {
-                return Err(invalid(format!(
-                    "{path}: `closed_lid = {other}`: on or off; nothing was changed"
-                )));
-            }
-        };
+        // The lid works during every mode now; a file written for the option still starts.
+        let notice = value("closed_lid").map(|_| {
+            format!(
+                "{path}: `closed_lid` is no longer read, the remote laptop can be closed and \
+                 opened during every mode: the line can go"
+            )
+        });
         let mic_hotkey = value("mic_hotkey")
             .filter(|keys| !keys.is_empty())
             .unwrap_or(MIC_HOTKEY)
@@ -223,7 +222,7 @@ impl File {
             name: section.name.clone(),
             monitors,
             release,
-            closed_lid,
+            notice,
             mic_hotkey,
             look,
         })
@@ -374,7 +373,7 @@ mod tests {
         let mode = mode("# my desk\nmonitor = DP-2, DP-3   # right\n", None).unwrap();
         assert_eq!(mode.name, None);
         assert_eq!(mode.monitors, ["DP-2", "DP-3"]);
-        assert!(!mode.closed_lid);
+        assert_eq!(mode.notice, None);
         assert_eq!(mode.mic_hotkey, "SUPER + CTRL + M");
         // There is no other mode to name.
         let error = self::mode("monitor = DP-2\n", Some("office")).unwrap_err();
@@ -394,17 +393,15 @@ mod tests {
 
     #[test]
     fn the_keys_before_any_section_are_the_default_of_every_mode() {
-        let text = "release = ctrl+alt+q\nclosed_lid = on\nmic_hotkey = SUPER + F9\n\
+        let text = "release = ctrl+alt+q\nmic_hotkey = SUPER + F9\n\
                     [office]\nmonitor = DP-1\n\
-                    [travel]\nmonitor = DP-2\nrelease = none\nclosed_lid = off\n\
+                    [travel]\nmonitor = DP-2\nrelease = none\n\
                     mic_hotkey = SUPER + F10\n";
         let office = mode(text, Some("office")).unwrap();
         assert_eq!(office.release, Hotkey::parse("ctrl+alt+q").unwrap());
-        assert!(office.closed_lid);
         assert_eq!(office.mic_hotkey, "SUPER + F9");
         let travel = mode(text, Some("travel")).unwrap();
         assert_eq!(travel.release, None);
-        assert!(!travel.closed_lid);
         assert_eq!(travel.mic_hotkey, "SUPER + F10");
     }
 
@@ -560,9 +557,21 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_lid_value_other_than_on_or_off_is_refused() {
-        let error = mode("monitor = DP-2\nclosed_lid = yes please\n", None).unwrap_err();
-        assert!(error.to_string().contains("closed_lid"), "{error}");
+    fn a_file_that_still_names_closed_lid_is_read_with_a_one_line_notice() {
+        for value in ["on", "off", "yes please"] {
+            let text = format!("monitor = DP-2\nclosed_lid = {value}\n");
+            let mode = mode(&text, None).unwrap();
+            assert_eq!(mode.monitors, ["DP-2"]);
+            let notice = mode.notice.expect("a notice");
+            assert!(notice.contains("closed_lid"), "{notice}");
+            assert!(!notice.contains('\n'), "{notice}");
+        }
+        // A named mode gets it from the defaults as well as from its own section.
+        let text = "closed_lid = on\n[office]\nmonitor = DP-1\n[travel]\nmonitor = DP-2\n";
+        assert!(mode(text, Some("office")).unwrap().notice.is_some());
+        let text = "[office]\nmonitor = DP-1\nclosed_lid = on\n[travel]\nmonitor = DP-2\n";
+        assert!(mode(text, Some("office")).unwrap().notice.is_some());
+        assert!(mode(text, Some("travel")).unwrap().notice.is_none());
     }
 
     #[test]
