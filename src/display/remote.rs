@@ -1540,6 +1540,101 @@ mod tests {
         assert_eq!(agent.hypr.monitor(SECOND).unwrap().x, 3840);
     }
 
+    /// A narrow third copy, so no two outputs of `three` have the same size.
+    fn narrow() -> OutputCopy {
+        OutputCopy {
+            width: 1280,
+            height: 720,
+            refresh_mhz: 60_000,
+            scale_milli: 1000,
+            transform: 0,
+        }
+    }
+
+    async fn three(agent: &Agent) {
+        let others = vec![portrait(), narrow()];
+        agent.inbox.try_send(start_of(others)).unwrap();
+        until(|| agent.streams.count() == 3).await;
+    }
+
+    /// The outputs the mode made, as the user's config sees them: name, place, size, turn,
+    /// from the left.
+    fn outputs(agent: &Agent) -> Vec<(String, i32, u32, i32)> {
+        let mut outputs: Vec<_> = ["NAVETTE-1", "NAVETTE-2", "NAVETTE-3", "NAVETTE-4"]
+            .into_iter()
+            .filter_map(|n| agent.hypr.monitor(n))
+            .map(|m| (m.name, m.x, m.width, m.transform))
+            .collect();
+        outputs.sort_by_key(|o| o.1);
+        outputs
+    }
+
+    fn the_desk_of_three() -> Vec<(String, i32, u32, i32)> {
+        vec![
+            ("NAVETTE-1".into(), 1920, 1920, 0),
+            ("NAVETTE-2".into(), 3840, 2560, 1),
+            ("NAVETTE-3".into(), 5280, 1280, 0),
+        ]
+    }
+
+    #[tokio::test]
+    async fn the_outputs_are_named_from_left_to_right() {
+        let agent = agent();
+        three(&agent).await;
+        // The first monitor from home's left is NAVETTE-1, the next NAVETTE-2, and so on:
+        // the name follows the place, so the n-th from the left is the same name.
+        assert_eq!(outputs(&agent), the_desk_of_three());
+    }
+
+    #[tokio::test]
+    async fn the_names_are_the_same_on_every_start() {
+        let agent = agent();
+        three(&agent).await;
+        let first = outputs(&agent);
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        until(|| outputs(&agent).is_empty()).await;
+
+        // Another mode in between, of two monitors, must leave nothing in the next one's names.
+        agent.inbox.try_send(start_of(vec![portrait()])).unwrap();
+        until(|| outputs(&agent).len() == 2).await;
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        until(|| outputs(&agent).is_empty()).await;
+
+        agent
+            .inbox
+            .try_send(start_of(vec![portrait(), narrow()]))
+            .unwrap();
+        // The streams are counted since the agent began: 3, then 2, then 3 again.
+        until(|| agent.streams.count() == 8).await;
+        assert_eq!(outputs(&agent), first);
+        assert_eq!(first, the_desk_of_three());
+    }
+
+    #[tokio::test]
+    async fn the_names_survive_a_hyprland_restart_on_the_remote() {
+        let agent = agent();
+        three(&agent).await;
+        agent.hypr.set_down(true, Vec::new());
+        // The streams end in the reverse order: the outputs must come back by name, not by
+        // who asks first.
+        for output in ["NAVETTE-3", "NAVETTE-2", "NAVETTE-1"] {
+            agent.streams.end(output);
+        }
+        tokio::time::sleep(RETRY * 2).await;
+        assert!(outputs(&agent).is_empty());
+        agent
+            .hypr
+            .set_down(false, vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
+        until(|| agent.streams.count() == 6).await;
+        assert_eq!(outputs(&agent), the_desk_of_three());
+    }
+
     #[tokio::test]
     async fn one_output_that_keeps_failing_ends_the_whole_mode() {
         let agent = agent();
