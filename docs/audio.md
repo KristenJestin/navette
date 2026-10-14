@@ -45,7 +45,12 @@ sent because the link is full is sent as soon as there is room, never dropped.
 Each change is logged, so the two journals say where a level stopped: on the remote,
 `navette: audio: the sink is at 40 %, told home` and `navette: audio: home set the sink to
 40 %`; at home, `navette: audio: the remote set its sound to 40 %` and `navette: audio: the
-remote's sound is at 40 %, told the remote`. The percentage is the one `wpctl` shows.
+remote's sound is at 40 %, told the remote`. The percentage is the one `wpctl` shows. Where
+PipeWire takes it, each side also logs `navette: audio: navette-remote-sound set to 40 %` (or
+`navette-home-speakers` on the remote), or `could not set`. A stream that has just opened does
+not have its volume controls yet, and PipeWire drops a level set before then: the level is
+kept and set as soon as the stream has them (`has no volume yet, 40 % kept for when it has`).
+A level home receives for a session it does not play is logged as `ignored`.
 
 ## The jitter buffer
 
@@ -189,7 +194,8 @@ them as concealed or lost.
    `wpctl set-volume <its id> 30%`): the laptop's mixer and bar show 30 %; mute it at home,
    and the laptop shows muted. If a level does not follow, `journalctl --user -u
    navette-agent | grep 'navette: audio: \(the sink\|home set\)'` on the laptop and the
-   `navette: audio: the remote` lines of `navette serve` say on which side it stopped.
+   `navette: audio: \(the remote\|navette-remote-sound\)` lines of `navette serve` say on
+   which side it stopped.
 
 On loopback, between two private PipeWire instances with a 1024-sample quantum, the gap was
 26 to 41 ms.
