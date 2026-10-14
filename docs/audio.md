@@ -27,13 +27,25 @@ everything, as for any application. The volume is told as a linear gain, so a sl
 (0.125) reaches home as 0.125; and the first time a session starts, whatever the sink holds is
 told, so home never starts at a level that is not the remote's.
 
-Home's playback is set by the remote only when the remote's level changes. Moving the volume
-of *Remote machine (Navette)* in the home mixer works until the remote's next change, which
-overwrites it; WirePlumber is told not to restore a volume it kept for that stream.
+It is one level, both ways. Moving *Remote machine (Navette)* in the home mixer moves the
+remote's sink to the same level, so the remote's mixer always shows what is heard. A level
+applied from the other side is not sent back: each side remembers the level the other side
+holds, and what its own mixer said when that level was applied, until its mixer says
+something else. A new home stream is at 100 % until the remote's level comes, and that is not
+taken for the user moving it. WirePlumber is told not to restore a volume it kept for that
+stream. If both machines move the level within the same few milliseconds, each may end at the
+other's; moving it once more sets both.
 
-The remote looks for a change 20 times a second while the sink runs, so a held volume key is
-followed within 50 ms. A level that cannot be sent because the link is full is sent as soon
-as there is room, never dropped.
+The sink and the playback set the level in one change of their controls (the overall volume
+at unity, the gain of each channel, the mute), and PipeWire's loop tells it at most every
+50 ms, so a level is never told half set. Each side looks for a change 20 times a second while
+the sound plays, so a held volume key is followed within about 100 ms. A level that cannot be
+sent because the link is full is sent as soon as there is room, never dropped.
+
+Each change is logged, so the two journals say where a level stopped: on the remote,
+`navette: audio: the sink is at 40 %, told home` and `navette: audio: home set the sink to
+40 %`; at home, `navette: audio: the remote set its sound to 40 %` and `navette: audio: the
+remote's sound is at 40 %, told the remote`. The percentage is the one `wpctl` shows.
 
 ## The jitter buffer
 
@@ -97,7 +109,7 @@ other services:
 | `48` `AudioStart` | home → remote | the session number |
 | `49` `AudioStop` | home → remote | none |
 | `50` `AudioFrame` | remote → home | the session and a sequence number, and `data_len`: the Opus packet follows as the message's payload (4000 bytes at most, or the link ends) |
-| `54` `AudioVolume` | remote → home | the session, the linear gain of the left and of the right channel, and whether it is muted: sent when the remote sink's volume or mute changes |
+| `54` `AudioVolume` | both ways | the session, the linear gain of the left and of the right channel, and whether it is muted: sent when the remote sink's (or home playback's) volume or mute changes, by the side whose mixer moved it |
 
 Home numbers each start: a frame of an earlier session, still on its way when home stopped,
 is dropped rather than taken for a late frame of the new one.
@@ -172,7 +184,12 @@ them as concealed or lost.
    laptop's mixer (`wpctl status`, the bar) shows the level you set. At home, `wpctl status`
    shows *Remote machine (Navette)* at the same level. Mute on the laptop (the mute key): the
    video falls silent at home and the home stream shows `[MUTED]`; unmute, and it comes back.
-   Home's own volume keys still turn everything down.
+   Home's own volume keys still turn everything down, and the laptop's level does not move.
+   Then the other way: at home, move *Remote machine (Navette)* in the mixer (or
+   `wpctl set-volume <its id> 30%`): the laptop's mixer and bar show 30 %; mute it at home,
+   and the laptop shows muted. If a level does not follow, `journalctl --user -u
+   navette-agent | grep 'navette: audio: \(the sink\|home set\)'` on the laptop and the
+   `navette: audio: the remote` lines of `navette serve` say on which side it stopped.
 
 On loopback, between two private PipeWire instances with a 1024-sample quantum, the gap was
 26 to 41 ms.
