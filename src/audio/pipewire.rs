@@ -521,10 +521,7 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
         for open in playing.borrow().values() {
             if let Some((rate, applied)) = &open.rate
                 && let Some(asked) = rate.due(applied.get())
-                && open
-                    .stream
-                    .set_control(spa::sys::SPA_PROP_rate, &[asked])
-                    .is_ok()
+                && set_control(&open.stream, spa::sys::SPA_PROP_rate, asked)
             {
                 applied.set(asked);
             }
@@ -787,6 +784,25 @@ fn open_sink(
         _module: None,
         _monitor: Some(Box::new(monitor)),
     })
+}
+
+/// Sets one control of a stream, with a single value. `pw_stream_set_control` takes a list of
+/// controls that ends with an id of 0: pipewire-rs's `set_control` leaves the end out, and
+/// PipeWire reads whatever the registers then hold as more controls.
+fn set_control(stream: &pw::stream::StreamRc, id: u32, value: f32) -> bool {
+    let values = [value];
+    // SAFETY: a live stream, used on its loop's thread; the value outlives the call, which
+    // copies it, and the list ends with an id of 0.
+    let result = unsafe {
+        pw::sys::pw_stream_set_control(
+            stream.as_raw_ptr(),
+            id,
+            1u32,
+            values.as_ptr().cast_mut(),
+            0u32,
+        )
+    };
+    result >= 0
 }
 
 /// Sets the volume and mute of a stream of ours, as a mixer would.
