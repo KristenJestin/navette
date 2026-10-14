@@ -140,6 +140,8 @@ struct RemoteOffer {
     selected: bool,
     /// Whether it was offered again once its files were in.
     offered_again: bool,
+    /// Its pastes on this machine, stopped when a newer copy replaces it.
+    pastes: Vec<Crossing>,
 }
 
 /// The two ends of one link's clipboard: the peer's messages in, the compositor's events in.
@@ -222,6 +224,19 @@ impl<C: Compositor> Bridge<C> {
             mime_types.len()
         ));
         let advertise = local_mimes_for_offer(&mime_types, !files.is_empty());
+        // A fetch of the copy it replaces would only compete with its own for the link.
+        let (replaced, pastes) = {
+            let mut remote = self.remote.borrow_mut();
+            (remote.serial, std::mem::take(&mut remote.pastes))
+        };
+        if pastes
+            .into_iter()
+            .fold(false, |any, p| self.progress.stop(p) | any)
+        {
+            log(format_args!(
+                "offer {replaced}: its paste stopped, offer {serial} replaced it"
+            ));
+        }
         *self.remote.borrow_mut() = RemoteOffer {
             serial,
             files,
@@ -420,6 +435,7 @@ impl<C: Compositor> Bridge<C> {
             let total = total.unwrap_or(0);
             let paste = Crossing::Paste(self.pastes.get().wrapping_add(1));
             self.pastes.set(self.pastes.get().wrapping_add(1));
+            self.remote.borrow_mut().pastes.push(paste);
             let done = Meter::default();
             let (meter, progress, notifier) =
                 (done.clone(), self.progress.clone(), self.notifier.clone());
@@ -1847,93 +1863,148 @@ mod tests {
         .await
     }
 
+    /// A bridge pasting the peer's offer 1, a file of four chunks, with one of them written in
+    /// its staging folder.
+    struct LargePaste {
+        /// The peer's end of the link.
+        peer: mpsc::Sender<(ClipboardMsg, Bytes)>,
+        sent: mpsc::Receiver<(ClipboardMsg, Bytes)>,
+        seen: Seen,
+        /// The application's end of the paste.
+        reader: pipe::Receiver,
+        /// The transfer of the file.
+        id: u32,
+        /// The bridge runs as long as its compositor does.
+        _compositor: mpsc::UnboundedSender<Selected>,
+    }
+
+    async fn a_large_paste_under_way(folder: &std::path::Path) -> LargePaste {
+        let (peer, from_peer) = mpsc::channel(16);
+        let (to_peer, mut sent) = outbound_channel();
+        let mut wire = Wire {
+            from_peer,
+            to_peer,
+            display: None,
+            audio: None,
+        };
+        let (events, selected) = mpsc::unbounded_channel();
+        let (seen, clipboard) = (Seen::new(), Arc::new(Fake::default()));
+        let (shown, bridge, inbox) = (seen.shown(), clipboard.clone(), folder.to_path_buf());
+        tokio::task::spawn_local(async move {
+            let inbox = Some(Inbox::new(inbox));
+            let serials = Rc::default();
+            super::run(
+                Side::Server,
+                &mut wire,
+                bridge,
+                selected,
+                inbox,
+                serials,
+                shown,
+            )
+            .await;
+        });
+        let offer = ClipboardMsg::Offer {
+            serial: 1,
+            mime_types: Vec::new(),
+            files: vec![ClipboardFile {
+                path: "big.bin".into(),
+                size: 4 * CHUNK as u64,
+                dir: false,
+            }],
+        };
+        peer.send((offer, Bytes::new())).await.unwrap();
+        within("the offer", async {
+            while clipboard.offered.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let (reader, writer) = std::io::pipe().unwrap();
+        events
+            .send(Selected::Paste {
+                mime_type: URI_LIST.into(),
+                fd: writer.into(),
+            })
+            .unwrap();
+        let ClipboardMsg::Request { id, .. } =
+            next_sent(&mut sent, |m| matches!(m, ClipboardMsg::Request { .. })).await
+        else {
+            unreachable!()
+        };
+        let chunk = ClipboardMsg::Data {
+            id,
+            offset: 0,
+            data_len: CHUNK as u32,
+            done: false,
+        };
+        peer.send((chunk, Bytes::from(vec![5; CHUNK])))
+            .await
+            .unwrap();
+        next_sent(&mut sent, |m| matches!(m, ClipboardMsg::Ack { .. })).await;
+        assert_eq!(tree(folder).len(), 2, "the staging folder and its file");
+        LargePaste {
+            peer,
+            sent,
+            seen,
+            reader: pipe::Receiver::from_owned_fd(reader.into()).unwrap(),
+            id,
+            _compositor: events,
+        }
+    }
+
+    /// The paste of `paste` ends with nothing for the application, and the peer is told to stop.
+    async fn the_paste_stopped(paste: &mut LargePaste, folder: &std::path::Path) {
+        assert_eq!(
+            next_sent(&mut paste.sent, |m| matches!(m, ClipboardMsg::Abort { .. })).await,
+            ClipboardMsg::Abort { id: paste.id },
+            "the peer is told to stop",
+        );
+        let mut pasted = Vec::new();
+        within("the paste", paste.reader.read_to_end(&mut pasted))
+            .await
+            .unwrap();
+        assert!(pasted.is_empty());
+        assert!(tree(folder).is_empty(), "{:?}", tree(folder));
+    }
+
     #[tokio::test]
     async fn a_cancel_stops_a_paste_and_leaves_no_half_written_file() {
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp.path().join("inbox");
         LocalSet::new()
             .run_until(async {
-                let (peer, from_peer) = mpsc::channel(16);
-                let (to_peer, mut sent) = outbound_channel();
-                let mut wire = Wire {
-                    from_peer,
-                    to_peer,
-                    display: None,
-                    audio: None,
+                let mut paste = a_large_paste_under_way(&folder).await;
+                paste.seen.click();
+                the_paste_stopped(&mut paste, &folder).await;
+                paste.seen.told("Paste cancelled").await;
+                assert_eq!(paste.seen.bars().last(), Some(&None));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_new_copy_during_a_large_fetch_stops_it_and_leaves_no_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("inbox");
+        LocalSet::new()
+            .run_until(async {
+                let mut paste = a_large_paste_under_way(&folder).await;
+                let newer = ClipboardMsg::Offer {
+                    serial: 2,
+                    mime_types: vec![TEXT.into()],
+                    files: Vec::new(),
                 };
-                let (events, selected) = mpsc::unbounded_channel();
-                let (seen, clipboard) = (Seen::new(), Arc::new(Fake::default()));
-                let (shown, bridge, inbox) = (seen.shown(), clipboard.clone(), folder.clone());
-                tokio::task::spawn_local(async move {
-                    let inbox = Some(Inbox::new(inbox));
-                    let serials = Rc::default();
-                    super::run(
-                        Side::Server,
-                        &mut wire,
-                        bridge,
-                        selected,
-                        inbox,
-                        serials,
-                        shown,
-                    )
-                    .await;
-                });
-                let offer = ClipboardMsg::Offer {
-                    serial: 1,
-                    mime_types: Vec::new(),
-                    files: vec![ClipboardFile {
-                        path: "big.bin".into(),
-                        size: 4 * CHUNK as u64,
-                        dir: false,
-                    }],
-                };
-                peer.send((offer, Bytes::new())).await.unwrap();
-                within("the offer", async {
-                    while clipboard.offered.lock().unwrap().is_empty() {
+                paste.peer.send((newer, Bytes::new())).await.unwrap();
+                the_paste_stopped(&mut paste, &folder).await;
+                within("the bar gone", async {
+                    while paste.seen.bars().last() != Some(&None) {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 })
                 .await;
-                let (reader, writer) = std::io::pipe().unwrap();
-                events
-                    .send(Selected::Paste {
-                        mime_type: URI_LIST.into(),
-                        fd: writer.into(),
-                    })
-                    .unwrap();
-                let ClipboardMsg::Request { id, .. } =
-                    next_sent(&mut sent, |m| matches!(m, ClipboardMsg::Request { .. })).await
-                else {
-                    unreachable!()
-                };
-                // One chunk of four is written, then the user clicks the bar.
-                let chunk = ClipboardMsg::Data {
-                    id,
-                    offset: 0,
-                    data_len: CHUNK as u32,
-                    done: false,
-                };
-                peer.send((chunk, Bytes::from(vec![5; CHUNK])))
-                    .await
-                    .unwrap();
-                next_sent(&mut sent, |m| matches!(m, ClipboardMsg::Ack { .. })).await;
-                assert_eq!(tree(&folder).len(), 2, "the staging folder and its file");
-                seen.click();
-
-                assert_eq!(
-                    next_sent(&mut sent, |m| matches!(m, ClipboardMsg::Abort { .. })).await,
-                    ClipboardMsg::Abort { id },
-                    "the peer is told to stop",
-                );
-                let mut reader = pipe::Receiver::from_owned_fd(reader.into()).unwrap();
-                let mut pasted = Vec::new();
-                within("the paste", reader.read_to_end(&mut pasted))
-                    .await
-                    .unwrap();
-                assert!(pasted.is_empty());
-                assert!(tree(&folder).is_empty(), "{:?}", tree(&folder));
-                seen.told("Paste cancelled").await;
-                assert_eq!(seen.bars().last(), Some(&None));
+                // The user stopped nothing: nothing is said.
+                assert!(paste.seen.notes.shown().is_empty());
             })
             .await;
     }

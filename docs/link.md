@@ -94,6 +94,9 @@ refuses a request against an offer that a newer copy has replaced.
   with why (no room, the other machine stopped it…), or `Paste cancelled`.
 - **When the link drops**, every paste and transfer in flight ends at once, and what it had
   written is removed; the files already pasted stay.
+- **When a newer copy replaces the one being pasted**, the paste of the older one stops, and
+  what it had written is removed: a large file of a copy nobody holds any more never competes
+  with the new one for the link. The application that pasted it gets nothing.
 - **The journal** follows each copy by its offer number, one line per step and on both
   machines: the offer sent and received with its file count, each paste asked and as what
   type, the files fetched, pasted (with how long it took) or failed with why, the files
