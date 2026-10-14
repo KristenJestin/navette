@@ -58,7 +58,10 @@ refuses a request against an offer that a newer copy has replaced.
   never followed and, with sockets, pipes and devices, are left out; the machine that copied
   names them in a notification when the other one pastes. A copied file is read only when the
   other machine pastes it, and only if it is still a regular file (not a link put in its
-  place).
+  place). Of the types the copy is on the clipboard as, only the standard ones cross: text
+  (`text/plain` and its charsets, `UTF8_STRING`, `STRING`, `TEXT`), `text/html`, `image/*`
+  and the file lists. The types an application keeps for its own instances (a token, a
+  process id) stay on their machine, where they mean something.
 - **Pasted files** go in a `Navette` folder of the download directory (`$XDG_DOWNLOAD_DIR`, as
   `user-dirs.dirs` names it, else `~/Downloads`), made if missing, and stay there. A paste
   first fills a hidden 0700 folder in it (`.navette-incoming-<pid>-<n>`), then moves each
@@ -68,6 +71,14 @@ refuses a request against an offer that a newer copy has replaced.
   cannot rename without replacing, a file is linked in then unlinked, a folder replaces an
   empty one made for it. The application that pasted gets their paths once they are all
   complete. A second paste of the same copy points at the same files.
+- **The same copy offered again** points at the same files too. An application that reads
+  every new selection fetches a copy of files as soon as it arrives, so each reconnect (the
+  lid closed and opened, a network blip), which offers each machine's copy again, would fetch
+  it again as `name (1)`. The machine that copied offers files unchanged since its last copy
+  of files (the same files, sizes and modification times) under the same offer number, kept
+  from one link to the next; the machine that fetched that copy answers with the files it
+  received, while they are all still in the `Navette` folder. A file changed since, or one
+  removed from the folder, is fetched again.
 - **A file manager that stops waiting.** A file manager reads the clipboard as soon as it
   changes, and gives up when the answer is slow: Omarchy's, flea, waits two seconds for each
   of the two file-list types, so about four seconds in all, which a large paste over the LAN
@@ -91,6 +102,9 @@ refuses a request against an offer that a newer copy has replaced.
   with why (no room, the other machine stopped it…), or `Paste cancelled`.
 - **When the link drops**, every paste and transfer in flight ends at once, and what it had
   written is removed; the files already pasted stay.
+- **When a newer copy replaces the one being pasted**, the paste of the older one stops, and
+  what it had written is removed: a large file of a copy nobody holds any more never competes
+  with the new one for the link. The application that pasted it gets nothing.
 - **The journal** follows each copy by its offer number, one line per step and on both
   machines: the offer sent and received with its file count, each paste asked and as what
   type, the files fetched, pasted (with how long it took) or failed with why, the files

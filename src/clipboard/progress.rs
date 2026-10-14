@@ -167,6 +167,26 @@ impl Progress {
         }
     }
 
+    /// The copy `serial` was made again: the peer may paste it again.
+    pub fn resume(&self, serial: u32) {
+        self.stopped.borrow_mut().remove(&serial);
+    }
+
+    /// Stops the paste `crossing` if it still runs, as a click on the bar would but alone and
+    /// without a word; whether it ran.
+    pub fn stop(&self, crossing: Crossing) -> bool {
+        let removed = self.running.borrow_mut().remove(&crossing);
+        let Some(Running {
+            stop: Stop::Task(task),
+            ..
+        }) = removed
+        else {
+            return false;
+        };
+        task.abort();
+        true
+    }
+
     /// `crossing`'s `run` served a file whole and waits for the peer to ask for the next one:
     /// it ends unless one comes within gliff's idle timeout, the peer's paste gone.
     fn idle(&self, crossing: Crossing, run: u64) {

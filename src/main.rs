@@ -261,6 +261,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             hypr::watch_events(hypr_events);
             let modes = tokio::spawn(mode::serve(home, peers_rx, orders_rx, hypr_events_rx));
             let control = tokio::spawn(mode::accept_orders(control, orders));
+            let kept = clipboard::Kept::default();
             // The files crossing show in the corners, which stop them.
             let shown = Shown {
                 bar: {
@@ -288,7 +289,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                     }
                 }
                 let hypr = clipboard::hypr(Target::default());
-                clipboard::attach(Side::Client, hypr, wire, shown.clone())
+                clipboard::attach(Side::Client, hypr, wire, kept.clone(), shown.clone())
             };
             let local = tokio::task::LocalSet::new();
             tokio::select! {
@@ -330,6 +331,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             // Home shows the files crossing, and stops them: this machine only says how a paste
             // ended.
             let shown = Shown::notifications(Arc::new(notify::NotifySend::new(notify::Command)));
+            let kept = clipboard::Kept::default();
             let attach = {
                 let audio_thread = audio_thread.clone();
                 move |mut wire: Wire| {
@@ -344,7 +346,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                         }
                     }
                     let hypr = clipboard::hypr(Target::default());
-                    clipboard::attach(Side::Server, hypr, wire, shown.clone())
+                    clipboard::attach(Side::Server, hypr, wire, kept.clone(), shown.clone())
                 }
             };
             let agent = link::agent(
