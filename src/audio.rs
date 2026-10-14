@@ -2099,13 +2099,18 @@ mod tests {
             .send(Message::Start { session: 1 })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        until(&remote_graph, |s| {
-            s.default == Some(DefaultNode::named(SINK))
-        })
-        .await;
+        // The default is already the sink while the first link has not put it back, so the
+        // state alone cannot tell the second link's start: its change is the third in the log.
+        let defaults = |s: &fake::State| {
+            s.log
+                .iter()
+                .filter(|entry| entry.starts_with("default {"))
+                .count()
+        };
+        until(&remote_graph, |s| defaults(s) == 3).await;
         // Long enough for a late put-back of the first link to land, if it were still coming.
         tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(defaults(&remote_graph.state()), 3);
         assert_eq!(remote_graph.state().default, Some(DefaultNode::named(SINK)));
         // And the second link's save is not wiped by the first one's clean-up.
         assert_eq!(
