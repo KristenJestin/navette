@@ -98,16 +98,22 @@ pub struct Decoding {
 
 impl Decoding {
     /// `modifiers`: the layouts in which the surface takes the GPU's pictures as dmabufs; with
-    /// none, they are read back. `ended` hears why decoding cannot go on.
+    /// none, they are read back, as they are once the surface sets `refused`. `ended` hears why
+    /// decoding cannot go on.
     pub fn start(
         gpu: Option<Arc<Gpu>>,
-        modifiers: Vec<u64>,
+        (modifiers, refused): (Vec<u64>, Arc<AtomicBool>),
         outbox: Outbox,
         show: Box<dyn FnMut(Picture) + Send>,
         ended: Ended,
     ) -> std::io::Result<Self> {
         let handover = Handover::of(&modifiers);
-        Self::start_with(Box::new(Real { gpu, handover }), outbox, show, ended)
+        let real = Real {
+            gpu,
+            handover,
+            refused,
+        };
+        Self::start_with(Box::new(real), outbox, show, ended)
     }
 
     fn start_with(
@@ -266,6 +272,7 @@ impl Handover {
 struct Real {
     gpu: Option<Arc<Gpu>>,
     handover: Handover,
+    refused: Arc<AtomicBool>,
 }
 
 impl Decoders for Real {
@@ -293,6 +300,7 @@ impl Decoders for Real {
                 decoder,
                 dmabuf,
                 tiled,
+                refused: self.refused.clone(),
                 size,
             }) as Box<dyn Decode>
         }))
@@ -311,7 +319,15 @@ struct GpuDecoder {
     dmabuf: bool,
     /// The dmabufs are in one of the compositor's tiled layouts.
     tiled: bool,
+    /// Set by the surface when the compositor refused a dmabuf.
+    refused: Arc<AtomicBool>,
     size: (u32, u32),
+}
+
+impl GpuDecoder {
+    fn dmabuf(&self) -> bool {
+        self.dmabuf && !self.refused.load(Ordering::Relaxed)
+    }
 }
 
 impl Decode for GpuDecoder {
@@ -320,7 +336,7 @@ impl Decode for GpuDecoder {
     }
 
     fn handover(&self) -> &'static str {
-        match (self.dmabuf, self.tiled) {
+        match (self.dmabuf(), self.tiled) {
             (true, true) => "shown as a tiled dmabuf",
             (true, false) => "shown as a linear dmabuf",
             (false, _) => "copied to the surface",
@@ -329,7 +345,7 @@ impl Decode for GpuDecoder {
 
     fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<Picture>, String> {
         let (width, height) = self.size;
-        if self.dmabuf {
+        if self.dmabuf() {
             return self
                 .decoder
                 .decode(main, aux)
@@ -685,7 +701,7 @@ mod tests {
             let shown = shown.clone();
             Decoding::start(
                 None,
-                Vec::new(),
+                Default::default(),
                 outbox.clone(),
                 Box::new(move |p| {
                     if let Picture::Bgra(f) = p {
@@ -885,7 +901,7 @@ mod tests {
             let shown = shown.clone();
             Decoding::start(
                 None,
-                Vec::new(),
+                Default::default(),
                 outbox.clone(),
                 // The surface is stuck until the test lets it go.
                 Box::new(move |_| {
