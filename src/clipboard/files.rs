@@ -78,8 +78,9 @@ fn walk(path: &Path, rel: &Path, out: &mut Copied) -> io::Result<()> {
 }
 
 /// Whether the entries of a peer's offer are acceptable: every path relative, without `..`,
-/// and distinct; no more entries and name bytes than an offer carries. Whatever their total
-/// size, as long as it can be counted: the free space is checked at paste time.
+/// and distinct, none at the top named like a staging folder (the sweep of stale ones would
+/// remove it from the inbox); no more entries and name bytes than an offer carries. Whatever
+/// their total size, as long as it can be counted: the free space is checked at paste time.
 pub fn validate(files: &[ClipboardFile]) -> Result<(), String> {
     if files.len() > MAX_FILE_ENTRIES {
         return Err(format!("more than {MAX_FILE_ENTRIES} files"));
@@ -95,7 +96,9 @@ pub fn validate(files: &[ClipboardFile]) -> Result<(), String> {
     for f in files {
         let path =
             safe_relative_path(&f.path).ok_or_else(|| format!("unsafe name {:?}", f.path))?;
-        if !seen.insert(path) || (f.dir && f.size != 0) {
+        let top = path.components().next().map(|c| c.as_os_str().as_bytes());
+        let staging = top.is_some_and(|top| top.starts_with(STAGING.as_bytes()));
+        if staging || !seen.insert(path) || (f.dir && f.size != 0) {
             return Err(format!("bad entry {:?}", f.path));
         }
     }
@@ -421,6 +424,21 @@ mod tests {
         assert!(staging.path_of("../evil").is_err());
         assert!(staging.path_of("/etc/passwd").is_err());
         assert!(staging.path_of("a/b").unwrap().starts_with(&staging.dir));
+    }
+
+    #[test]
+    fn a_name_the_stale_staging_sweep_would_remove_is_refused() {
+        let entry = |path: &str| ClipboardFile {
+            path: path.into(),
+            size: 0,
+            dir: true,
+        };
+        for bad in [".navette-incoming-1-0", ".navette-incoming-x"] {
+            assert!(validate(&[entry(bad)]).is_err(), "{bad:?} accepted");
+        }
+        // Deeper in a folder, the sweep never sees it.
+        let nested = [entry("photos"), entry("photos/.navette-incoming-1-0")];
+        assert_eq!(validate(&nested), Ok(()));
     }
 
     #[test]
