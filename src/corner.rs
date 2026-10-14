@@ -603,9 +603,31 @@ impl Corner {
         (width.ceil() as u32, height.ceil() as u32)
     }
 
+    /// The most room the corner takes whatever it shows, in logical pixels: its longest line,
+    /// under the bar of the files crossing.
+    pub fn room(&self) -> (u32, u32) {
+        let now = Instant::now();
+        let mut widest = Corner::new(self.side, None, self.label.clone());
+        widest.update(Update::Mic(Status::Home), now);
+        widest.update(
+            Update::Files(Some(Bar {
+                done: 0,
+                total: u64::MAX,
+            })),
+            now,
+        );
+        widest.update(Update::Say("M".repeat(LONGEST)), now);
+        widest.size(now)
+    }
+
     /// The corner at `now`, at `scale` pixels per logical pixel.
     pub fn draw(&self, now: Instant, scale: f64) -> Canvas {
-        let (width, height) = self.size(now);
+        self.draw_in(now, scale, self.size(now))
+    }
+
+    /// The corner at `now` on a canvas of `size` logical pixels, at `scale`.
+    pub fn draw_in(&self, now: Instant, scale: f64, size: (u32, u32)) -> Canvas {
+        let (width, height) = size;
         let px = |v: u32| ((v as f64 * scale).ceil() as u32).max(1);
         let mut canvas = Canvas::new(px(width), px(height));
         let mut pen = Pen {
@@ -1027,6 +1049,23 @@ mod tests {
             ring(&away).1
         )));
         assert_eq!(here.button(), away.button());
+    }
+
+    #[test]
+    fn a_corner_drawn_in_its_room_keeps_its_shapes_where_they_are() {
+        let now = Instant::now();
+        let home = corner(Side::Home, Status::Home, now);
+        let room = home.room();
+        let tight = home.draw(now, 2.0);
+        let roomy = home.draw_in(now, 2.0, room);
+        assert_eq!((roomy.width, roomy.height), (2 * room.0, 2 * room.1));
+        for y in 0..tight.height {
+            for x in 0..tight.width {
+                assert_eq!(tight.at(x, y), roomy.at(x, y), "({x}, {y})");
+            }
+        }
+        // Around it, nothing.
+        assert_eq!(roomy.at(roomy.width - 1, roomy.height - 1).0, 0);
     }
 
     #[test]
