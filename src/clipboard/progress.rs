@@ -4,7 +4,7 @@
 //! home shows both, whichever machine pasted.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -90,6 +90,9 @@ pub struct Progress {
     bar: Arc<dyn Fn(Option<Bar>) + Send + Sync>,
     ticking: Rc<Cell<bool>>,
     runs: Rc<Cell<u64>>,
+    /// The copies whose serving the user stopped: the peer's next requests for them are
+    /// refused, rather than start them again.
+    stopped: Rc<RefCell<HashSet<u32>>>,
 }
 
 impl Progress {
@@ -99,6 +102,7 @@ impl Progress {
             bar,
             ticking: Rc::default(),
             runs: Rc::default(),
+            stopped: Rc::default(),
         }
     }
 
@@ -134,17 +138,20 @@ impl Progress {
     }
 
     /// The meter, stop flag and run of the peer's paste of copy `serial`, started now with
-    /// `total` bytes to serve unless it runs already.
-    pub fn serving(&self, serial: u32, total: u64) -> (Meter, Rc<Cell<bool>>, u64) {
+    /// `total` bytes to serve unless it runs already; none once the user stopped it.
+    pub fn serving(&self, serial: u32, total: u64) -> Option<(Meter, Rc<Cell<bool>>, u64)> {
+        if self.stopped.borrow().contains(&serial) {
+            return None;
+        }
         let crossing = Crossing::Serve(serial);
         if let Some(running) = self.running.borrow().get(&crossing)
             && let Stop::Source(stopped) = &running.stop
         {
-            return (running.done.clone(), stopped.clone(), running.run);
+            return Some((running.done.clone(), stopped.clone(), running.run));
         }
         let (done, stopped) = (Meter::default(), Rc::new(Cell::new(false)));
         let run = self.start(crossing, total, done.clone(), Stop::Source(stopped.clone()));
-        (done, stopped, run)
+        Some((done, stopped, run))
     }
 
     /// `crossing`'s `run` is over; the bar loses it at its next move.
@@ -167,6 +174,9 @@ impl Progress {
                 match running.stop {
                     Stop::Task(task) => task.abort(),
                     Stop::Source(stopped) => stopped.set(true),
+                }
+                if let Crossing::Serve(serial) = crossing {
+                    self.stopped.borrow_mut().insert(serial);
                 }
                 matches!(crossing, Crossing::Paste(_)).then_some(crossing)
             })

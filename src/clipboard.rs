@@ -257,7 +257,11 @@ impl<C: Compositor> Bridge<C> {
                     self.notifier
                         .show("Not sent: links and special files", &skipped.join(", "));
                 }
-                let (done, stopped, run) = self.progress.serving(serial, total);
+                let Some((done, stopped, run)) = self.progress.serving(serial, total) else {
+                    // The user stopped this copy's paste: its next files are not served.
+                    self.transfers.refuse(id);
+                    return;
+                };
                 let crossing = Crossing::Serve(serial);
                 match files::open_copied(&path) {
                     Ok(file) => self.transfers.serve(
@@ -692,7 +696,7 @@ mod tests {
     use tokio::task::LocalSet;
 
     use super::*;
-    use crate::clipboard::progress::Bar;
+    use crate::clipboard::progress::{Bar, CADENCE};
     use crate::link::{self, Heartbeat};
     use crate::notify;
     use crate::wire::LinkMsg;
@@ -1809,6 +1813,57 @@ mod tests {
                 assert_eq!(seen.bars().last(), Some(&None));
                 // Nothing this machine pasted was stopped: it says nothing.
                 assert!(seen.notes.shown().is_empty());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_cancel_between_two_files_refuses_the_next_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (first, second) = (tmp.path().join("a.txt"), tmp.path().join("b.txt"));
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let list = uri_list_of(&[first, second]);
+        LocalSet::new()
+            .run_until(async {
+                let (out, mut sent) = outbound_channel();
+                let seen = Seen::new();
+                let clipboard = Arc::new(Fake::default());
+                let bridge = Bridge::new(
+                    Transfers::new(out, Side::Client),
+                    Jobs::new(|_, _| {}),
+                    clipboard.clone(),
+                    None,
+                    Rc::default(),
+                    &seen.shown(),
+                );
+                let mime_types = clipboard.select(&[(URI_LIST, list.as_bytes())]);
+                bridge.on_compositor_event(Selected::Selection { mime_types });
+                let ClipboardMsg::Offer { serial, .. } =
+                    next_sent(&mut sent, |m| matches!(m, ClipboardMsg::Offer { .. })).await
+                else {
+                    unreachable!()
+                };
+                let request = |id, file| ClipboardMsg::Request {
+                    id,
+                    serial,
+                    item: ClipboardItem::File(file),
+                };
+                bridge.on_peer_msg(request(2, 0), Bytes::new());
+                next_sent(&mut sent, |m| {
+                    matches!(m, ClipboardMsg::Data { done: true, .. })
+                })
+                .await;
+                // The first file is served whole; the user clicks before the peer asks for the
+                // second.
+                bridge.cancel();
+                bridge.on_peer_msg(request(4, 1), Bytes::new());
+                assert_eq!(
+                    next_sent(&mut sent, |_| true).await,
+                    ClipboardMsg::Abort { id: 4 },
+                );
+                tokio::time::sleep(CADENCE * 2).await;
+                assert_eq!(seen.bars().last(), Some(&None));
             })
             .await;
     }
