@@ -244,6 +244,7 @@ async fn main() -> io::Result<()> {
         logind: Arc::new(navette::lid::LiveLogind),
         lid_record: navette::lid::record_path(),
         lid_poll: navette::lid::POLL,
+        notifier: Arc::new(navette::notify::NotifySend::new(navette::notify::Command)),
     };
     tokio::spawn(remote::serve(peers_rx, ports, hypr_events_rx));
     // The display only: no clipboard bridge here.

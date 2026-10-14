@@ -297,6 +297,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 logind: Arc::new(lid::LiveLogind),
                 lid_record: lid::record_path(),
                 lid_poll: lid::POLL,
+                notifier: Arc::new(notify::NotifySend::new(notify::Command)),
             };
             let mut display = tokio::spawn(remote::serve(peers_rx, ports, hypr_events_rx));
             let graph = PipeWire::default();
