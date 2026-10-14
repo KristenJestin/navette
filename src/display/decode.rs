@@ -1017,12 +1017,7 @@ mod tests {
         for (id, kind) in frames.chars().enumerate() {
             decoding.video(frame(id as u64, kind == 'k'));
             // One at a time, so none is dropped for a full queue.
-            for _ in 0..500 {
-                if acks(&outbox) > id {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            wait_until(|| acks(&outbox) > id);
         }
         drop(decoding);
         assert_eq!(acks(&outbox), frames.len(), "every frame is acked");
