@@ -1,13 +1,18 @@
 //! Files on the clipboard. On the copying side, what a copy offers: the files the user copied,
 //! directories walked, links and special files left out and named, read again only at paste
-//! time. On the pasting side, which names of the peer's are accepted.
+//! time. On the pasting side, where the peer's files go: a `Navette` folder in the download
+//! directory, filled through a hidden folder of its own so a cancelled or failed paste leaves
+//! no half-written file, and never outside it or over a file already there, whatever names the
+//! peer sends.
 //!
 //! The walk adapts gliff's `crates/gliff-transport/src/clipboard/files.rs` (MIT, Copyright (c)
 //! 2026 Kevin McConnell; the notice is in full in `src/clipboard.rs`), without its 4 GiB cap:
 //! a copy of any size is offered.
 
+use std::ffi::{CString, OsStr, OsString};
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use gliff_proto::ClipboardFile;
@@ -107,14 +112,219 @@ pub fn open_copied(path: &Path) -> io::Result<tokio::fs::File> {
     Ok(tokio::fs::File::from_std(file))
 }
 
+/// Where pasted files go: the `Navette` folder of the download directory.
+#[derive(Clone, Debug)]
+pub struct Inbox {
+    pub dir: PathBuf,
+    /// The bytes free for the user on the disk that holds a folder.
+    pub free: fn(&Path) -> io::Result<u64>,
+}
+
+impl Inbox {
+    pub fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            free: free_space,
+        }
+    }
+
+    /// The machine's own: `Navette` in `$XDG_DOWNLOAD_DIR` (from the environment or
+    /// `user-dirs.dirs`), else in `~/Downloads`. None without a home folder.
+    pub fn of_this_user() -> Option<Self> {
+        let home = PathBuf::from(std::env::var_os("HOME").filter(|h| !h.is_empty())?);
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|c| !c.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        let downloads = match std::env::var_os("XDG_DOWNLOAD_DIR").filter(|d| !d.is_empty()) {
+            Some(dir) => PathBuf::from(dir),
+            None => download_dir(&home, &config),
+        };
+        Some(Self::new(downloads.join("Navette")))
+    }
+
+    /// Room for `bytes` more, or why not.
+    pub fn check_room(&self, bytes: u64) -> io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let free = (self.free)(&self.dir)?;
+        if free < bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!("{} needed, {} free", human_bytes(bytes), human_bytes(free)),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The download directory `user-dirs.dirs` names, else `~/Downloads`.
+fn download_dir(home: &Path, config: &Path) -> PathBuf {
+    let named = std::fs::read_to_string(config.join("user-dirs.dirs"))
+        .ok()
+        .and_then(|dirs| {
+            dirs.lines().find_map(|line| {
+                let value = line.trim().strip_prefix("XDG_DOWNLOAD_DIR=")?;
+                let value = value.trim_matches('"');
+                let path = match value.strip_prefix("$HOME") {
+                    Some(rest) => home.join(rest.trim_start_matches('/')),
+                    None => PathBuf::from(value),
+                };
+                path.is_absolute().then_some(path)
+            })
+        });
+    named.unwrap_or_else(|| home.join("Downloads"))
+}
+
+fn free_space(dir: &Path) -> io::Result<u64> {
+    let path = CString::new(dir.as_os_str().as_bytes()).map_err(invalid)?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a statvfs the call fills.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+/// The hidden folder one paste fills in the inbox. Removed with whatever it holds when dropped:
+/// a paste that fails or is cancelled leaves nothing behind.
+pub struct Staging {
+    dir: PathBuf,
+    inbox: PathBuf,
+}
+
+impl Staging {
+    pub fn create_in(inbox: &Inbox) -> io::Result<Self> {
+        std::fs::create_dir_all(&inbox.dir)?;
+        sweep_stale(&inbox.dir);
+        // Pasted files can be private: the folder is the user's alone while it fills.
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        let pid = std::process::id();
+        for n in 0u32.. {
+            let dir = inbox.dir.join(format!("{STAGING}{pid}-{n}"));
+            match builder.create(&dir) {
+                Ok(()) => {
+                    return Ok(Self {
+                        dir,
+                        inbox: inbox.dir.clone(),
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
+    }
+
+    /// Where the entry the peer names `path` is written: inside this folder, or nowhere.
+    pub fn path_of(&self, path: &str) -> io::Result<PathBuf> {
+        safe_relative_path(path)
+            .map(|rel| self.dir.join(rel))
+            .ok_or_else(|| invalid(format!("unsafe name {path:?}")))
+    }
+
+    /// Moves each top-level entry into the inbox under its own name, or the name with a suffix
+    /// when one is already there; their paths there.
+    pub fn finish<'a>(self, tops: impl Iterator<Item = &'a str>) -> io::Result<Vec<PathBuf>> {
+        tops.map(|top| place(&self.path_of(top)?, &self.inbox, OsStr::new(top)))
+            .collect()
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.dir)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!("navette: clipboard: a cancelled paste was not removed: {e}");
+        }
+    }
+}
+
+/// The prefix of a staging folder's name, then `<pid>-<n>`.
+const STAGING: &str = ".navette-incoming-";
+
+/// Removes the staging folders of processes that no longer exist: a killed one never drops
+/// its own.
+fn sweep_stale(inbox: &Path) {
+    let Ok(entries) = std::fs::read_dir(inbox) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(STAGING))
+            .and_then(|n| n.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != std::process::id() && !Path::new("/proc").join(pid.to_string()).exists() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Moves `from` into `dir` as `name`, or `name (1)`, `name (2)`… : never over what is there.
+fn place(from: &Path, dir: &Path, name: &OsStr) -> io::Result<PathBuf> {
+    for n in 0u32.. {
+        let to = dir.join(suffixed(name, n));
+        match rename_no_replace(from, &to) {
+            Ok(()) => return Ok(to),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
+/// `report.pdf`, then `report (1).pdf`, `report (2).pdf`…
+fn suffixed(name: &OsStr, n: u32) -> OsString {
+    if n == 0 {
+        return name.to_owned();
+    }
+    let path = Path::new(name);
+    let stem = path.file_stem().unwrap_or(name);
+    let mut out = stem.to_owned();
+    out.push(format!(" ({n})"));
+    if let Some(ext) = path.extension() {
+        out.push(".");
+        out.push(ext);
+    }
+    out
+}
+
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    let from = CString::new(from.as_os_str().as_bytes()).map_err(invalid)?;
+    let to = CString::new(to.as_os_str().as_bytes()).map_err(invalid)?;
+    // SAFETY: two NUL-terminated paths, relative to nothing (they are absolute or the cwd's).
+    let done = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if done != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Bytes as a short figure: `1.5 GiB`.
+pub fn human_bytes(n: u64) -> String {
+    gliff_transport::clipboard::progress::human_bytes(n)
+}
+
 fn invalid(e: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
 
     use super::*;
@@ -184,6 +394,11 @@ mod tests {
             };
             assert!(validate(&[entry]).is_err(), "{bad:?} accepted");
         }
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = Staging::create_in(&Inbox::new(tmp.path().into())).unwrap();
+        assert!(staging.path_of("../evil").is_err());
+        assert!(staging.path_of("/etc/passwd").is_err());
+        assert!(staging.path_of("a/b").unwrap().starts_with(&staging.dir));
     }
 
     #[test]
@@ -193,5 +408,71 @@ mod tests {
         std::fs::write(tmp.path().join("secret"), b"no").unwrap();
         symlink(tmp.path().join("secret"), &copied).unwrap();
         assert!(open_copied(&copied).is_err());
+    }
+
+    #[test]
+    fn an_existing_name_gets_a_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = Inbox::new(tmp.path().join("Navette"));
+        std::fs::create_dir_all(&inbox.dir).unwrap();
+        std::fs::write(inbox.dir.join("report.pdf"), b"old").unwrap();
+        std::fs::write(inbox.dir.join("report (1).pdf"), b"older").unwrap();
+        std::fs::create_dir(inbox.dir.join("photos")).unwrap();
+
+        let staging = Staging::create_in(&inbox).unwrap();
+        std::fs::write(staging.path_of("report.pdf").unwrap(), b"new").unwrap();
+        std::fs::create_dir(staging.path_of("photos").unwrap()).unwrap();
+        let placed = staging
+            .finish(["report.pdf", "photos"].into_iter())
+            .unwrap();
+
+        assert_eq!(
+            placed,
+            [
+                inbox.dir.join("report (2).pdf"),
+                inbox.dir.join("photos (1)")
+            ]
+        );
+        assert_eq!(std::fs::read(inbox.dir.join("report.pdf")).unwrap(), b"old");
+        assert_eq!(std::fs::read(&placed[0]).unwrap(), b"new");
+        // The staging folder went with the paste.
+        assert_eq!(std::fs::read_dir(&inbox.dir).unwrap().count(), 5);
+    }
+
+    #[test]
+    fn a_dropped_staging_folder_leaves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = Inbox::new(tmp.path().into());
+        let staging = Staging::create_in(&inbox).unwrap();
+        std::fs::write(staging.path_of("half.bin").unwrap(), b"half").unwrap();
+        drop(staging);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_download_folder_is_the_one_user_dirs_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (home, config) = (tmp.path().join("home"), tmp.path().join("config"));
+        assert_eq!(download_dir(&home, &config), home.join("Downloads"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("user-dirs.dirs"),
+            "# written by xdg-user-dirs-update\nXDG_DOWNLOAD_DIR=\"$HOME/Téléchargements\"\n",
+        )
+        .unwrap();
+        assert_eq!(download_dir(&home, &config), home.join("Téléchargements"));
+    }
+
+    #[test]
+    fn too_little_room_is_said_before_anything_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = Inbox {
+            dir: tmp.path().join("Navette"),
+            free: |_| Ok(1 << 20),
+        };
+        let error = inbox.check_room(2 << 30).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert!(error.to_string().contains("2.0 GiB needed"), "{error}");
+        inbox.check_room(1 << 10).unwrap();
     }
 }
