@@ -684,14 +684,14 @@ pub(crate) mod tests {
         }
     }
 
-    struct Desk {
-        tmp: tempfile::TempDir,
-        home: Store,
-        remote: Store,
+    pub(crate) struct Desk {
+        pub(crate) tmp: tempfile::TempDir,
+        pub(crate) home: Store,
+        pub(crate) remote: Store,
     }
 
     /// Two machines paired over loopback, the way `navette pair` does it.
-    async fn paired_desk() -> Desk {
+    pub(crate) async fn paired_desk() -> Desk {
         let tmp = tempfile::tempdir().unwrap();
         let desk = Desk {
             home: Store::new(tmp.path().join("home")),

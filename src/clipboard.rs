@@ -814,6 +814,8 @@ mod tests {
         clipboard: Arc<Fake>,
         events: mpsc::UnboundedSender<Selected>,
         seen: Seen,
+        /// Its display's end of the link, once it is up.
+        display: tokio::sync::Mutex<mpsc::UnboundedReceiver<crate::display::wire::Peer>>,
         /// Its end of the link: aborting it drops the link.
         link: tokio::task::JoinHandle<()>,
     }
@@ -829,6 +831,11 @@ mod tests {
 
         /// An application pastes `mime_type`; what it reads.
         async fn paste(&self, mime_type: &str) -> Vec<u8> {
+            self.paste_for(mime_type, Duration::from_secs(10)).await
+        }
+
+        /// The same, within `limit`.
+        async fn paste_for(&self, mime_type: &str, limit: Duration) -> Vec<u8> {
             let (reader, writer) = std::io::pipe().unwrap();
             self.events
                 .send(Selected::Paste {
@@ -838,8 +845,9 @@ mod tests {
                 .unwrap();
             let mut reader = pipe::Receiver::from_owned_fd(reader.into()).unwrap();
             let mut data = Vec::new();
-            within("the paste", reader.read_to_end(&mut data))
+            tokio::time::timeout(limit, reader.read_to_end(&mut data))
                 .await
+                .expect("the paste in time")
                 .unwrap();
             data
         }
@@ -867,32 +875,45 @@ mod tests {
     }
 
     fn machine(side: Side, stream: tokio::io::DuplexStream, inbox: Inbox) -> Machine {
+        machine_on(side, inbox, |service| {
+            tokio::task::spawn_local(async move {
+                link::run(stream, heartbeat(), move |wire| service(wire)).await;
+            })
+        })
+    }
+
+    /// The service a machine runs on each connection of its link: its clipboard bridge, its
+    /// display's end handed out.
+    type Service = Rc<dyn Fn(Wire) -> std::pin::Pin<Box<dyn Future<Output = ()>>>>;
+
+    /// A machine whose link `link` starts with the service it runs.
+    fn machine_on(
+        side: Side,
+        inbox: Inbox,
+        link: impl FnOnce(Service) -> tokio::task::JoinHandle<()>,
+    ) -> Machine {
         let clipboard = Arc::new(Fake::default());
         let (events, selected) = mpsc::unbounded_channel();
-        let bridge = clipboard.clone();
+        let selected = Rc::new(RefCell::new(Some(selected)));
+        let (displays, display) = mpsc::unbounded_channel();
         let seen = Seen::new();
-        let shown = seen.shown();
-        let link = tokio::task::spawn_local(async move {
-            let service = |mut wire| async move {
+        let (bridge, shown) = (clipboard.clone(), seen.shown());
+        let service: Service = Rc::new(move |mut wire: Wire| {
+            let _ = displays.send(wire.display.take().unwrap());
+            let selected = selected.borrow_mut().take().expect("one connection");
+            let (bridge, inbox, shown) = (bridge.clone(), inbox.clone(), shown.clone());
+            Box::pin(async move {
                 let serials = Rc::default();
-                super::run(
-                    side,
-                    &mut wire,
-                    bridge,
-                    selected,
-                    Some(inbox),
-                    serials,
-                    shown,
-                )
-                .await;
-            };
-            link::run(stream, heartbeat(), service).await;
+                let inbox = Some(inbox);
+                super::run(side, &mut wire, bridge, selected, inbox, serials, shown).await;
+            })
         });
         Machine {
             clipboard,
             events,
             seen,
-            link,
+            display: tokio::sync::Mutex::new(display),
+            link: link(service),
         }
     }
 
@@ -1736,6 +1757,219 @@ mod tests {
                 assert_eq!(seen.bars().last(), Some(&None));
                 // Nothing this machine pasted was stopped: it says nothing.
                 assert!(seen.notes.shown().is_empty());
+            })
+            .await;
+    }
+
+    /// Two ends joined by a line of about 500 Mbit/s each way, like a home network.
+    fn lan() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
+        let (home, home_line) = tokio::io::duplex(64 * 1024);
+        let (remote_line, remote) = tokio::io::duplex(64 * 1024);
+        let (home_read, home_write) = tokio::io::split(home_line);
+        let (remote_read, remote_write) = tokio::io::split(remote_line);
+        tokio::task::spawn_local(carry(home_read, remote_write));
+        tokio::task::spawn_local(carry(remote_read, home_write));
+        (home, remote)
+    }
+
+    /// At most 64 KiB a millisecond.
+    async fn carry(
+        mut from: impl tokio::io::AsyncRead + Unpin,
+        mut to: impl tokio::io::AsyncWrite + Unpin,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let mut tick = tokio::time::interval(Duration::from_millis(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut buf = vec![0; 64 * 1024];
+        loop {
+            tick.tick().await;
+            match from.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if to.write_all(&buf[..n]).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// What a paste of files did to the picture.
+    struct Measured {
+        /// From the paste to its last byte in the receiving folder.
+        elapsed: Duration,
+        /// Each frame's delay from the remote's queue to home's display, while it ran.
+        delays: Vec<Duration>,
+        pasted: std::path::PathBuf,
+    }
+
+    impl Measured {
+        /// The delay below which `part` of the frames came.
+        fn delay(&self, part: f64) -> Duration {
+            let mut delays = self.delays.clone();
+            delays.sort();
+            delays[((delays.len() - 1) as f64 * part) as usize]
+        }
+    }
+
+    /// The remote copies `copied` and home pastes it, while the remote streams a 60 kB frame
+    /// every 16 ms, as its encoder would: one waiting at most.
+    async fn frames_during_a_paste(
+        home: &Machine,
+        remote: &Machine,
+        copied: &std::path::Path,
+        limit: Duration,
+    ) -> Measured {
+        use crate::display::wire::{Incoming, Msg};
+        use gliff_proto::ServerMsg;
+        use std::time::Instant;
+
+        let mut home_display = home.display.lock().await.recv().await.unwrap();
+        let remote_display = remote.display.lock().await.recv().await.unwrap();
+        let list = uri_list_of(&[copied.to_path_buf()]);
+        remote.copy(&[(URI_LIST, list.as_bytes())]);
+        home.offered(1).await;
+        let sent = RefCell::new(HashMap::new());
+        let delays = RefCell::new(Vec::new());
+        let pictures = async {
+            let mut tick = tokio::time::interval(Duration::from_millis(16));
+            for frame_id in 0u64.. {
+                tokio::select! {
+                    _ = tick.tick() => if remote_display.outbox.video_ready() {
+                        let frame = ServerMsg::VideoFrame {
+                            frame_id,
+                            pts_us: 0,
+                            keyframe: false,
+                            damage: Vec::new(),
+                            data_len: 60_000,
+                            aux_len: 0,
+                        };
+                        sent.borrow_mut().insert(frame_id, Instant::now());
+                        let payloads = vec![vec![7; 60_000], Vec::new()];
+                        remote_display.outbox.send(Msg::Video(frame), payloads);
+                    },
+                    got = home_display.inbox.recv() => {
+                        if let Some(Incoming::Video {
+                            msg: ServerMsg::VideoFrame { frame_id, .. },
+                            ..
+                        }) = got
+                            && let Some(at) = sent.borrow_mut().remove(&frame_id)
+                        {
+                            delays.borrow_mut().push(at.elapsed());
+                        }
+                    },
+                }
+            }
+        };
+        let begin = Instant::now();
+        let pasted = tokio::select! {
+            pasted = home.paste_for(URI_LIST, limit) => pasted,
+            () = pictures => unreachable!(),
+        };
+        let paths = parse_uri_list(&String::from_utf8(pasted).unwrap());
+        Measured {
+            elapsed: begin.elapsed(),
+            delays: delays.into_inner(),
+            pasted: paths.into_iter().next().expect("the pasted file"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_transfer_interleaved_with_picture_frames_keeps_them_flowing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("large.bin");
+        let content: Vec<u8> = (0..32u32 << 20).map(|i| (i % 249) as u8).collect();
+        std::fs::write(&copied, &content).unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home_end, remote_end) = lan();
+                let home = machine(Side::Client, home_end, Inbox::new(tmp.path().join("home")));
+                let remote = machine(Side::Server, remote_end, Inbox::new(tmp.path().join("r")));
+                let measured =
+                    frames_during_a_paste(&home, &remote, &copied, Duration::from_secs(30)).await;
+                assert!(std::fs::read(&measured.pasted).unwrap() == content);
+                // Half a second of transfer at least, so a frame every 16 ms: many of them.
+                assert!(
+                    measured.delays.len() >= 10,
+                    "{} frames",
+                    measured.delays.len()
+                );
+                // A frame waits for the chunk on the line at most, not for the file.
+                let worst = measured.delay(1.0);
+                assert!(
+                    worst < Duration::from_millis(100),
+                    "a frame waited {worst:?}"
+                );
+            })
+            .await;
+    }
+
+    /// The 2 GB measure of the pull request, over TLS on loopback between two paired
+    /// instances: `cargo test --release -- --ignored --nocapture two_gb`. Its files go in
+    /// `target/`, on disk; `NAVETTE_BENCH_BYTES` sets another size.
+    #[tokio::test]
+    #[ignore = "a measure, minutes long and 4 GB on disk"]
+    async fn two_gb_over_a_loopback_link_between_two_paired_instances() {
+        use std::io::Write;
+        let bytes: u64 = std::env::var("NAVETTE_BENCH_BYTES")
+            .ok()
+            .and_then(|b| b.parse().ok())
+            .unwrap_or(2_000_000_000);
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        let tmp = tempfile::tempdir_in(target).unwrap();
+        let copied = tmp.path().join("large.bin");
+        {
+            let mut file = std::io::BufWriter::new(std::fs::File::create(&copied).unwrap());
+            let block: Vec<u8> = (0..8u32 << 20).map(|i| (i % 251) as u8).collect();
+            let mut left = bytes;
+            while left > 0 {
+                let n = left.min(block.len() as u64) as usize;
+                file.write_all(&block[..n]).unwrap();
+                left -= n as u64;
+            }
+        }
+        let desk = link::tests::paired_desk().await;
+        LocalSet::new()
+            .run_until(async {
+                let (events, _log) = mpsc::unbounded_channel();
+                let acceptor = link::home_acceptor(&desk.home, None).await.unwrap();
+                let home = machine_on(Side::Client, Inbox::new(tmp.path().join("home")), {
+                    let events = events.clone();
+                    |service| {
+                        let attach = move |wire| service(wire);
+                        tokio::task::spawn_local(link::serve(
+                            acceptor,
+                            Heartbeat::default(),
+                            events,
+                            attach,
+                        ))
+                    }
+                });
+                let dialer = link::remote_dialer(&desk.remote).unwrap();
+                let remote =
+                    machine_on(Side::Server, Inbox::new(tmp.path().join("r")), |service| {
+                        tokio::task::spawn_local(link::agent(
+                            dialer,
+                            Heartbeat::default(),
+                            link::Backoff::default(),
+                            events,
+                            move |wire| service(wire),
+                        ))
+                    });
+                let m =
+                    frames_during_a_paste(&home, &remote, &copied, Duration::from_secs(3600)).await;
+                assert_eq!(std::fs::metadata(&m.pasted).unwrap().len(), bytes);
+                let rate = bytes as f64 / m.elapsed.as_secs_f64() / 1e6;
+                eprintln!(
+                    "{bytes} bytes in {:.1} s: {rate:.0} MB/s ({:.0} Mbit/s); {} frames, delay \
+                     p50 {:?}, p99 {:?}, max {:?}",
+                    m.elapsed.as_secs_f64(),
+                    rate * 8.0,
+                    m.delays.len(),
+                    m.delay(0.5),
+                    m.delay(0.99),
+                    m.delay(1.0),
+                );
             })
             .await;
     }
