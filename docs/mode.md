@@ -40,7 +40,7 @@ stops the start with a message that names them, and nothing is changed.
 ## Named modes
 
 A `[name]` section in `mode.conf` defines a mode of its own. The keys before the first section
-are the default of every mode: `release`, `closed_lid`, `mic_hotkey` and the corner's
+are the default of every mode: `release`, `mic_hotkey` and the corner's
 `remote_label`, `home_label` and `remote_bar` (a section may set its own), and a `monitor` among them is the one unnamed mode, so a file with no sections keeps
 working, and `navette mode start` with no name starts it.
 
@@ -52,7 +52,6 @@ monitor = desc:Dell Inc. DELL U2723QE, desc:LG Electronics LG ULTRAWIDE
 
 [call]
 monitor = DP-2
-closed_lid = on
 ```
 
 A name is letters, digits, `-`, `_` and `.`, 32 characters at most. With no name,
@@ -240,12 +239,12 @@ Navette never writes this config: it declares each output's mode, place and scal
 
 ## Closing the remote laptop
 
-The remote laptop can be closed while a mode runs, and opened again, if home's `mode.conf`
-says so (it is off by default):
+The remote laptop can be closed while a mode runs, and opened again, at any moment, with
+nothing to turn on and no restart of the mode. With no mode running, the lid is not watched
+and the laptop does what it always does (closing it suspends it, if that is its setting).
 
-```
-closed_lid = on     # or off
-```
+A `mode.conf` written when this was an option still starts: `closed_lid`, whatever its value,
+is no longer read, and `navette mode start` says so on one line; the line can go.
 
 - **Closed**, the laptop's own screen (the output named `eDP-…`, `LVDS-…` or `DSI-…`; both,
   on a laptop with two) is disabled within a second, and Hyprland moves its workspaces to
@@ -265,13 +264,13 @@ closed_lid = on     # or off
   back: when Hyprland could not be reached to take it, the agent tries again at Hyprland's
   next event, at the next mode, and when it starts again after a crash (its lock went with
   it). If the agent's loop fails, the agent ends and systemd starts it again.
-- **When the lid cannot be watched**, the mode runs without the option, the lid does what it
+- **When the lid cannot be watched**, the mode runs all the same, the lid does what it
   always does, and `navette serve` says why at home, as the agent does in its journal
   (`journalctl --user -u navette-agent`). Nothing else is tried. That is when logind or the
   laptop's policy refuses the lock, when `LidClosed` cannot be read (then no lock is taken;
   if it stops being readable for five seconds, the screen comes back and the lock is let
-  go), and without `XDG_RUNTIME_DIR`. An agent too old to know `closed_lid` is named in
-  `navette mode start`'s answer.
+  go), and without `XDG_RUNTIME_DIR`. An agent too old to keep its lid during a mode is
+  named in `navette mode start`'s answer.
 
 Nothing else on the laptop changes: its idle lock works as usual, and so does a lock on
 closing the lid (Omarchy's lid bind locks the session when no physical monitor is plugged in;
