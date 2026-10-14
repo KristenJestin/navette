@@ -31,9 +31,10 @@ use tokio::sync::oneshot;
 use crate::desk::{Change, Desk, DeskError};
 use crate::display::decode::{self, Decoding, Picture, Video};
 use crate::display::wire::{Display, Incoming, MAX_OUTPUTS, Msg, OutputCopy, Peer, Pointer};
-use crate::display::{Ended, Released};
+use crate::display::{Ended, Keyboard, Released};
 use crate::hypr::{self, Eval, Hypr, lua_string};
 use crate::input::{self, Hotkey};
+use crate::notify::Notifier;
 
 mod config;
 
@@ -177,6 +178,9 @@ pub struct Home {
     pub mic: Option<Arc<dyn Mic>>,
     /// The remote's sound, with `navette serve --audio`.
     pub sound: Option<Arc<dyn Sound>>,
+    /// Says where the keyboard went when the release hotkey moves it. Not the mic's notifier:
+    /// one that replaces the previous message would let each hide the other's.
+    pub notifier: Arc<dyn Notifier>,
 }
 
 /// The workspace each given monitor showed when home windows were last sent home.
@@ -202,8 +206,8 @@ struct Active {
     desk: Arc<Mutex<Desk<Eval>>>,
     /// Why a surface or a decoder cannot go on.
     ended: UnboundedReceiver<String>,
-    /// Each time the release hotkey gave the keyboard back.
-    released: UnboundedReceiver<()>,
+    /// Each time the release hotkey gave the keyboard back, and a surface took it again.
+    released: UnboundedReceiver<Keyboard>,
     /// The `navette mode start` waiting for the remote's answer.
     starting: Option<(oneshot::Sender<io::Result<String>>, tokio::time::Instant)>,
     /// `closed_lid = on` was asked of the remote.
@@ -444,7 +448,9 @@ pub async fn serve(
                 }
             }
             Some(said) = said(&mut active) => match said {
-                Said::Released => {
+                Said::Keyboard(Keyboard::Remote) => home.notifier.show("Keyboard → remote", ""),
+                Said::Keyboard(Keyboard::Home) => {
+                    home.notifier.show("Keyboard → home", "");
                     if let Some(a) = &active {
                         let (hypr, given) = (home.hypr.clone(), a.monitors.clone());
                         let focus = move || hypr::focus_last_window(&*hypr, &given);
@@ -488,8 +494,8 @@ pub async fn serve(
 
 /// What the running mode's surface and decoder say.
 enum Said {
-    /// The release hotkey gave the keyboard back.
-    Released,
+    /// The keyboard went home by the release hotkey, or came back to the remote.
+    Keyboard(Keyboard),
     /// Why they gave up.
     Ended(String),
 }
@@ -501,7 +507,7 @@ async fn said(active: &mut Option<Active>) -> Option<Said> {
     };
     tokio::select! {
         Some(why) = a.ended.recv() => Some(Said::Ended(why)),
-        Some(()) = a.released.recv() => Some(Said::Released),
+        Some(keyboard) = a.released.recv() => Some(Said::Keyboard(keyboard)),
         else => None,
     }
 }
@@ -1163,6 +1169,7 @@ mod tests {
         cursors: Arc<Mutex<Vec<(String, Pointer)>>>,
         inputs: Arc<Mutex<Vec<(String, input::Queue)>>>,
         releases: Arc<Mutex<Vec<Released>>>,
+        notices: Arc<crate::notify::Fake>,
         on_open: Arc<Mutex<OnOpen>>,
         refuse: Arc<Mutex<Vec<String>>>,
         peers: UnboundedSender<Peer>,
@@ -1204,6 +1211,7 @@ mod tests {
         let (peers, peers_rx) = mpsc::unbounded_channel();
         let (orders, orders_rx) = mpsc::unbounded_channel();
         let (events, events_rx) = mpsc::unbounded_channel();
+        let notices = Arc::new(crate::notify::Fake::default());
         let home = Home {
             config_dir: config.path().to_path_buf(),
             hypr: hypr.clone(),
@@ -1212,6 +1220,7 @@ mod tests {
             desk_record: config.path().join("desk"),
             mic: Some(mic.clone()),
             sound: Some(sound.clone()),
+            notifier: notices.clone(),
         };
         tokio::spawn(serve(home, peers_rx, orders_rx, events_rx));
         Desk {
@@ -1223,6 +1232,7 @@ mod tests {
             ends,
             hotkeys,
             releases,
+            notices,
             on_open,
             refuse,
             cursors,
@@ -1367,9 +1377,29 @@ mod tests {
         let _remote = started(&desk).await;
         assert_eq!(desk.hypr.focused(), []);
         let released = desk.releases.lock().unwrap()[0].clone();
-        released.send(()).unwrap();
+        released.send(Keyboard::Home).unwrap();
         // Focused with the pointer left where it is, over the covered monitor.
         until(|| desk.hypr.focused() == [("0xb2".to_string(), false)]).await;
+    }
+
+    #[tokio::test]
+    async fn the_release_hotkey_shows_that_the_keyboard_is_home() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        assert_eq!(desk.notices.shown(), []);
+        let released = desk.releases.lock().unwrap()[0].clone();
+        released.send(Keyboard::Home).unwrap();
+        until(|| desk.notices.summaries() == ["Keyboard → home"]).await;
+    }
+
+    #[tokio::test]
+    async fn the_keyboard_coming_back_to_the_remote_shows_it() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        let released = desk.releases.lock().unwrap()[0].clone();
+        released.send(Keyboard::Home).unwrap();
+        released.send(Keyboard::Remote).unwrap();
+        until(|| desk.notices.summaries() == ["Keyboard → home", "Keyboard → remote"]).await;
     }
 
     #[tokio::test]
@@ -1381,7 +1411,7 @@ mod tests {
         });
         let _remote = started(&desk).await;
         let released = desk.releases.lock().unwrap()[0].clone();
-        released.send(()).unwrap();
+        released.send(Keyboard::Home).unwrap();
         // The mode goes on, and a stop still answers once the release was handled.
         answer(ask(&desk, false).await).await.unwrap();
         assert_eq!(desk.hypr.focused(), []);
@@ -1829,6 +1859,7 @@ mod tests {
             desk_record: desk._config.path().join("desk"),
             mic: None,
             sound: None,
+            notifier: Arc::new(crate::notify::Fake::default()),
         };
         open_desk(
             &crashed,

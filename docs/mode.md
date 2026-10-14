@@ -259,7 +259,10 @@ other monitor they stay home.
   back as it was. A modifier counts as the key pressed, even
   when a keyboard option makes it something else (Shift while Caps Lock is on, with
   Omarchy's `shift:both_capslock_cancel`). Moving the pointer off the monitor and back
-  captures it again. Choose another chord (modifiers and one key), or
+  captures it again. Both moves are said by a short desktop notification, `Keyboard → home`
+  when the hotkey is typed and `Keyboard → remote` the next time a reserved monitor takes the
+  keyboard (once, whichever reserved monitor it is); moving between reserved monitors with no
+  release says nothing. These notifications replace one another, apart from the mic's. Choose another chord (modifiers and one key), or
   none (`release = none`, or `release =` left empty), in `mode.conf`, where `#` starts a
   comment:
 

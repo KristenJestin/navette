@@ -241,6 +241,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 desk_record: Desk::<Eval>::default_record()?,
                 mic: mic.clone().map(|mic| mic as Arc<dyn mode::Mic>),
                 sound: sound.clone().map(|sound| sound as Arc<dyn mode::Sound>),
+                notifier: Arc::new(notify::NotifySend::new(notify::Command)),
             };
             let (peers, peers_rx) = mpsc::unbounded_channel();
             let (orders, orders_rx) = mpsc::unbounded_channel();
