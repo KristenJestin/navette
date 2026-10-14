@@ -537,6 +537,8 @@ pub mod fake {
         pub transform: i32,
         /// Disabled by a rule: listed by `monitors all`, its mode and place kept.
         pub disabled: bool,
+        /// The make, model and serial Hyprland reports.
+        pub description: String,
     }
 
     impl FakeMonitor {
@@ -551,6 +553,14 @@ pub mod fake {
                 scale: 1.0,
                 transform: 0,
                 disabled: false,
+                description: String::new(),
+            }
+        }
+
+        pub fn described(self, description: &str) -> Self {
+            Self {
+                description: description.into(),
+                ..self
             }
         }
     }
@@ -851,6 +861,7 @@ pub mod fake {
             scale: field("scale")?.parse().ok()?,
             transform: field("transform")?.parse().ok()?,
             disabled: false,
+            description: String::new(),
         })
     }
 
@@ -871,8 +882,8 @@ pub mod fake {
                     .enumerate()
                     .map(|(id, m)| {
                         format!(
-                            r#"{{"id":{id},"name":"{}","width":{},"height":{},"refreshRate":{},"x":{},"y":{},"scale":{},"transform":{},"focused":false,"disabled":{},"activeWorkspace":{{"id":{},"name":"{}"}}}}"#,
-                            m.name, m.width, m.height, m.refresh, m.x, m.y, m.scale, m.transform,
+                            r#"{{"id":{id},"name":"{}","description":"{}","width":{},"height":{},"refreshRate":{},"x":{},"y":{},"scale":{},"transform":{},"focused":false,"disabled":{},"activeWorkspace":{{"id":{},"name":"{}"}}}}"#,
+                            m.name, m.description, m.width, m.height, m.refresh, m.x, m.y, m.scale, m.transform,
                             m.disabled, state.shown(&m.name), state.shown(&m.name)
                         )
                     })

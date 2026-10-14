@@ -34,10 +34,11 @@ use crate::display::{Ended, Released};
 use crate::hypr::{self, Eval, Hypr, lua_string};
 use crate::input::{self, Hotkey};
 
-const CONFIG_FILE: &str = "mode.conf";
-/// The keys that switch the mic, unless `mode.conf` names others (`mic_hotkey = ...`): free in
-/// Omarchy's own bindings.
-const MIC_HOTKEY: &str = "SUPER + CTRL + M";
+mod config;
+
+pub use config::list;
+use config::{Mode, resolve};
+
 /// How long the remote has to make its output.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -56,113 +57,6 @@ const ORDER_READ: Duration = if cfg!(test) {
     Duration::from_secs(5)
 };
 const ORDER_LONGEST: u64 = 64;
-
-/// The mode's config: which home monitors the remote machine takes, by output name, one or
-/// more separated by commas, each once.
-pub fn monitors(config_dir: &Path) -> io::Result<Vec<String>> {
-    let path = config_dir.join(CONFIG_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "no mode configured: write `monitor = <output name>` in {}",
-                    path.display()
-                ),
-            ));
-        }
-        Err(e) => return Err(e),
-    };
-    let names: Vec<String> = setting(&text, "monitor")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .collect();
-    if names.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{} names no monitor: `monitor = <output name>`, or several: \
-                 `monitor = DP-1, DP-2`",
-                path.display()
-            ),
-        ));
-    }
-    if let Some(twice) = names
-        .iter()
-        .enumerate()
-        .find_map(|(i, name)| names[..i].contains(name).then_some(name))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} names {twice} twice", path.display()),
-        ));
-    }
-    if names.len() > usize::from(MAX_OUTPUTS) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{} names {} monitors, {MAX_OUTPUTS} at most",
-                path.display(),
-                names.len()
-            ),
-        ));
-    }
-    Ok(names)
-}
-
-/// The value of `key = value` in the mode's config, where `#` starts a comment.
-fn setting<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    text.lines()
-        .map(|line| line.split_once('#').map_or(line, |(kept, _)| kept))
-        .filter_map(|line| line.split_once('='))
-        .find(|(name, _)| name.trim() == key)
-        .map(|(_, value)| value.trim())
-}
-
-/// The release hotkey, from `release = <chord>` in the mode's config: `shift+escape` when it
-/// says none, no hotkey for `release = none` or an empty `release =`.
-pub fn release_hotkey(config_dir: &Path) -> io::Result<Option<Hotkey>> {
-    let path = config_dir.join(CONFIG_FILE);
-    let text = std::fs::read_to_string(&path)?;
-    let spec = setting(&text, "release").unwrap_or(input::DEFAULT_HOTKEY);
-    Hotkey::parse(spec).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: `release = {spec}`: {e}", path.display()),
-        )
-    })
-}
-
-/// Whether the remote laptop may be closed while the mode runs: `closed_lid = on` in the
-/// mode's config; off when it says nothing.
-pub fn closed_lid(config_dir: &Path) -> io::Result<bool> {
-    let path = config_dir.join(CONFIG_FILE);
-    let text = std::fs::read_to_string(&path)?;
-    match setting(&text, "closed_lid") {
-        None | Some("off") => Ok(false),
-        Some("on") => Ok(true),
-        Some(other) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{}: `closed_lid = {other}`: on or off; nothing was changed",
-                path.display()
-            ),
-        )),
-    }
-}
-
-/// The keys that switch the mic: `mic_hotkey` in `mode.conf`, or [`MIC_HOTKEY`].
-fn mic_hotkey(config_dir: &Path) -> String {
-    let text = std::fs::read_to_string(config_dir.join(CONFIG_FILE)).unwrap_or_default();
-    setting(&text, "mic_hotkey")
-        .filter(|keys| !keys.is_empty())
-        .unwrap_or(MIC_HOTKEY)
-        .to_string()
-}
 
 /// The home mic, which goes to the remote machine while a mode runs (the port behind which
 /// tests put a fake). Its calls wait for PipeWire and the link: they are made off the executor.
@@ -255,10 +149,12 @@ impl Screen for crate::display::surface::Surface {
     }
 }
 
-/// An order from `navette mode start|stop`, with where to answer.
+/// An order from `navette mode start|stop` or `navette status`, with where to answer.
 pub enum Order {
-    Start(oneshot::Sender<io::Result<String>>),
+    /// The mode called so; with no name, the one the config has.
+    Start(Option<String>, oneshot::Sender<io::Result<String>>),
     Stop(oneshot::Sender<io::Result<String>>),
+    Status(oneshot::Sender<io::Result<String>>),
 }
 
 /// What home needs to run a mode.
@@ -283,6 +179,10 @@ struct Active {
     /// Home first, before the rest goes.
     _mic: Option<MicSent>,
     _sound: Option<SoundPlayed>,
+    /// The mode's name, `None` for the unnamed one.
+    name: Option<String>,
+    /// What was stopped to start this one, said with the answer to `navette mode start`.
+    switched: Option<String>,
     /// The monitors given, left to right: monitor `i` shows output `i`.
     monitors: Vec<String>,
     /// The home monitor that takes the home windows the cover would hide; none when every
@@ -313,6 +213,32 @@ impl Active {
     fn label(&self) -> String {
         self.monitors.join(", ")
     }
+
+    /// The mode, as said to the user.
+    fn title(&self) -> String {
+        match &self.name {
+            Some(name) => format!("mode `{name}`"),
+            None => "the mode".to_string(),
+        }
+    }
+
+    /// `DP-2 is back home`, once the monitors are given back.
+    fn given_back(&self) -> String {
+        let verb = if self.monitors.len() > 1 { "are" } else { "is" };
+        format!("{} {verb} back home", self.label())
+    }
+}
+
+/// What `navette status` says: the mode, and whether the remote machine is there for the next.
+fn status(active: Option<&Active>, peer: Option<&Peer>) -> String {
+    let mode = match active {
+        None => "no mode is running".to_string(),
+        Some(a) if a.starting.is_some() => format!("{} is starting on {}", a.title(), a.label()),
+        Some(a) => format!("{} runs on {}", a.title(), a.label()),
+    };
+    let linked = peer.is_some_and(|p| !p.outbox.is_closed());
+    let link = if linked { "connected" } else { "not connected" };
+    format!("{mode}; the remote machine is {link}")
 }
 
 /// Serves the orders and the links, until both channels close.
@@ -370,6 +296,9 @@ pub async fn serve(
                             a.label(),
                             outputs.join(", ")
                         );
+                        if let Some(switched) = &a.switched {
+                            text = format!("{switched}; {text}");
+                        }
                         if a.closed_lid && closed_lid.is_none() {
                             text.push_str(
                                 "; the remote machine's agent does not know closed_lid, its lid \
@@ -422,8 +351,8 @@ pub async fn serve(
                 Heard::Msg(_) => {}
             },
             order = orders.recv() => match order {
-                Some(Order::Start(reply)) => {
-                    match start(&home, peer.as_ref(), &mut active).await {
+                Some(Order::Start(name, reply)) => {
+                    match start(&home, peer.as_ref(), name.as_deref(), &mut active).await {
                         Ok(()) => {
                             if let Some(a) = &mut active {
                                 let wait = start_timeout(a.monitors.len());
@@ -437,19 +366,21 @@ pub async fn serve(
                     }
                 }
                 Some(Order::Stop(reply)) => {
-                    let given = active.as_ref().map(|a| (a.label(), a.monitors.len()));
+                    let given = active.as_ref().map(Active::given_back);
                     let answer = match given {
-                        Some((monitors, count)) => {
+                        Some(back) => {
                             if let Some(peer) = &peer {
                                 peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
                             }
                             stop(&mut active, "stopped").await;
-                            let verb = if count > 1 { "are" } else { "is" };
-                            Ok(format!("{monitors} {verb} back home"))
+                            Ok(back)
                         }
                         None => Ok("no mode was running".to_string()),
                     };
                     let _ = reply.send(answer);
+                }
+                Some(Order::Status(reply)) => {
+                    let _ = reply.send(Ok(status(active.as_ref(), peer.as_ref())));
                 }
                 None => break,
             },
@@ -557,33 +488,25 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
     }
 }
 
-/// Every check first, then the surfaces, then the order to the remote.
-async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) -> io::Result<()> {
-    if let Some(a) = active {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("a mode is already running on {}", a.label()),
-        ));
-    }
-    let names = self::monitors(&home.config_dir)?;
-    let hotkey = release_hotkey(&home.config_dir)?;
-    let closed_lid = closed_lid(&home.config_dir)?;
+/// A mode whose checks all passed.
+struct Plan {
+    mode: Mode,
+    /// The monitors it gives, in home's left-to-right order.
+    given: Vec<hypr::Monitor>,
+    /// Every monitor at home.
+    monitors: Vec<hypr::Monitor>,
+}
+
+/// Every check of a mode (the config, the monitors, the link), before anything changes.
+async fn check<'p>(
+    home: &Home,
+    peer: Option<&'p Peer>,
+    name: Option<&str>,
+) -> io::Result<(Plan, &'p Peer)> {
+    let mode = Mode::read(&home.config_dir, name)?;
     let hypr = home.hypr.clone();
     let monitors = blocking(move || hypr::monitors(&*hypr)).await?;
-    let mut given = Vec::new();
-    for name in &names {
-        let Some(found) = monitors.iter().find(|m| m.name == *name && !m.disabled) else {
-            let there: Vec<_> = monitors.iter().map(|m| m.name.as_str()).collect();
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "no monitor {name} at home (there are: {}); nothing was changed",
-                    there.join(", ")
-                ),
-            ));
-        };
-        given.push(found.clone());
-    }
+    let mut given = resolve(&mode.monitors, &monitors)?;
     // The remote's outputs keep home's physical order, whatever the config's.
     given.sort_by_key(|m| (m.x, m.y));
     let Some(peer) = peer.filter(|p| !p.outbox.is_closed()) else {
@@ -593,6 +516,54 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
              nothing was changed",
         ));
     };
+    Ok((
+        Plan {
+            mode,
+            given,
+            monitors,
+        },
+        peer,
+    ))
+}
+
+/// Every check first, then the surfaces, then the order to the remote. A mode already running
+/// is stopped, its monitors given back, only once the other has passed its checks.
+async fn start(
+    home: &Home,
+    peer: Option<&Peer>,
+    name: Option<&str>,
+    active: &mut Option<Active>,
+) -> io::Result<()> {
+    let (plan, peer) = check(home, peer, name).await?;
+    let mut switched = None;
+    if let Some(a) = active.as_ref() {
+        if a.name == plan.mode.name {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} is already running on {}", a.title(), a.label()),
+            ));
+        }
+        switched = Some(format!("{} stopped, {}", a.title(), a.given_back()));
+        peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
+        let to = plan.mode.name.as_deref().unwrap_or("the unnamed mode");
+        stop(active, &format!("switching to {to}")).await;
+    }
+    launch(home, peer, plan, switched, active).await
+}
+
+async fn launch(
+    home: &Home,
+    peer: &Peer,
+    Plan {
+        mode,
+        given,
+        monitors,
+    }: Plan,
+    switched: Option<String>,
+    active: &mut Option<Active>,
+) -> io::Result<()> {
+    let hotkey = mode.release;
+    let closed_lid = mode.closed_lid;
     let mut copies = given.iter().map(|m| OutputCopy {
         width: m.width,
         height: m.height,
@@ -608,7 +579,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
         .filter(|m| !names.contains(&m.name) && !m.disabled)
         .min_by_key(|m| (m.x, m.y))
         .map(|m| m.name.clone());
-    let desk = open_desk(home, &names, home_monitor.clone()).await?;
+    let desk = open_desk(home, &names, home_monitor.clone(), &mode.mic_hotkey).await?;
     // Off the executor, and so is the undo when one fails: the desk drops with the closure.
     let (ended_tx, ended) = tokio::sync::mpsc::unbounded_channel();
     let (released_tx, released) = tokio::sync::mpsc::unbounded_channel();
@@ -675,6 +646,8 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
     *active = Some(Active {
         _mic: mic,
         _sound: sound,
+        name: mode.name,
+        switched,
         monitors: names,
         home_monitor,
         seen,
@@ -721,12 +694,17 @@ fn decoding_gpus<T>(
 /// Opens the desk (undoing what a previous run left) and keeps home windows off the `given`
 /// monitors: their workspaces go to `other`, the leftmost home monitor kept home, and so do
 /// windows that would open on any of their workspaces. With a mic, binds its hotkey.
-async fn open_desk(home: &Home, given: &[String], other: Option<String>) -> io::Result<Desk<Eval>> {
+async fn open_desk(
+    home: &Home,
+    given: &[String],
+    other: Option<String>,
+    mic_hotkey: &str,
+) -> io::Result<Desk<Eval>> {
     let (hypr, record, given) = (home.hypr.clone(), home.desk_record.clone(), given.to_vec());
     let mic_bind = home
         .mic
         .as_ref()
-        .map(|mic| (mic_hotkey(&home.config_dir), mic.toggle_command()));
+        .map(|mic| (mic_hotkey.to_string(), mic.toggle_command()));
     blocking(move || {
         let mut desk = Desk::start(Eval(hypr.clone()), record).map_err(|e| match e {
             DeskError::Hypr(crate::hypr::HyprError::Io(e)) => io::Error::other(format!(
@@ -859,7 +837,7 @@ pub fn control_path() -> io::Result<PathBuf> {
     Ok(PathBuf::from(runtime).join("navette").join("control.sock"))
 }
 
-/// Listens for `navette mode start|stop`, in a directory only this user can enter.
+/// Listens for `navette mode start|stop` and `navette status`, in a directory only this user can enter.
 pub fn listen(path: &Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let dir = path.parent().expect("the socket sits in a directory");
@@ -894,9 +872,15 @@ pub async fn accept_orders(listener: UnixListener, orders: UnboundedSender<Order
             }
             let (reply, answer) = oneshot::channel();
             let order = match line.trim() {
-                "start" => Order::Start(reply),
+                "start" => Order::Start(None, reply),
                 "stop" => Order::Stop(reply),
-                _ => return,
+                "status" => Order::Status(reply),
+                other => match other.strip_prefix("start ").map(str::trim) {
+                    Some(name) if config::is_name(name) => {
+                        Order::Start(Some(name.to_string()), reply)
+                    }
+                    _ => return,
+                },
             };
             if orders.send(order).is_err() {
                 return;
@@ -911,7 +895,23 @@ pub async fn accept_orders(listener: UnixListener, orders: UnboundedSender<Order
     }
 }
 
-/// `navette mode start|stop`: sends the order to `navette serve` and returns its answer.
+/// The order that starts the mode called `name`, or the config's own with no name.
+pub fn start_order(name: Option<&str>) -> io::Result<String> {
+    match name {
+        None => Ok("start".to_string()),
+        Some(name) if config::is_name(name) => Ok(format!("start {name}")),
+        Some(name) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "`{name}` is not a mode name: letters, digits, `-`, `_` and `.`, {} at most",
+                config::NAME_LONGEST
+            ),
+        )),
+    }
+}
+
+/// `navette mode start|stop`, `navette status`: sends the order to `navette serve` and returns
+/// its answer.
 pub async fn order(path: &Path, order: &str) -> io::Result<String> {
     order_within(path, order, ORDER_TIMEOUT).await
 }
@@ -951,6 +951,7 @@ mod tests {
 
     use tokio::sync::{mpsc, watch};
 
+    use super::config::CONFIG_FILE;
     use super::*;
     use crate::display::wire::{Cursor, Outbox};
     use crate::hypr::fake::{FakeHypr, FakeMonitor, FakeWindow};
@@ -1184,12 +1185,32 @@ mod tests {
     async fn ask(desk: &Desk, start: bool) -> oneshot::Receiver<io::Result<String>> {
         let (reply, answer) = oneshot::channel();
         let order = if start {
-            Order::Start(reply)
+            Order::Start(None, reply)
         } else {
             Order::Stop(reply)
         };
         desk.orders.send(order).unwrap();
         answer
+    }
+
+    /// `navette mode start <name>`.
+    async fn ask_mode(desk: &Desk, name: &str) -> oneshot::Receiver<io::Result<String>> {
+        let (reply, answer) = oneshot::channel();
+        desk.orders
+            .send(Order::Start(Some(name.to_string()), reply))
+            .unwrap();
+        answer
+    }
+
+    /// `navette status`.
+    async fn status_of(desk: &Desk) -> String {
+        let (reply, answer) = oneshot::channel();
+        desk.orders.send(Order::Status(reply)).unwrap();
+        answer_text(answer).await
+    }
+
+    async fn answer_text(answer: oneshot::Receiver<io::Result<String>>) -> String {
+        self::answer(answer).await.unwrap()
     }
 
     async fn answer(answer: oneshot::Receiver<io::Result<String>>) -> io::Result<String> {
@@ -1679,10 +1700,15 @@ mod tests {
             mic: None,
             sound: None,
         };
-        open_desk(&crashed, &["DP-1".to_string()], Some("DP-3".to_string()))
-            .await
-            .unwrap()
-            .crash();
+        open_desk(
+            &crashed,
+            &["DP-1".to_string()],
+            Some("DP-3".to_string()),
+            "SUPER + CTRL + M",
+        )
+        .await
+        .unwrap()
+        .crash();
         assert_eq!(desk.hypr.place("0x12a").0, "DP-3");
         let _remote = started(&desk).await;
         answer(ask(&desk, false).await).await.unwrap();
@@ -1782,22 +1808,9 @@ mod tests {
             format!("# the work monitor\nmonitor = DP-2   # the middle one\n{example}\n"),
         )
         .unwrap();
-        assert_eq!(monitors(config.path()).unwrap(), ["DP-2"]);
-        assert_eq!(
-            release_hotkey(config.path()).unwrap(),
-            Hotkey::parse("ctrl+alt+q").unwrap()
-        );
-    }
-
-    #[test]
-    fn an_empty_release_hotkey_means_none() {
-        let config = tempfile::tempdir().unwrap();
-        std::fs::write(
-            config.path().join(CONFIG_FILE),
-            "monitor = DP-2\nrelease =\n",
-        )
-        .unwrap();
-        assert_eq!(release_hotkey(config.path()).unwrap(), None);
+        let mode = Mode::read(config.path(), None).unwrap();
+        assert_eq!(mode.monitors, ["DP-2"]);
+        assert_eq!(mode.release, Hotkey::parse("ctrl+alt+q").unwrap());
     }
 
     #[tokio::test]
@@ -2107,11 +2120,15 @@ mod tests {
         tokio::spawn(async move {
             while let Some(order) = orders_rx.recv().await {
                 match order {
-                    Order::Start(reply) => {
-                        let _ = reply.send(Err(io::Error::other("no monitor X")));
+                    Order::Start(name, reply) => {
+                        let why = format!("no monitor X for {name:?}");
+                        let _ = reply.send(Err(io::Error::other(why)));
                     }
                     Order::Stop(reply) => {
                         let _ = reply.send(Ok("DP-1 is back home".into()));
+                    }
+                    Order::Status(reply) => {
+                        let _ = reply.send(Ok("no mode is running".into()));
                     }
                 }
             }
@@ -2124,7 +2141,12 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
         assert_eq!(order(&path, "stop").await.unwrap(), "DP-1 is back home");
         let error = order(&path, "start").await.unwrap_err();
-        assert_eq!(error.to_string(), "no monitor X");
+        assert_eq!(error.to_string(), "no monitor X for None");
+        let error = order(&path, &start_order(Some("office")).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "no monitor X for Some(\"office\")");
+        assert_eq!(order(&path, "status").await.unwrap(), "no mode is running");
         assert!(listen(&path).is_err(), "a second serve is refused");
     }
 
@@ -2385,17 +2407,240 @@ mod tests {
         assert!(desk.hypr.changes().is_empty());
     }
 
+    fn two_modes() -> &'static str {
+        "[office]\nmonitor = DP-1\n[travel]\nmonitor = DP-2\n"
+    }
+
+    /// Answers the remote's side of a start: the output it made, once home asked for it.
+    async fn made(remote: &Remote, asked: usize) {
+        until(|| starts(remote).len() == asked).await;
+        remote
+            .to_home
+            .try_send(Incoming::Display(Display::Started {
+                output: "NAVETTE-1".into(),
+                others: None,
+                closed_lid: None,
+            }))
+            .unwrap();
+    }
+
     #[test]
-    fn several_monitors_are_read_from_the_config_each_once() {
-        let config = tempfile::tempdir().unwrap();
-        let path = config.path().join(CONFIG_FILE);
-        std::fs::write(&path, "monitor = DP-3 , DP-2,   # the two right ones\n").unwrap();
-        assert_eq!(monitors(config.path()).unwrap(), ["DP-3", "DP-2"]);
-        std::fs::write(&path, "monitor = DP-3, DP-2, DP-3\n").unwrap();
-        let error = monitors(config.path()).unwrap_err().to_string();
-        assert!(error.contains("DP-3 twice"), "{error}");
-        std::fs::write(&path, "monitor = ,\n").unwrap();
-        assert!(monitors(config.path()).is_err());
+    fn a_mode_name_on_the_control_line_is_checked() {
+        assert_eq!(start_order(None).unwrap(), "start");
+        assert_eq!(start_order(Some("office-2")).unwrap(), "start office-2");
+        for bad in ["", "two words", "a\nstop", &"n".repeat(33)] {
+            let error = start_order(Some(bad)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_named_mode_gives_its_own_monitors() {
+        let desk = desk_with(two_modes());
+        let remote = connect(&desk);
+        let pending = ask_mode(&desk, "travel").await;
+        made(&remote, 1).await;
+        assert_eq!(
+            answer(pending).await.unwrap(),
+            "DP-2 shows the remote machine's NAVETTE-1"
+        );
+        assert_eq!(*desk.covered.lock().unwrap(), ["DP-2"]);
+        assert_eq!(starts(&remote)[0].width, 2560);
+    }
+
+    #[tokio::test]
+    async fn with_no_name_and_several_modes_nothing_starts_and_the_names_are_said() {
+        let desk = desk_with(two_modes());
+        let remote = connect(&desk);
+        let error = answer(ask(&desk, true).await).await.unwrap_err();
+        assert!(error.to_string().contains("office, travel"), "{error}");
+        assert!(desk.covered.lock().unwrap().is_empty());
+        assert!(remote.outbox.queued().is_empty());
+        assert!(desk.hypr.changes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_mode_name_changes_nothing() {
+        let desk = desk_with(two_modes());
+        let remote = connect(&desk);
+        let error = answer(ask_mode(&desk, "holiday").await).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("office, travel"), "{error}");
+        assert!(desk.covered.lock().unwrap().is_empty());
+        assert!(remote.outbox.queued().is_empty());
+        assert!(desk.hypr.changes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mode_naming_a_monitor_that_is_not_connected_changes_nothing() {
+        let desk = desk_with("[office]\nmonitor = DP-1\n[away]\nmonitor = DP-1, HDMI-A-9\n");
+        let remote = connect(&desk);
+        let error = answer(ask_mode(&desk, "away").await).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("HDMI-A-9"), "{error}");
+        assert!(desk.covered.lock().unwrap().is_empty());
+        assert!(remote.outbox.queued().is_empty());
+        assert!(desk.hypr.changes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_monitor_named_by_its_description_survives_a_change_of_connectors() {
+        let config = "[desk]\nmonitor = desc:Dell Inc. DELL U2723QE\n";
+        let dell = "Dell Inc. DELL U2723QE 7XYZ123";
+        let plugged = |first: &str, second: &str| {
+            vec![
+                FakeMonitor::new("DP-1", 1920, 1080, 0).described(first),
+                FakeMonitor::new("DP-2", 2560, 1440, 1920).described(second),
+            ]
+        };
+        for (monitors, covered) in [
+            (plugged(dell, "LG Electronics LG ULTRAWIDE 0123"), "DP-1"),
+            (plugged("LG Electronics LG ULTRAWIDE 0123", dell), "DP-2"),
+        ] {
+            let desk = desk_on(config, monitors, FakeMic::default());
+            let remote = connect(&desk);
+            let pending = ask_mode(&desk, "desk").await;
+            made(&remote, 1).await;
+            answer(pending).await.unwrap();
+            assert_eq!(*desk.covered.lock().unwrap(), [covered]);
+        }
+    }
+
+    #[tokio::test]
+    async fn starting_another_mode_gives_the_first_back_then_starts_the_other_and_says_so() {
+        let desk = desk_with(two_modes());
+        let remote = connect(&desk);
+        let first = ask_mode(&desk, "office").await;
+        made(&remote, 1).await;
+        answer(first).await.unwrap();
+        assert_eq!(*desk.covered.lock().unwrap(), ["DP-1"]);
+
+        let second = ask_mode(&desk, "travel").await;
+        made(&remote, 2).await;
+        let text = answer(second).await.unwrap();
+        assert_eq!(
+            text,
+            "mode `office` stopped, DP-1 is back home; \
+             DP-2 shows the remote machine's NAVETTE-1"
+        );
+        assert_eq!(*desk.covered.lock().unwrap(), ["DP-2"]);
+        // The remote is told to give its output back before it is asked for the next one.
+        let sequence: Vec<_> = remote
+            .outbox
+            .queued()
+            .into_iter()
+            .filter_map(|m| match m {
+                Msg::Display(Display::Start { .. }) => Some("start"),
+                Msg::Display(Display::Stop) => Some("stop"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sequence, ["start", "stop", "start"]);
+        // The mic and the sound went back home with the first mode, and came again.
+        assert_eq!(mic_log(&desk), ["start", "stop", "start"]);
+        assert_eq!(sound_log(&desk), ["start", "stop", "start"]);
+        assert!(
+            status_of(&desk)
+                .await
+                .starts_with("mode `travel` runs on DP-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_to_a_mode_that_fails_its_checks_leaves_the_running_one_alone() {
+        let desk = desk_with("[office]\nmonitor = DP-1\n[away]\nmonitor = HDMI-A-9\n");
+        let remote = connect(&desk);
+        let first = ask_mode(&desk, "office").await;
+        made(&remote, 1).await;
+        answer(first).await.unwrap();
+        let queued = remote.outbox.queued().len();
+
+        for name in ["holiday", "away"] {
+            let error = answer(ask_mode(&desk, name).await).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound, "{name}");
+        }
+        assert_eq!(*desk.covered.lock().unwrap(), ["DP-1"]);
+        assert_eq!(
+            remote.outbox.queued().len(),
+            queued,
+            "the remote is told nothing"
+        );
+        assert_eq!(mic_log(&desk), ["start"]);
+        assert!(
+            status_of(&desk)
+                .await
+                .starts_with("mode `office` runs on DP-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn starting_the_running_mode_again_is_refused() {
+        let desk = desk_with(two_modes());
+        let remote = connect(&desk);
+        let first = ask_mode(&desk, "office").await;
+        made(&remote, 1).await;
+        answer(first).await.unwrap();
+
+        let error = answer(ask_mode(&desk, "office").await).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(error.to_string().contains("mode `office`"), "{error}");
+        assert_eq!(*desk.covered.lock().unwrap(), ["DP-1"]);
+        assert_eq!(starts(&remote).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_named_mode_gives_its_monitors_back() {
+        let desk = desk_with(two_modes());
+        let remote = connect(&desk);
+        let first = ask_mode(&desk, "travel").await;
+        made(&remote, 1).await;
+        answer(first).await.unwrap();
+        assert_eq!(
+            answer(ask(&desk, false).await).await.unwrap(),
+            "DP-2 is back home"
+        );
+        assert!(desk.covered.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_status_says_what_runs_and_whether_the_remote_machine_is_there() {
+        let desk = desk_with(two_modes());
+        assert_eq!(
+            status_of(&desk).await,
+            "no mode is running; the remote machine is not connected"
+        );
+        let remote = connect(&desk);
+        assert_eq!(
+            status_of(&desk).await,
+            "no mode is running; the remote machine is connected"
+        );
+        let pending = ask_mode(&desk, "office").await;
+        until(|| !starts(&remote).is_empty()).await;
+        assert_eq!(
+            status_of(&desk).await,
+            "mode `office` is starting on DP-1; the remote machine is connected"
+        );
+        made(&remote, 1).await;
+        answer(pending).await.unwrap();
+        assert_eq!(
+            status_of(&desk).await,
+            "mode `office` runs on DP-1; the remote machine is connected"
+        );
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(
+            status_of(&desk).await,
+            "no mode is running; the remote machine is connected"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_status_of_the_unnamed_mode_has_no_name() {
+        let desk = desk("DP-1");
+        let _remote = started(&desk).await;
+        assert_eq!(
+            status_of(&desk).await,
+            "the mode runs on DP-1; the remote machine is connected"
+        );
     }
 
     #[test]
