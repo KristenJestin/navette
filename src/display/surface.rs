@@ -26,7 +26,9 @@
 //!
 //! The corner (#69) is a subsurface at the top left, under the remote's bar: drawn at home over
 //! the picture, never part of it. Its input region is the mic button: the pointer over it is
-//! over the corner, not the picture, and what it does there stays home.
+//! over the corner, not the picture, and what it does there stays home. Going from the picture
+//! to the button and back is no leave of the monitor: the keyboard, the shortcuts and what is
+//! held stay with the remote; only the motion stops while over the button.
 
 use std::collections::HashMap;
 use std::io;
@@ -486,7 +488,7 @@ fn run(
             subsurface: None,
             timer: None,
         }),
-        over: None,
+        hover: Hover::default(),
         handle: event_loop.handle(),
         viewporter: viewporter.clone(),
         compositor,
@@ -648,8 +650,7 @@ struct State {
     physical_width: Option<f64>,
     /// None when the compositor has no subsurfaces.
     corner: Option<CornerSlot>,
-    /// What the pointer is over, while it is over the surface or its corner.
-    over: Option<Over>,
+    hover: Hover,
     handle: LoopHandle<'static, State>,
     viewporter: wp_viewporter::WpViewporter,
     compositor: CompositorState,
@@ -670,6 +671,53 @@ enum Over {
     Picture,
     /// The corner's mic button, its input region.
     Corner,
+}
+
+/// Where the pointer is, as far as the seat goes.
+#[derive(Default)]
+struct Hover {
+    /// What the pointer is over, while it is over the surface or its corner.
+    over: Option<Over>,
+    /// The pointer came over the picture and has not left the monitor since: over the corner,
+    /// the keyboard and what is held stay with the remote.
+    inside: bool,
+    /// It left the picture or the corner in this frame: it left the monitor, unless the other
+    /// one takes it in the same frame.
+    leaving: bool,
+    /// The keyboard left the picture or the corner: it left the monitor, unless the other one
+    /// takes it in the same batch of events. The compositor moves it with the pointer, the
+    /// keyboard's leave and enter first (measured on Hyprland 0.56.2).
+    typing_away: bool,
+}
+
+/// The keyboard's focus on the picture or its corner.
+#[derive(Clone, Copy, Debug)]
+enum Typing<'a> {
+    /// With the keys already held at home.
+    Enter {
+        keys: &'a [u32],
+    },
+    Leave,
+    /// The events the compositor sent together are all handled.
+    Settled,
+}
+
+/// The keyboard's focus going between the picture and its corner is no leave of the monitor:
+/// the keys held stay held on the remote.
+fn type_on(hover: &mut Hover, capture: &mut Capture, grab: &mut dyn Grab, event: Typing) {
+    match event {
+        Typing::Enter { keys } => {
+            if !std::mem::take(&mut hover.typing_away) {
+                input::handle(capture, grab, Seat::KeyboardEnter { keys });
+            }
+        }
+        Typing::Leave => hover.typing_away = true,
+        Typing::Settled => {
+            if std::mem::take(&mut hover.typing_away) {
+                input::handle(capture, grab, Seat::KeyboardLeave { ours: true });
+            }
+        }
+    }
 }
 
 /// A pointer event, as far as where it goes matters.
@@ -697,13 +745,17 @@ enum Pointing {
         discrete: Option<i32>,
         stop: bool,
     },
+    /// The end of a group of events, a leave and an enter going together.
+    Frame,
 }
 
 /// Hands a pointer event to what the pointer is over: the picture's to the capture, which sends
 /// them to the remote; the corner's to the corner, which keeps them home, a press of the left
-/// button switching the mic. True when the corner must be drawn again.
+/// button switching the mic. The compositor sends the leave of one and the enter of the other in
+/// one frame: the monitor is left only at the end of a frame that took the pointer off both.
+/// True when the corner must be drawn again.
 fn point(
-    over: &mut Option<Over>,
+    hover: &mut Hover,
     capture: &mut Capture,
     grab: &mut dyn Grab,
     corner: Option<(&mut Corner, &Feed)>,
@@ -715,28 +767,35 @@ fn point(
             x,
             y,
         } => {
-            *over = Some(Over::Picture);
-            input::handle(capture, grab, Seat::PointerEnter { x, y });
-            false
-        }
-        Pointing::Leave {
-            over: Over::Picture,
-        } => {
-            *over = None;
-            input::handle(capture, grab, Seat::PointerLeave);
+            hover.over = Some(Over::Picture);
+            hover.leaving = false;
+            if std::mem::replace(&mut hover.inside, true) {
+                capture.motion(x, y);
+            } else {
+                input::handle(capture, grab, Seat::PointerEnter { x, y });
+            }
             false
         }
         Pointing::Enter {
             over: Over::Corner, ..
         } => {
-            *over = Some(Over::Corner);
+            hover.over = Some(Over::Corner);
+            hover.leaving = false;
             corner.is_some_and(|(c, _)| c.hover(true))
         }
-        Pointing::Leave { over: Over::Corner } => {
-            *over = None;
-            corner.is_some_and(|(c, _)| c.hover(false))
+        Pointing::Leave { over } => {
+            hover.over = None;
+            hover.leaving = hover.inside;
+            over == Over::Corner && corner.is_some_and(|(c, _)| c.hover(false))
         }
-        _ if *over == Some(Over::Corner) => {
+        Pointing::Frame => {
+            if std::mem::take(&mut hover.leaving) {
+                hover.inside = false;
+                input::handle(capture, grab, Seat::PointerLeave);
+            }
+            false
+        }
+        _ if hover.over == Some(Over::Corner) => {
             if let (
                 Pointing::Button {
                     button: BTN_LEFT,
@@ -842,6 +901,18 @@ impl State {
         (corner.surface() == surface).then_some(Over::Corner)
     }
 
+    /// The keyboard's focus on the picture or its corner.
+    fn type_on(&mut self, event: Typing) {
+        let mut grab = LayerGrab {
+            layer: self.layer.as_ref(),
+            inhibit: self.inhibit.as_ref(),
+            inhibitor: &mut self.inhibitor,
+            seat: &self.seat,
+            qh: &self.qh,
+        };
+        type_on(&mut self.hover, &mut self.capture, &mut grab, event);
+    }
+
     /// A pointer event goes where the pointer is.
     fn point(&mut self, event: Pointing) {
         let mut grab = LayerGrab {
@@ -855,7 +926,7 @@ impl State {
             let painter = slot.painter.as_mut()?;
             Some((&mut painter.corner, &slot.feed))
         });
-        if point(&mut self.over, &mut self.capture, &mut grab, corner, event) {
+        if point(&mut self.hover, &mut self.capture, &mut grab, corner, event) {
             self.show_corner();
         }
     }
@@ -1336,7 +1407,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
 impl Dispatch<wl_pointer::WlPointer, ()> for State {
     fn event(
         state: &mut Self,
-        _: &wl_pointer::WlPointer,
+        pointer: &wl_pointer::WlPointer,
         event: wl_pointer::Event,
         _: &(),
         _: &Connection,
@@ -1371,16 +1442,23 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 }
                 None => {}
             },
-            Event::Leave { surface, .. } => match state.over(&surface) {
-                Some(Over::Picture) => {
-                    state.entered = None;
-                    state.point(Pointing::Leave {
-                        over: Over::Picture,
-                    });
+            Event::Leave { surface, .. } => {
+                match state.over(&surface) {
+                    Some(Over::Picture) => {
+                        state.entered = None;
+                        state.point(Pointing::Leave {
+                            over: Over::Picture,
+                        });
+                    }
+                    Some(over) => state.point(Pointing::Leave { over }),
+                    None => {}
                 }
-                Some(over) => state.point(Pointing::Leave { over }),
-                None => {}
-            },
+                // Before version 5, no frames: each leave is a leave of the monitor.
+                if pointer.version() < 5 {
+                    state.point(Pointing::Frame);
+                }
+            }
+            Event::Frame => state.point(Pointing::Frame),
             Event::Motion {
                 surface_x,
                 surface_y,
@@ -1451,10 +1529,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 Ok(text) => state.seat(Seat::Keymap(text)),
                 Err(e) => tracing::warn!("cannot read home's keymap: {e}"),
             },
-            Event::Enter { surface, keys, .. } if state.ours(&surface) => {
+            Event::Enter { surface, keys, .. } if state.over(&surface).is_some() => {
                 let (codes, _) = keys.as_chunks::<4>();
                 let codes: Vec<u32> = codes.iter().map(|code| u32::from_ne_bytes(*code)).collect();
-                state.seat(Seat::KeyboardEnter { keys: &codes });
+                state.type_on(Typing::Enter { keys: &codes });
             }
             Event::Modifiers {
                 mods_depressed,
@@ -1468,9 +1546,14 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 locked: mods_locked,
                 group,
             }),
-            Event::Leave { surface, .. } => state.seat(Seat::KeyboardLeave {
-                ours: state.ours(&surface),
-            }),
+            Event::Leave { surface, .. } if state.over(&surface).is_some() => {
+                state.type_on(Typing::Leave);
+                // After the enter that may come with it, sent at once.
+                state
+                    .handle
+                    .insert_idle(|state| state.type_on(Typing::Settled));
+            }
+            Event::Leave { .. } => state.seat(Seat::KeyboardLeave { ours: false }),
             Event::Key {
                 key,
                 state: WEnum::Value(pressed),
@@ -1530,7 +1613,7 @@ mod tests {
         let mut corner = feed.corner(Side::Remote);
         let queue = input::Queue::default();
         let mut capture = Capture::new(queue.clone(), None);
-        let mut over = None;
+        let mut hover = Hover::default();
         let events = [
             Pointing::Enter {
                 over: Over::Corner,
@@ -1556,7 +1639,7 @@ mod tests {
         let mut redraws = 0;
         for event in events {
             if point(
-                &mut over,
+                &mut hover,
                 &mut capture,
                 &mut NoGrab,
                 Some((&mut corner, &feed)),
@@ -1573,7 +1656,7 @@ mod tests {
         assert_eq!(redraws, 1, "drawn again with the hotkey shown");
         // Back over the picture, the pointer goes to the remote again.
         point(
-            &mut over,
+            &mut hover,
             &mut capture,
             &mut NoGrab,
             Some((&mut corner, &feed)),
@@ -1585,7 +1668,7 @@ mod tests {
             y: 300.0,
         };
         point(
-            &mut over,
+            &mut hover,
             &mut capture,
             &mut NoGrab,
             Some((&mut corner, &feed)),
@@ -1596,7 +1679,7 @@ mod tests {
             pressed: true,
         };
         point(
-            &mut over,
+            &mut hover,
             &mut capture,
             &mut NoGrab,
             Some((&mut corner, &feed)),
@@ -1612,6 +1695,252 @@ mod tests {
                 }
             ]
         );
+    }
+
+    const KEY_LEFTSHIFT: u32 = 42;
+    const KEY_ESC: u32 = 1;
+    const KEY_T: u32 = 20;
+
+    /// The surface's hold on the keyboard, as calls.
+    #[derive(Default)]
+    struct Holds(Vec<&'static str>);
+
+    impl Grab for Holds {
+        fn interactive(&mut self, on: bool) {
+            self.0.push(if on { "on_demand" } else { "none" });
+        }
+        fn inhibit(&mut self) {
+            self.0.push("inhibit");
+        }
+        fn uninhibit(&mut self) {
+            self.0.push("uninhibit");
+        }
+        fn commit(&mut self) {}
+    }
+
+    /// The pointer over the picture of a reserved monitor, with its corner, the keyboard taken.
+    struct Desk {
+        hover: Hover,
+        capture: Capture,
+        holds: Holds,
+        queue: input::Queue,
+        feed: Feed,
+        corner: Corner,
+        /// How many of the queue's events were looked at.
+        seen: usize,
+    }
+
+    impl Desk {
+        fn new() -> Self {
+            let queue = input::Queue::default();
+            let mut capture = Capture::new(
+                queue.clone(),
+                input::Hotkey::parse(input::DEFAULT_HOTKEY).unwrap(),
+            );
+            let us = hypr_input::keymap_from_names(&hypr_input::KeymapNames {
+                layout: "us".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            capture.keymap(us);
+            let feed = feed();
+            let corner = feed.corner(Side::Remote);
+            let mut desk = Self {
+                hover: Hover::default(),
+                capture,
+                holds: Holds::default(),
+                queue,
+                feed,
+                corner,
+                seen: 0,
+            };
+            desk.point(&[Pointing::Enter {
+                over: Over::Picture,
+                x: 300.0,
+                y: 300.0,
+            }]);
+            desk.sent();
+            desk.holds.0.clear();
+            desk
+        }
+
+        fn point(&mut self, events: &[Pointing]) {
+            for &event in events {
+                point(
+                    &mut self.hover,
+                    &mut self.capture,
+                    &mut self.holds,
+                    Some((&mut self.corner, &self.feed)),
+                    event,
+                );
+            }
+        }
+
+        fn key(&mut self, code: u32, pressed: bool) {
+            input::handle(
+                &mut self.capture,
+                &mut self.holds,
+                Seat::Key { code, pressed },
+            );
+        }
+
+        fn type_on(&mut self, events: &[Typing]) {
+            for &event in events {
+                type_on(&mut self.hover, &mut self.capture, &mut self.holds, event);
+            }
+        }
+
+        /// The keyboard follows the pointer from one of the client's surfaces to the other,
+        /// the keys held at home with it, before the pointer's events (Hyprland 0.56.2).
+        fn keyboard_moves(&mut self, held: &[u32]) {
+            self.type_on(&[Typing::Leave, Typing::Enter { keys: held }]);
+        }
+
+        /// To the button and back, as the compositor says it: each leave and enter in a frame,
+        /// with the keyboard's focus.
+        fn over_the_button_and_back(&mut self, held: &[u32]) {
+            self.point(&[Pointing::Motion { x: 60.0, y: 40.0 }, Pointing::Frame]);
+            self.keyboard_moves(held);
+            self.point(&[
+                Pointing::Leave {
+                    over: Over::Picture,
+                },
+                Pointing::Enter {
+                    over: Over::Corner,
+                    x: 50.0,
+                    y: 14.0,
+                },
+                Pointing::Frame,
+                Pointing::Motion { x: 52.0, y: 15.0 },
+                Pointing::Frame,
+            ]);
+            self.type_on(&[Typing::Settled]);
+            self.key(KEY_T, true);
+            self.key(KEY_T, false);
+            self.keyboard_moves(held);
+            self.point(&[
+                Pointing::Leave { over: Over::Corner },
+                Pointing::Enter {
+                    over: Over::Picture,
+                    x: 60.0,
+                    y: 80.0,
+                },
+                Pointing::Frame,
+            ]);
+            self.type_on(&[Typing::Settled]);
+        }
+
+        /// What went to the remote since last asked.
+        fn sent(&mut self) -> Vec<input::Event> {
+            let queued = self.queue.queued();
+            let new = queued[self.seen..].to_vec();
+            self.seen = queued.len();
+            new.into_iter()
+                .filter(|e| !matches!(e, input::Event::Keymap(_)))
+                .collect()
+        }
+    }
+
+    fn key(code: u32, pressed: bool) -> input::Event {
+        input::Event::Key { code, pressed }
+    }
+
+    #[test]
+    fn a_held_modifier_survives_a_pass_over_the_mic_button() {
+        let mut desk = Desk::new();
+        desk.key(KEY_LEFTSHIFT, true);
+        desk.over_the_button_and_back(&[KEY_LEFTSHIFT]);
+        desk.key(KEY_LEFTSHIFT, false);
+        assert_eq!(
+            desk.sent(),
+            [
+                key(KEY_LEFTSHIFT, true),
+                input::Event::Motion { x: 60.0, y: 40.0 },
+                key(KEY_T, true),
+                key(KEY_T, false),
+                input::Event::Motion { x: 60.0, y: 80.0 },
+                key(KEY_LEFTSHIFT, false),
+            ],
+            "no release, no motion over the button"
+        );
+    }
+
+    #[test]
+    fn the_keyboard_stays_with_the_remote_over_the_mic_button() {
+        let mut desk = Desk::new();
+        desk.over_the_button_and_back(&[]);
+        assert_eq!(desk.holds.0, [] as [&str; 0], "neither given nor taken");
+        assert!(desk.sent().contains(&key(KEY_T, true)));
+    }
+
+    #[test]
+    fn a_release_by_the_hotkey_is_not_undone_by_a_pass_over_the_mic_button() {
+        let mut desk = Desk::new();
+        desk.key(KEY_LEFTSHIFT, true);
+        desk.key(KEY_ESC, true);
+        desk.key(KEY_ESC, false);
+        desk.key(KEY_LEFTSHIFT, false);
+        assert_eq!(desk.holds.0, ["none", "uninhibit"]);
+        desk.sent();
+        desk.over_the_button_and_back(&[]);
+        assert_eq!(desk.holds.0, ["none", "uninhibit"], "not taken back");
+        assert!(
+            !desk
+                .sent()
+                .iter()
+                .any(|e| matches!(e, input::Event::Key { .. })),
+            "the keys stay home"
+        );
+    }
+
+    #[test]
+    fn leaving_the_monitor_still_releases_everything() {
+        // From the picture.
+        let mut desk = Desk::new();
+        desk.key(KEY_LEFTSHIFT, true);
+        desk.type_on(&[Typing::Leave]);
+        desk.point(&[
+            Pointing::Leave {
+                over: Over::Picture,
+            },
+            Pointing::Frame,
+        ]);
+        desk.type_on(&[Typing::Settled]);
+        assert_eq!(
+            desk.sent(),
+            [key(KEY_LEFTSHIFT, true), input::Event::ReleaseAll]
+        );
+        assert_eq!(desk.holds.0, ["none", "uninhibit"]);
+        // From the button.
+        let mut desk = Desk::new();
+        desk.key(KEY_LEFTSHIFT, true);
+        desk.keyboard_moves(&[KEY_LEFTSHIFT]);
+        desk.point(&[
+            Pointing::Leave {
+                over: Over::Picture,
+            },
+            Pointing::Enter {
+                over: Over::Corner,
+                x: 50.0,
+                y: 14.0,
+            },
+            Pointing::Frame,
+        ]);
+        desk.type_on(&[Typing::Settled, Typing::Leave]);
+        desk.point(&[Pointing::Leave { over: Over::Corner }, Pointing::Frame]);
+        desk.type_on(&[Typing::Settled]);
+        assert_eq!(
+            desk.sent(),
+            [key(KEY_LEFTSHIFT, true), input::Event::ReleaseAll]
+        );
+        assert_eq!(desk.holds.0, ["none", "uninhibit"]);
+        // Back over the picture, the keyboard is taken again.
+        desk.point(&[Pointing::Enter {
+            over: Over::Picture,
+            x: 5.0,
+            y: 5.0,
+        }]);
+        assert_eq!(desk.holds.0, ["none", "uninhibit", "on_demand", "inhibit"]);
     }
 
     #[test]

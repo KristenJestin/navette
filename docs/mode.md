@@ -156,9 +156,11 @@ While a mode runs, every home monitor shows, at its top left, what it is and whe
   a `PRO` tag and the mic button. It starts 26 pixels down, below the remote's bar (the height
   of Omarchy's bar), so that the bar's menu and workspaces stay in sight. It is drawn at home
   over the picture and never sent: the remote machine never sees it, and the pointer over its
-  button is home's (the keys held go up on the remote machine, as when the pointer leaves the
-  monitor), so a click there stays home. Anywhere else the pointer goes to the remote machine
-  as before.
+  button is home's, so a click there stays home. Passing over the button is not leaving the
+  monitor: the keyboard stays with the remote machine, the keys held stay held there, and a
+  keyboard given back by the release hotkey stays home; only the pointer's moves stop until it
+  is back over the picture. A drag that passes over the button goes on to the remote machine.
+  Anywhere else the pointer goes to the remote machine as before.
 - **On each of home's own monitors**, at the same place, below home's bar (the compositor places
   it after the space the bar reserves): a red glow, a `MAISON` tag and the mic button while the
   mic is home; the mic button alone, dimmed, while the mic is on the remote machine.
