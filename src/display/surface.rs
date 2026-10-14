@@ -443,6 +443,12 @@ fn run(
         );
         Some(if turned { height } else { width } as f64)
     });
+    // Where the monitor stands in home's layout: a drag carried past the surface's edge goes on
+    // to the work monitor beside it.
+    if let Some(info) = state.outputs.info(&output) {
+        let (x, y) = info.logical_position.unwrap_or(info.location);
+        state.capture.at(x, y);
+    }
 
     let surface = compositor.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(
