@@ -37,8 +37,13 @@ navette mode stop      # DP-2, DP-3 are back home
 
 `mode start` checks everything before it changes anything, and says what is missing: no
 `mode.conf`, a monitor named twice or that does not exist at home, or no remote machine
-connected. `mode stop` answers once the monitors are back. The two commands reach
-`navette serve` over a Unix socket in `$XDG_RUNTIME_DIR/navette`, private to the user.
+connected. If the link to the remote machine drops before it has answered for every output,
+`mode start` gives back what it had changed and ends with `navette: the link to the remote
+machine dropped while the mode was starting; nothing was changed` (a non-zero exit); if the home
+desk could not be given back, it says so instead, and it is restored at the next start. A drop
+once the mode is up only gives the monitors back, as below. `mode stop` answers once the
+monitors are back. The two commands reach `navette serve` over a Unix socket in
+`$XDG_RUNTIME_DIR/navette`, private to the user.
 
 While the mode runs:
 
