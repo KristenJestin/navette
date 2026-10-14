@@ -242,16 +242,17 @@ impl<C: Compositor> Bridge<C> {
                     }
                 });
             }
-            ClipboardItem::File(_) => {
-                let (path, total, skipped) = {
+            ClipboardItem::File(index) => {
+                let (path, size, total, skipped) = {
                     let mut local = self.local.borrow_mut();
                     let Some(path) = local.files.path_for(&item).map(PathBuf::from) else {
                         self.transfers.refuse(id);
                         return;
                     };
+                    let size = local.files.entries[index as usize].size;
                     // Listed and validated: the sum is counted.
                     let total = files::total(&local.files.entries).unwrap_or(u64::MAX);
-                    (path, total, std::mem::take(&mut local.skipped))
+                    (path, size, total, std::mem::take(&mut local.skipped))
                 };
                 if !skipped.is_empty() {
                     self.notifier
@@ -268,6 +269,8 @@ impl<C: Compositor> Bridge<C> {
                         id,
                         Served {
                             source: ReadSource(file),
+                            size,
+                            read: 0,
                             done,
                             stopped,
                             progress: self.progress.clone(),
