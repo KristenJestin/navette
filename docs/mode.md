@@ -26,6 +26,59 @@ monitor = DP-2, DP-3
 Their order in `mode.conf` does not matter: the remote's outputs follow where the monitors
 stand at home, from left to right (by their position in `hyprctl monitors`).
 
+A monitor can also be named by its description, the make and model `hyprctl monitors` shows
+(Hyprland's own `desc:` rule), so that a change of connector order breaks nothing:
+
+```
+monitor = desc:Dell Inc. DELL U2723QE, DP-3
+```
+
+`desc:` is followed by the start of the description (no comma in it); give more of it, the
+serial included, when two monitors share a model: a description that fits two monitors, or none,
+stops the start with a message that names them, and nothing is changed.
+
+## Named modes
+
+A `[name]` section in `mode.conf` defines a mode of its own. The keys before the first section
+are the default of every mode: `release`, `closed_lid` and `mic_hotkey` (a section may set its
+own), and a `monitor` among them is the one unnamed mode, so a file with no sections keeps
+working, and `navette mode start` with no name starts it.
+
+```
+release = ctrl+alt+q
+
+[office]
+monitor = desc:Dell Inc. DELL U2723QE, desc:LG Electronics LG ULTRAWIDE
+
+[call]
+monitor = DP-2
+closed_lid = on
+```
+
+A name is letters, digits, `-`, `_` and `.`, 32 characters at most. With no name,
+`navette mode start` starts the unnamed mode, or the only named one, and with several asks for a
+name.
+
+```
+navette mode list           # each mode and its monitors, as written
+navette mode start office
+navette mode start call     # office stops first: its monitors are back home, then call starts
+navette status              # mode `call` runs on DP-2; the remote machine is connected
+```
+
+`mode start <other>` while a mode runs checks the other one first: when it fails (a name that is
+not defined, a monitor that is not there, a description that fits two), the running mode is left
+as it is. Otherwise the running mode stops as `mode stop` does, everything is given back, and the
+answer says so before it says what the new mode shows. A switch is refused, with nothing
+changed, while the running mode is itself still starting (wait for its answer, or `mode stop`).
+If the new mode then cannot start (its cover cannot go up, the remote cannot make its outputs),
+the answer says both: the first mode was stopped and its monitors are back home, and why the
+second did not start; no mode runs. Home numbers each start and the remote says the number back
+in its answers, so that an answer of a mode already stopped never ends or confirms the next one
+(an agent too old to say it back is taken at its word). `navette status` says which mode runs
+(`no mode is running` otherwise), on which monitors, and whether the remote machine is connected.
+`mode list` reads the file and does not need `navette serve`.
+
 ## Running it
 
 At home, `navette serve` runs as before; on the remote machine, `navette agent`. Then, at home:

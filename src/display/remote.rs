@@ -171,6 +171,8 @@ struct Active {
     lid: Option<lid::Watch>,
     /// `closed_lid = on` was asked, said back in `Started`.
     closed_lid: bool,
+    /// The start's generation, said back in `Started` and `Failed`.
+    generation: Option<u32>,
 }
 
 struct Output {
@@ -294,13 +296,14 @@ pub async fn serve_peer(
         tokio::select! {
             msg = peer.inbox.recv() => match msg {
                 None => break,
-                Some(Incoming::Display(Display::Start { output, caps, others, closed_lid })) => {
+                Some(Incoming::Display(Display::Start { output, caps, others, closed_lid, generation })) => {
                     stop(&mut active, ports).await;
                     restore_now(ports).await;
                     let mut copies = vec![output];
                     copies.extend(others.unwrap_or_default());
                     match start(copies, caps) {
                         Ok(mut mode) => {
+                            mode.generation = generation;
                             if closed_lid == Some(true) {
                                 mode.closed_lid = true;
                                 mode.lid = watch_lid(ports, &peer.outbox);
@@ -308,9 +311,10 @@ pub async fn serve_peer(
                             mode.bring_up(0, ports, &home, &peer.outbox);
                             active = Some(mode);
                         }
-                        Err(reason) => peer
-                            .outbox
-                            .send(Msg::Display(Display::Failed { reason }), Vec::new()),
+                        Err(reason) => peer.outbox.send(
+                            Msg::Display(Display::Failed { reason, generation }),
+                            Vec::new(),
+                        ),
                     }
                 }
                 Some(Incoming::Display(Display::Stop)) => stop(&mut active, ports).await,
@@ -414,13 +418,15 @@ pub async fn serve_peer(
                                     output: names[0].clone(),
                                     others: (names.len() > 1).then(|| names[1..].to_vec()),
                                     closed_lid: mode.closed_lid.then_some(true),
+                                    generation: mode.generation,
                                 };
                                 peer.outbox.send(Msg::Display(started), Vec::new());
                             }
                         }
                         Err(e) if mode.starting => {
+                            let generation = mode.generation;
                             stop(&mut active, ports).await;
-                            let reason = Display::Failed { reason: start_failed(index, e) };
+                            let reason = Display::Failed { reason: start_failed(index, e), generation };
                             peer.outbox.send(Msg::Display(reason), Vec::new());
                         }
                         Err(e) => {
@@ -507,6 +513,7 @@ fn start(copies: Vec<OutputCopy>, caps: ClientCaps) -> Result<Active, String> {
         up: None,
         lid: None,
         closed_lid: false,
+        generation: None,
     })
 }
 
@@ -543,8 +550,12 @@ async fn failed(
             output.failures
         );
         eprintln!("navette: {reason}; the mode ends");
+        let generation = mode.generation;
         stop(active, ports).await;
-        outbox.send(Msg::Display(Display::Failed { reason }), Vec::new());
+        outbox.send(
+            Msg::Display(Display::Failed { reason, generation }),
+            Vec::new(),
+        );
         return;
     }
     let wait = RETRY
@@ -816,6 +827,7 @@ mod tests {
     /// A start of `copy()`, then `others` right of it.
     fn start_of(others: Vec<OutputCopy>) -> Incoming {
         Incoming::Display(Display::Start {
+            generation: None,
             output: copy(),
             caps: ClientCaps {
                 codecs: vec![Codec::H264],
@@ -826,6 +838,27 @@ mod tests {
             },
             others: (!others.is_empty()).then_some(others),
             closed_lid: None,
+        })
+    }
+
+    /// A start that home numbered.
+    fn start_numbered(generation: u32) -> Incoming {
+        let Incoming::Display(Display::Start {
+            output,
+            caps,
+            others,
+            closed_lid,
+            ..
+        }) = start()
+        else {
+            unreachable!()
+        };
+        Incoming::Display(Display::Start {
+            generation: Some(generation),
+            output,
+            caps,
+            others,
+            closed_lid,
         })
     }
 
@@ -841,6 +874,7 @@ mod tests {
             unreachable!()
         };
         Incoming::Display(Display::Start {
+            generation: None,
             output,
             caps,
             others,
@@ -1081,6 +1115,7 @@ mod tests {
                 .outbox
                 .queued()
                 .contains(&Msg::Display(Display::Started {
+                    generation: None,
                     output: FIRST.into(),
                     others: None,
                     closed_lid: None,
@@ -1155,6 +1190,7 @@ mod tests {
         assert_eq!(
             agent.outbox.queued()[1],
             Msg::Display(Display::Started {
+                generation: None,
                 output: FIRST.into(),
                 others: None,
                 closed_lid: None,
@@ -1277,6 +1313,7 @@ mod tests {
         assert_eq!(
             agent.outbox.queued(),
             [Msg::Display(Display::Failed {
+                generation: None,
                 reason: "NAVETTE-1: no encoder".into()
             })]
         );
@@ -1284,6 +1321,47 @@ mod tests {
         assert_eq!(
             agent.hypr.changes().last().unwrap(),
             "output remove NAVETTE-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_answer_carries_the_generation_of_the_start_it_answers() {
+        // Started.
+        let agent = agent();
+        agent.inbox.try_send(start_numbered(7)).unwrap();
+        let started = Msg::Display(Display::Started {
+            generation: Some(7),
+            output: FIRST.into(),
+            others: None,
+            closed_lid: None,
+        });
+        until(|| agent.outbox.queued().contains(&started)).await;
+        // The mode failing later, on the remote's own: still the start's.
+        *agent.streams.refuse.lock().unwrap() = true;
+        agent.streams.end_last();
+        until(|| failed(&agent.outbox).is_some()).await;
+        let generations: Vec<_> = agent
+            .outbox
+            .queued()
+            .into_iter()
+            .filter_map(|m| match m {
+                Msg::Display(Display::Failed { generation, .. }) => Some(generation),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(generations, [Some(7)]);
+
+        // A start that could not be made.
+        let agent = self::agent();
+        *agent.streams.refuse.lock().unwrap() = true;
+        agent.inbox.try_send(start_numbered(8)).unwrap();
+        until(|| !agent.outbox.queued().is_empty()).await;
+        assert_eq!(
+            agent.outbox.queued(),
+            [Msg::Display(Display::Failed {
+                generation: Some(8),
+                reason: "NAVETTE-1: no encoder".into()
+            })]
         );
     }
 
@@ -1326,7 +1404,7 @@ mod tests {
 
     fn failed(outbox: &Outbox) -> Option<String> {
         outbox.queued().into_iter().find_map(|msg| match msg {
-            Msg::Display(Display::Failed { reason }) => Some(reason),
+            Msg::Display(Display::Failed { reason, .. }) => Some(reason),
             _ => None,
         })
     }
@@ -1499,6 +1577,7 @@ mod tests {
         assert_eq!(
             agent.outbox.queued()[2],
             Msg::Display(Display::Started {
+                generation: None,
                 output: FIRST.into(),
                 others: Some(vec![SECOND.into()]),
                 closed_lid: None,
@@ -1933,6 +2012,7 @@ mod tests {
         assert_eq!(
             agent.outbox.queued()[1],
             Msg::Display(Display::Started {
+                generation: None,
                 output: FIRST.into(),
                 others: None,
                 closed_lid: Some(true),
