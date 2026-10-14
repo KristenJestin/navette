@@ -1217,7 +1217,18 @@ impl CompositorHandler for State {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        let corner = self.corner.as_mut().and_then(|c| c.painter.as_mut());
+        if corner.is_some_and(|painter| painter.framed(surface)) {
+            self.show_corner();
+            return;
+        }
         self.waiting_frame = false;
         self.present();
     }
@@ -1313,8 +1324,9 @@ impl Shows for State {
         {
             return;
         }
-        commit_corner(&mut (painter.surface(), picture.as_ref()));
         let next = painter.corner.next_draw(now);
+        painter.ask_frame(next, &self.qh);
+        commit_corner(&mut (painter.surface(), picture.as_ref()));
         draw_again(self, next);
     }
 }
