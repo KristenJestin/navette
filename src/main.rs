@@ -23,7 +23,7 @@ use navette::input;
 use navette::lid;
 use navette::link::{self, Backoff, Event, Heartbeat, Wire};
 use navette::mic::{self, Mic, NoSound, Routing};
-use navette::mode::{self, Home};
+use navette::mode::{self, Home, HomeGpu};
 use navette::notify;
 use navette::pair::{self, Pin, Timeouts};
 use navette::single::{self, AgentLock};
@@ -237,7 +237,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 config_dir: store.dir().to_path_buf(),
                 hypr: Arc::new(hypr::Live),
                 screens: Arc::new(mode::LiveScreens),
-                gpu,
+                gpu: Arc::new(HomeGpu::new(gpu)),
                 desk_record: Desk::<Eval>::default_record()?,
                 mic: mic.clone().map(|mic| mic as Arc<dyn mode::Mic>),
                 sound: sound.clone().map(|sound| sound as Arc<dyn mode::Sound>),

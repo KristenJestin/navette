@@ -18,7 +18,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -170,13 +170,48 @@ pub struct Home {
     pub hypr: Arc<dyn Hypr>,
     pub screens: Arc<dyn Screens>,
     /// The GPU that decodes, or none for the CPU.
-    pub gpu: Option<Arc<Gpu>>,
+    pub gpu: Arc<HomeGpu>,
     /// Where the desk recorder keeps what it must undo.
     pub desk_record: PathBuf,
     /// The mic, when home plays the remote's sound.
     pub mic: Option<Arc<dyn Mic>>,
     /// The remote's sound, with `navette serve --audio`.
     pub sound: Option<Arc<dyn Sound>>,
+}
+
+/// Home's GPU, kept from one mode to the next until a decoder lost it. A lost device fails
+/// every decode, so the next mode must not build its first decoder on it.
+pub struct HomeGpu<T = Arc<Gpu>> {
+    gpu: Mutex<Option<T>>,
+    /// Set by the decoders when one was lost.
+    lost: Arc<AtomicBool>,
+}
+
+impl<T: Clone> HomeGpu<T> {
+    pub fn new(gpu: Option<T>) -> Self {
+        Self {
+            gpu: Mutex::new(gpu),
+            lost: Arc::default(),
+        }
+    }
+
+    /// What the decoders set when a GPU decoder is lost.
+    pub fn lost(&self) -> Arc<AtomicBool> {
+        self.lost.clone()
+    }
+
+    /// The GPU for a mode, opened again first if a decoder lost it since. When it cannot be
+    /// opened again, the mode decodes on the CPU and the next one tries again.
+    pub fn current(&self, open: impl FnOnce() -> Option<T>) -> Option<T> {
+        let mut gpu = self.gpu.lock().unwrap();
+        if self.lost.load(Ordering::Relaxed) {
+            *gpu = open();
+            if gpu.is_some() {
+                self.lost.store(false, Ordering::Relaxed);
+            }
+        }
+        gpu.clone()
+    }
 }
 
 /// The workspace each given monitor showed when home windows were last sent home.
@@ -655,8 +690,10 @@ async fn launch(
         home.sound.clone(),
     );
     let covered = names.clone();
-    let (shown, desk, mic, sound) = blocking(move || {
-        let gpus = decoding_gpus(gpu, &covered, decode::open_gpu)?;
+    let (shown, desk, mic, sound, gpu) = blocking(move || {
+        let lost = gpu.lost();
+        let gpu = gpu.current(decode::open_gpu);
+        let gpus = decoding_gpus(gpu.clone(), &covered, decode::open_gpu)?;
         let mut shown = Vec::new();
         for ((index, name), gpu) in covered.iter().enumerate().zip(gpus) {
             let output = index as u8;
@@ -671,7 +708,7 @@ async fn launch(
                 (screen.dmabuf_modifiers(), screen.dmabuf_refused()),
                 outbox.on(output),
                 screen.pictures(),
-                ended_tx.clone(),
+                (ended_tx.clone(), lost.clone()),
             )?;
             shown.push(Shown { decoding, screen });
         }
@@ -691,10 +728,10 @@ async fn launch(
             }
             MicSent(mic)
         });
-        Ok((shown, desk, mic, sound))
+        Ok((shown, desk, mic, sound, gpu))
     })
     .await?;
-    let caps = decode::caps(&home.gpu, (3840, 2160));
+    let caps = decode::caps(&gpu, (3840, 2160));
     peer.outbox.send(
         Msg::Display(Display::Start {
             output: first,
@@ -1208,7 +1245,7 @@ mod tests {
             config_dir: config.path().to_path_buf(),
             hypr: hypr.clone(),
             screens: Arc::new(screens),
-            gpu: None,
+            gpu: Arc::new(HomeGpu::new(None)),
             desk_record: config.path().join("desk"),
             mic: Some(mic.clone()),
             sound: Some(sound.clone()),
@@ -1825,7 +1862,7 @@ mod tests {
             config_dir: desk._config.path().to_path_buf(),
             hypr: desk.hypr.clone(),
             screens: Arc::new(FakeScreens::default()),
-            gpu: None,
+            gpu: Arc::new(HomeGpu::new(None)),
             desk_record: desk._config.path().join("desk"),
             mic: None,
             sound: None,
@@ -3012,6 +3049,38 @@ mod tests {
         let gpus = decoding_gpus(None, &names(2), open).unwrap();
         assert_eq!(gpus, [None, None]);
         assert_eq!(opened.get(), 2);
+    }
+
+    #[test]
+    fn a_mode_started_with_no_loss_keeps_the_gpu_it_has() {
+        let gpu = HomeGpu::new(Some(Arc::new(0)));
+        let first = gpu.current(|| panic!("no GPU is opened again")).unwrap();
+        let again = gpu.current(|| panic!("no GPU is opened again")).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+    }
+
+    #[test]
+    fn a_mode_started_after_a_lost_gpu_decodes_on_a_fresh_one() {
+        let gpu = HomeGpu::new(Some(Arc::new(0)));
+        let lost_one = gpu.current(|| None).unwrap();
+        gpu.lost().store(true, Ordering::Relaxed);
+        let fresh = gpu.current(|| Some(Arc::new(1))).unwrap();
+        assert!(!Arc::ptr_eq(&lost_one, &fresh));
+        // It is kept, not opened again, for the mode after.
+        let kept = gpu.current(|| panic!("no GPU is opened again")).unwrap();
+        assert!(Arc::ptr_eq(&fresh, &kept));
+    }
+
+    #[test]
+    fn a_lost_gpu_that_cannot_be_opened_again_is_tried_again_at_the_next_mode() {
+        let gpu = HomeGpu::new(Some(Arc::new(0)));
+        gpu.lost().store(true, Ordering::Relaxed);
+        assert!(
+            gpu.current(|| None).is_none(),
+            "the mode decodes on the CPU"
+        );
+        let fresh = gpu.current(|| Some(Arc::new(1))).unwrap();
+        assert_eq!(*fresh, 1);
     }
 
     fn names(count: usize) -> Vec<String> {
