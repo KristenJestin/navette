@@ -234,11 +234,12 @@ other monitor they stay home.
   own virtual keyboard and pointer on each output. A key held as the pointer crosses (Shift,
   Ctrl, Super) stays down: it goes up on the output the pointer leaves and down again on the
   next one, as a virtual keyboard's modifiers are its own; leaving for a home monitor releases
-  everything. A drag (a button held) stays on the monitor where it began: home's compositor
-  keeps the pointer's events for that surface until the button goes up. Carrying it to the
-  next output would take each surface knowing where home's other work monitors stand, and the
-  remote taking a press on one output's virtual pointer and the motion on another's as one
-  drag, which nothing here shows it does.
+  everything. A drag (a button held, a window moved by its title) goes from one work monitor
+  to the next as on a single desk: home's compositor keeps the pointer's events for the
+  surface where the button went down until it goes up, and that surface sends the motion past
+  its edge to the work monitor under it. A drag never leaves the work monitors: past their
+  outer edge, onto a home monitor, it stops at that edge, and when the button goes up there
+  the pointer is home's again.
 
 - **Shortcuts.** While the pointer is over the reserved monitor, home's surface holds the
   keyboard and a shortcuts inhibitor, so home's binds do not fire. A bind flagged
