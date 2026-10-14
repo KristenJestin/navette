@@ -93,7 +93,7 @@ pub fn create(
         &rule(index, copy, place(&monitors, copies, scales, index)),
     )?;
     hypr::dispatch(hypr, &format!("output create headless {name}"))?;
-    match check(hypr, &name, copy).and_then(|scale| hide_cursor(hypr).map(|()| scale)) {
+    match check(hypr, &name, copy).and_then(|scale| follow_cursor(hypr).map(|()| scale)) {
         Ok(scale) => Ok(scale),
         Err(e) => {
             let _ = remove(hypr, index);
@@ -139,8 +139,8 @@ fn check(hypr: &dyn Hypr, name: &str, copy: &OutputCopy) -> io::Result<f32> {
     }))
 }
 
-/// Declares every rule again, and hides the cursor again, after a `hyprctl reload` dropped
-/// them.
+/// Declares every rule again, and hides the cursor again if it is over a copy, after a
+/// `hyprctl reload` dropped them.
 pub fn reapply(hypr: &dyn Hypr, copies: &[OutputCopy], scales: &[Option<f32>]) -> io::Result<()> {
     let monitors = hypr::monitors(hypr)?;
     for (index, copy) in copies.iter().enumerate() {
@@ -149,7 +149,7 @@ pub fn reapply(hypr: &dyn Hypr, copies: &[OutputCopy], scales: &[Option<f32>]) -
             &rule(index, copy, place(&monitors, copies, scales, index)),
         )?;
     }
-    hide_cursor(hypr)
+    follow_cursor(hypr)
 }
 
 /// Removes copy `index`, the others staying; one already gone (Hyprland restarted) is not an
@@ -161,13 +161,26 @@ pub fn remove(hypr: &dyn Hypr, index: usize) -> io::Result<()> {
     }
 }
 
-/// Hyprland paints its cursor into the copy's frames (see [`REMOTE_CURSOR`]): hidden while the
-/// copy is there.
-fn hide_cursor(hypr: &dyn Hypr) -> io::Result<()> {
+/// Hyprland paints its cursor into a copy's frames (see [`REMOTE_CURSOR`]): hidden while it is
+/// over a copy, shown over the remote's own screens, so the laptop's trackpad still shows it
+/// there. Hyprland has no cursor setting of its own per monitor.
+pub fn follow_cursor(hypr: &dyn Hypr) -> io::Result<()> {
     if REMOTE_CURSOR {
         return Ok(());
     }
-    cursor_invisible(hypr, true)
+    let (x, y) = hypr::cursor(hypr)?;
+    let over_a_copy = hypr::monitors(hypr)?
+        .iter()
+        .any(|m| is_copy(&m.name) && !m.disabled && covers(m, x, y));
+    cursor_invisible(hypr, over_a_copy)
+}
+
+/// Whether `m` holds the layout's point (`x`, `y`).
+fn covers(m: &Monitor, x: f64, y: f64) -> bool {
+    let width = logical_width(m.width, m.height, m.transform, m.scale);
+    let height = logical_width(m.height, m.width, m.transform, m.scale);
+    let (left, top) = (f64::from(m.x), f64::from(m.y));
+    (left..left + f64::from(width)).contains(&x) && (top..top + f64::from(height)).contains(&y)
 }
 
 fn cursor_invisible(hypr: &dyn Hypr, invisible: bool) -> io::Result<()> {
@@ -217,7 +230,7 @@ mod tests {
                 "eval hl.monitor({ output = \"NAVETTE-1\", mode = \"2560x1440@59.94\", \
                  position = \"1920x0\", scale = 1.25, transform = 1 })",
                 "output create headless NAVETTE-1",
-                "eval hl.config({ cursor = { invisible = true } })",
+                "eval hl.config({ cursor = { invisible = false } })",
             ]
         );
         let made = hypr.monitor("NAVETTE-1").unwrap();
@@ -271,23 +284,37 @@ mod tests {
     }
 
     #[test]
-    fn the_remote_cursor_is_hidden_while_the_copy_is_there() {
+    fn the_remote_cursor_is_hidden_only_over_a_copy() {
         let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
         let copies = [copy(), copy()];
         create(&hypr, &copies, &[], 0).unwrap();
         create(&hypr, &copies, &[], 1).unwrap();
+        hypr.move_cursor(100, 100);
+        follow_cursor(&hypr).unwrap();
+        assert!(!hypr.cursor_invisible());
+        // The second copy: right of the first, 1440 / 1.25 = 1152 wide once turned.
+        hypr.move_cursor(1920 + 1152 + 10, 100);
+        follow_cursor(&hypr).unwrap();
         assert!(hypr.cursor_invisible());
-        // One copy made again: the other is still there, the cursor stays hidden.
-        remove(&hypr, 1).unwrap();
-        assert!(hypr.cursor_invisible());
-        remove_all(&hypr).unwrap();
+        hypr.move_cursor(1919, 1199);
+        follow_cursor(&hypr).unwrap();
         assert!(!hypr.cursor_invisible());
     }
 
     #[test]
-    fn a_reload_hides_the_remote_cursor_again() {
+    fn a_copy_made_under_the_pointer_hides_it() {
+        let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
+        hypr.move_cursor(2000, 100);
+        create(&hypr, &[copy()], &[], 0).unwrap();
+        assert!(hypr.cursor_invisible());
+    }
+
+    #[test]
+    fn a_reload_hides_the_remote_cursor_again_over_a_copy() {
         let hypr = FakeHypr::with(vec![FakeMonitor::new("eDP-1", 1920, 1200, 0)]);
         create(&hypr, &[copy()], &[], 0).unwrap();
+        hypr.move_cursor(2000, 100);
+        follow_cursor(&hypr).unwrap();
         hypr.reload();
         reapply(&hypr, &[copy()], &[]).unwrap();
         assert!(hypr.cursor_invisible());

@@ -54,6 +54,8 @@ pub enum Event {
     ConfigReloaded,
     MonitorAdded(String),
     MonitorRemoved(String),
+    /// Another monitor has the focus, as when the pointer crosses onto it.
+    MonitorFocused,
     /// A window opened or moved, a workspace moved, or a monitor shows another workspace: a
     /// window may now be on a covered monitor.
     Placed,
@@ -69,6 +71,7 @@ impl Event {
             "configreloaded" => Event::ConfigReloaded,
             "monitoradded" => Event::MonitorAdded(data.to_owned()),
             "monitorremoved" => Event::MonitorRemoved(data.to_owned()),
+            "focusedmon" => Event::MonitorFocused,
             "openwindow" | "movewindowv2" | "moveworkspacev2" | "workspacev2" => Event::Placed,
             _ => Event::Other,
         }
@@ -208,6 +211,18 @@ pub fn monitors(hypr: &dyn Hypr) -> io::Result<Vec<Monitor>> {
             format!("Hyprland's monitor list: {e}"),
         )
     })
+}
+
+/// Where the pointer is, on the layout.
+pub fn cursor(hypr: &dyn Hypr) -> io::Result<(f64, f64)> {
+    let reply: serde_json::Value = serde_json::from_str(&hypr.request("j/cursorpos")?)?;
+    match (reply["x"].as_f64(), reply["y"].as_f64()) {
+        (Some(x), Some(y)) => Ok((x, y)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Hyprland's cursor position: {reply}"),
+        )),
+    }
 }
 
 /// A request whose reply must be `ok`: Hyprland has no other error channel.
@@ -570,6 +585,8 @@ pub mod fake {
         chosen_scale: Option<f32>,
         /// `cursor:invisible`, set at runtime; a reload or a restart sets it back.
         cursor_invisible: bool,
+        /// Where the pointer is, on the layout.
+        cursor: (i32, i32),
         windows: Vec<FakeWindow>,
         /// `cursor:no_warps`, as set now.
         no_warps: bool,
@@ -764,6 +781,10 @@ pub mod fake {
             self.state.lock().unwrap().cursor_invisible
         }
 
+        pub fn move_cursor(&self, x: i32, y: i32) {
+            self.state.lock().unwrap().cursor = (x, y);
+        }
+
         pub fn monitor(&self, name: &str) -> Option<FakeMonitor> {
             let state = self.state.lock().unwrap();
             state.monitors.iter().find(|m| m.name == name).cloned()
@@ -864,6 +885,10 @@ pub mod fake {
                 ));
             }
             state.requests.push(command.to_string());
+            if command == "j/cursorpos" {
+                let (x, y) = state.cursor;
+                return Ok(format!(r#"{{"x": {x}, "y": {y}}}"#));
+            }
             if command == "j/monitors all" {
                 let list: Vec<String> = state
                     .monitors
@@ -1092,6 +1117,11 @@ mod tests {
             Event::parse("monitorremoved>>HDMI-A-1"),
             Event::MonitorRemoved("HDMI-A-1".into())
         );
+        assert_eq!(
+            Event::parse("focusedmon>>NAVETTE-1,11"),
+            Event::MonitorFocused
+        );
+        assert_eq!(Event::parse("focusedmonv2>>NAVETTE-1,11"), Event::Other);
         assert_eq!(Event::parse("monitoraddedv2>>3,DP-2,desc"), Event::Other);
         assert_eq!(Event::parse("workspace>>2"), Event::Other);
         assert_eq!(Event::parse("garbage"), Event::Other);
@@ -1258,6 +1288,13 @@ mod port_tests {
             .map(|m| (m.name.as_str(), m.width, m.x))
             .collect();
         assert_eq!(names, [("DP-1", 1920, 0), ("DP-2", 2560, 1920)]);
+    }
+
+    #[test]
+    fn the_pointer_is_read_from_hyprland_s_reply() {
+        let hypr = FakeHypr::default();
+        hypr.move_cursor(2000, 15);
+        assert_eq!(cursor(&hypr).unwrap(), (2000.0, 15.0));
     }
 
     use fake::FakeWindow;
