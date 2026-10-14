@@ -1003,10 +1003,16 @@ impl<G: Graph> Home<G> {
     /// A message from the remote; its sound is ignored unless home is playing, and plays only
     /// when it belongs to the session home asked for last.
     pub fn received(&mut self, message: Message) -> io::Result<()> {
-        if let Message::Volume { session, level } = message
-            && let Some(playback) = &mut self.playback
-            && session == playback.session
-        {
+        if let Message::Volume { session, level } = message {
+            let Some(playback) = self.playback.as_mut().filter(|p| p.session == session) else {
+                // Not an error, but the one place to see why a level was not heard.
+                eprintln!(
+                    "navette: audio: the remote set its sound to {}, ignored: not the session \
+                     home plays",
+                    shown(level)
+                );
+                return Ok(());
+            };
             playback.level.applying(level);
             self.graph.set_level(&playback._node, level)?;
             eprintln!(
