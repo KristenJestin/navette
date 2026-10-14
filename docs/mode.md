@@ -152,18 +152,17 @@ While a mode runs, every home monitor shows, at its top left, what it is and whe
 (nothing of it with no mode):
 
 - **On each reserved monitor**, over the remote's picture: a warm orange glow from the corner,
-  a `REMOTE` tag and the mic button. It starts 26 pixels down, below the remote's bar, so that
-  the bar's menu and workspaces stay in sight ([`remote_bar`](#the-corners-tags-and-offset)
-  sets that height). It is drawn at home
+  a `REMOTE` tag and the mic button. It sits at the very top, over whatever the remote shows
+  there, unless [`remote_bar`](#the-corners-tags-and-offset) moves it down. It is drawn at home
   over the picture and never sent: the remote machine never sees it, and the pointer over its
   button is home's, so a click there stays home. Passing over the button is not leaving the
   monitor: the keyboard stays with the remote machine, the keys held stay held there, and a
   keyboard given back by the release hotkey stays home; only the pointer's moves stop until it
   is back over the picture. A drag that passes over the button goes on to the remote machine.
   Anywhere else the pointer goes to the remote machine as before.
-- **On each of home's own monitors**, at the same place, below home's bar (the compositor places
-  it after the space the bar reserves), or at the height [`home_bar`](#the-corners-tags-and-offset)
-  sets, over it: a red glow, a `HOME` tag and the mic button, wherever the mic is. As on the
+- **On each of home's own monitors**, at the same place, over whatever home shows there (a bar
+  included), unless [`home_bar`](#the-corners-tags-and-offset) moves it down or below the space
+  home's bars reserve: a red glow, a `HOME` tag and the mic button, wherever the mic is. As on the
   reserved monitors, only the button tells where the mic is.
 - **The mic button** shows a mic and a round check. On the side that has the mic the check
   draws in and the button turns green; on the other it wipes out (350 ms). A click switches the
@@ -189,19 +188,22 @@ Four keys of `mode.conf`, global or per `[name]` section like `release`:
 ```
 remote_label = REMOTE   # the tag on the reserved monitors
 home_label = HOME       # the tag on home's own monitors
-remote_bar = 26         # logical pixels; 0 for a remote without a top bar
-home_bar = auto         # below home's bar, or logical pixels from the top, over it
+remote_bar = 0          # logical pixels from the top, over what the remote shows there
+home_bar = 0            # logical pixels from the top, over home's bars, or auto: below them
 ```
 
 A label is printable ASCII (what the corner's font draws), 12 characters at most; anything else
-stops the start with a message, and nothing is changed. `remote_bar` is how far below the top of
-a reserved monitor the corner starts: the height of the remote desktop's bar. The defaults are
-the ones shown, so a remote whose bar is not 26 pixels high sets it.
+stops the start with a message, and nothing is changed. The defaults are the ones shown: both
+corners at the very top-left, drawn over whatever is there.
 
-`home_bar` places the corner on home's own monitors. With `auto` the compositor puts it below
-the space home's bars reserve at the top. A number puts it that many logical pixels from the top
-of the monitor, ignoring that space: `0` for the very top, over a bar that leaves its left end
-free. Anything else stops the start with a message, and nothing is changed.
+`remote_bar` is how far below the top of a reserved monitor the corner starts, in logical
+pixels: the height of the remote's bar, say, to keep its left end in sight. Anything but a
+number, 0 or more, stops the start with a message, and nothing is changed.
+
+`home_bar` places the corner on home's own monitors. A number puts it that many logical pixels
+from the top of the monitor, ignoring the space home's bars reserve there. With `auto` the
+compositor puts it below that space. Anything else stops the start with a message, and nothing
+is changed.
 
 ## The remote's workspaces
 

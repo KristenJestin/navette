@@ -2456,7 +2456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_remote_corner_starts_below_the_bar_height_the_mode_sets() {
+    async fn the_remote_corner_starts_at_the_top_unless_the_mode_sets_a_height() {
         let tall = desk_with("monitor = DP-2\nremote_bar = 40\n");
         let _remote = started(&tall).await;
         let feeds = tall.feeds.lock().unwrap().clone();
@@ -2467,12 +2467,12 @@ mod tests {
         let default = desk("DP-2");
         let _remote = started(&default).await;
         for (_, feed) in default.feeds.lock().unwrap().iter() {
-            assert_eq!(feed.look().remote_bar, 26);
+            assert_eq!(feed.look().remote_bar, 0);
         }
     }
 
     #[tokio::test]
-    async fn home_s_corner_starts_where_the_mode_sets_it() {
+    async fn home_s_corner_starts_at_the_top_unless_the_mode_sets_it() {
         let top = desk_with("monitor = DP-2\nhome_bar = 0\n");
         let _remote = started(&top).await;
         let feeds = top.feeds.lock().unwrap().clone();
@@ -2480,10 +2480,15 @@ mod tests {
         for (_, feed) in feeds {
             assert_eq!(feed.look().home_bar, Some(0));
         }
+        let below = desk_with("monitor = DP-2\nhome_bar = auto\n");
+        let _remote = started(&below).await;
+        for (_, feed) in below.feeds.lock().unwrap().iter() {
+            assert_eq!(feed.look().home_bar, None);
+        }
         let default = desk("DP-2");
         let _remote = started(&default).await;
         for (_, feed) in default.feeds.lock().unwrap().iter() {
-            assert_eq!(feed.look().home_bar, None);
+            assert_eq!(feed.look().home_bar, Some(0));
         }
     }
 
