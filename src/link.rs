@@ -256,13 +256,6 @@ async fn send<W: AsyncWrite + Unpin>(
                 None => sound_open = false,
             },
             _ = tick.tick() => writer.write_msg(&LinkMsg::Heartbeat).await.map_err(io_error)?,
-            clip = outbound.recv(), if open => match clip {
-                Some((msg, payload)) => writer
-                    .write_msg_with_payloads(&LinkMsg::from(msg), &[&payload])
-                    .await
-                    .map_err(io_error)?,
-                None => open = false,
-            },
             (output, msg, payloads) = display.next() => {
                 let parts: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
                 let begin = Instant::now();
@@ -272,6 +265,15 @@ async fn send<W: AsyncWrite + Unpin>(
                     .map_err(io_error)?;
                 display.report_write(output, begin.elapsed());
             }
+            // The clipboard last: a file's chunk waits for the picture, the sound and the input,
+            // and gliff's window (four chunks in flight) keeps a transfer from piling up more.
+            clip = outbound.recv(), if open => match clip {
+                Some((msg, payload)) => writer
+                    .write_msg_with_payloads(&LinkMsg::from(msg), &[&payload])
+                    .await
+                    .map_err(io_error)?,
+                None => open = false,
+            },
         }
     }
 }
@@ -1660,5 +1662,50 @@ pub(crate) mod tests {
             .unwrap();
         assert!(error.to_string().contains("fell behind"), "{error}");
         drop(ends.home);
+    }
+
+    #[tokio::test]
+    async fn a_picture_frame_never_waits_behind_the_clipboard_s_chunks() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (queued, mut ready) = mpsc::unbounded_channel();
+        // Everything is queued before the link writes a byte past the duplex's room: chunks of
+        // a file transfer first, then one frame.
+        tokio::spawn(run(a, fast(), move |wire: Wire| async move {
+            for n in 0..6u64 {
+                let chunk = ClipboardMsg::Data {
+                    id: 1,
+                    offset: n * CHUNK as u64,
+                    data_len: CHUNK as u32,
+                    done: false,
+                };
+                wire.to_peer
+                    .send((chunk, Bytes::from(vec![0; CHUNK])))
+                    .await
+                    .unwrap();
+            }
+            let (msg, payloads) = video_frame(0, 16);
+            wire.display.as_ref().unwrap().outbox.send(msg, payloads);
+            queued.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        ready.recv().await.unwrap();
+        let mut peer = Framed::new(b);
+        let mut chunks_before = 0;
+        loop {
+            let msg: LinkMsg = tokio::time::timeout(Duration::from_secs(5), peer.read_msg())
+                .await
+                .expect("a message in time")
+                .unwrap();
+            match msg {
+                LinkMsg::ClipboardData { data_len, .. } => {
+                    peer.read_payload(data_len).await.unwrap();
+                    chunks_before += 1;
+                }
+                LinkMsg::Video(ServerMsg::VideoFrame { .. }, _) => break,
+                _ => {}
+            }
+        }
+        // The chunk already on its way when the frame came, at most.
+        assert!(chunks_before <= 1, "{chunks_before} chunks went first");
     }
 }
