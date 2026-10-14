@@ -99,13 +99,14 @@ pub struct Decoding {
 impl Decoding {
     /// `modifiers`: the layouts in which the surface takes the GPU's pictures as dmabufs; with
     /// none, they are read back, as they are once the surface sets `refused`. `ended` hears why
-    /// decoding cannot go on.
+    /// decoding cannot go on; `lost` is set when a GPU decoder was lost, so that the GPU it
+    /// came from is not used for the next mode.
     pub fn start(
         gpu: Option<Arc<Gpu>>,
         (modifiers, refused): (Vec<u64>, Arc<AtomicBool>),
         outbox: Outbox,
         show: Box<dyn FnMut(Picture) + Send>,
-        ended: Ended,
+        (ended, lost): (Ended, Arc<AtomicBool>),
     ) -> std::io::Result<Self> {
         let handover = Handover::of(&modifiers);
         let real = Real {
@@ -113,14 +114,14 @@ impl Decoding {
             handover,
             refused,
         };
-        Self::start_with(Box::new(real), outbox, show, ended)
+        Self::start_with(Box::new(real), outbox, show, (ended, lost))
     }
 
     fn start_with(
         decoders: Box<dyn Decoders>,
         outbox: Outbox,
         show: Box<dyn FnMut(Picture) + Send>,
-        ended: Ended,
+        (ended, lost): (Ended, Arc<AtomicBool>),
     ) -> std::io::Result<Self> {
         let (video, rx) = std::sync::mpsc::channel();
         let queued = Arc::new(AtomicUsize::new(0));
@@ -135,6 +136,7 @@ impl Decoding {
                         outbox,
                         queued,
                         ended,
+                        lost,
                     };
                     thread.run(show, rx)
                 })?
@@ -394,6 +396,8 @@ struct Thread {
     outbox: Outbox,
     queued: Arc<AtomicUsize>,
     ended: Ended,
+    /// Set when a GPU decoder was lost.
+    lost: Arc<AtomicBool>,
 }
 
 impl Thread {
@@ -523,6 +527,9 @@ impl Thread {
                             failures = 0;
                             stats.lost();
                             decoder = None;
+                            if tier == "GPU" {
+                                self.lost.store(true, Ordering::Relaxed);
+                            }
                             if tier == "GPU" && !renewed {
                                 eprintln!(
                                     "navette: {output}: the GPU decoder failed ({e}); a new one \
@@ -708,7 +715,7 @@ mod tests {
                         shown.lock().unwrap().push((f.width, f.height, f.pixels));
                     }
                 }),
-                tokio::sync::mpsc::unbounded_channel().0,
+                (tokio::sync::mpsc::unbounded_channel().0, Default::default()),
             )
             .unwrap()
         };
@@ -877,7 +884,7 @@ mod tests {
             Box::new(Fakes::default()),
             outbox.clone(),
             Box::new(|_| {}),
-            ended,
+            (ended, Default::default()),
         )
         .unwrap();
         decoding.video(config(size.0, size.1));
@@ -908,7 +915,7 @@ mod tests {
                     let _ = held.recv();
                     *shown.lock().unwrap() += 1;
                 }),
-                tokio::sync::mpsc::unbounded_channel().0,
+                (tokio::sync::mpsc::unbounded_channel().0, Default::default()),
             )
             .unwrap()
         };
@@ -952,6 +959,15 @@ mod tests {
     /// Returns the pictures shown, the decoders made, the keyframes asked for and why the mode
     /// was told to end, if it was.
     fn play(fakes: Fakes, frames: &str) -> (usize, Vec<&'static str>, usize, Option<String>) {
+        play_marking(fakes, frames, Default::default())
+    }
+
+    /// As [`play`], with the flag the decoders set when a GPU decoder is lost.
+    fn play_marking(
+        fakes: Fakes,
+        frames: &str,
+        lost: Arc<AtomicBool>,
+    ) -> (usize, Vec<&'static str>, usize, Option<String>) {
         let made = fakes.made.clone();
         let outbox = Outbox::default();
         let shown = Arc::new(AtomicUsize::new(0));
@@ -964,7 +980,7 @@ mod tests {
                 Box::new(move |_| {
                     shown.fetch_add(1, Ordering::Relaxed);
                 }),
-                ended,
+                (ended, lost),
             )
             .unwrap()
         };
@@ -1020,6 +1036,36 @@ mod tests {
         assert_eq!(made, ["GPU", "GPU"]);
         assert_eq!(shown, 3);
         assert_eq!(ended, None);
+    }
+
+    #[test]
+    fn a_lost_gpu_decoder_marks_home_s_gpu_as_lost() {
+        let lost = Arc::new(AtomicBool::new(false));
+        let fakes = Fakes {
+            gpus: [Some(2), None].into(),
+            ..Default::default()
+        };
+        play_marking(fakes, "kppppp", lost.clone());
+        assert!(lost.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_gpu_decoder_never_lost_leaves_home_s_gpu_as_it_is() {
+        let lost = Arc::new(AtomicBool::new(false));
+        let fakes = Fakes {
+            gpus: [None].into(),
+            ..Default::default()
+        };
+        play_marking(fakes, "kppp", lost.clone());
+        assert!(!lost.load(Ordering::Relaxed));
+        // A GPU that never showed a picture cannot decode here: it was not lost.
+        let fakes = Fakes {
+            gpus: [Some(0)].into(),
+            cpu: Some(None),
+            ..Default::default()
+        };
+        play_marking(fakes, "kppp", lost.clone());
+        assert!(!lost.load(Ordering::Relaxed));
     }
 
     #[test]
