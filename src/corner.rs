@@ -13,6 +13,8 @@
 //!   hotkey and `navette mic toggle` do; hovering it shows the hotkey.
 //! - **Messages** (`Mic → remote`, `Keyboard → home`, …) show under the button for two seconds,
 //!   in place of desktop notifications.
+//! - **Files crossing** the clipboard, either way, show as a bar under the tag, with what is
+//!   left; a click on it stops them all.
 //!
 //! [`Board`] carries the mic's place and the messages to every corner open; [`Corner`] is one
 //! corner, drawn in software into ARGB pixels. Its text uses a 5×8 bitmap font of its own, so
@@ -23,6 +25,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
+use crate::clipboard::files::human_bytes;
+use crate::clipboard::progress::Bar;
 use crate::mic::Status;
 use crate::notify::Notifier;
 
@@ -49,6 +53,17 @@ pub enum Update {
     Mic(Status),
     /// A message to show under the button.
     Say(String),
+    /// The files crossing the clipboard; none once they are done.
+    Files(Option<Bar>),
+}
+
+/// What a click on the corner does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Press {
+    /// Switches the mic.
+    Mic,
+    /// Stops the files crossing.
+    Cancel,
 }
 
 type Listener = Box<dyn FnMut(&Update) -> bool + Send>;
@@ -59,10 +74,13 @@ pub struct Board {
     inner: Mutex<Inner>,
     /// What a click on the mic button does.
     toggle: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Bumped by a click on the bar: the clipboard stops every file crossing.
+    cancel: watch::Sender<u64>,
 }
 
 struct Inner {
     mic: Status,
+    files: Option<Bar>,
     /// Each returns false once its corner is gone.
     listeners: Vec<Listener>,
 }
@@ -72,9 +90,11 @@ impl Default for Board {
         Self {
             inner: Mutex::new(Inner {
                 mic: Status::Off,
+                files: None,
                 listeners: Vec::new(),
             }),
             toggle: OnceLock::new(),
+            cancel: watch::channel(0).0,
         }
     }
 }
@@ -97,11 +117,27 @@ impl Board {
             .tell(&Update::Say(text.to_owned()));
     }
 
-    /// `listener` hears where the mic is now, then every change and message, until it returns
-    /// false.
+    /// The files crossing the clipboard: every corner shows their bar, or no more.
+    pub fn files(&self, bar: Option<Bar>) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.files != bar {
+            inner.files = bar;
+            inner.tell(&Update::Files(bar));
+        }
+    }
+
+    /// Changes at each click on the bar.
+    pub fn cancels(&self) -> watch::Receiver<u64> {
+        self.cancel.subscribe()
+    }
+
+    /// `listener` hears where the mic is now and the files crossing, then every change and
+    /// message, until it returns false.
     pub fn listen(&self, mut listener: impl FnMut(&Update) -> bool + Send + 'static) {
         let mut inner = self.inner.lock().unwrap();
-        if listener(&Update::Mic(inner.mic)) {
+        let files = inner.files;
+        if listener(&Update::Mic(inner.mic)) && (files.is_none() || listener(&Update::Files(files)))
+        {
             inner.listeners.push(Box::new(listener));
         }
     }
@@ -218,8 +254,12 @@ impl Feed {
         self.board.listen(listener);
     }
 
-    pub fn click(&self) {
-        self.board.click();
+    /// A click on the corner, by where it fell.
+    pub fn press(&self, press: Press) {
+        match press {
+            Press::Mic => self.board.click(),
+            Press::Cancel => self.board.cancel.send_modify(|n| *n = n.wrapping_add(1)),
+        }
     }
 }
 
@@ -343,6 +383,7 @@ const TAG_TEXT: Color = rgb(0x1b1206, 1.0);
 const PILL: Color = rgb(0x0e1013, 0.85);
 const BORDER: Color = rgb(0xffffff, 0.15);
 const LABEL: Color = rgb(0xe7e2d8, 1.0);
+const FILL: Color = rgb(0x3d7bd9, 0.9);
 
 /// The corner's layout, in logical pixels.
 const PAD: f64 = 10.0;
@@ -354,6 +395,8 @@ const GLOW: (f64, f64) = (150.0, 80.0);
 const DOT: f64 = 2.0;
 /// The longest message shown, in characters; a longer one ends with `…`.
 const LONGEST: usize = 64;
+/// The narrowest the bar of the files crossing is.
+const BAR_WIDTH: f64 = 160.0;
 /// How much a corner on a side without the mic is dimmed.
 const DIMMED: f64 = 0.5;
 
@@ -368,6 +411,9 @@ pub struct Corner {
     check: (f64, f64, Option<Instant>),
     message: Option<(String, Instant)>,
     hover: bool,
+    files: Option<Bar>,
+    /// Where the pointer is over the corner, in its logical pixels.
+    pointer: Option<(f64, f64)>,
 }
 
 impl Corner {
@@ -380,6 +426,8 @@ impl Corner {
             check: (0.0, 0.0, None),
             message: None,
             hover: false,
+            files: None,
+            pointer: None,
         }
     }
 
@@ -398,6 +446,21 @@ impl Corner {
                 }
             }
             Update::Say(text) => self.message = Some((text, now)),
+            Update::Files(bar) => self.files = bar,
+        }
+    }
+
+    /// The pointer moved to (`x`, `y`) over the corner.
+    pub fn point_at(&mut self, x: f64, y: f64) {
+        self.pointer = Some((x, y));
+    }
+
+    /// What a click where the pointer is does: on the bar, it stops the files; anywhere else,
+    /// it switches the mic.
+    pub fn press(&self) -> Press {
+        match (self.bar(), self.pointer) {
+            (Some(bar), Some((x, y))) if bar.holds(x, y) => Press::Cancel,
+            _ => Press::Mic,
         }
     }
 
@@ -484,6 +547,32 @@ impl Corner {
         })
     }
 
+    /// The bar of the files crossing, under the tag: where a click stops them.
+    pub fn bar(&self) -> Option<Rect> {
+        let text = self.bar_text()?;
+        Some(Rect {
+            x: PAD,
+            y: PAD + ROW + 6.0,
+            width: (text_width(&text) + 2.0 * 6.0).max(BAR_WIDTH),
+            height: ROW,
+        })
+    }
+
+    fn bar_text(&self) -> Option<String> {
+        let bar = self.files?;
+        let percent = (bar.done as u128 * 100 / bar.total.max(1) as u128).min(100);
+        Some(format!(
+            "Files {percent}%, {} left  x",
+            human_bytes(bar.left())
+        ))
+    }
+
+    /// The top of the line under the button: under the bar when there is one.
+    fn line_y(&self) -> f64 {
+        let rows = if self.bar().is_some() { 2.0 } else { 1.0 };
+        PAD + rows * (ROW + 6.0)
+    }
+
     /// The line under the button: the message, else the hint while hovered.
     fn line(&self, now: Instant) -> Option<String> {
         let text = match self.message_at(now) {
@@ -508,9 +597,13 @@ impl Corner {
             right = button.x + button.width;
         }
         let mut bottom = PAD + ROW;
+        if let Some(bar) = self.bar() {
+            right = right.max(bar.x + bar.width);
+            bottom = bar.y + bar.height;
+        }
         if let Some(line) = self.line(now) {
             right = right.max(PAD + text_width(&line) + 2.0 * 6.0);
-            bottom = PAD + ROW + 6.0 + ROW;
+            bottom = self.line_y() + ROW;
         }
         let (mut width, mut height) = (right + PAD, bottom + PAD);
         if !self.shrunk() {
@@ -555,10 +648,23 @@ impl Corner {
             pen.ring(cx, cy, 7.0, accent);
             pen.check(cx, cy, check, accent);
         }
+        if let (Some(bar), Some(files), Some(text)) = (self.bar(), self.files, self.bar_text()) {
+            pen.rounded(bar, 5.0, PILL);
+            let part = (files.done as f64 / files.total.max(1) as f64).min(1.0);
+            if part > 0.0 {
+                let done = Rect {
+                    width: (bar.width * part).max(10.0),
+                    ..bar
+                };
+                pen.rounded(done, 5.0, FILL);
+            }
+            pen.rounded_outline(bar, 5.0, BORDER);
+            pen.text(bar.x + 6.0, bar.y + (ROW - 7.0 * DOT) / 2.0, &text, LABEL);
+        }
         if let Some(line) = self.line(now) {
             let row = Rect {
                 x: PAD,
-                y: PAD + ROW + 6.0,
+                y: self.line_y(),
                 width: text_width(&line) + 2.0 * 6.0,
                 height: ROW,
             };
@@ -1046,6 +1152,81 @@ mod tests {
         let (one, two) = (pro.draw(now, 1.0), pro.draw(now, 2.0));
         // The corner grows with its tag: its size is compared with itself, not pinned.
         assert_eq!((two.width, two.height), (one.width * 2, one.height * 2));
+    }
+
+    #[test]
+    fn the_bar_shows_the_files_crossing_with_what_is_left_and_goes_after() {
+        let now = Instant::now();
+        let mut pro = corner(Side::Remote, Status::Remote, now);
+        let files = Bar {
+            done: 1 << 30,
+            total: 3 << 30,
+        };
+        pro.update(Update::Files(Some(files)), now);
+        assert_eq!(
+            pro.bar_text().as_deref(),
+            Some("Files 33%, 2.0 GiB left  x")
+        );
+        let bar = pro.bar().expect("the bar");
+        let (width, height) = pro.size(now);
+        assert!(f64::from(width) >= bar.x + bar.width && f64::from(height) >= bar.y + bar.height);
+        let drawn = pro.draw(now, 1.0);
+        let blue = |(r, g, b, a): (u8, u8, u8, u8)| a > 0 && b > r + 60 && b > g + 30;
+        let (y, left, right) = (bar.y + 2.0, bar.x + 4.0, bar.x + bar.width - 4.0);
+        assert!(blue(color(&drawn, left as u32, y as u32)), "a third done");
+        assert!(
+            !blue(color(&drawn, right as u32, y as u32)),
+            "the rest to go"
+        );
+        // A message goes under the bar, not over it.
+        pro.update(Update::Say("Mic → remote".into()), now);
+        assert!(pro.line_y() >= bar.y + bar.height);
+
+        pro.update(Update::Files(None), now);
+        assert_eq!(pro.bar(), None);
+    }
+
+    #[test]
+    fn a_click_on_the_bar_stops_the_files_and_anywhere_else_switches_the_mic() {
+        let now = Instant::now();
+        let board = Arc::new(Board::default());
+        let (clicked, clicks) = std::sync::mpsc::channel();
+        let clicked = Mutex::new(clicked);
+        board.on_click(move || clicked.lock().unwrap().send(()).unwrap());
+        let mut cancels = board.cancels();
+        let feed = Feed::new(board, None, Look::default());
+        let mut pro = feed.corner(Side::Remote);
+        pro.update(Update::Mic(Status::Remote), now);
+        pro.update(Update::Files(Some(Bar { done: 0, total: 10 })), now);
+        let (bar, button) = (pro.bar().unwrap(), pro.button().unwrap());
+
+        pro.point_at(bar.x + bar.width / 2.0, bar.y + 4.0);
+        assert_eq!(pro.press(), Press::Cancel);
+        feed.press(pro.press());
+        assert!(cancels.has_changed().unwrap(), "the files are stopped");
+        cancels.borrow_and_update();
+
+        pro.point_at(button.x + 4.0, button.y + 4.0);
+        assert_eq!(pro.press(), Press::Mic);
+        feed.press(pro.press());
+        clicks
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the mic switched");
+        assert!(!cancels.has_changed().unwrap(), "the files go on");
+    }
+
+    #[test]
+    fn a_corner_opened_while_files_cross_shows_their_bar() {
+        let board = Board::default();
+        let files = Some(Bar { done: 1, total: 2 });
+        board.files(files);
+        let heard = listening(&board);
+        assert_eq!(
+            *heard[0].lock().unwrap(),
+            [Update::Mic(Status::Off), Update::Files(files)]
+        );
+        board.files(None);
+        assert_eq!(heard[1].lock().unwrap().last(), Some(&Update::Files(None)));
     }
 
     /// Two corners listening to `board`, the updates each heard, as a corner would take them.

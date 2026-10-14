@@ -1119,7 +1119,7 @@ mod tests {
 
     use super::config::CONFIG_FILE;
     use super::*;
-    use crate::corner::{Look, Side, Update};
+    use crate::corner::{Look, Press, Side, Update};
     use crate::display::wire::{Cursor, Outbox};
     use crate::hypr::fake::{FakeHypr, FakeMonitor, FakeWindow};
     use crate::mic::Status;
@@ -1675,7 +1675,7 @@ mod tests {
         desk.board.say("Mic → remote");
         let feeds = desk.feeds.lock().unwrap().clone();
         for (_, feed) in &feeds {
-            feed.click();
+            feed.press(Press::Mic);
         }
         until(|| clicks.load(Ordering::Relaxed) == feeds.len()).await;
         assert_eq!(

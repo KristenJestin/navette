@@ -13,11 +13,11 @@
 //! (`ClipboardItem`, say) included: change the version instead.
 
 use bytes::Bytes;
-use gliff_proto::clipboard::validate_files;
 use gliff_proto::{ClientMsg, ClipboardFile, ClipboardItem, ClipboardMsg, ServerMsg};
 use minicbor::{Decode, Encode};
 
 use crate::audio;
+use crate::clipboard::files::validate;
 use crate::display::wire::{Display, Msg};
 use crate::input;
 
@@ -282,8 +282,8 @@ pub const MAX_MIME_TYPES: usize = 64;
 pub const MAX_MIME_LEN: usize = 255;
 
 /// The peer's message, with an offer this machine will not hold (too many or too long mime
-/// types, or files `validate_files` refuses: a path out of the spool, too many entries) made
-/// empty. The bridge then withdraws the peer's previous copy rather than keep offering it.
+/// types, or files [`validate`] refuses: an absolute path or one with `..`, too many entries,
+/// sizes past what a count holds) made empty. The bridge then withdraws the peer's previous copy rather than keep offering it.
 pub fn checked(msg: ClipboardMsg) -> ClipboardMsg {
     match msg {
         ClipboardMsg::Offer {
@@ -292,7 +292,7 @@ pub fn checked(msg: ClipboardMsg) -> ClipboardMsg {
             files,
         } if mime_types.len() > MAX_MIME_TYPES
             || mime_types.iter().any(|m| m.len() > MAX_MIME_LEN)
-            || validate_files(&files).is_err() =>
+            || validate(&files).is_err() =>
         {
             ClipboardMsg::Offer {
                 serial,

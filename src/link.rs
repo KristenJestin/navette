@@ -52,6 +52,11 @@ const INBOUND: usize = 16;
 /// be lost, ends the link, so both sides give the monitor back.
 const DISPLAY_INBOUND: usize = 256;
 
+/// While the picture keeps the link busy, the clipboard still gets one message in this many
+/// frames: its offers, requests and acks, and a transfer's chunks, never wait past gliff's idle
+/// timeout.
+const FRAMES_PER_CLIP: usize = 8;
+
 /// The largest video frame stream: a 4K keyframe is a few MiB.
 const MAX_VIDEO_PAYLOAD: u32 = 32 << 20;
 
@@ -231,6 +236,7 @@ async fn send<W: AsyncWrite + Unpin>(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut open = true;
     let mut sound_open = true;
+    let mut frames = 0;
     loop {
         tokio::select! {
             // Input first: a key must not wait behind a video frame already queued.
@@ -256,14 +262,10 @@ async fn send<W: AsyncWrite + Unpin>(
                 None => sound_open = false,
             },
             _ = tick.tick() => writer.write_msg(&LinkMsg::Heartbeat).await.map_err(io_error)?,
-            clip = outbound.recv(), if open => match clip {
-                Some((msg, payload)) => writer
-                    .write_msg_with_payloads(&LinkMsg::from(msg), &[&payload])
-                    .await
-                    .map_err(io_error)?,
-                None => open = false,
-            },
-            (output, msg, payloads) = display.next() => {
+            // The picture waits once it had enough turns in a row with the clipboard waiting.
+            (output, msg, payloads) = display.next(),
+                if frames < FRAMES_PER_CLIP || outbound.is_empty() =>
+            {
                 let parts: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
                 let begin = Instant::now();
                 writer
@@ -271,7 +273,20 @@ async fn send<W: AsyncWrite + Unpin>(
                     .await
                     .map_err(io_error)?;
                 display.report_write(output, begin.elapsed());
+                frames += 1;
             }
+            // The clipboard last: a file's chunk waits for the picture, the sound and the input,
+            // and gliff's window (four chunks in flight) keeps a transfer from piling up more.
+            clip = outbound.recv(), if open => match clip {
+                Some((msg, payload)) => {
+                    writer
+                        .write_msg_with_payloads(&LinkMsg::from(msg), &[&payload])
+                        .await
+                        .map_err(io_error)?;
+                    frames = 0;
+                }
+                None => open = false,
+            },
         }
     }
 }
@@ -682,14 +697,14 @@ pub(crate) mod tests {
         }
     }
 
-    struct Desk {
-        tmp: tempfile::TempDir,
-        home: Store,
-        remote: Store,
+    pub(crate) struct Desk {
+        pub(crate) tmp: tempfile::TempDir,
+        pub(crate) home: Store,
+        pub(crate) remote: Store,
     }
 
     /// Two machines paired over loopback, the way `navette pair` does it.
-    async fn paired_desk() -> Desk {
+    pub(crate) async fn paired_desk() -> Desk {
         let tmp = tempfile::tempdir().unwrap();
         let desk = Desk {
             home: Store::new(tmp.path().join("home")),
@@ -1660,5 +1675,121 @@ pub(crate) mod tests {
             .unwrap();
         assert!(error.to_string().contains("fell behind"), "{error}");
         drop(ends.home);
+    }
+
+    #[tokio::test]
+    async fn a_picture_frame_never_waits_behind_the_clipboard_s_chunks() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (queued, mut ready) = mpsc::unbounded_channel();
+        // Everything is queued before the link writes a byte past the duplex's room: chunks of
+        // a file transfer first, then one frame.
+        tokio::spawn(run(a, fast(), move |wire: Wire| async move {
+            for n in 0..6u64 {
+                let chunk = ClipboardMsg::Data {
+                    id: 1,
+                    offset: n * CHUNK as u64,
+                    data_len: CHUNK as u32,
+                    done: false,
+                };
+                wire.to_peer
+                    .send((chunk, Bytes::from(vec![0; CHUNK])))
+                    .await
+                    .unwrap();
+            }
+            let (msg, payloads) = video_frame(0, 16);
+            wire.display.as_ref().unwrap().outbox.send(msg, payloads);
+            queued.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        ready.recv().await.unwrap();
+        let mut peer = Framed::new(b);
+        let mut chunks_before = 0;
+        loop {
+            let msg: LinkMsg = tokio::time::timeout(Duration::from_secs(5), peer.read_msg())
+                .await
+                .expect("a message in time")
+                .unwrap();
+            match msg {
+                LinkMsg::ClipboardData { data_len, .. } => {
+                    peer.read_payload(data_len).await.unwrap();
+                    chunks_before += 1;
+                }
+                LinkMsg::Video(ServerMsg::VideoFrame { .. }, _) => break,
+                _ => {}
+            }
+        }
+        // The chunk already on its way when the frame came, at most.
+        assert!(chunks_before <= 1, "{chunks_before} chunks went first");
+    }
+
+    #[tokio::test]
+    async fn the_clipboard_keeps_moving_under_a_saturated_video_stream() {
+        // A narrow line: each frame takes several reads, and two outputs refill the queue
+        // meanwhile, so a frame always waits when the link picks what to write next.
+        let (a, b) = tokio::io::duplex(16 * 1024);
+        // The peer here sends no heartbeat: the link must not give up on it meanwhile.
+        let patient = Heartbeat {
+            interval: Duration::from_millis(20),
+            timeout: Duration::from_secs(10),
+        };
+        tokio::spawn(run(a, patient, move |wire: Wire| async move {
+            for n in 0..3u64 {
+                let chunk = ClipboardMsg::Data {
+                    id: 1,
+                    offset: n * 16,
+                    data_len: 16,
+                    done: false,
+                };
+                wire.to_peer
+                    .send((chunk, Bytes::from(vec![0; 16])))
+                    .await
+                    .unwrap();
+            }
+            let outbox = &wire.display.as_ref().unwrap().outbox;
+            let mut id = 0;
+            loop {
+                for output in 0..2 {
+                    let outbox = outbox.on(output);
+                    if outbox.video_ready() {
+                        let (msg, payloads) = video_frame(id, 60_000);
+                        outbox.send(msg, payloads);
+                        id += 1;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }));
+        let mut peer = Framed::new(b);
+        let mut gaps = Vec::new();
+        let mut frames = 0;
+        let three_turns = async {
+            while gaps.len() < 3 {
+                match peer.read_msg().await.unwrap() {
+                    LinkMsg::ClipboardData { data_len, .. } => {
+                        peer.read_payload(data_len).await.unwrap();
+                        gaps.push(std::mem::take(&mut frames));
+                    }
+                    LinkMsg::Video(
+                        ServerMsg::VideoFrame {
+                            data_len, aux_len, ..
+                        },
+                        _,
+                    ) => {
+                        peer.read_payload(data_len).await.unwrap();
+                        peer.read_payload(aux_len).await.unwrap();
+                        frames += 1;
+                    }
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), three_turns)
+            .await
+            .unwrap_or_else(|_| panic!("the clipboard's turn never came: {frames} frames"));
+        // The frames still go first: the clipboard gets one message in so many.
+        assert!(
+            gaps.iter().all(|&gap| gap >= FRAMES_PER_CLIP),
+            "frames between clipboard messages: {gaps:?}"
+        );
     }
 }

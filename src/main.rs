@@ -16,6 +16,7 @@ use gliff_transport::clipboard::Side;
 use hypr_input::Target;
 use navette::audio::{self, pipewire::PipeWire};
 use navette::clipboard;
+use navette::clipboard::progress::Shown;
 use navette::corner::{self, Board};
 use navette::desk::Desk;
 use navette::display::{decode, remote};
@@ -251,7 +252,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 desk_record: Desk::<Eval>::default_record()?,
                 mic: mic.clone().map(|mic| mic as Arc<dyn mode::Mic>),
                 sound: sound.clone().map(|sound| sound as Arc<dyn mode::Sound>),
-                board,
+                board: board.clone(),
                 notifier: Arc::new(notify::NotifySend::new(notify::Command)),
             };
             let (peers, peers_rx) = mpsc::unbounded_channel();
@@ -260,6 +261,15 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             hypr::watch_events(hypr_events);
             let modes = tokio::spawn(mode::serve(home, peers_rx, orders_rx, hypr_events_rx));
             let control = tokio::spawn(mode::accept_orders(control, orders));
+            // The files crossing show in the corners, which stop them.
+            let shown = Shown {
+                bar: {
+                    let board = board.clone();
+                    Arc::new(move |bar| board.files(bar))
+                },
+                notifier: Arc::new(notify::NotifySend::new(notify::Command)),
+                cancel: board.cancels(),
+            };
             // Each service takes its part of the link; the clipboard bridge, not `Send`, runs on
             // this thread, in a local set.
             let attach = move |mut wire: Wire| {
@@ -277,7 +287,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                         eprintln!("navette: audio: {e}");
                     }
                 }
-                clipboard::attach(Side::Client, clipboard::hypr(Target::default()), wire)
+                let hypr = clipboard::hypr(Target::default());
+                clipboard::attach(Side::Client, hypr, wire, shown.clone())
             };
             let local = tokio::task::LocalSet::new();
             tokio::select! {
@@ -316,6 +327,9 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let saved = audio::Saved::in_dir(audio::Saved::default_dir()?);
             // The latest link's audio thread; each one joins the one before it.
             let audio_thread = Arc::new(Mutex::new(None));
+            // Home shows the files crossing, and stops them: this machine only says how a paste
+            // ended.
+            let shown = Shown::notifications(Arc::new(notify::NotifySend::new(notify::Command)));
             let attach = {
                 let audio_thread = audio_thread.clone();
                 move |mut wire: Wire| {
@@ -329,7 +343,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                             Err(e) => eprintln!("navette: audio: {e}"),
                         }
                     }
-                    clipboard::attach(Side::Server, clipboard::hypr(Target::default()), wire)
+                    let hypr = clipboard::hypr(Target::default());
+                    clipboard::attach(Side::Server, hypr, wire, shown.clone())
                 }
             };
             let agent = link::agent(
