@@ -337,22 +337,50 @@ fn suffixed(name: &OsStr, n: u32) -> OsString {
 }
 
 fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
-    let from = CString::new(from.as_os_str().as_bytes()).map_err(invalid)?;
-    let to = CString::new(to.as_os_str().as_bytes()).map_err(invalid)?;
+    let (c_from, c_to) = (c_path(from)?, c_path(to)?);
     // SAFETY: two NUL-terminated paths, relative to nothing (they are absolute or the cwd's).
     let done = unsafe {
         libc::renameat2(
             libc::AT_FDCWD,
-            from.as_ptr(),
+            c_from.as_ptr(),
             libc::AT_FDCWD,
-            to.as_ptr(),
+            c_to.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
     };
-    if done != 0 {
-        return Err(io::Error::last_os_error());
+    let done = if done == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    };
+    or_without_noreplace(done, from, to)
+}
+
+fn c_path(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(invalid)
+}
+
+/// `done`, or on a filesystem without `RENAME_NOREPLACE` (EINVAL), the same move by other
+/// means, never over what is there: a file is linked under its new name then unlinked, a
+/// folder replaces an empty one made for it (which fails if anything got in meanwhile).
+fn or_without_noreplace(done: io::Result<()>, from: &Path, to: &Path) -> io::Result<()> {
+    match done {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+        done => return done,
     }
-    Ok(())
+    if !std::fs::symlink_metadata(from)?.is_dir() {
+        std::fs::hard_link(from, to)?;
+        return std::fs::remove_file(from);
+    }
+    std::fs::create_dir(to)?;
+    std::fs::rename(from, to).map_err(|e| {
+        // Only the empty folder made here goes, never what someone put in it.
+        let _ = std::fs::remove_dir(to);
+        match e.kind() {
+            io::ErrorKind::DirectoryNotEmpty => io::ErrorKind::AlreadyExists.into(),
+            _ => e,
+        }
+    })
 }
 
 /// Bytes as a short figure: `1.5 GiB`.
@@ -517,6 +545,37 @@ mod tests {
         let failed = staging.finish(["first.txt", "second.txt"].into_iter());
         assert!(failed.is_err());
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn without_rename_noreplace_a_file_and_a_folder_move_and_never_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (from, to) = (tmp.path().join("staged"), tmp.path().join("inbox"));
+        std::fs::create_dir_all(from.join("photos")).unwrap();
+        std::fs::create_dir(&to).unwrap();
+        std::fs::write(from.join("report.pdf"), b"new").unwrap();
+        std::fs::write(from.join("photos/beach.jpg"), b"sand").unwrap();
+        std::fs::write(to.join("taken.pdf"), b"mine").unwrap();
+        std::fs::create_dir(to.join("taken")).unwrap();
+        // What renameat2 says on a filesystem without RENAME_NOREPLACE.
+        let unsupported = || Err(io::Error::from_raw_os_error(libc::EINVAL));
+        let moved =
+            |a: &str, b: &str| or_without_noreplace(unsupported(), &from.join(a), &to.join(b));
+
+        moved("report.pdf", "report.pdf").unwrap();
+        moved("photos", "photos").unwrap();
+        assert_eq!(std::fs::read(to.join("report.pdf")).unwrap(), b"new");
+        assert_eq!(std::fs::read(to.join("photos/beach.jpg")).unwrap(), b"sand");
+        assert!(!from.join("report.pdf").exists() && !from.join("photos").exists());
+
+        std::fs::write(from.join("again.pdf"), b"again").unwrap();
+        std::fs::create_dir(from.join("again")).unwrap();
+        let taken = moved("again.pdf", "taken.pdf").unwrap_err();
+        assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(to.join("taken.pdf")).unwrap(), b"mine");
+        let taken = moved("again", "taken").unwrap_err();
+        assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
+        assert!(from.join("again.pdf").exists() && from.join("again").exists());
     }
 
     #[test]
