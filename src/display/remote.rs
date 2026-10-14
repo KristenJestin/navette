@@ -1056,9 +1056,10 @@ mod tests {
             height: 720,
         };
         agent.input.push(area.clone());
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Read before the start, whichever the loop would take first.
+        until(|| agent.input.queued().is_empty()).await;
         agent.inbox.try_send(start()).unwrap();
-        until(|| agent.injected(0).is_some()).await;
+        until(|| started(&agent.outbox)).await;
         agent.input.push(key(true));
         until(|| agent.injected(0).unwrap().2.len() == 2).await;
         let (output, keymap, events) = agent.injected(0).unwrap();
@@ -1071,7 +1072,7 @@ mod tests {
     async fn a_dropped_link_releases_everything_before_the_output_goes() {
         let agent = agent();
         agent.inbox.try_send(start()).unwrap();
-        until(|| agent.injected(0).is_some()).await;
+        until(|| started(&agent.outbox)).await;
         agent.input.push(key(true));
         until(|| agent.injected(0).unwrap().2.len() == 1).await;
         let Agent {
@@ -1173,7 +1174,7 @@ mod tests {
         let home = input::Event::Keymap("home keymap".into());
         let including = r#"xkb_keymap { xkb_symbols { include "pc+us" }; };"#;
         agent.inbox.try_send(start()).unwrap();
-        until(|| agent.injected(0).is_some()).await;
+        until(|| started(&agent.outbox)).await;
         agent.input.push(home.clone());
         // Queued together, the newer keymap would replace it before the agent reads it.
         until(|| agent.injected(0).unwrap().2 == [home.clone()]).await;
@@ -2201,7 +2202,7 @@ mod tests {
         let area = |width| input::Event::Area { width, height: 720 };
         agent.input.push(area(1280));
         agent.input.on(1).push(area(1600));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        until(|| agent.input.queued().is_empty()).await;
         two(&agent).await;
         until(|| agent.injected(1).is_some_and(|i| i.2 == [area(1600)])).await;
         agent
@@ -2211,7 +2212,7 @@ mod tests {
         until(|| agent.hypr.monitor(FIRST).is_none()).await;
         // The next mode's first surface says its size; its second has not yet.
         agent.input.push(area(1920));
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        until(|| agent.input.queued().is_empty()).await;
         two(&agent).await;
         until(|| agent.streams.started_on(SECOND) == 2).await;
         until(|| agent.injected(3).is_some()).await;
