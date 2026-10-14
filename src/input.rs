@@ -19,12 +19,13 @@
 //! **Several outputs.** A mode of several monitors has one surface, and one remote output, per
 //! monitor: each event names its output, and the remote injects it there. The queue's rules
 //! hold per output: a motion replaces only its own output's, a cut keeps each output's area
-//! and releases everything on each output it dropped events of.
+//! and releases everything on each output it dropped events of. A drag that leaves the surface
+//! where it began goes on to the output under the pointer (see [`Capture::motion`]).
 //!
 //! The release hotkey and the held-key bookkeeping are adapted from gliff's client
 //! (`crates/gliff/src/main.rs`; gliff, MIT, see `LICENSES/gliff-MIT.txt`).
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 use std::sync::{Arc, Mutex};
 
@@ -111,6 +112,38 @@ struct Shared {
     /// The keys home's surfaces sent down, on any output, and home still holds as far as they
     /// know: the next surface to take the keyboard presses them again on its own output.
     carried: Mutex<BTreeSet<u32>>,
+    /// Where each output's surface stands in home's layout, for a drag that leaves it.
+    places: Mutex<BTreeMap<u8, Place>>,
+}
+
+/// A surface's rectangle in home's layout, in logical pixels.
+#[derive(Clone, Copy, Debug)]
+struct Place {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl Place {
+    /// Its right and bottom edges belong to the monitor beyond.
+    fn holds(&self, x: f64, y: f64) -> bool {
+        (self.x..self.x + self.width).contains(&x) && (self.y..self.y + self.height).contains(&y)
+    }
+
+    fn distance(&self, x: f64, y: f64) -> f64 {
+        let dx = (self.x - x).max(x - self.x - self.width).max(0.0);
+        let dy = (self.y - y).max(y - self.y - self.height).max(0.0);
+        dx.hypot(dy)
+    }
+
+    /// The point of the surface nearest to (`x`, `y`), in the surface's own pixels.
+    fn local(&self, x: f64, y: f64) -> (f64, f64) {
+        (
+            x.clamp(self.x, self.x + self.width) - self.x,
+            y.clamp(self.y, self.y + self.height) - self.y,
+        )
+    }
 }
 
 /// One direction's queue (see the module's doc for its policy). What it is given is for output
@@ -429,6 +462,9 @@ pub struct Capture {
     locks_sent: Option<Vec<String>>,
     /// Hears each time the hotkey gives the keyboard back.
     on_release: Option<crate::display::Released>,
+    /// The surface's origin in home's layout, and its size.
+    at: Option<(i32, i32)>,
+    size: Option<(u32, u32)>,
 }
 
 impl Capture {
@@ -443,6 +479,8 @@ impl Capture {
             released: false,
             locks_sent: None,
             on_release: None,
+            at: None,
+            size: None,
         }
     }
 
@@ -467,7 +505,28 @@ impl Capture {
     }
 
     pub fn area(&mut self, width: u32, height: u32) {
+        self.size = Some((width, height));
+        self.place();
         self.queue.push(Event::Area { width, height });
+    }
+
+    /// The surface's origin in home's layout (its monitor's logical position).
+    pub fn at(&mut self, x: i32, y: i32) {
+        self.at = Some((x, y));
+        self.place();
+    }
+
+    fn place(&self) {
+        if let (Some((x, y)), Some((width, height))) = (self.at, self.size) {
+            let place = Place {
+                x: x.into(),
+                y: y.into(),
+                width: width.into(),
+                height: height.into(),
+            };
+            let mut places = self.queue.shared.places.lock().unwrap();
+            places.insert(self.queue.output, place);
+        }
     }
 
     /// The pointer came over the surface: the keyboard follows it.
@@ -530,8 +589,37 @@ impl Capture {
         }
     }
 
+    /// While a button is held, home's compositor keeps the pointer on the surface that had the
+    /// press, its positions going past the surface's edges (measured on Hyprland 0.56.2): they
+    /// go to the work monitor under them, as the remote takes a press on one output's pointer
+    /// and the motion on another's as one drag. Off every work monitor, the drag stops at the
+    /// nearest edge, so a remote window never goes where home shows no remote output.
     pub fn motion(&mut self, x: f64, y: f64) {
-        self.queue.push(Event::Motion { x, y });
+        let (output, x, y) = if self.held_buttons.is_empty() {
+            (self.queue.output, x, y)
+        } else {
+            self.across(x, y)
+        };
+        self.queue.on(output).push(Event::Motion { x, y });
+    }
+
+    /// The output under the surface's position (`x`, `y`), and the position on it.
+    fn across(&self, x: f64, y: f64) -> (u8, f64, f64) {
+        let places = self.queue.shared.places.lock().unwrap();
+        let Some(own) = places.get(&self.queue.output) else {
+            return (self.queue.output, x, y);
+        };
+        let (x, y) = (own.x + x, own.y + y);
+        let under = places.iter().find(|(_, place)| place.holds(x, y));
+        let (&output, place) = under
+            .or_else(|| {
+                places
+                    .iter()
+                    .min_by(|(_, a), (_, b)| a.distance(x, y).total_cmp(&b.distance(x, y)))
+            })
+            .expect("the surface's own place is there");
+        let (x, y) = place.local(x, y);
+        (output, x, y)
     }
 
     pub fn button(&mut self, button: u32, pressed: bool) {
@@ -600,9 +688,12 @@ impl Capture {
 }
 
 impl Drop for Capture {
-    /// The surface goes (the mode stops): nothing stays held on the remote.
+    /// The surface goes (the mode stops): nothing stays held on the remote, and no drag goes to
+    /// its output.
     fn drop(&mut self) {
         self.release();
+        let mut places = self.queue.shared.places.lock().unwrap();
+        places.remove(&self.queue.output);
     }
 }
 
@@ -820,6 +911,14 @@ mod tests {
 
     fn key(code: u32, pressed: bool) -> Event {
         Event::Key { code, pressed }
+    }
+
+    fn button(button: u32, pressed: bool) -> Event {
+        Event::Button { button, pressed }
+    }
+
+    fn motion(x: f64, y: f64) -> Event {
+        Event::Motion { x, y }
     }
 
     #[test]
@@ -1363,5 +1462,106 @@ mod tests {
         );
         second.keyboard_entered(&[KEY_LEFTSHIFT]);
         assert_eq!(sent_on(&queue), []);
+    }
+
+    /// Two work monitors side by side, right of a home one: 1920x1080 at x 1920, then
+    /// 2560x1440 at x 3840; their sizes already sent.
+    fn two_work_monitors() -> (Queue, Capture, Capture) {
+        let queue = Queue::default();
+        let mut first = Capture::new(queue.clone(), None);
+        let mut second = Capture::new(queue.on(1), None);
+        first.at(1920, 0);
+        first.area(1920, 1080);
+        second.at(3840, 0);
+        second.area(2560, 1440);
+        queue.shared.waiting.lock().unwrap().events.clear();
+        (queue, first, second)
+    }
+
+    #[test]
+    fn a_drag_started_on_one_reserved_monitor_reaches_the_next_one() {
+        let (queue, mut first, _second) = two_work_monitors();
+        first.enter(1800.0, 500.0);
+        first.button(BTN_LEFT, true);
+        // Home's compositor keeps the pointer on the first surface while the button is held,
+        // its positions past the surface's right edge.
+        first.motion(1919.0, 500.0);
+        first.motion(2020.0, 510.0);
+        assert_eq!(
+            queue.queued_on(),
+            [
+                (0, motion(1800.0, 500.0)),
+                (0, button(BTN_LEFT, true)),
+                (0, motion(1919.0, 500.0)),
+                (1, motion(100.0, 510.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_drag_comes_back_from_the_next_monitor_to_the_one_it_started_on() {
+        let (queue, _first, mut second) = two_work_monitors();
+        second.enter(10.0, 500.0);
+        second.button(BTN_LEFT, true);
+        second.motion(-50.0, 500.0);
+        assert_eq!(queue.queued_on().last(), Some(&(0, motion(1870.0, 500.0))));
+    }
+
+    #[test]
+    fn a_drag_stops_at_the_outer_edge_of_the_reserved_monitors() {
+        let (queue, mut first, mut second) = two_work_monitors();
+        // Onto the home monitor on the left: the first work monitor's left edge.
+        first.enter(10.0, 500.0);
+        first.button(BTN_LEFT, true);
+        first.motion(-300.0, 500.0);
+        assert_eq!(queue.queued_on().last(), Some(&(0, motion(0.0, 500.0))));
+        first.button(BTN_LEFT, false);
+        first.leave();
+        // Past the second's right edge, and below the first, which is shorter than the second.
+        second.enter(2500.0, 700.0);
+        second.button(BTN_LEFT, true);
+        second.motion(2900.0, 1600.0);
+        assert_eq!(queue.queued_on().last(), Some(&(1, motion(2560.0, 1440.0))));
+        second.motion(-100.0, 1100.0);
+        assert_eq!(queue.queued_on().last(), Some(&(0, motion(1820.0, 1080.0))));
+    }
+
+    #[test]
+    fn releasing_the_button_on_the_other_monitor_hands_the_pointer_to_its_surface() {
+        let (queue, mut first, mut second) = two_work_monitors();
+        first.enter(1800.0, 500.0);
+        first.button(BTN_LEFT, true);
+        first.motion(2020.0, 500.0);
+        // The release comes to the surface that had the press, then the compositor hands the
+        // pointer over.
+        first.button(BTN_LEFT, false);
+        assert_eq!(first.leave(), Focus::Give);
+        assert_eq!(second.enter(100.0, 500.0), Focus::Take);
+        second.motion(110.0, 500.0);
+        assert_eq!(
+            queue.queued_on(),
+            [
+                (0, motion(1800.0, 500.0)),
+                (0, button(BTN_LEFT, true)),
+                (1, motion(100.0, 500.0)),
+                (0, button(BTN_LEFT, false)),
+                (0, Event::ReleaseAll),
+                (1, motion(110.0, 500.0)),
+            ]
+        );
+        // No button held: its positions are its own again.
+        first.enter(5.0, 5.0);
+        first.motion(-20.0, 5.0);
+        assert_eq!(queue.queued_on().last(), Some(&(0, motion(-20.0, 5.0))));
+    }
+
+    #[test]
+    fn a_surface_gone_is_no_place_for_a_drag() {
+        let (queue, mut first, second) = two_work_monitors();
+        drop(second);
+        first.enter(1800.0, 500.0);
+        first.button(BTN_LEFT, true);
+        first.motion(2020.0, 500.0);
+        assert_eq!(queue.queued_on().last(), Some(&(0, motion(1920.0, 500.0))));
     }
 }
