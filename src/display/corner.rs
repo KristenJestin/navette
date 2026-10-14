@@ -9,6 +9,8 @@
 
 use std::io;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -43,8 +45,6 @@ use crate::corner::{Corner, Feed, Side, Update};
 
 /// `BTN_LEFT`: the button that clicks the mic button.
 pub(super) const BTN_LEFT: u32 = 0x110;
-/// How long the compositor has to place a home corner.
-const PLACE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The layer surface's namespace, for layer rules.
 pub const NAMESPACE: &str = "navette-corner";
 
@@ -187,53 +187,50 @@ pub(super) fn scale_of(info: &OutputInfo) -> f64 {
 /// The corner on one of home's own monitors, on its own thread. Dropping it removes it.
 pub struct HomeCorner {
     stop: Option<channel::Sender<()>>,
+    /// The compositor's socket: shut down at the drop, a thread still waiting on it ends.
+    socket: UnixStream,
+    /// Set at the drop: the thread's end is no failure then.
+    dropped: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl HomeCorner {
-    /// Puts the corner on `output` and waits until the compositor has placed it.
+    /// Puts the corner on `output`. It goes up on its own thread, never holding the mode's start:
+    /// a corner that cannot go up says why and leaves the mode as it is.
     pub fn open(output: &str, feed: Feed) -> io::Result<Self> {
-        Self::open_on(super::surface::compositor()?, output, feed, PLACE_TIMEOUT)
+        Self::open_on(super::surface::compositor()?, output, feed)
     }
 
-    fn open_on(socket: UnixStream, output: &str, feed: Feed, wait: Duration) -> io::Result<Self> {
+    fn open_on(socket: UnixStream, output: &str, feed: Feed) -> io::Result<Self> {
         let shutdown = socket.try_clone()?;
         let conn = Connection::from_socket(socket).map_err(wayland)?;
         let (stop, stopped) = channel::channel();
-        let (ready_tx, ready) = std::sync::mpsc::channel();
         let output = output.to_string();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let gone = dropped.clone();
         let thread = std::thread::Builder::new()
             .name("navette-corner".into())
             .spawn(move || {
-                if let Err(e) = run(conn, &output, feed, stopped, &ready_tx) {
-                    tracing::debug!("the corner on {output} ended: {e}");
-                    let _ = ready_tx.send(Err(e));
+                if let Err(e) = run(conn, &output, feed, stopped)
+                    && !gone.load(Ordering::Relaxed)
+                {
+                    eprintln!("navette: no corner on {output}: {e}");
                 }
             })?;
-        let corner = Self {
+        Ok(Self {
             stop: Some(stop),
+            socket: shutdown,
+            dropped,
             thread: Some(thread),
-        };
-        match ready.recv_timeout(wait) {
-            Ok(Ok(())) => Ok(corner),
-            Ok(Err(e)) => Err(e),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let _ = shutdown.shutdown(std::net::Shutdown::Both);
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "the compositor did not place the corner in time",
-                ))
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err(io::Error::other("the corner's thread ended"))
-            }
-        }
+        })
     }
 }
 
 impl Drop for HomeCorner {
     fn drop(&mut self) {
+        self.dropped.store(true, Ordering::Relaxed);
         self.stop = None;
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -249,7 +246,6 @@ fn run(
     output_name: &str,
     feed: Feed,
     stopped: channel::Channel<()>,
-    ready: &std::sync::mpsc::Sender<io::Result<()>>,
 ) -> io::Result<()> {
     let (globals, queue) = registry_queue_init::<State>(&conn).map_err(wayland)?;
     let qh = queue.handle();
@@ -330,12 +326,8 @@ fn run(
             }
         })
         .map_err(|e| wayland(e.error))?;
-    let mut told = false;
     while !state.exit {
         event_loop.dispatch(None, &mut state)?;
-        if state.configured && !std::mem::replace(&mut told, true) {
-            let _ = ready.send(Ok(()));
-        }
     }
     Ok(())
 }
@@ -544,5 +536,21 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
             } => state.feed.click(),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_home_corner_the_compositor_never_places_does_not_hold_the_start() {
+        let (ours, _silent) = UnixStream::pair().unwrap();
+        let begin = Instant::now();
+        let corner = HomeCorner::open_on(ours, "DP-2", Feed::new(Arc::default(), None));
+        assert!(corner.is_ok(), "it goes up on its own time");
+        assert!(begin.elapsed() < Duration::from_millis(500));
+        drop(corner);
+        assert!(begin.elapsed() < Duration::from_secs(1), "nor its stop");
     }
 }
