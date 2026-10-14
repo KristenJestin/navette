@@ -32,8 +32,15 @@ pub const MESSAGE: Duration = Duration::from_secs(2);
 pub const CHECK: Duration = Duration::from_millis(350);
 /// The most characters a tag holds.
 pub const LABEL_LONGEST: usize = 12;
-/// While the check moves, the corner is drawn again this often; otherwise only when it changes.
-pub const FRAME: Duration = Duration::from_millis(16);
+
+/// When a corner is drawn again with nothing new heard.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Next {
+    /// At the compositor's next frame, while the check moves: one step per refresh of the
+    /// monitor, never two in one.
+    Frame,
+    After(Duration),
+}
 
 /// What a corner hears.
 #[derive(Clone, Debug, PartialEq)]
@@ -424,16 +431,16 @@ impl Corner {
         (now.saturating_duration_since(*since) < MESSAGE).then_some(text.as_str())
     }
 
-    /// When the corner must be drawn again with nothing new heard: soon while the check moves,
-    /// when the message goes, or never.
-    pub fn next_draw(&self, now: Instant) -> Option<Duration> {
+    /// When the corner must be drawn again with nothing new heard: at the next frame while the
+    /// check moves, when the message goes, or never.
+    pub fn next_draw(&self, now: Instant) -> Option<Next> {
         let (_, to, since) = self.check;
         if since.is_some() && self.check_at(now) != to {
-            return Some(FRAME);
+            return Some(Next::Frame);
         }
         let (_, said) = self.message.as_ref()?;
         let left = MESSAGE.checked_sub(now.saturating_duration_since(*said))?;
-        (!left.is_zero()).then_some(left)
+        (!left.is_zero()).then_some(Next::After(left))
     }
 
     /// The home corner while the mic is on the remote: the button alone, dimmed.
@@ -958,7 +965,7 @@ mod tests {
         );
         pro.update(Update::Mic(Status::Remote), now);
         assert_eq!(pro.check_at(now), 0.0);
-        assert_eq!(pro.next_draw(now), Some(FRAME));
+        assert_eq!(pro.next_draw(now), Some(Next::Frame));
         let half = now + CHECK / 2;
         assert!((pro.check_at(half) - 0.5).abs() < 0.01);
         assert_eq!(pro.check_at(now + CHECK), 1.0);
@@ -971,12 +978,31 @@ mod tests {
     }
 
     #[test]
+    fn the_moving_check_is_drawn_again_at_the_compositor_s_next_frame_not_on_a_timer() {
+        let now = Instant::now();
+        let mut pro = corner(Side::Remote, Status::Home, now);
+        pro.update(Update::Mic(Status::Remote), now);
+        pro.update(Update::Say("Mic → remote".into()), now);
+        // A timer of its own drifts against the monitor's refresh: now and then two steps land
+        // in one refresh and one is never shown.
+        for step in 0..21 {
+            let at = now + CHECK * step / 21;
+            assert_eq!(pro.next_draw(at), Some(Next::Frame), "step {step}");
+        }
+        // The message alone still waits its time.
+        assert_eq!(
+            pro.next_draw(now + CHECK),
+            Some(Next::After(MESSAGE - CHECK))
+        );
+    }
+
+    #[test]
     fn a_message_shows_for_two_seconds() {
         let now = Instant::now();
         let mut pro = corner(Side::Remote, Status::Remote, now);
         pro.update(Update::Say("Keyboard → home".into()), now);
         assert_eq!(pro.line(now).as_deref(), Some("Keyboard → home"));
-        assert_eq!(pro.next_draw(now), Some(MESSAGE));
+        assert_eq!(pro.next_draw(now), Some(Next::After(MESSAGE)));
         assert_eq!(pro.line(now + MESSAGE), None);
         assert_eq!(pro.next_draw(now + MESSAGE), None);
     }

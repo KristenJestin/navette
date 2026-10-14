@@ -1,6 +1,6 @@
 //! The corner on screen (see [`crate::corner`]): drawn in shared memory, again only when it
-//! changes and while its check moves. Its input region is the mic button alone, so the pointer
-//! anywhere else goes where it would without it.
+//! changes and at each of the compositor's frames while its check moves. Its input region is the
+//! mic button alone, so the pointer anywhere else goes where it would without it.
 //!
 //! On a reserved monitor it is a subsurface of the remote's picture ([`super::surface`]); on each
 //! of home's own monitors, a small layer surface of its own, [`HomeCorner`]: on the overlay
@@ -33,7 +33,7 @@ use smithay_client_toolkit::{
     registry_handlers,
 };
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface};
+use wayland_client::protocol::{wl_callback, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface};
 use wayland_client::{Connection, Dispatch, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1::{self, WpCursorShapeDeviceV1},
@@ -41,7 +41,7 @@ use wayland_protocols::wp::cursor_shape::v1::client::{
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
-use crate::corner::{Corner, Feed, Side, Update};
+use crate::corner::{Corner, Feed, Next, Side, Update};
 
 /// `BTN_LEFT`: the button that clicks the mic button.
 pub(super) const BTN_LEFT: u32 = 0x110;
@@ -57,6 +57,8 @@ pub(super) struct Painter {
     shown: Option<Buffer>,
     /// The scale it was last drawn at.
     scale: Option<f64>,
+    /// A frame was asked of the compositor and has not come yet.
+    framing: bool,
 }
 
 impl Painter {
@@ -72,6 +74,7 @@ impl Painter {
             pool: None,
             shown: None,
             scale: None,
+            framing: false,
         }
     }
 
@@ -81,6 +84,27 @@ impl Painter {
 
     pub fn scale(&self) -> Option<f64> {
         self.scale
+    }
+
+    /// Asks the compositor for its next frame when `next` waits for it, unless asked already;
+    /// before the commit.
+    pub fn ask_frame<D>(&mut self, next: Option<Next>, qh: &QueueHandle<D>)
+    where
+        D: Dispatch<wl_callback::WlCallback, wl_surface::WlSurface> + 'static,
+    {
+        if next == Some(Next::Frame) && !self.framing {
+            self.surface.frame(qh, self.surface.clone());
+            self.framing = true;
+        }
+    }
+
+    /// A frame came for `surface`: true when it is the corner's, to be drawn again.
+    pub fn framed(&mut self, surface: &wl_surface::WlSurface) -> bool {
+        let ours = *surface == self.surface;
+        if ours {
+            self.framing = false;
+        }
+        ours
     }
 
     /// Draws the corner at `now` and attaches it, with the button as its input region; the
@@ -123,7 +147,7 @@ impl Painter {
     }
 }
 
-/// A state that shows a corner, drawn again by a timer while it moves.
+/// A state that shows a corner, drawn again at the compositor's frames while it moves.
 pub(super) trait Shows: Sized + 'static {
     fn timer(&mut self) -> &mut Option<RegistrationToken>;
     fn handle(&self) -> LoopHandle<'static, Self>;
@@ -131,13 +155,16 @@ pub(super) trait Shows: Sized + 'static {
     fn show_corner(&mut self);
 }
 
-/// Draws the corner again after `after`; with none, only when something changes.
-pub(super) fn draw_again<D: Shows>(state: &mut D, after: Option<Duration>) {
+/// Draws the corner again after the time `next` says; at a frame, the frame asked does it; with
+/// none, only when something changes.
+pub(super) fn draw_again<D: Shows>(state: &mut D, next: Option<Next>) {
     let handle = state.handle();
     if let Some(token) = state.timer().take() {
         handle.remove(token);
     }
-    let Some(after) = after else { return };
+    let Some(Next::After(after)) = next else {
+        return;
+    };
     let token = handle.insert_source(Timer::from_duration(after), |_, _, state: &mut D| {
         // Fired: nothing to remove when it is drawn again.
         *state.timer() = None;
@@ -277,6 +304,7 @@ fn run(
         scale: 1.0,
         size: None,
         handle: event_loop.handle(),
+        qh: qh.clone(),
         timer: None,
         pointer: None,
         shapes,
@@ -345,6 +373,7 @@ struct State {
     /// The size last asked of the compositor.
     size: Option<(u32, u32)>,
     handle: LoopHandle<'static, State>,
+    qh: QueueHandle<State>,
     timer: Option<RegistrationToken>,
     pointer: Option<wl_pointer::WlPointer>,
     shapes: Option<WpCursorShapeManagerV1>,
@@ -372,6 +401,8 @@ impl Shows for State {
         else {
             return;
         };
+        let next = self.painter.corner.next_draw(now);
+        self.painter.ask_frame(next, &self.qh);
         if let Some(layer) = &self.layer {
             if self.size != Some(size) {
                 layer.set_size(size.0, size.1);
@@ -379,7 +410,6 @@ impl Shows for State {
             }
             layer.commit();
         }
-        let next = self.painter.corner.next_draw(now);
         draw_again(self, next);
     }
 }
@@ -403,7 +433,17 @@ impl CompositorHandler for State {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        if self.painter.framed(surface) {
+            self.show_corner();
+        }
+    }
 
     fn surface_enter(
         &mut self,

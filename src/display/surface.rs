@@ -847,6 +847,32 @@ fn again(drawn: Option<f64>, scale: f64) -> bool {
     drawn.is_some_and(|drawn| drawn != scale)
 }
 
+/// The picture's surface and its corner, as the corner is committed.
+trait Commits {
+    fn corner(&mut self);
+    fn picture(&mut self);
+}
+
+/// Commits the corner just drawn, then the picture's surface with nothing new: Hyprland shows a
+/// desynchronized subsurface's commit only once its parent commits, so the corner would move only
+/// as often as pictures come, and not at all over a still one.
+fn commit_corner(surfaces: &mut dyn Commits) {
+    surfaces.corner();
+    surfaces.picture();
+}
+
+impl Commits for (&wl_surface::WlSurface, Option<&wl_surface::WlSurface>) {
+    fn corner(&mut self) {
+        self.0.commit();
+    }
+
+    fn picture(&mut self) {
+        if let Some(picture) = self.1 {
+            picture.commit();
+        }
+    }
+}
+
 /// The layer surface's hold on the keyboard; nothing before the surface is mapped.
 struct LayerGrab<'a> {
     layer: Option<&'a LayerSurface>,
@@ -1191,7 +1217,18 @@ impl CompositorHandler for State {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        let corner = self.corner.as_mut().and_then(|c| c.painter.as_mut());
+        if corner.is_some_and(|painter| painter.framed(surface)) {
+            self.show_corner();
+            return;
+        }
         self.waiting_frame = false;
         self.present();
     }
@@ -1276,6 +1313,7 @@ impl Shows for State {
 
     fn show_corner(&mut self) {
         let scale = self.scale();
+        let picture = self.surface().cloned();
         let Some(painter) = self.corner.as_mut().and_then(|c| c.painter.as_mut()) else {
             return;
         };
@@ -1286,8 +1324,9 @@ impl Shows for State {
         {
             return;
         }
-        painter.surface().commit();
         let next = painter.corner.next_draw(now);
+        painter.ask_frame(next, &self.qh);
+        commit_corner(&mut (painter.surface(), picture.as_ref()));
         draw_again(self, next);
     }
 }
@@ -2009,6 +2048,33 @@ mod tests {
         assert!(again(Some(drawn), scale(Some(2560.0), Some((1920, 1080)))));
         // Not drawn yet: it is drawn when it opens.
         assert!(!again(None, 1.5));
+    }
+
+    /// Hyprland as measured (0.56): a desynchronized subsurface's commit is shown only once its
+    /// parent commits.
+    #[derive(Default)]
+    struct Hyprland {
+        drawn: u32,
+        shown: u32,
+    }
+
+    impl Commits for Hyprland {
+        fn corner(&mut self) {
+            self.drawn += 1;
+        }
+
+        fn picture(&mut self) {
+            self.shown = self.drawn;
+        }
+    }
+
+    #[test]
+    fn the_corner_moves_over_a_still_picture() {
+        let mut hyprland = Hyprland::default();
+        for _ in 0..3 {
+            commit_corner(&mut hyprland);
+            assert_eq!(hyprland.shown, hyprland.drawn, "no picture came");
+        }
     }
 
     #[test]
