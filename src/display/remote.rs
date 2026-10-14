@@ -349,6 +349,20 @@ pub async fn serve_peer(
                 None => input_open = false,
             },
             Some(event) = events.recv() => {
+                // The pointer crossed onto another monitor: only the cursor follows it, and
+                // only while copies are there.
+                if event == hypr::Event::MonitorFocused {
+                    if active.is_some() {
+                        let hypr = hypr.clone();
+                        let followed =
+                            tokio::task::spawn_blocking(move || output::follow_cursor(&*hypr))
+                                .await;
+                        if let Ok(Err(e)) = followed {
+                            eprintln!("navette: could not hide or show the cursor: {e}");
+                        }
+                    }
+                    continue;
+                }
                 // A reload, or a script on the lid, may have turned the laptop's screen on;
                 // with no lid watched, a restore that failed may now go through.
                 match active.as_ref().and_then(|a| a.lid.as_ref()) {
@@ -1164,12 +1178,42 @@ mod tests {
         );
     }
 
+    /// Puts the pointer over the first output, as home's input or the laptop's trackpad does,
+    /// and waits for the agent to hide it.
+    async fn pointer_on_the_first_output(agent: &Agent) {
+        agent.hypr.move_cursor(2000, 100);
+        agent.events.send(hypr::Event::MonitorFocused).unwrap();
+        until(|| agent.hypr.cursor_invisible()).await;
+    }
+
     #[tokio::test]
-    async fn the_remote_cursor_is_hidden_while_the_mode_runs_and_back_when_it_stops() {
+    async fn the_remote_pointer_is_left_out_of_the_frames_sent_home() {
         let agent = agent();
         agent.inbox.try_send(start()).unwrap();
         until(|| agent.streams.count() == 1).await;
-        assert!(agent.hypr.cursor_invisible());
+        assert!(!agent.hypr.cursor_invisible());
+        // Hyprland draws it into the output's frames: hidden while it is over one.
+        pointer_on_the_first_output(&agent).await;
+    }
+
+    #[tokio::test]
+    async fn the_remote_pointer_stays_visible_on_its_own_screen_during_a_mode() {
+        let agent = agent();
+        agent.inbox.try_send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+        pointer_on_the_first_output(&agent).await;
+        // The laptop's trackpad takes it back to the laptop's screen.
+        agent.hypr.move_cursor(1900, 100);
+        agent.events.send(hypr::Event::MonitorFocused).unwrap();
+        until(|| !agent.hypr.cursor_invisible()).await;
+    }
+
+    #[tokio::test]
+    async fn stopping_the_mode_leaves_the_remote_pointer_as_it_was() {
+        let agent = agent();
+        agent.inbox.try_send(start()).unwrap();
+        until(|| agent.streams.count() == 1).await;
+        pointer_on_the_first_output(&agent).await;
         agent
             .inbox
             .try_send(Incoming::Display(Display::Stop))
@@ -1179,10 +1223,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_no_mode_the_pointer_is_left_alone() {
+        let agent = agent();
+        agent.hypr.move_cursor(2000, 100);
+        agent.events.send(hypr::Event::MonitorFocused).unwrap();
+        tokio::time::sleep(RETRY * 2).await;
+        assert_eq!(agent.hypr.changes(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
     async fn a_dropped_link_shows_the_remote_cursor_again() {
         let agent = agent();
         agent.inbox.try_send(start()).unwrap();
         until(|| agent.streams.count() == 1).await;
+        pointer_on_the_first_output(&agent).await;
         drop(agent.inbox);
         agent.task.await.unwrap();
         assert!(!agent.hypr.cursor_invisible());
@@ -1193,6 +1247,7 @@ mod tests {
         let agent = agent();
         agent.inbox.try_send(start()).unwrap();
         until(|| agent.streams.count() == 1).await;
+        pointer_on_the_first_output(&agent).await;
         agent.hypr.set_down(true, Vec::new());
         agent.streams.end_last();
         tokio::time::sleep(RETRY * 2).await;
@@ -1505,7 +1560,7 @@ mod tests {
         );
         assert!(agent.hypr.monitor(FIRST).is_none());
         assert!(agent.hypr.monitor(SECOND).is_none());
-        // The first output hid the laptop's cursor: shown again with the outputs gone.
+        // Shown with the outputs gone, wherever the pointer was.
         assert!(!agent.hypr.cursor_invisible());
         // The first stream went before its output.
         let dropped = agent.streams.dropped.lock().unwrap();
@@ -1966,6 +2021,7 @@ mod tests {
         let agent = agent();
         agent.inbox.try_send(start()).unwrap();
         until(|| agent.streams.count() == 1).await;
+        pointer_on_the_first_output(&agent).await;
         agent.hypr.reload();
         assert!(!agent.hypr.cursor_invisible());
         agent.events.send(hypr::Event::ConfigReloaded).unwrap();
