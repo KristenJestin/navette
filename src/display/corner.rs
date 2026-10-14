@@ -43,7 +43,7 @@ use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 use crate::corner::{Corner, Feed, Next, Side, Update};
 
-/// `BTN_LEFT`: the button that clicks the mic button.
+/// `BTN_LEFT`: the button that clicks the mic button, or the bar of the files crossing.
 pub(super) const BTN_LEFT: u32 = 0x110;
 /// The layer surface's namespace, for layer rules.
 pub const NAMESPACE: &str = "navette-corner";
@@ -131,12 +131,15 @@ impl Painter {
         buffer.attach_to(&self.surface).ok()?;
         self.viewport.set_destination(size.0 as i32, size.1 as i32);
         let region = Region::new(compositor).ok()?;
-        if let Some(button) = self.corner.button() {
+        for area in [self.corner.button(), self.corner.bar()]
+            .into_iter()
+            .flatten()
+        {
             region.add(
-                button.x as i32,
-                button.y as i32,
-                button.width.ceil() as i32,
-                button.height.ceil() as i32,
+                area.x as i32,
+                area.y as i32,
+                area.width.ceil() as i32,
+                area.height.ceil() as i32,
             );
         }
         self.surface.set_input_region(Some(region.wl_region()));
@@ -556,10 +559,16 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
     ) {
         use wl_pointer::Event;
         match event {
-            Event::Enter { serial, .. } => {
+            Event::Enter {
+                serial,
+                surface_x,
+                surface_y,
+                ..
+            } => {
                 if let Some(shape) = &state.shape {
                     shape.set_shape(serial, wp_cursor_shape_device_v1::Shape::Pointer);
                 }
+                state.painter.corner.point_at(surface_x, surface_y);
                 if state.painter.corner.hover(true) {
                     state.show_corner();
                 }
@@ -569,11 +578,16 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     state.show_corner();
                 }
             }
+            Event::Motion {
+                surface_x,
+                surface_y,
+                ..
+            } => state.painter.corner.point_at(surface_x, surface_y),
             Event::Button {
                 button: BTN_LEFT,
                 state: WEnum::Value(wl_pointer::ButtonState::Pressed),
                 ..
-            } => state.feed.click(),
+            } => state.feed.press(state.painter.corner.press()),
             _ => {}
         }
     }

@@ -252,7 +252,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 desk_record: Desk::<Eval>::default_record()?,
                 mic: mic.clone().map(|mic| mic as Arc<dyn mode::Mic>),
                 sound: sound.clone().map(|sound| sound as Arc<dyn mode::Sound>),
-                board,
+                board: board.clone(),
                 notifier: Arc::new(notify::NotifySend::new(notify::Command)),
             };
             let (peers, peers_rx) = mpsc::unbounded_channel();
@@ -261,7 +261,15 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             hypr::watch_events(hypr_events);
             let modes = tokio::spawn(mode::serve(home, peers_rx, orders_rx, hypr_events_rx));
             let control = tokio::spawn(mode::accept_orders(control, orders));
-            let shown = Shown::notifications(Arc::new(notify::NotifySend::new(notify::Command)));
+            // The files crossing show in the corners, which stop them.
+            let shown = Shown {
+                bar: {
+                    let board = board.clone();
+                    Arc::new(move |bar| board.files(bar))
+                },
+                notifier: Arc::new(notify::NotifySend::new(notify::Command)),
+                cancel: board.cancels(),
+            };
             // Each service takes its part of the link; the clipboard bridge, not `Send`, runs on
             // this thread, in a local set.
             let attach = move |mut wire: Wire| {

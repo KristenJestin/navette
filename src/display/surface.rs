@@ -770,11 +770,16 @@ fn point(
             false
         }
         Pointing::Enter {
-            over: Over::Corner, ..
+            over: Over::Corner,
+            x,
+            y,
         } => {
             hover.over = Some(Over::Corner);
             hover.leaving = false;
-            corner.is_some_and(|(c, _)| c.hover(true))
+            corner.is_some_and(|(c, _)| {
+                c.point_at(x, y);
+                c.hover(true)
+            })
         }
         Pointing::Leave { over } => {
             hover.over = None;
@@ -789,15 +794,16 @@ fn point(
             false
         }
         _ if hover.over == Some(Over::Corner) => {
-            if let (
-                Pointing::Button {
-                    button: BTN_LEFT,
-                    pressed: true,
-                },
-                Some((_, feed)),
-            ) = (event, corner)
-            {
-                feed.click();
+            match (event, corner) {
+                (Pointing::Motion { x, y }, Some((corner, _))) => corner.point_at(x, y),
+                (
+                    Pointing::Button {
+                        button: BTN_LEFT,
+                        pressed: true,
+                    },
+                    Some((corner, feed)),
+                ) => feed.press(corner.press()),
+                _ => {}
             }
             false
         }
@@ -1681,6 +1687,56 @@ mod tests {
         fn inhibit(&mut self) {}
         fn uninhibit(&mut self) {}
         fn commit(&mut self) {}
+    }
+
+    #[test]
+    fn a_click_on_the_files_bar_stops_them_and_is_not_sent_to_the_remote() {
+        let board = Arc::new(crate::corner::Board::default());
+        let (clicked, clicks) = std::sync::mpsc::channel();
+        let clicked = Mutex::new(clicked);
+        board.on_click(move || clicked.lock().unwrap().send(()).unwrap());
+        let cancels = board.cancels();
+        let feed = Feed::new(board, None, Default::default());
+        let mut corner = feed.corner(Side::Remote);
+        let files = crate::clipboard::progress::Bar { done: 1, total: 4 };
+        corner.update(
+            crate::corner::Update::Files(Some(files)),
+            std::time::Instant::now(),
+        );
+        let bar = corner.bar().unwrap();
+        let queue = input::Queue::default();
+        let mut capture = Capture::new(queue.clone(), None);
+        let mut hover = Hover::default();
+        let events = [
+            Pointing::Enter {
+                over: Over::Corner,
+                x: bar.x + 2.0,
+                y: 2.0,
+            },
+            Pointing::Motion {
+                x: bar.x + 20.0,
+                y: bar.y + 10.0,
+            },
+            Pointing::Button {
+                button: BTN_LEFT,
+                pressed: true,
+            },
+        ];
+        for event in events {
+            point(
+                &mut hover,
+                &mut capture,
+                &mut NoGrab,
+                Some((&mut corner, &feed)),
+                event,
+            );
+        }
+        assert!(cancels.has_changed().unwrap(), "the files are stopped");
+        assert!(
+            clicks.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the mic stays"
+        );
+        assert_eq!(queue.queued(), [], "nothing for the remote");
     }
 
     #[test]
