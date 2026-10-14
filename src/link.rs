@@ -111,8 +111,10 @@ impl Backoff {
 }
 
 impl Default for Backoff {
+    /// Capped at a few seconds: a refused dial to a LAN address costs nothing, and home may be
+    /// back at any moment, so the agent must not be found asleep for half a minute.
     fn default() -> Self {
-        Self::new(Duration::from_secs(1), Duration::from_secs(30))
+        Self::new(Duration::from_secs(1), Duration::from_secs(3))
     }
 }
 
@@ -640,6 +642,9 @@ fn paired_as(store: &Store, role: Role) -> io::Result<crate::store::Pairing> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use gliff_proto::{ClientMsg, ClipboardFile};
     use tokio::sync::mpsc;
 
@@ -1050,6 +1055,76 @@ pub(crate) mod tests {
         assert_eq!(delays, [1, 2, 4, 5, 5]);
         backoff.reset();
         assert_eq!(backoff.next_delay(), Duration::from_secs(1));
+    }
+
+    /// What "within seconds" means for a redial to a LAN address.
+    const A_FEW_SECONDS: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn the_backoff_never_exceeds_the_cap() {
+        let mut backoff = Backoff::default();
+        let cap = backoff.max;
+        assert!(cap <= A_FEW_SECONDS, "a LAN redial is cheap: {cap:?}");
+        for _ in 0..1000 {
+            assert!(backoff.next_delay() <= cap);
+        }
+    }
+
+    /// A dialer that refuses until `home_is_back`, then answers like home does.
+    struct Outage {
+        home_is_back: Arc<AtomicBool>,
+    }
+
+    impl Dial for Outage {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn dial(&self) -> io::Result<Self::Stream> {
+            if !self.home_is_back.load(Ordering::SeqCst) {
+                return Err(io::ErrorKind::ConnectionRefused.into());
+            }
+            let (agent_side, mut home_side) = tokio::io::duplex(1024);
+            tokio::spawn(async move {
+                let _ = hello(&mut home_side, Heartbeat::default()).await;
+                // Keeps the link up until the test ends.
+                std::future::pending::<()>().await;
+            });
+            Ok(agent_side)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_agent_redials_within_the_cap_after_a_long_outage() {
+        let home_is_back = Arc::new(AtomicBool::new(false));
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let backoff = Backoff::default();
+        let agent = tokio::spawn(agent(
+            Outage {
+                home_is_back: home_is_back.clone(),
+            },
+            Heartbeat::default(),
+            backoff,
+            events_tx,
+            nothing,
+        ));
+        // Ten minutes without home: far more failures than it takes to reach the cap.
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        while events.try_recv().is_ok() {}
+        // Home comes back right after a refused dial, the worst moment: the agent has just
+        // started its longest wait.
+        while !matches!(events.recv().await, Some(Event::Retrying(_))) {}
+        home_is_back.store(true, Ordering::SeqCst);
+        let back = tokio::time::Instant::now();
+        let waited = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Event::Connected = events.recv().await.expect("the agent is alive") {
+                    return back.elapsed();
+                }
+            }
+        })
+        .await
+        .expect("the agent dials home again");
+        agent.abort();
+        assert!(waited <= A_FEW_SECONDS, "dialled again after {waited:?}");
     }
 
     #[tokio::test]

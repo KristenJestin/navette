@@ -43,6 +43,8 @@ xkbcommon = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
+# Paused time, so a long outage is tested without sleeping through it.
+tokio = { version = "1.53", features = ["test-util"] }
 
 # The tests encode and decode real pictures on the CPU: unoptimised, OpenH264 and the colour
 # conversion are too slow for a picture to be refined at the pace the session keeps.
