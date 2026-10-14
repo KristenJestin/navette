@@ -25,6 +25,7 @@ use navette::link::{self, Backoff, Event, Heartbeat, Wire};
 use navette::mic::{self, Mic, NoSound, Routing};
 use navette::mode::{self, Home};
 use navette::pair::{self, Pin, Timeouts};
+use navette::single::{self, AgentLock};
 use navette::store::Store;
 use navette::transport::bind_lan;
 use tokio::sync::mpsc;
@@ -267,6 +268,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             Ok(())
         }
         Command::Agent => {
+            // Before anything is dialed: a second agent would drop the first one's link.
+            let _one_agent = AgentLock::take(&single::agent_lock_path()?)?;
             let dialer = link::remote_dialer(&store)?;
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));

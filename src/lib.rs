@@ -14,6 +14,7 @@ pub mod link;
 pub mod mic;
 pub mod mode;
 pub mod pair;
+pub mod single;
 pub mod store;
 pub mod transport;
 pub mod wire;
