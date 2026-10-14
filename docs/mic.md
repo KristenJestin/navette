@@ -62,6 +62,20 @@ the next reload. A bind of the user's on the same keys still fires as well: pick
 Hyprland refuses do not stop the mode: it runs without the hotkey, `navette serve` says why, and
 the bar and `navette mic` still switch the mic.
 
+## Saying where it went
+
+At each switch, `navette serve` shows a short notification through the desktop's notification
+service (it runs `notify-send`, from libnotify 0.8 or later): `Mic → remote` or `Mic → home`.
+That covers the hotkey, the bar, `navette mic` and a mode starting or stopping. A mode that
+stops with the mic already home moves nothing, and says nothing. A mic that cannot go where it
+should shows `Mic failed` with why, and a switch that does not happen (no mode running, the
+mic failed, PipeWire refusing) shows `Mic not switched` with why, since a hotkey has no
+terminal to print it to.
+
+Each notification replaces the previous one of the mic, so they do not pile up. Without a
+notification service, or without `notify-send`, the mic switches all the same, and `navette
+serve` says once that nothing will be shown.
+
 ## Showing it in a bar
 
 `navette mic watch` prints where the mic goes, then a line at each change, until it is
@@ -114,7 +128,8 @@ never is.
 3. Start a call on the laptop, with the home speakers playing it: speak, and the other side
    hears you, without its own voice coming back (ask them).
 4. Press `SUPER + CTRL + M` with the pointer over the work monitor: `navette mic status` says
-   `home`, and the call hears silence. Press it again over a home monitor: they hear you again.
+   `home`, the call hears silence, and a notification says `Mic → home`. Press it again over a
+   home monitor: they hear you again, and the same notification, replaced, says `Mic → remote`.
    Do the same with the bar item, mid-call.
 5. Meanwhile, at home, `wpctl status` shows *Mic away (Navette)* as the default source while
    the mic is remote, and the home mic again while it is home; a home app recording from the
