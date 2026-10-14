@@ -1,5 +1,5 @@
 //! Home's decode: on the GPU (VA-API and gliff-vk's recombine, the picture handed over as a
-//! dmabuf with no copy), or on the CPU (gliff-sw) when the GPU cannot. Runs on its own
+//! dmabuf with no copy, in a layout the compositor takes), or on the CPU (gliff-sw) when the GPU cannot. Runs on its own
 //! thread, acks every frame so the remote keeps pacing, and measures what it does.
 //!
 //! Adapted from gliff's client decode path, `crates/gliff/src/net.rs` (gliff, MIT, see
@@ -19,6 +19,9 @@ use gliff_vk::{Decoder, DisplayFrame, Gpu};
 
 use super::Ended;
 use super::wire::{Msg, Outbox};
+
+/// `DRM_FORMAT_MOD_LINEAR`.
+const LINEAR: u64 = 0;
 
 /// The CPU decoder holds the newest picture of a High-profile stream until the next access
 /// unit; after this long without one it is drained, so a still screen shows its last state.
@@ -94,16 +97,17 @@ pub struct Decoding {
 }
 
 impl Decoding {
-    /// `dmabuf`: the surface takes the GPU's pictures as dmabufs; otherwise they are read back.
-    /// `ended` hears why decoding cannot go on.
+    /// `modifiers`: the layouts in which the surface takes the GPU's pictures as dmabufs; with
+    /// none, they are read back. `ended` hears why decoding cannot go on.
     pub fn start(
         gpu: Option<Arc<Gpu>>,
-        dmabuf: bool,
+        modifiers: Vec<u64>,
         outbox: Outbox,
         show: Box<dyn FnMut(Picture) + Send>,
         ended: Ended,
     ) -> std::io::Result<Self> {
-        Self::start_with(Box::new(Real { gpu, dmabuf }), outbox, show, ended)
+        let handover = Handover::of(&modifiers);
+        Self::start_with(Box::new(Real { gpu, handover }), outbox, show, ended)
     }
 
     fn start_with(
@@ -210,10 +214,58 @@ trait Decoders: Send {
     fn cpu(&mut self, dual: bool) -> Result<Box<dyn Decode>, String>;
 }
 
+/// How the GPU's pictures reach the surface.
+#[derive(Debug, PartialEq)]
+enum Handover {
+    /// As linear dmabufs, when the compositor takes them: the layout every GPU writes.
+    Linear,
+    /// As dmabufs in one of the compositor's tiled layouts (Hyprland on NVIDIA lists only those).
+    Tiled(Vec<u64>),
+    /// Read back and copied to the surface.
+    Copy,
+}
+
+impl Handover {
+    /// From the layouts in which the compositor takes the decoder's dmabufs.
+    fn of(modifiers: &[u64]) -> Self {
+        if modifiers.contains(&LINEAR) {
+            Self::Linear
+        } else if modifiers.is_empty() {
+            Self::Copy
+        } else {
+            Self::Tiled(modifiers.to_vec())
+        }
+    }
+
+    /// The decoder for this handover, and whether its pictures are dmabufs: `tiled` makes one
+    /// for the tiled layouts, `plain` one with linear pictures. When the GPU can write none of
+    /// the tiled layouts, the pictures are copied.
+    fn decoder<D>(
+        &self,
+        tiled: impl FnOnce(&[u64]) -> Result<D, String>,
+        plain: impl FnOnce() -> Result<D, String>,
+    ) -> Result<(D, bool), String> {
+        match self {
+            Self::Linear => plain().map(|d| (d, true)),
+            Self::Copy => plain().map(|d| (d, false)),
+            Self::Tiled(modifiers) => match tiled(modifiers) {
+                Ok(d) => Ok((d, true)),
+                Err(e) => {
+                    eprintln!(
+                        "navette: the GPU cannot write the compositor's tiled layouts ({e}); \
+                         the pictures are copied"
+                    );
+                    plain().map(|d| (d, false))
+                }
+            },
+        }
+    }
+}
+
 /// The decoders of gliff-vk and gliff-sw.
 struct Real {
     gpu: Option<Arc<Gpu>>,
-    dmabuf: bool,
+    handover: Handover,
 }
 
 impl Decoders for Real {
@@ -227,17 +279,23 @@ impl Decoders for Real {
             self.gpu = open_gpu();
         }
         let gpu = self.gpu.as_ref()?;
-        Some(
-            Decoder::new(gpu, dual, size.0, size.1)
-                .map(|decoder| {
-                    Box::new(GpuDecoder {
-                        decoder,
-                        dmabuf: self.dmabuf,
-                        size,
-                    }) as Box<dyn Decode>
-                })
-                .map_err(|e| e.to_string()),
-        )
+        let (width, height) = size;
+        let made = self.handover.decoder(
+            |modifiers| {
+                Decoder::with_modifiers(gpu, dual, width, height, modifiers)
+                    .map_err(|e| e.to_string())
+            },
+            || Decoder::new(gpu, dual, width, height).map_err(|e| e.to_string()),
+        );
+        Some(made.map(|(decoder, dmabuf)| {
+            let tiled = dmabuf && matches!(self.handover, Handover::Tiled(_));
+            Box::new(GpuDecoder {
+                decoder,
+                dmabuf,
+                tiled,
+                size,
+            }) as Box<dyn Decode>
+        }))
     }
 
     fn cpu(&mut self, dual: bool) -> Result<Box<dyn Decode>, String> {
@@ -251,6 +309,8 @@ struct GpuDecoder {
     decoder: Decoder,
     /// The surface takes the pictures as dmabufs; otherwise they are read back.
     dmabuf: bool,
+    /// The dmabufs are in one of the compositor's tiled layouts.
+    tiled: bool,
     size: (u32, u32),
 }
 
@@ -260,10 +320,10 @@ impl Decode for GpuDecoder {
     }
 
     fn handover(&self) -> &'static str {
-        if self.dmabuf {
-            "shown as a dmabuf"
-        } else {
-            "copied to the surface"
+        match (self.dmabuf, self.tiled) {
+            (true, true) => "shown as a tiled dmabuf",
+            (true, false) => "shown as a linear dmabuf",
+            (false, _) => "copied to the surface",
         }
     }
 
@@ -625,7 +685,7 @@ mod tests {
             let shown = shown.clone();
             Decoding::start(
                 None,
-                false,
+                Vec::new(),
                 outbox.clone(),
                 Box::new(move |p| {
                     if let Picture::Bgra(f) = p {
@@ -825,7 +885,7 @@ mod tests {
             let shown = shown.clone();
             Decoding::start(
                 None,
-                false,
+                Vec::new(),
                 outbox.clone(),
                 // The surface is stuck until the test lets it go.
                 Box::new(move |_| {
@@ -985,6 +1045,47 @@ mod tests {
         let line = stats.line(Some("CPU")).unwrap();
         assert!(line.contains("on the CPU"), "{line}");
         assert!(line.contains("2 decoders lost"), "{line}");
+    }
+
+    const BLOCK_LINEAR: u64 = 0x0300_0000_0060_6015;
+
+    #[test]
+    fn a_compositor_that_takes_linear_dmabufs_keeps_the_linear_pictures() {
+        assert_eq!(Handover::of(&[BLOCK_LINEAR, LINEAR]), Handover::Linear);
+        let made = Handover::Linear.decoder(|_| Ok("tiled"), || Ok("linear"));
+        assert_eq!(made, Ok(("linear", true)));
+    }
+
+    #[test]
+    fn a_compositor_with_only_tiled_dmabufs_gets_tiled_pictures_with_no_copy() {
+        let handover = Handover::of(&[BLOCK_LINEAR]);
+        assert_eq!(handover, Handover::Tiled(vec![BLOCK_LINEAR]));
+        let asked = Mutex::new(Vec::new());
+        let made = handover.decoder(
+            |modifiers| {
+                asked.lock().unwrap().extend_from_slice(modifiers);
+                Ok("tiled")
+            },
+            || Ok("linear"),
+        );
+        assert_eq!(made, Ok(("tiled", true)));
+        assert_eq!(*asked.lock().unwrap(), [BLOCK_LINEAR]);
+    }
+
+    #[test]
+    fn a_gpu_that_cannot_write_the_compositor_s_tiled_layouts_falls_back_to_the_copy() {
+        let made = Handover::of(&[BLOCK_LINEAR]).decoder(
+            |_| Err::<&str, _>("no usable modifier".into()),
+            || Ok("linear"),
+        );
+        assert_eq!(made, Ok(("linear", false)));
+    }
+
+    #[test]
+    fn a_compositor_that_takes_no_dmabuf_from_the_decoder_s_gpu_gets_a_copy() {
+        assert_eq!(Handover::of(&[]), Handover::Copy);
+        let made = Handover::Copy.decoder(|_| Ok("tiled"), || Ok("linear"));
+        assert_eq!(made, Ok(("linear", false)));
     }
 
     #[test]

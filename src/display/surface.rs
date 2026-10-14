@@ -1,9 +1,10 @@
 //! Home's surface on the reserved monitor (the kind chosen in #2): a layer-shell surface on the
 //! overlay layer, bound to that output, anchored on every edge, above the bar. A GPU picture is
-//! a dmabuf handed to the compositor as is (linux-dmabuf), with no copy; a CPU picture goes
-//! through shared memory, as does a GPU picture when the compositor does not take the decoder's
-//! linear dmabufs (Hyprland on an NVIDIA GPU lists only tiled ones), or when the decoder's GPU
-//! is not the compositor's. The newest picture wins: one is shown per frame callback, and an
+//! a dmabuf handed to the compositor as is (linux-dmabuf), with no copy: linear when the
+//! compositor takes linear XRGB8888, else in one of the tiled layouts it lists (Hyprland on an
+//! NVIDIA GPU lists only tiled ones). A CPU picture goes through shared memory, as does a GPU
+//! picture when the decoder can write none of those layouts, or when the decoder's GPU is not
+//! the compositor's. The newest picture wins: one is shown per frame callback, and an
 //! older one still waiting is dropped, which gives its image back to the decoder.
 //!
 //! Focus follows the pointer (#7): the surface takes the keyboard (`on_demand`) and a shortcuts
@@ -79,11 +80,20 @@ use crate::input::{self, Capture, Grab, Hotkey, Seat};
 const PLACE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const XRGB8888: u32 = drm_fourcc::DrmFourcc::Xrgb8888 as u32;
-const LINEAR: u64 = 0;
+/// `DRM_FORMAT_MOD_INVALID`: a buffer whose layout the driver keeps to itself, which an
+/// exported image never has.
+const INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
-/// Whether the compositor's formats, as (fourcc, modifier), hold the decoder's linear XRGB8888.
-fn takes_linear_xrgb(formats: impl IntoIterator<Item = (u32, u64)>) -> bool {
-    formats.into_iter().any(|f| f == (XRGB8888, LINEAR))
+/// The layouts in which the compositor's formats, as (fourcc, modifier), take the decoder's
+/// XRGB8888, each once.
+fn xrgb_modifiers(formats: impl IntoIterator<Item = (u32, u64)>) -> Vec<u64> {
+    let mut modifiers = Vec::new();
+    for (format, modifier) in formats {
+        if format == XRGB8888 && modifier != INVALID && !modifiers.contains(&modifier) {
+            modifiers.push(modifier);
+        }
+    }
+    modifiers
 }
 
 /// The layer surface's namespace, for layer rules.
@@ -179,8 +189,8 @@ fn shown(pointer: Pointer) -> Pointer {
 
 /// The surface, on its own thread. Dropping it removes the surface.
 pub struct Surface {
-    /// The compositor takes the decoder's linear XRGB8888 dmabuf.
-    linear_dmabuf: bool,
+    /// The layouts in which the compositor takes the decoder's XRGB8888 dmabufs.
+    modifiers: Vec<u64>,
     pictures: Option<channel::Sender<Show>>,
     pointer: Newest<Pointer>,
     thread: Option<JoinHandle<()>>,
@@ -234,15 +244,15 @@ impl Surface {
                 let _ = ended.send(why);
             })?;
         let mut surface = Self {
-            linear_dmabuf: false,
+            modifiers: Vec::new(),
             pictures: Some(pictures),
             pointer,
             thread: Some(thread),
         };
         match ready.recv_timeout(wait) {
-            Ok(Ok((size, linear_dmabuf))) => {
-                tracing::debug!(?size, linear_dmabuf, "surface placed");
-                surface.linear_dmabuf = linear_dmabuf;
+            Ok(Ok((size, modifiers))) => {
+                tracing::debug!(?size, ?modifiers, "surface placed");
+                surface.modifiers = modifiers;
                 Ok(surface)
             }
             Ok(Err(e)) => Err(e),
@@ -263,9 +273,10 @@ impl Surface {
         }
     }
 
-    /// Whether a GPU picture can be handed over as is; otherwise it is read back first.
-    pub fn takes_linear_dmabuf(&self) -> bool {
-        self.linear_dmabuf
+    /// The layouts in which a GPU picture can be handed over as is; with none, it is read back
+    /// first.
+    pub fn dmabuf_modifiers(&self) -> Vec<u64> {
+        self.modifiers.clone()
     }
 
     /// Where the decoder sends its pictures.
@@ -316,8 +327,9 @@ fn compositor() -> io::Result<UnixStream> {
     }
 }
 
-/// The surface's size once placed, and whether the compositor takes linear dmabufs.
-type Ready = io::Result<((u32, u32), bool)>;
+/// The surface's size once placed, and the layouts in which the compositor takes the decoder's
+/// dmabufs.
+type Ready = io::Result<((u32, u32), Vec<u64>)>;
 
 fn wayland(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("wayland: {e}"))
@@ -362,7 +374,7 @@ fn run(
         transform: wl_output::Transform::Normal,
         size: None,
         ready: Some(ready.clone()),
-        linear_dmabuf: None,
+        modifiers: None,
         render_node: hypr_capture::render_node(None),
         pending: None,
         waiting_frame: false,
@@ -402,7 +414,7 @@ fn run(
     event_loop.dispatch(Some(Duration::from_millis(100)), &mut state)?;
     // Version 4's feedback comes once complete: no guess before its `done`.
     for _ in 0..10 {
-        if state.linear_dmabuf.is_some() || state.dmabuf.version().is_none_or(|v| v < 4) {
+        if state.modifiers.is_some() || state.dmabuf.version().is_none_or(|v| v < 4) {
             break;
         }
         conn.roundtrip().map_err(wayland)?;
@@ -410,15 +422,15 @@ fn run(
     }
 
     // Before version 4, the formats came as a list, with no main device.
-    if state.linear_dmabuf.is_none() {
-        let linear = takes_linear_xrgb(
+    if state.modifiers.is_none() {
+        let modifiers = xrgb_modifiers(
             state
                 .dmabuf
                 .modifiers()
                 .iter()
                 .map(|f| (f.format, f.modifier)),
         );
-        state.linear_dmabuf = Some(linear);
+        state.modifiers = Some(modifiers);
     }
 
     let output = state
@@ -505,8 +517,8 @@ struct State {
     /// The surface's size in logical pixels, once configured.
     size: Option<(u32, u32)>,
     ready: Option<std::sync::mpsc::Sender<Ready>>,
-    /// From the compositor's dmabuf feedback (version 4 and up).
-    linear_dmabuf: Option<bool>,
+    /// The XRGB8888 layouts the compositor takes from the decoder's GPU, once known.
+    modifiers: Option<Vec<u64>>,
     /// The decoder's GPU, compared with the compositor's main device.
     render_node: PathBuf,
     pending: Option<Picture>,
@@ -852,7 +864,8 @@ impl LayerShellHandler for State {
                 self.shown_shm = Some(buffer);
             }
             if let Some(ready) = self.ready.take() {
-                let _ = ready.send(Ok((size, self.linear_dmabuf.unwrap_or(false))));
+                let modifiers = self.modifiers.clone().unwrap_or_default();
+                let _ = ready.send(Ok((size, modifiers)));
             }
         }
     }
@@ -871,14 +884,18 @@ impl DmabufHandler for State {
         feedback: DmabufFeedback,
     ) {
         let table = feedback.format_table();
-        let linear = takes_linear_xrgb(feedback.tranches().iter().flat_map(|tranche| {
+        let modifiers = xrgb_modifiers(feedback.tranches().iter().flat_map(|tranche| {
             tranche
                 .formats
                 .iter()
                 .filter_map(|&i| table.get(i as usize))
                 .map(|f| (f.format, f.modifier))
         }));
-        self.linear_dmabuf = Some(linear && same_gpu(feedback.main_device(), &self.render_node));
+        self.modifiers = Some(if same_gpu(feedback.main_device(), &self.render_node) {
+            modifiers
+        } else {
+            Vec::new()
+        });
     }
 
     fn created(
@@ -1184,19 +1201,27 @@ mod tests {
         assert_eq!(char_device((256 << 12) | (226 << 8) | 44), "226:300");
     }
 
+    const ARGB8888: u32 = drm_fourcc::DrmFourcc::Argb8888 as u32;
+
     #[test]
-    fn a_compositor_with_only_tiled_dmabufs_gets_a_copy() {
-        assert!(!takes_linear_xrgb([
+    fn a_compositor_with_only_tiled_dmabufs_is_offered_its_tiled_layouts() {
+        let modifiers = xrgb_modifiers([
             (XRGB8888, BLOCK_LINEAR),
-            (XRGB8888, 0x00ff_ffff_ffff_ffff)
-        ]));
+            (ARGB8888, 0x0300_0000_0060_6014),
+            (XRGB8888, INVALID),
+            (XRGB8888, BLOCK_LINEAR),
+        ]);
+        assert_eq!(modifiers, [BLOCK_LINEAR]);
     }
 
     #[test]
     fn a_compositor_that_takes_linear_xrgb_gets_the_dmabuf() {
-        assert!(takes_linear_xrgb([
-            (XRGB8888, BLOCK_LINEAR),
-            (XRGB8888, LINEAR)
-        ]));
+        let modifiers = xrgb_modifiers([(XRGB8888, BLOCK_LINEAR), (XRGB8888, 0)]);
+        assert_eq!(modifiers, [BLOCK_LINEAR, 0]);
+    }
+
+    #[test]
+    fn a_compositor_without_xrgb_dmabufs_gets_a_copy() {
+        assert!(xrgb_modifiers([(ARGB8888, 0), (XRGB8888, INVALID)]).is_empty());
     }
 }

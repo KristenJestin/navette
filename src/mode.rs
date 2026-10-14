@@ -220,8 +220,8 @@ pub trait Screen: Send {
     fn pictures(&self) -> Box<dyn FnMut(Picture) + Send>;
     /// The remote pointer: its image, shown at home's pointer over the cover.
     fn cursor(&self, pointer: Pointer);
-    /// The GPU's pictures can be handed over as dmabufs, with no copy.
-    fn takes_dmabuf(&self) -> bool;
+    /// The layouts in which the GPU's pictures can be handed over as dmabufs, with no copy.
+    fn dmabuf_modifiers(&self) -> Vec<u64>;
 }
 
 /// The real cover: a layer surface on the monitor.
@@ -250,8 +250,8 @@ impl Screen for crate::display::surface::Surface {
         crate::display::surface::Surface::cursor(self, pointer)
     }
 
-    fn takes_dmabuf(&self) -> bool {
-        self.takes_linear_dmabuf()
+    fn dmabuf_modifiers(&self) -> Vec<u64> {
+        crate::display::surface::Surface::dmabuf_modifiers(self)
     }
 }
 
@@ -634,7 +634,7 @@ async fn start(home: &Home, peer: Option<&Peer>, active: &mut Option<Active>) ->
             )?;
             let decoding = Decoding::start(
                 gpu,
-                screen.takes_dmabuf(),
+                screen.dmabuf_modifiers(),
                 outbox.on(output),
                 screen.pictures(),
                 ended_tx.clone(),
@@ -1014,8 +1014,8 @@ mod tests {
             Box::new(|_| {})
         }
 
-        fn takes_dmabuf(&self) -> bool {
-            false
+        fn dmabuf_modifiers(&self) -> Vec<u64> {
+            Vec::new()
         }
 
         fn cursor(&self, pointer: Pointer) {
