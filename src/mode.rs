@@ -11,7 +11,8 @@
 //! and made again after a config reload. A home window that lands on a given monitor all the
 //! same (moved, dragged, opened on an explicit workspace) is sent back to a home monitor as
 //! Hyprland reports it (#31). The remote's sound plays at home, and the home mic goes to the
-//! remote machine, for as long as the mode runs.
+//! remote machine, for as long as the mode runs. Every home monitor shows its corner meanwhile
+//! (#69), and a notification says when the mode is up and when it stops.
 //!
 //! `navette serve` owns the link and the surface, so the two commands reach it over a Unix
 //! socket in `$XDG_RUNTIME_DIR/navette`, private to the user.
@@ -28,12 +29,14 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
+use crate::corner::{Board, Feed};
 use crate::desk::{Change, Desk, DeskError};
 use crate::display::decode::{self, Decoding, Picture, Video};
 use crate::display::wire::{Display, Incoming, MAX_OUTPUTS, Msg, OutputCopy, Peer, Pointer};
-use crate::display::{Ended, Released};
+use crate::display::{Ended, Keyboard, Released};
 use crate::hypr::{self, Eval, Hypr, lua_string};
 use crate::input::{self, Hotkey};
+use crate::notify::Notifier;
 
 mod config;
 
@@ -101,14 +104,18 @@ impl Drop for SoundPlayed {
 pub trait Screens: Send + Sync {
     /// Covers `monitor`; the guard takes the cover away when dropped. Home's input over it goes
     /// to `input`, until `hotkey`, which `released` then hears. `ended` hears it if the cover
-    /// goes away on its own.
+    /// goes away on its own. The cover shows the corner `feed` tells.
     fn open(
         &self,
         monitor: &str,
         input: input::Queue,
         hotkey: (Option<Hotkey>, Released),
         ended: Ended,
+        feed: Feed,
     ) -> io::Result<Box<dyn Screen>>;
+
+    /// Shows the corner on `monitor`, one of home's own, until the guard is dropped.
+    fn corner(&self, monitor: &str, feed: Feed) -> io::Result<Box<dyn Send>>;
 }
 
 pub trait Screen: Send {
@@ -131,9 +138,16 @@ impl Screens for LiveScreens {
         input: input::Queue,
         hotkey: (Option<Hotkey>, Released),
         ended: Ended,
+        feed: Feed,
     ) -> io::Result<Box<dyn Screen>> {
         Ok(Box::new(crate::display::surface::Surface::open(
-            monitor, input, hotkey, ended,
+            monitor, input, hotkey, ended, feed,
+        )?))
+    }
+
+    fn corner(&self, monitor: &str, feed: Feed) -> io::Result<Box<dyn Send>> {
+        Ok(Box::new(crate::display::corner::HomeCorner::open(
+            monitor, feed,
         )?))
     }
 }
@@ -177,6 +191,10 @@ pub struct Home {
     pub mic: Option<Arc<dyn Mic>>,
     /// The remote's sound, with `navette serve --audio`.
     pub sound: Option<Arc<dyn Sound>>,
+    /// What the corners show: where the mic is, and short messages.
+    pub board: Arc<Board>,
+    /// Says, once each, that a mode started and stopped.
+    pub notifier: Arc<dyn Notifier>,
 }
 
 /// Home's GPU, kept from one mode to the next until a decoder lost it. A lost device fails
@@ -234,15 +252,28 @@ struct Active {
     home_monitor: Option<String>,
     seen: Arc<Mutex<Seen>>,
     shown: Vec<Shown>,
+    /// The corners on home's own monitors.
+    _corners: Vec<Box<dyn Send>>,
     desk: Arc<Mutex<Desk<Eval>>>,
     /// Why a surface or a decoder cannot go on.
     ended: UnboundedReceiver<String>,
-    /// Each time the release hotkey gave the keyboard back.
-    released: UnboundedReceiver<()>,
+    /// Each time the release hotkey gave the keyboard back, and a surface took it again.
+    released: UnboundedReceiver<Keyboard>,
     /// The `navette mode start` waiting for the remote's answer.
     starting: Option<(oneshot::Sender<io::Result<String>>, tokio::time::Instant)>,
     /// `closed_lid = on` was asked of the remote.
     closed_lid: bool,
+    /// Says the mode stopped, once it said it started: last, once the rest is gone.
+    told: Option<Told>,
+}
+
+/// The notification that a mode stopped, shown when the mode goes, however it ends.
+struct Told(Arc<dyn Notifier>, String);
+
+impl Drop for Told {
+    fn drop(&mut self) {
+        self.0.show(&self.1, "");
+    }
 }
 
 /// One monitor's cover and the decoder of its output's stream.
@@ -364,6 +395,9 @@ pub async fn serve(
                         && let Some((reply, _)) = a.starting.take()
                     {
                         let verb = if a.monitors.len() > 1 { "show" } else { "shows" };
+                        let shown = format!("{} {verb} the remote machine", a.label());
+                        home.notifier.show(&shown, "");
+                        a.told = Some(Told(home.notifier.clone(), a.given_back()));
                         let mut text = format!(
                             "{} {verb} the remote machine's {}",
                             a.label(),
@@ -479,7 +513,9 @@ pub async fn serve(
                 }
             }
             Some(said) = said(&mut active) => match said {
-                Said::Released => {
+                Said::Keyboard(Keyboard::Remote) => home.board.say("Keyboard → remote"),
+                Said::Keyboard(Keyboard::Home) => {
+                    home.board.say("Keyboard → home");
                     if let Some(a) = &active {
                         let (hypr, given) = (home.hypr.clone(), a.monitors.clone());
                         let focus = move || hypr::focus_last_window(&*hypr, &given);
@@ -523,8 +559,8 @@ pub async fn serve(
 
 /// What the running mode's surface and decoder say.
 enum Said {
-    /// The release hotkey gave the keyboard back.
-    Released,
+    /// The keyboard went home by the release hotkey, or came back to the remote.
+    Keyboard(Keyboard),
     /// Why they gave up.
     Ended(String),
 }
@@ -536,7 +572,7 @@ async fn said(active: &mut Option<Active>) -> Option<Said> {
     };
     tokio::select! {
         Some(why) = a.ended.recv() => Some(Said::Ended(why)),
-        Some(()) = a.released.recv() => Some(Said::Released),
+        Some(keyboard) = a.released.recv() => Some(Said::Keyboard(keyboard)),
         else => None,
     }
 }
@@ -678,6 +714,14 @@ async fn launch(
         .min_by_key(|m| (m.x, m.y))
         .map(|m| m.name.clone());
     let desk = open_desk(home, &names, home_monitor.clone(), &mode.mic_hotkey).await?;
+    // The hotkey is shown over the mic button; with no mic, there is no button.
+    let hint = home.mic.as_ref().map(|_| mode.mic_hotkey.clone());
+    let feed = Feed::new(home.board.clone(), hint);
+    let home_monitors: Vec<String> = monitors
+        .iter()
+        .filter(|m| !names.contains(&m.name) && !m.disabled)
+        .map(|m| m.name.clone())
+        .collect();
     // Off the executor, and so is the undo when one fails: the desk drops with the closure.
     let (ended_tx, ended) = tokio::sync::mpsc::unbounded_channel();
     let (released_tx, released) = tokio::sync::mpsc::unbounded_channel();
@@ -690,7 +734,7 @@ async fn launch(
         home.sound.clone(),
     );
     let covered = names.clone();
-    let (shown, desk, mic, sound, gpu) = blocking(move || {
+    let (shown, corners, desk, mic, sound, gpu) = blocking(move || {
         let lost = gpu.lost();
         let gpu = gpu.current(decode::open_gpu);
         let gpus = decoding_gpus(gpu.clone(), &covered, decode::open_gpu)?;
@@ -702,6 +746,7 @@ async fn launch(
                 input.on(output),
                 (hotkey, released_tx.clone()),
                 ended_tx.clone(),
+                feed.clone(),
             )?;
             let decoding = Decoding::start(
                 gpu,
@@ -712,6 +757,17 @@ async fn launch(
             )?;
             shown.push(Shown { decoding, screen });
         }
+        // A corner that cannot go up leaves the mode as it is: it only shows what it is.
+        let corners = home_monitors
+            .iter()
+            .filter_map(|name| match screens.corner(name, feed.clone()) {
+                Ok(corner) => Some(corner),
+                Err(e) => {
+                    eprintln!("navette: no corner on {name}: {e}");
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         // Last, as nothing after them can fail: a mode without its sound or its mic is still
         // a mode. The mic is kept when it failed, so that the stop clears what it says.
         let sound = sound.map(|sound| {
@@ -728,7 +784,7 @@ async fn launch(
             }
             MicSent(mic)
         });
-        Ok((shown, desk, mic, sound, gpu))
+        Ok((shown, corners, desk, mic, sound, gpu))
     })
     .await?;
     let caps = decode::caps(&gpu, (3840, 2160));
@@ -754,11 +810,13 @@ async fn launch(
         home_monitor,
         seen,
         shown,
+        _corners: corners,
         desk: Arc::new(Mutex::new(desk)),
         ended,
         released,
         starting: None,
         closed_lid,
+        told: None,
     });
     // What was already under the monitors comes out from under the covers.
     send_home(home, sending).await;
@@ -1058,8 +1116,10 @@ mod tests {
 
     use super::config::CONFIG_FILE;
     use super::*;
+    use crate::corner::{Side, Update};
     use crate::display::wire::{Cursor, Outbox};
     use crate::hypr::fake::{FakeHypr, FakeMonitor, FakeWindow};
+    use crate::mic::Status;
 
     /// What a test makes happen as a screen opens.
     type OnOpen = Option<Box<dyn Fn() + Send>>;
@@ -1082,12 +1142,63 @@ mod tests {
         on_open: Arc<Mutex<OnOpen>>,
         /// The monitors whose cover cannot go up.
         refuse: Arc<Mutex<Vec<String>>>,
+        /// The corners showing right now, by monitor and side, and what each heard.
+        corners: Corners,
+        /// What each corner was handed, by monitor.
+        feeds: Arc<Mutex<Vec<(String, Feed)>>>,
+    }
+
+    /// The corners showing, by monitor and side, and what each heard.
+    #[derive(Clone, Default)]
+    struct Corners {
+        shown: Arc<Mutex<Vec<(String, Side)>>>,
+        heard: Arc<Mutex<Vec<(String, Update)>>>,
+    }
+
+    /// A corner, drawn nowhere: it records what it hears until dropped.
+    struct FakeCorner {
+        monitor: String,
+        corners: Corners,
+        open: Arc<AtomicBool>,
+    }
+
+    impl FakeCorner {
+        fn open(monitor: &str, side: Side, feed: &Feed, corners: &Corners) -> Self {
+            corners
+                .shown
+                .lock()
+                .unwrap()
+                .push((monitor.to_string(), side));
+            let open = Arc::new(AtomicBool::new(true));
+            let (still, heard, name) = (open.clone(), corners.heard.clone(), monitor.to_string());
+            feed.listen(move |update| {
+                let open = still.load(Ordering::Relaxed);
+                if open {
+                    heard.lock().unwrap().push((name.clone(), update.clone()));
+                }
+                open
+            });
+            Self {
+                monitor: monitor.to_string(),
+                corners: corners.clone(),
+                open,
+            }
+        }
+    }
+
+    impl Drop for FakeCorner {
+        fn drop(&mut self) {
+            self.open.store(false, Ordering::Relaxed);
+            let mut shown = self.corners.shown.lock().unwrap();
+            shown.retain(|(m, _)| *m != self.monitor);
+        }
     }
 
     struct FakeScreen {
         monitor: String,
         covered: Arc<Mutex<Vec<String>>>,
         cursors: Arc<Mutex<Vec<(String, Pointer)>>>,
+        _corner: FakeCorner,
     }
 
     impl Screens for FakeScreens {
@@ -1097,6 +1208,7 @@ mod tests {
             input: input::Queue,
             (hotkey, released): (Option<Hotkey>, Released),
             ended: Ended,
+            feed: Feed,
         ) -> io::Result<Box<dyn Screen>> {
             if self.refuse.lock().unwrap().iter().any(|m| m == monitor) {
                 return Err(io::Error::other("no layer shell"));
@@ -1112,11 +1224,20 @@ mod tests {
             if let Some(hook) = &*self.on_open.lock().unwrap() {
                 hook();
             }
+            let corner = FakeCorner::open(monitor, Side::Remote, &feed, &self.corners);
+            self.feeds.lock().unwrap().push((monitor.to_string(), feed));
             Ok(Box::new(FakeScreen {
                 monitor: monitor.to_string(),
                 covered: self.covered.clone(),
                 cursors: self.cursors.clone(),
+                _corner: corner,
             }))
+        }
+
+        fn corner(&self, monitor: &str, feed: Feed) -> io::Result<Box<dyn Send>> {
+            let corner = FakeCorner::open(monitor, Side::Home, &feed, &self.corners);
+            self.feeds.lock().unwrap().push((monitor.to_string(), feed));
+            Ok(Box::new(corner))
         }
     }
 
@@ -1202,6 +1323,10 @@ mod tests {
         releases: Arc<Mutex<Vec<Released>>>,
         on_open: Arc<Mutex<OnOpen>>,
         refuse: Arc<Mutex<Vec<String>>>,
+        corners: Corners,
+        feeds: Arc<Mutex<Vec<(String, Feed)>>>,
+        board: Arc<Board>,
+        notices: Arc<crate::notify::Fake>,
         peers: UnboundedSender<Peer>,
         orders: UnboundedSender<Order>,
         events: UnboundedSender<hypr::Event>,
@@ -1238,6 +1363,10 @@ mod tests {
         let refuse = screens.refuse.clone();
         let cursors = screens.cursors.clone();
         let inputs = screens.inputs.clone();
+        let corners = screens.corners.clone();
+        let feeds = screens.feeds.clone();
+        let board = Arc::new(Board::default());
+        let notices = Arc::new(crate::notify::Fake::default());
         let (peers, peers_rx) = mpsc::unbounded_channel();
         let (orders, orders_rx) = mpsc::unbounded_channel();
         let (events, events_rx) = mpsc::unbounded_channel();
@@ -1249,6 +1378,8 @@ mod tests {
             desk_record: config.path().join("desk"),
             mic: Some(mic.clone()),
             sound: Some(sound.clone()),
+            board: board.clone(),
+            notifier: notices.clone(),
         };
         tokio::spawn(serve(home, peers_rx, orders_rx, events_rx));
         Desk {
@@ -1264,6 +1395,10 @@ mod tests {
             refuse,
             cursors,
             inputs,
+            corners,
+            feeds,
+            board,
+            notices,
             peers,
             orders,
             events,
@@ -1404,9 +1539,149 @@ mod tests {
         let _remote = started(&desk).await;
         assert_eq!(desk.hypr.focused(), []);
         let released = desk.releases.lock().unwrap()[0].clone();
-        released.send(()).unwrap();
+        released.send(Keyboard::Home).unwrap();
         // Focused with the pointer left where it is, over the covered monitor.
         until(|| desk.hypr.focused() == [("0xb2".to_string(), false)]).await;
+    }
+
+    /// The corners showing, by monitor and side, in home's order.
+    fn corners(desk: &Desk) -> Vec<(String, Side)> {
+        let mut shown = desk.corners.shown.lock().unwrap().clone();
+        shown.sort_by(|a, b| a.0.cmp(&b.0));
+        shown
+    }
+
+    fn corner(monitor: &str, side: Side) -> (String, Side) {
+        (monitor.to_string(), side)
+    }
+
+    /// What the corners heard, by monitor.
+    fn heard(desk: &Desk) -> Vec<(String, Update)> {
+        desk.corners.heard.lock().unwrap().clone()
+    }
+
+    fn said(monitor: &str, text: &str) -> (String, Update) {
+        (monitor.to_string(), Update::Say(text.to_string()))
+    }
+
+    #[tokio::test]
+    async fn each_reserved_monitor_shows_its_corner_while_the_mode_runs() {
+        let monitors = vec![
+            FakeMonitor::new("DP-1", 1920, 1080, 0),
+            FakeMonitor::new("DP-2", 2560, 1440, 1920),
+            FakeMonitor::new("DP-3", 1920, 1080, 4480),
+        ];
+        let desk = desk_on("monitor = DP-2, DP-3\n", monitors, FakeMic::default());
+        desk.board.mic(Status::Remote);
+        let (_remote, text) = started_with(&desk, &["NAVETTE-1", "NAVETTE-2"]).await;
+        text.unwrap();
+        assert_eq!(
+            corners(&desk),
+            [
+                corner("DP-1", Side::Home),
+                corner("DP-2", Side::Remote),
+                corner("DP-3", Side::Remote)
+            ]
+        );
+        // Each one shows where the mic is from the start.
+        for monitor in ["DP-1", "DP-2", "DP-3"] {
+            let mic = (monitor.to_string(), Update::Mic(Status::Remote));
+            assert!(heard(&desk).contains(&mic), "{monitor}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_mode_shows_no_corner() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        assert_eq!(corners(&desk), []);
+        drop(remote);
+        let _remote = started(&desk).await;
+        assert_eq!(
+            corners(&desk),
+            [corner("DP-1", Side::Home), corner("DP-2", Side::Remote)]
+        );
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(corners(&desk), []);
+        let before = heard(&desk).len();
+        desk.board.say("Mic → home");
+        assert_eq!(heard(&desk).len(), before, "nobody hears the board");
+    }
+
+    #[tokio::test]
+    async fn the_release_hotkey_says_keyboard_home_in_the_corner() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        let released = desk.releases.lock().unwrap()[0].clone();
+        released.send(Keyboard::Home).unwrap();
+        until(|| {
+            let heard = heard(&desk);
+            heard.contains(&said("DP-1", "Keyboard → home"))
+                && heard.contains(&said("DP-2", "Keyboard → home"))
+        })
+        .await;
+        released.send(Keyboard::Remote).unwrap();
+        until(|| heard(&desk).contains(&said("DP-2", "Keyboard → remote"))).await;
+        // In the corners only: the desktop's notifications said the start alone.
+        assert_eq!(desk.notices.summaries(), ["DP-2 shows the remote machine"]);
+    }
+
+    #[tokio::test]
+    async fn starting_and_stopping_a_mode_notifies_each_machine_once() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        assert_eq!(desk.notices.summaries(), ["DP-2 shows the remote machine"]);
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(
+            desk.notices.summaries(),
+            ["DP-2 shows the remote machine", "DP-2 is back home"]
+        );
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(desk.notices.summaries().len(), 2, "said once");
+    }
+
+    #[tokio::test]
+    async fn a_mode_the_remote_never_started_notifies_nothing() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        remote
+            .to_home
+            .try_send(Incoming::Display(Display::Failed {
+                reason: "no headless backend".into(),
+                generation: None,
+            }))
+            .unwrap();
+        answer(pending).await.unwrap_err();
+        assert_eq!(desk.notices.shown(), []);
+    }
+
+    #[tokio::test]
+    async fn the_corner_never_reaches_the_frames_sent_or_the_input_forwarded() {
+        let desk = desk("DP-2");
+        let clicks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = clicks.clone();
+        desk.board.on_click(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+        });
+        let remote = started(&desk).await;
+        let queued = remote.outbox.queued().len();
+        // Everything a corner shows and does.
+        desk.board.mic(Status::Remote);
+        desk.board.say("Mic → remote");
+        let feeds = desk.feeds.lock().unwrap().clone();
+        for (_, feed) in &feeds {
+            feed.click();
+        }
+        until(|| clicks.load(Ordering::Relaxed) == feeds.len()).await;
+        assert_eq!(
+            remote.outbox.queued().len(),
+            queued,
+            "nothing for the remote"
+        );
+        let inputs = desk.inputs.lock().unwrap();
+        assert!(inputs.iter().all(|(_, queue)| queue.queued().is_empty()));
     }
 
     #[tokio::test]
@@ -1418,7 +1693,7 @@ mod tests {
         });
         let _remote = started(&desk).await;
         let released = desk.releases.lock().unwrap()[0].clone();
-        released.send(()).unwrap();
+        released.send(Keyboard::Home).unwrap();
         // The mode goes on, and a stop still answers once the release was handled.
         answer(ask(&desk, false).await).await.unwrap();
         assert_eq!(desk.hypr.focused(), []);
@@ -1866,6 +2141,8 @@ mod tests {
             desk_record: desk._config.path().join("desk"),
             mic: None,
             sound: None,
+            board: Arc::default(),
+            notifier: Arc::new(crate::notify::Fake::default()),
         };
         open_desk(
             &crashed,

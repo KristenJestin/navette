@@ -23,6 +23,10 @@
 //! as gliff's client does (gliff, MIT, see `LICENSES/gliff-MIT.txt`); before the first one, or
 //! for one with nothing to show, the pointer is the default arrow. While
 //! [`super::REMOTE_CURSOR`] is off, it is always the default arrow.
+//!
+//! The corner (#69) is a subsurface at the top left, under the remote's bar: drawn at home over
+//! the picture, never part of it. Its input region is the mic button: the pointer over it is
+//! over the corner, not the picture, and what it does there stays home.
 
 use std::collections::HashMap;
 use std::io;
@@ -37,8 +41,8 @@ use std::time::Duration;
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
-use smithay_client_toolkit::reexports::calloop::EventLoop;
 use smithay_client_toolkit::reexports::calloop::channel::{self, Channel, Event as ChannelEvent};
+use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::shell::WaylandSurface;
@@ -48,14 +52,15 @@ use smithay_client_toolkit::shell::wlr_layer::{
 };
 use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
+use smithay_client_toolkit::subcompositor::SubcompositorState;
 use smithay_client_toolkit::{
     delegate_compositor, delegate_dmabuf, delegate_layer, delegate_output, delegate_registry,
-    delegate_shm, registry_handlers,
+    delegate_shm, delegate_subcompositor, registry_handlers,
 };
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{
-    wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
+    wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_subsurface, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols::wp::cursor_shape::v1::client::{
@@ -72,9 +77,11 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 use super::REMOTE_CURSOR;
+use super::corner::{BTN_LEFT, Painter, Shows, draw_again, listen};
 use super::decode::Picture;
 use super::wire::{Cursor, MAX_CURSOR, Pointer};
 use super::{Ended, Released};
+use crate::corner::{Corner, Feed, REMOTE_BAR, Side};
 use crate::input::{self, Capture, Grab, Hotkey, Seat};
 
 /// How long the compositor has to place the surface.
@@ -247,15 +254,17 @@ pub struct Surface {
 impl Surface {
     /// Puts the surface on `output` and waits until the compositor has placed it. Home's input
     /// over it goes to `input`; `hotkey` gives the keyboard back. `ended` hears it if the
-    /// surface goes away on its own: the monitor unplugged, the compositor gone.
+    /// surface goes away on its own: the monitor unplugged, the compositor gone. Its corner
+    /// shows what `feed` tells.
     pub fn open(
         output: &str,
         input: input::Queue,
         (hotkey, released): (Option<Hotkey>, Released),
         ended: Ended,
+        feed: Feed,
     ) -> io::Result<Self> {
         let capture = (input, hotkey, Some(released));
-        Self::open_on(compositor()?, output, capture, PLACE_TIMEOUT, ended)
+        Self::open_on(compositor()?, output, capture, PLACE_TIMEOUT, (ended, feed))
     }
 
     fn open_on(
@@ -263,7 +272,7 @@ impl Surface {
         output: &str,
         (input, hotkey, released): (input::Queue, Option<Hotkey>, Option<Released>),
         wait: Duration,
-        ended: Ended,
+        (ended, feed): (Ended, Feed),
     ) -> io::Result<Self> {
         let shutdown = socket.try_clone()?;
         let conn = Connection::from_socket(socket).map_err(wayland)?;
@@ -289,7 +298,7 @@ impl Surface {
                     conn,
                     &output,
                     (channel, newest),
-                    (capture, imports),
+                    (capture, imports, feed),
                     &ready_tx,
                 ) {
                     Ok(None) => return,
@@ -373,7 +382,7 @@ impl Drop for Surface {
 
 /// The compositor's socket: `WAYLAND_DISPLAY`, else the running Hyprland's, as after a
 /// restart of Hyprland the inherited name may be gone.
-fn compositor() -> io::Result<UnixStream> {
+pub(super) fn compositor() -> io::Result<UnixStream> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is not set"))?;
@@ -405,7 +414,7 @@ fn run(
     conn: Connection,
     output_name: &str,
     (pictures, pointer): (Channel<Show>, Newest<Pointer>),
-    (capture, imports): (Capture, Imports),
+    (capture, imports, feed): (Capture, Imports, Feed),
     ready: &std::sync::mpsc::Sender<Ready>,
 ) -> io::Result<Option<String>> {
     let (globals, queue) = registry_queue_init::<State>(&conn).map_err(wayland)?;
@@ -422,6 +431,11 @@ fn run(
         .map_err(|_| io::Error::other("the compositor has no seat"))?;
     let inhibit: Option<ZwpKeyboardShortcutsInhibitManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
     let shapes: Option<WpCursorShapeManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+    // No corner without subsurfaces: the picture is shown all the same.
+    let subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh)
+        .map_err(|e| tracing::warn!("no corner over the remote's picture: {e}"))
+        .ok();
+    let mut event_loop: EventLoop<'static, State> = EventLoop::try_new()?;
     if inhibit.is_none() {
         eprintln!(
             "navette: the compositor cannot inhibit its shortcuts: they stay home over the \
@@ -465,13 +479,23 @@ fn run(
         cursor_hidden: false,
         entered: None,
         physical_width: None,
+        corner: subcompositor.map(|sub| CornerSlot {
+            subcompositor: sub,
+            feed,
+            painter: None,
+            subsurface: None,
+            timer: None,
+        }),
+        over: None,
+        handle: event_loop.handle(),
+        viewporter: viewporter.clone(),
+        compositor,
     };
     state.cursor_viewport = Some(viewporter.get_viewport(&state.cursor_surface, &qh, ()));
 
     if state.dmabuf.version().is_some_and(|v| v >= 4) {
         let _ = state.dmabuf.get_default_feedback(&qh);
     }
-    let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
     WaylandSource::new(conn.clone(), queue)
         .insert(event_loop.handle())
         .map_err(|e| wayland(e.error))?;
@@ -529,7 +553,7 @@ fn run(
         state.capture.at(x, y);
     }
 
-    let surface = compositor.create_surface(&qh);
+    let surface = state.compositor.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(
         &qh,
         surface.clone(),
@@ -548,7 +572,7 @@ fn run(
 
     event_loop
         .handle()
-        .insert_source(pictures, |event, _, state| match event {
+        .insert_source(pictures, move |event, _, state| match event {
             ChannelEvent::Msg(Show::Picture(picture)) => {
                 // An older picture still waiting is dropped here.
                 state.pending = Some(picture);
@@ -622,6 +646,127 @@ struct State {
     entered: Option<u32>,
     /// The monitor's width in pixels, turned as laid out.
     physical_width: Option<f64>,
+    /// None when the compositor has no subsurfaces.
+    corner: Option<CornerSlot>,
+    /// What the pointer is over, while it is over the surface or its corner.
+    over: Option<Over>,
+    handle: LoopHandle<'static, State>,
+    viewporter: wp_viewporter::WpViewporter,
+    compositor: CompositorState,
+}
+
+/// The corner over the picture: a subsurface, made once the surface is placed.
+struct CornerSlot {
+    subcompositor: SubcompositorState,
+    feed: Feed,
+    painter: Option<Painter>,
+    subsurface: Option<wl_subsurface::WlSubsurface>,
+    timer: Option<RegistrationToken>,
+}
+
+/// What the pointer is over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Over {
+    Picture,
+    /// The corner's mic button, its input region.
+    Corner,
+}
+
+/// A pointer event, as far as where it goes matters.
+#[derive(Clone, Copy, Debug)]
+enum Pointing {
+    Enter {
+        over: Over,
+        x: f64,
+        y: f64,
+    },
+    Leave {
+        over: Over,
+    },
+    Motion {
+        x: f64,
+        y: f64,
+    },
+    Button {
+        button: u32,
+        pressed: bool,
+    },
+    Axis {
+        axis: gliff_proto::Axis,
+        value: f64,
+        discrete: Option<i32>,
+        stop: bool,
+    },
+}
+
+/// Hands a pointer event to what the pointer is over: the picture's to the capture, which sends
+/// them to the remote; the corner's to the corner, which keeps them home, a press of the left
+/// button switching the mic. True when the corner must be drawn again.
+fn point(
+    over: &mut Option<Over>,
+    capture: &mut Capture,
+    grab: &mut dyn Grab,
+    corner: Option<(&mut Corner, &Feed)>,
+    event: Pointing,
+) -> bool {
+    match event {
+        Pointing::Enter {
+            over: Over::Picture,
+            x,
+            y,
+        } => {
+            *over = Some(Over::Picture);
+            input::handle(capture, grab, Seat::PointerEnter { x, y });
+            false
+        }
+        Pointing::Leave {
+            over: Over::Picture,
+        } => {
+            *over = None;
+            input::handle(capture, grab, Seat::PointerLeave);
+            false
+        }
+        Pointing::Enter {
+            over: Over::Corner, ..
+        } => {
+            *over = Some(Over::Corner);
+            corner.is_some_and(|(c, _)| c.hover(true))
+        }
+        Pointing::Leave { over: Over::Corner } => {
+            *over = None;
+            corner.is_some_and(|(c, _)| c.hover(false))
+        }
+        _ if *over == Some(Over::Corner) => {
+            if let (
+                Pointing::Button {
+                    button: BTN_LEFT,
+                    pressed: true,
+                },
+                Some((_, feed)),
+            ) = (event, corner)
+            {
+                feed.click();
+            }
+            false
+        }
+        Pointing::Motion { x, y } => {
+            capture.motion(x, y);
+            false
+        }
+        Pointing::Button { button, pressed } => {
+            capture.button(button, pressed);
+            false
+        }
+        Pointing::Axis {
+            axis,
+            value,
+            discrete,
+            stop,
+        } => {
+            capture.axis(axis, value, discrete, stop);
+            false
+        }
+    }
 }
 
 /// The layer surface's hold on the keyboard; nothing before the surface is mapped.
@@ -686,6 +831,63 @@ impl State {
 
     fn ours(&self, surface: &wl_surface::WlSurface) -> bool {
         self.surface() == Some(surface)
+    }
+
+    /// What `surface` is of this client's: the picture, its corner, or neither.
+    fn over(&self, surface: &wl_surface::WlSurface) -> Option<Over> {
+        if self.ours(surface) {
+            return Some(Over::Picture);
+        }
+        let corner = self.corner.as_ref()?.painter.as_ref()?;
+        (corner.surface() == surface).then_some(Over::Corner)
+    }
+
+    /// A pointer event goes where the pointer is.
+    fn point(&mut self, event: Pointing) {
+        let mut grab = LayerGrab {
+            layer: self.layer.as_ref(),
+            inhibit: self.inhibit.as_ref(),
+            inhibitor: &mut self.inhibitor,
+            seat: &self.seat,
+            qh: &self.qh,
+        };
+        let corner = self.corner.as_mut().and_then(|slot| {
+            let painter = slot.painter.as_mut()?;
+            Some((&mut painter.corner, &slot.feed))
+        });
+        if point(&mut self.over, &mut self.capture, &mut grab, corner, event) {
+            self.show_corner();
+        }
+    }
+
+    /// Puts the corner over the picture, under the remote's bar, once the surface is placed.
+    fn open_corner(&mut self) {
+        let parent = match self.surface() {
+            Some(surface) => surface.clone(),
+            None => return,
+        };
+        let Some(slot) = &mut self.corner else { return };
+        let (subsurface, surface) = slot.subcompositor.create_subsurface(parent, &self.qh);
+        subsurface.set_position(0, REMOTE_BAR);
+        // Drawn when it changes, whatever the pictures do.
+        subsurface.set_desync();
+        let viewport = self.viewporter.get_viewport(&surface, &self.qh, ());
+        slot.painter = Some(Painter::new(
+            slot.feed.corner(Side::Remote),
+            surface,
+            viewport,
+        ));
+        slot.subsurface = Some(subsurface);
+        let feed = slot.feed.clone();
+        let heard = listen(&feed, &self.handle, |state: &mut State, update| {
+            if let Some(painter) = state.corner.as_mut().and_then(|c| c.painter.as_mut()) {
+                painter.corner.update(update, std::time::Instant::now());
+            }
+            state.show_corner();
+        });
+        if let Err(e) = heard {
+            tracing::warn!("the corner hears nothing: {e}");
+        }
     }
 
     /// The monitor's scale: its pixels per logical pixel.
@@ -934,6 +1136,8 @@ impl LayerShellHandler for State {
         }
         self.size = Some(size);
         if first {
+            // Before the surface's commit below, which places it.
+            self.open_corner();
             // Black until the first picture, so the monitor shows at once that it is taken.
             if let Some(buffer) = self.shm_buffer(1, 1, |canvas| canvas.fill(0))
                 && let Some(surface) = self.surface().cloned()
@@ -953,6 +1157,36 @@ impl LayerShellHandler for State {
                 let _ = ready.send(Ok((size, modifiers)));
             }
         }
+    }
+}
+
+impl Shows for State {
+    fn timer(&mut self) -> &mut Option<RegistrationToken> {
+        match &mut self.corner {
+            Some(slot) => &mut slot.timer,
+            None => unreachable!("a corner's timer runs only with a corner"),
+        }
+    }
+
+    fn handle(&self) -> LoopHandle<'static, Self> {
+        self.handle.clone()
+    }
+
+    fn show_corner(&mut self) {
+        let scale = self.scale();
+        let Some(painter) = self.corner.as_mut().and_then(|c| c.painter.as_mut()) else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if painter
+            .paint(now, scale, &self.shm, &self.compositor)
+            .is_none()
+        {
+            return;
+        }
+        painter.surface().commit();
+        let next = painter.corner.next_draw(now);
+        draw_again(self, next);
     }
 }
 
@@ -1058,6 +1292,7 @@ impl ProvidesRegistryState for State {
 }
 
 delegate_compositor!(State);
+delegate_subcompositor!(State);
 delegate_output!(State);
 delegate_shm!(State);
 delegate_dmabuf!(State);
@@ -1114,30 +1349,54 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 surface,
                 surface_x,
                 surface_y,
-            } if state.ours(&surface) => {
-                state.entered = Some(serial);
-                state.set_cursor();
-                state.seat(Seat::PointerEnter {
-                    x: surface_x,
-                    y: surface_y,
-                });
-            }
-            Event::Leave { surface, .. } if state.ours(&surface) => {
-                state.entered = None;
-                state.seat(Seat::PointerLeave);
-            }
+            } => match state.over(&surface) {
+                Some(Over::Picture) => {
+                    state.entered = Some(serial);
+                    state.set_cursor();
+                    state.point(Pointing::Enter {
+                        over: Over::Picture,
+                        x: surface_x,
+                        y: surface_y,
+                    });
+                }
+                Some(Over::Corner) => {
+                    if let Some(shape) = &state.shape {
+                        shape.set_shape(serial, wp_cursor_shape_device_v1::Shape::Pointer);
+                    }
+                    state.point(Pointing::Enter {
+                        over: Over::Corner,
+                        x: surface_x,
+                        y: surface_y,
+                    });
+                }
+                None => {}
+            },
+            Event::Leave { surface, .. } => match state.over(&surface) {
+                Some(Over::Picture) => {
+                    state.entered = None;
+                    state.point(Pointing::Leave {
+                        over: Over::Picture,
+                    });
+                }
+                Some(over) => state.point(Pointing::Leave { over }),
+                None => {}
+            },
             Event::Motion {
                 surface_x,
                 surface_y,
                 ..
-            } => state.capture.motion(surface_x, surface_y),
+            } => state.point(Pointing::Motion {
+                x: surface_x,
+                y: surface_y,
+            }),
             Event::Button {
                 button,
                 state: WEnum::Value(pressed),
                 ..
-            } => state
-                .capture
-                .button(button, pressed == wl_pointer::ButtonState::Pressed),
+            } => state.point(Pointing::Button {
+                button,
+                pressed: pressed == wl_pointer::ButtonState::Pressed,
+            }),
             Event::AxisDiscrete { discrete, .. } => state.discrete = Some(discrete),
             Event::Axis {
                 axis: WEnum::Value(axis),
@@ -1145,12 +1404,22 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 ..
             } => {
                 let discrete = state.discrete.take();
-                state.capture.axis(axis_of(axis), value, discrete, false);
+                state.point(Pointing::Axis {
+                    axis: axis_of(axis),
+                    value,
+                    discrete,
+                    stop: false,
+                });
             }
             Event::AxisStop {
                 axis: WEnum::Value(axis),
                 ..
-            } => state.capture.axis(axis_of(axis), 0.0, None, true),
+            } => state.point(Pointing::Axis {
+                axis: axis_of(axis),
+                value: 0.0,
+                discrete: None,
+                stop: true,
+            }),
             _ => {}
         }
     }
@@ -1237,6 +1506,114 @@ mod tests {
 
     const BLOCK_LINEAR: u64 = 0x0300_0000_0060_6015;
 
+    fn feed() -> Feed {
+        Feed::new(Arc::default(), None)
+    }
+
+    /// A hold on the keyboard that holds nothing.
+    struct NoGrab;
+
+    impl Grab for NoGrab {
+        fn interactive(&mut self, _: bool) {}
+        fn inhibit(&mut self) {}
+        fn uninhibit(&mut self) {}
+        fn commit(&mut self) {}
+    }
+
+    #[test]
+    fn a_click_on_the_mic_button_switches_the_mic_and_is_not_sent_to_the_remote() {
+        let board = Arc::new(crate::corner::Board::default());
+        let (clicked, clicks) = std::sync::mpsc::channel();
+        let clicked = Mutex::new(clicked);
+        board.on_click(move || clicked.lock().unwrap().send(()).unwrap());
+        let feed = Feed::new(board, Some("SUPER + CTRL + M".into()));
+        let mut corner = feed.corner(Side::Remote);
+        let queue = input::Queue::default();
+        let mut capture = Capture::new(queue.clone(), None);
+        let mut over = None;
+        let events = [
+            Pointing::Enter {
+                over: Over::Corner,
+                x: 70.0,
+                y: 20.0,
+            },
+            Pointing::Motion { x: 72.0, y: 21.0 },
+            Pointing::Button {
+                button: BTN_LEFT,
+                pressed: true,
+            },
+            Pointing::Button {
+                button: BTN_LEFT,
+                pressed: false,
+            },
+            Pointing::Axis {
+                axis: gliff_proto::Axis::Vertical,
+                value: 10.0,
+                discrete: Some(1),
+                stop: false,
+            },
+        ];
+        let mut redraws = 0;
+        for event in events {
+            if point(
+                &mut over,
+                &mut capture,
+                &mut NoGrab,
+                Some((&mut corner, &feed)),
+                event,
+            ) {
+                redraws += 1;
+            }
+        }
+        clicks
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the mic switched");
+        assert!(clicks.try_recv().is_err(), "once, on the press");
+        assert_eq!(queue.queued(), [], "nothing for the remote");
+        assert_eq!(redraws, 1, "drawn again with the hotkey shown");
+        // Back over the picture, the pointer goes to the remote again.
+        point(
+            &mut over,
+            &mut capture,
+            &mut NoGrab,
+            Some((&mut corner, &feed)),
+            Pointing::Leave { over: Over::Corner },
+        );
+        let back = Pointing::Enter {
+            over: Over::Picture,
+            x: 5.0,
+            y: 300.0,
+        };
+        point(
+            &mut over,
+            &mut capture,
+            &mut NoGrab,
+            Some((&mut corner, &feed)),
+            back,
+        );
+        let press = Pointing::Button {
+            button: BTN_LEFT,
+            pressed: true,
+        };
+        point(
+            &mut over,
+            &mut capture,
+            &mut NoGrab,
+            Some((&mut corner, &feed)),
+            press,
+        );
+        assert_eq!(
+            queue.queued(),
+            [
+                input::Event::Motion { x: 5.0, y: 300.0 },
+                input::Event::Button {
+                    button: BTN_LEFT,
+                    pressed: true
+                }
+            ]
+        );
+    }
+
     #[test]
     fn a_compositor_that_never_places_the_surface_does_not_hold_the_start() {
         let (ours, _silent) = UnixStream::pair().unwrap();
@@ -1246,7 +1623,7 @@ mod tests {
             "DP-1",
             Default::default(),
             std::time::Duration::from_millis(300),
-            tokio::sync::mpsc::unbounded_channel().0,
+            (tokio::sync::mpsc::unbounded_channel().0, feed()),
         )
         .err()
         .expect("no surface");

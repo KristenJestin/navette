@@ -16,6 +16,7 @@ use gliff_transport::clipboard::Side;
 use hypr_input::Target;
 use navette::audio::{self, pipewire::PipeWire};
 use navette::clipboard;
+use navette::corner::{self, Board};
 use navette::desk::Desk;
 use navette::display::{decode, remote};
 use navette::hypr::{self, Eval};
@@ -221,10 +222,11 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                     .await
                     .map_err(std::io::Error::other)?;
             }
-            let mic = graph.clone().map(|graph| {
-                let notifier = Arc::new(notify::NotifySend::new(notify::Command));
-                Arc::new(Mic::new(graph, saved, toggle, notifier))
-            });
+            // What the mic says at each switch shows in the corners, not as notifications.
+            let board = Arc::new(Board::default());
+            let mic = graph
+                .clone()
+                .map(|graph| Arc::new(Mic::new(graph, saved, toggle, board.clone())));
             let sound = graph
                 .is_some()
                 .then(|| Arc::new(audio::HomeSound::default()));
@@ -232,6 +234,14 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 Some(mic) => mic.clone(),
                 None => Arc::new(NoSound::default()),
             };
+            if mic.is_some() {
+                let routing = routing.clone();
+                board.on_click(move || {
+                    // Refused, the mic says why in the corners.
+                    let _ = routing.order(mic::Order::Toggle);
+                });
+            }
+            tokio::spawn(corner::follow(board.clone(), routing.watch()));
             let mic_control = tokio::spawn(mic::serve(mic_control, routing));
             let home = Home {
                 config_dir: store.dir().to_path_buf(),
@@ -241,6 +251,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 desk_record: Desk::<Eval>::default_record()?,
                 mic: mic.clone().map(|mic| mic as Arc<dyn mode::Mic>),
                 sound: sound.clone().map(|sound| sound as Arc<dyn mode::Sound>),
+                board,
+                notifier: Arc::new(notify::NotifySend::new(notify::Command)),
             };
             let (peers, peers_rx) = mpsc::unbounded_channel();
             let (orders, orders_rx) = mpsc::unbounded_channel();
