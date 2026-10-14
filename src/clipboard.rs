@@ -249,7 +249,8 @@ impl<C: Compositor> Bridge<C> {
                         self.transfers.refuse(id);
                         return;
                     };
-                    let total = local.files.entries.iter().map(|f| f.size).sum();
+                    // Listed and validated: the sum is counted.
+                    let total = files::total(&local.files.entries).unwrap_or(u64::MAX);
                     (path, total, std::mem::take(&mut local.skipped))
                 };
                 if !skipped.is_empty() {
@@ -354,6 +355,12 @@ impl<C: Compositor> Bridge<C> {
                 log(format_args!("no folder for pasted files: $HOME is not set"));
                 return;
             };
+            if let Err(e) = files::validate(&files) {
+                log(format_args!("a paste of files is refused: {e}"));
+                self.notifier.show("Paste failed", &e);
+                return;
+            }
+            // Validated: gliff's sum of the sizes cannot overflow.
             let (label, total) = describe_files(&files);
             let total = total.unwrap_or(0);
             let paste = Crossing::Paste(self.pastes.get().wrapping_add(1));
@@ -429,7 +436,7 @@ async fn receive_files(
     meter: &Meter,
 ) -> Result<Vec<PathBuf>, TransferError> {
     files::validate(files).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    inbox.check_room(files.iter().map(|f| f.size).sum())?;
+    inbox.check_room(files::total(files).unwrap_or(u64::MAX))?;
     let staging = Staging::create_in(inbox)?;
     for (i, f) in files.iter().enumerate() {
         let dest = staging.path_of(&f.path)?;
@@ -1513,6 +1520,51 @@ mod tests {
                 }
                 assert!(!tmp.path().join("escaped").exists());
                 assert!(tree(tmp.path()).iter().all(|(p, _)| p.starts_with("inbox")));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_paste_of_files_whose_sizes_overflow_fails_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("inbox");
+        LocalSet::new()
+            .run_until(async {
+                let (out, _sent) = outbound_channel();
+                let seen = Seen::new();
+                let bridge = Bridge::new(
+                    Transfers::new(out, Side::Client),
+                    Jobs::new(|_, _| {}),
+                    Arc::new(Fake::default()),
+                    Some(Inbox::new(folder.clone())),
+                    Rc::default(),
+                    &seen.shown(),
+                );
+                // As a peer would send it past the link's check: two files of 2^63 bytes.
+                let half = |path: &str| ClipboardFile {
+                    path: path.into(),
+                    size: 1 << 63,
+                    dir: false,
+                };
+                let offer = ClipboardMsg::Offer {
+                    serial: 1,
+                    mime_types: Vec::new(),
+                    files: vec![half("a.bin"), half("b.bin")],
+                };
+                bridge.on_peer_msg(offer, Bytes::new());
+                let (reader, writer) = std::io::pipe().unwrap();
+                bridge.on_compositor_event(Selected::Paste {
+                    mime_type: URI_LIST.into(),
+                    fd: writer.into(),
+                });
+                let mut reader = pipe::Receiver::from_owned_fd(reader.into()).unwrap();
+                let mut pasted = Vec::new();
+                within("the paste", reader.read_to_end(&mut pasted))
+                    .await
+                    .unwrap();
+                assert!(pasted.is_empty());
+                assert!(tree(&folder).is_empty(), "{:?}", tree(&folder));
+                seen.told("Paste failed").await;
             })
             .await;
     }

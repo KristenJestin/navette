@@ -176,8 +176,13 @@ impl Progress {
     fn now(&self) -> Option<Bar> {
         let running = self.running.borrow();
         (!running.is_empty()).then(|| Bar {
-            done: running.values().map(|r| r.done.get()).sum(),
-            total: running.values().map(|r| r.total).sum(),
+            // Each total is counted, not their sum: several near the limit saturate it.
+            done: running
+                .values()
+                .fold(0, |sum, r| sum.saturating_add(r.done.get())),
+            total: running
+                .values()
+                .fold(0, |sum, r| sum.saturating_add(r.total)),
         })
     }
 }

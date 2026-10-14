@@ -79,7 +79,7 @@ fn walk(path: &Path, rel: &Path, out: &mut Copied) -> io::Result<()> {
 
 /// Whether the entries of a peer's offer are acceptable: every path relative, without `..`,
 /// and distinct; no more entries and name bytes than an offer carries. Whatever their total
-/// size: the free space is checked at paste time.
+/// size, as long as it can be counted: the free space is checked at paste time.
 pub fn validate(files: &[ClipboardFile]) -> Result<(), String> {
     if files.len() > MAX_FILE_ENTRIES {
         return Err(format!("more than {MAX_FILE_ENTRIES} files"));
@@ -87,6 +87,9 @@ pub fn validate(files: &[ClipboardFile]) -> Result<(), String> {
     let names: usize = files.iter().map(|f| f.path.len()).sum();
     if names > MAX_FILE_PATH_BYTES {
         return Err(format!("names longer than {MAX_FILE_PATH_BYTES} bytes"));
+    }
+    if total(files).is_none() {
+        return Err("sizes past what a count holds".into());
     }
     let mut seen = std::collections::HashSet::new();
     for f in files {
@@ -97,6 +100,13 @@ pub fn validate(files: &[ClipboardFile]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The bytes the entries hold, none past what a count holds: a peer can name any sizes.
+pub fn total(files: &[ClipboardFile]) -> Option<u64> {
+    files
+        .iter()
+        .try_fold(0u64, |sum, f| sum.checked_add(f.size))
 }
 
 /// Opens a copied file to serve it, at paste time: only a regular file, and never through a
@@ -382,6 +392,18 @@ mod tests {
             dir: false,
         };
         assert_eq!(validate(&[five_gib]), Ok(()));
+    }
+
+    #[test]
+    fn an_offer_whose_sizes_add_up_past_what_a_count_holds_is_refused() {
+        let half = |path: &str| ClipboardFile {
+            path: path.into(),
+            size: 1 << 63,
+            dir: false,
+        };
+        let files = [half("a.bin"), half("b.bin")];
+        assert_eq!(total(&files), None);
+        assert!(validate(&files).is_err());
     }
 
     #[test]

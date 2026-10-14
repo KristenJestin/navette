@@ -282,8 +282,8 @@ pub const MAX_MIME_TYPES: usize = 64;
 pub const MAX_MIME_LEN: usize = 255;
 
 /// The peer's message, with an offer this machine will not hold (too many or too long mime
-/// types, or files [`validate`] refuses: an absolute path or one with `..`, too many entries)
-/// made empty. The bridge then withdraws the peer's previous copy rather than keep offering it.
+/// types, or files [`validate`] refuses: an absolute path or one with `..`, too many entries,
+/// sizes past what a count holds) made empty. The bridge then withdraws the peer's previous copy rather than keep offering it.
 pub fn checked(msg: ClipboardMsg) -> ClipboardMsg {
     match msg {
         ClipboardMsg::Offer {
