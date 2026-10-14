@@ -261,8 +261,8 @@ struct Active {
     released: UnboundedReceiver<Keyboard>,
     /// The `navette mode start` waiting for the remote's answer.
     starting: Option<(oneshot::Sender<io::Result<String>>, tokio::time::Instant)>,
-    /// `closed_lid = on` was asked of the remote.
-    closed_lid: bool,
+    /// What the config says that is no longer read, said with `mode start`'s answer.
+    notice: Option<String>,
     /// Says the mode stopped, once it said it started: last, once the rest is gone.
     told: Option<Told>,
 }
@@ -406,11 +406,14 @@ pub async fn serve(
                         if let Some(switched) = &a.switched {
                             text = format!("{switched}; {text}");
                         }
-                        if a.closed_lid && closed_lid.is_none() {
+                        if closed_lid.is_none() {
                             text.push_str(
-                                "; the remote machine's agent does not know closed_lid, its lid \
-                                 does what it always does: update navette there",
+                                "; the remote machine's agent does not keep its lid during a \
+                                 mode, closing it does what it always does: update navette there",
                             );
+                        }
+                        if let Some(notice) = &a.notice {
+                            text = format!("{text}; {notice}");
                         }
                         let _ = reply.send(Ok(text));
                     }
@@ -438,7 +441,7 @@ pub async fn serve(
                      keyboard and pointer: {reason}"
                 ),
                 Heard::Msg(Incoming::NoLid(reason)) => eprintln!(
-                    "navette: closed_lid: the remote machine's lid does what it always does: \
+                    "navette: lid: the remote machine's lid does what it always does: \
                      {reason}"
                 ),
                 Heard::Pointer(pointers) => {
@@ -697,7 +700,6 @@ async fn launch(
     active: &mut Option<Active>,
 ) -> io::Result<()> {
     let hotkey = mode.release;
-    let closed_lid = mode.closed_lid;
     let mut copies = given.iter().map(|m| OutputCopy {
         width: m.width,
         height: m.height,
@@ -793,7 +795,8 @@ async fn launch(
             output: first,
             caps,
             others: (!others.is_empty()).then_some(others),
-            closed_lid: Some(closed_lid),
+            // An agent of the release before keeps its lid only when asked.
+            closed_lid: Some(true),
             generation: Some(generation),
         }),
         Vec::new(),
@@ -815,7 +818,7 @@ async fn launch(
         ended,
         released,
         starting: None,
-        closed_lid,
+        notice: mode.notice,
         told: None,
     });
     // What was already under the monitors comes out from under the covers.
@@ -1517,7 +1520,7 @@ mod tests {
                 generation: None,
                 output: "NAVETTE-1".into(),
                 others: None,
-                closed_lid: None,
+                closed_lid: Some(true),
             }))
             .unwrap();
         let text = answer(pending).await.unwrap();
@@ -1709,7 +1712,7 @@ mod tests {
                 generation: None,
                 output: "NAVETTE-1".into(),
                 others: None,
-                closed_lid: None,
+                closed_lid: Some(true),
             }))
             .unwrap();
         answer(pending).await.unwrap();
@@ -1925,7 +1928,7 @@ mod tests {
                 generation: None,
                 output: "NAVETTE-1".into(),
                 others: None,
-                closed_lid: None,
+                closed_lid: Some(true),
             }))
             .unwrap();
         answer(pending).await.unwrap();
@@ -1993,7 +1996,7 @@ mod tests {
                 generation: None,
                 output: "NAVETTE-1".into(),
                 others: Some(vec!["NAVETTE-2".into()]),
-                closed_lid: None,
+                closed_lid: Some(true),
             }))
             .unwrap();
         answer(pending).await.unwrap();
@@ -2283,26 +2286,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_lid_on_is_sent_with_the_mode() {
-        let desk = desk_with("monitor = DP-2\nclosed_lid = on   # the laptop stays shut\n");
-        let remote = connect(&desk);
-        let _pending = ask(&desk, true).await;
-        until(|| !starts(&remote).is_empty()).await;
-        assert_eq!(closed_lid_sent(&remote), [Some(true)]);
+    async fn the_lid_is_asked_with_every_mode_with_no_key_in_the_config() {
+        // An agent of the release before keeps its lid only when asked: it is always asked.
+        for text in [
+            "monitor = DP-2\n",
+            "monitor = DP-2\nclosed_lid = off\n",
+            "monitor = DP-2\nclosed_lid = on\n",
+        ] {
+            let desk = desk_with(text);
+            let remote = connect(&desk);
+            let _pending = ask(&desk, true).await;
+            until(|| !starts(&remote).is_empty()).await;
+            assert_eq!(closed_lid_sent(&remote), [Some(true)], "{text}");
+        }
     }
 
-    #[tokio::test]
-    async fn closed_lid_is_off_by_default() {
-        let desk = desk("DP-2");
-        let remote = connect(&desk);
-        let _pending = ask(&desk, true).await;
-        until(|| !starts(&remote).is_empty()).await;
-        assert_eq!(closed_lid_sent(&remote), [Some(false)]);
-    }
-
-    /// A mode with `closed_lid = on` the remote says started, `said` back: `mode start`'s answer.
-    async fn started_with_the_lid(said: Option<bool>) -> String {
-        let desk = desk_with("monitor = DP-2\nclosed_lid = on\n");
+    /// A mode of `text` the remote says started, `said` back: `mode start`'s answer.
+    async fn started_saying(text: &str, said: Option<bool>) -> String {
+        let desk = desk_with(text);
         let remote = connect(&desk);
         let pending = ask(&desk, true).await;
         until(|| !starts(&remote).is_empty()).await;
@@ -2319,25 +2320,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_agent_that_does_not_know_closed_lid_is_said_at_start() {
-        let text = started_with_the_lid(None).await;
-        assert!(
-            text.contains("closed_lid") && text.contains("update"),
-            "{text}"
-        );
-        let text = started_with_the_lid(Some(true)).await;
-        assert!(!text.contains("closed_lid"), "{text}");
+    async fn an_agent_that_does_not_keep_its_lid_is_said_at_start() {
+        let text = started_saying("monitor = DP-2\n", None).await;
+        assert!(text.contains("lid") && text.contains("update"), "{text}");
+        let text = started_saying("monitor = DP-2\n", Some(true)).await;
+        assert!(!text.contains("lid"), "{text}");
     }
 
     #[tokio::test]
-    async fn a_closed_lid_value_other_than_on_or_off_fails_clearly_and_changes_nothing() {
-        let desk = desk_with("monitor = DP-2\nclosed_lid = yes please\n");
-        let remote = connect(&desk);
-        let error = answer(ask(&desk, true).await).await.unwrap_err();
-        assert!(error.to_string().contains("closed_lid"), "{error}");
-        assert!(desk.covered.lock().unwrap().is_empty());
-        assert!(remote.outbox.queued().is_empty());
-        assert!(desk.hypr.changes().is_empty());
+    async fn a_config_that_still_names_closed_lid_starts_with_a_notice() {
+        for value in ["on", "off", "yes please"] {
+            let config = format!("monitor = DP-2\nclosed_lid = {value}\n");
+            let text = started_saying(&config, Some(true)).await;
+            assert!(text.contains("closed_lid"), "{text}");
+            assert!(!text.contains('\n'), "{text}");
+        }
     }
 
     #[tokio::test]
@@ -2464,7 +2461,7 @@ mod tests {
                 generation: None,
                 output: "NAVETTE-1".into(),
                 others: None,
-                closed_lid: None,
+                closed_lid: Some(true),
             }))
             .unwrap();
         answer(pending).await.unwrap();
@@ -2507,7 +2504,7 @@ mod tests {
                 generation: None,
                 output: "NAVETTE-1".into(),
                 others: None,
-                closed_lid: None,
+                closed_lid: Some(true),
             }))
             .unwrap();
         answer(pending).await.unwrap();
@@ -2797,7 +2794,7 @@ mod tests {
                 generation: None,
                 output: outputs[0].into(),
                 others: (!others.is_empty()).then_some(others),
-                closed_lid: None,
+                closed_lid: Some(true),
             }))
             .unwrap();
         let text = answer(pending).await;
@@ -2954,7 +2951,7 @@ mod tests {
                 generation,
                 output: "NAVETTE-1".into(),
                 others: None,
-                closed_lid: None,
+                closed_lid: Some(true),
             }))
             .unwrap();
     }

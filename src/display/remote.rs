@@ -170,10 +170,8 @@ struct Active {
     starting: bool,
     /// The output being started, and its start.
     up: Option<(usize, tokio::task::JoinHandle<io::Result<Running>>)>,
-    /// With `closed_lid = on`: the lid's watch.
+    /// The lid's watch, for as long as the mode runs.
     lid: Option<lid::Watch>,
-    /// `closed_lid = on` was asked, said back in `Started`.
-    closed_lid: bool,
     /// The start's generation, said back in `Started` and `Failed`.
     generation: Option<u32>,
     /// The outputs, once the user was told home drives them: told again when the mode stops.
@@ -310,7 +308,7 @@ pub async fn serve_peer(
         tokio::select! {
             msg = peer.inbox.recv() => match msg {
                 None => break,
-                Some(Incoming::Display(Display::Start { output, caps, others, closed_lid, generation })) => {
+                Some(Incoming::Display(Display::Start { output, caps, others, generation, .. })) => {
                     stop(&mut active, ports).await;
                     restore_now(ports).await;
                     let mut copies = vec![output];
@@ -318,10 +316,8 @@ pub async fn serve_peer(
                     match start(copies, caps) {
                         Ok(mut mode) => {
                             mode.generation = generation;
-                            if closed_lid == Some(true) {
-                                mode.closed_lid = true;
-                                mode.lid = watch_lid(ports, &peer.outbox);
-                            }
+                            // Whatever home asks: one of the release before may say `Some(false)`.
+                            mode.lid = watch_lid(ports, &peer.outbox);
                             mode.bring_up(0, ports, &home, &peer.outbox);
                             active = Some(mode);
                         }
@@ -431,7 +427,7 @@ pub async fn serve_peer(
                                 let started = Display::Started {
                                     output: names[0].clone(),
                                     others: (names.len() > 1).then(|| names[1..].to_vec()),
-                                    closed_lid: mode.closed_lid.then_some(true),
+                                    closed_lid: Some(true),
                                     generation: mode.generation,
                                 };
                                 peer.outbox.send(Msg::Display(started), Vec::new());
@@ -480,7 +476,7 @@ pub async fn serve_peer(
 fn watch_lid(ports: &Ports, outbox: &Outbox) -> Option<lid::Watch> {
     let outbox = outbox.clone();
     let told = move |why: String| {
-        eprintln!("navette: closed_lid: {why}; the lid does what it always does");
+        eprintln!("navette: lid: {why}; the lid does what it always does");
         outbox.send(Msg::NoLid(why), Vec::new());
     };
     match lid::Watch::start(
@@ -492,7 +488,7 @@ fn watch_lid(ports: &Ports, outbox: &Outbox) -> Option<lid::Watch> {
     ) {
         Ok(watch) => Some(watch),
         Err(e) => {
-            eprintln!("navette: closed_lid: the lid cannot be watched: {e}");
+            eprintln!("navette: lid: the lid cannot be watched: {e}");
             None
         }
     }
@@ -528,7 +524,6 @@ fn start(copies: Vec<OutputCopy>, caps: ClientCaps) -> Result<Active, String> {
         starting: true,
         up: None,
         lid: None,
-        closed_lid: false,
         generation: None,
         told: None,
     })
@@ -895,7 +890,7 @@ mod tests {
         })
     }
 
-    /// A start with `closed_lid = on`.
+    /// A start as home sends it, the lid asked for an agent of the release before.
     fn start_with_the_lid() -> Incoming {
         let Incoming::Display(Display::Start {
             output,
@@ -1194,7 +1189,7 @@ mod tests {
                     generation: None,
                     output: FIRST.into(),
                     others: None,
-                    closed_lid: None,
+                    closed_lid: Some(true),
                 }))
         );
         // The stream starts again after a stop of its own: still a picture, no second word.
@@ -1284,7 +1279,7 @@ mod tests {
                 generation: None,
                 output: FIRST.into(),
                 others: None,
-                closed_lid: None,
+                closed_lid: Some(true),
             })
         );
     }
@@ -1424,7 +1419,7 @@ mod tests {
             generation: Some(7),
             output: FIRST.into(),
             others: None,
-            closed_lid: None,
+            closed_lid: Some(true),
         });
         until(|| agent.outbox.queued().contains(&started)).await;
         // The mode failing later, on the remote's own: still the start's.
@@ -1672,7 +1667,7 @@ mod tests {
                 generation: None,
                 output: FIRST.into(),
                 others: Some(vec![SECOND.into()]),
-                closed_lid: None,
+                closed_lid: Some(true),
             })
         );
     }
@@ -1934,7 +1929,7 @@ mod tests {
         agent.hypr.monitor("eDP-1").unwrap().disabled
     }
 
-    /// A mode with `closed_lid = on`, its output streaming.
+    /// A mode as home starts it, its output streaming.
     async fn running_with_the_lid(agent: &Agent) {
         agent.inbox.try_send(start_with_the_lid()).unwrap();
         until(|| agent.streams.count() == 1).await;
@@ -2051,13 +2046,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_the_option_off_the_lid_changes_nothing() {
+    async fn a_lid_closed_during_a_mode_started_without_closed_lid_disables_the_laptop_screen() {
+        // Home of the release before sends `Some(false)` by default, and older ones nothing.
+        for asked in [None, Some(false)] {
+            let agent = agent();
+            let Incoming::Display(Display::Start {
+                output,
+                caps,
+                others,
+                ..
+            }) = start()
+            else {
+                unreachable!()
+            };
+            let start = Display::Start {
+                generation: None,
+                output,
+                caps,
+                others,
+                closed_lid: asked,
+            };
+            agent.inbox.try_send(Incoming::Display(start)).unwrap();
+            until(|| agent.streams.count() == 1).await;
+            assert_eq!(agent.logind.held(), 1, "{asked:?}");
+            agent.logind.close(true);
+            until(|| laptop_disabled(&agent)).await;
+            agent.logind.close(false);
+            until(|| !laptop_disabled(&agent)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn with_no_mode_the_lid_is_not_watched_and_no_lock_is_held() {
         let agent = agent();
         agent.logind.close(true);
-        agent.inbox.try_send(start()).unwrap();
-        until(|| agent.streams.count() == 1).await;
         tokio::time::sleep(LID_POLL * 5).await;
         assert_eq!((agent.logind.taken(), agent.logind.looked()), (0, 0));
+        assert!(!laptop_disabled(&agent));
+        // Nor once a mode has come and gone.
+        running_with_the_lid(&agent).await;
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        until(|| agent.logind.held() == 0).await;
+        let looked = agent.logind.looked();
+        tokio::time::sleep(LID_POLL * 5).await;
+        assert_eq!(agent.logind.looked(), looked);
         assert!(!laptop_disabled(&agent));
     }
 

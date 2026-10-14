@@ -84,8 +84,8 @@ pub enum Display {
         /// The other monitors, outputs 1, 2…, in home's left-to-right order.
         #[n(2)]
         others: Option<Vec<OutputCopy>>,
-        /// `closed_lid = on` in home's `mode.conf`: the remote laptop works with its lid
-        /// closed while the mode runs (`crate::lid`). An agent that does not know it ignores it.
+        /// Always `Some(true)`: an agent of the release before keeps its lid (`crate::lid`)
+        /// only when asked. An agent now keeps it during every mode, and ignores this.
         #[n(3)]
         closed_lid: Option<bool>,
         /// Which mode this is, said back in `Started` and `Failed` so that home can tell the
@@ -105,7 +105,7 @@ pub enum Display {
         /// The names of outputs 1, 2…; an agent that knows only one output never sends them.
         #[n(1)]
         others: Option<Vec<String>>,
-        /// `Some(true)` when `closed_lid` was asked: an agent that does not know it never says.
+        /// `Some(true)`: the agent keeps its lid during the mode. One that does not never says.
         #[n(2)]
         closed_lid: Option<bool>,
         /// The `generation` of the `Start` it answers, when it had one.
