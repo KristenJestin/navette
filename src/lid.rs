@@ -1,4 +1,4 @@
-//! The remote laptop's lid while a mode runs, when home's `mode.conf` says `closed_lid = on`.
+//! The remote laptop's lid while a mode runs: it can be closed and opened at any moment.
 //! Closed, the laptop's own screen is disabled at runtime and Hyprland moves its workspaces to
 //! Navette's outputs; opened, it comes back with the mode it had. The lid does not suspend the
 //! laptop meanwhile: the agent holds logind's `handle-lid-switch` inhibitor lock for the mode's
@@ -31,7 +31,7 @@ pub trait Logind: Send + Sync {
     fn inhibit_lid(&self) -> io::Result<Box<dyn Send + Sync>>;
 }
 
-/// How often the lid is read while a mode runs with `closed_lid = on`: the lock keeps the
+/// How often the lid is read while a mode runs: the lock keeps the
 /// laptop up meanwhile, so a second is soon enough.
 pub const POLL: Duration = Duration::from_secs(1);
 
@@ -270,7 +270,7 @@ fn watch(
         match kept {
             Err(e) if !said => {
                 said = true;
-                eprintln!("navette: closed_lid: {e}");
+                eprintln!("navette: lid: {e}");
             }
             Err(_) => {}
             Ok(()) => said = false,
