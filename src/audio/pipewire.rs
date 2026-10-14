@@ -290,6 +290,8 @@ struct Open {
     _module: Option<Module>,
     /// The sink's monitor, that its sound is read from.
     _monitor: Option<Box<Open>>,
+    /// The level asked for the stream, until it has the controls to take it.
+    asked: Asked,
 }
 
 /// How often the loop applies the rate the playing streams ask for: the rate follows a level
@@ -325,6 +327,27 @@ impl Rate {
     fn due(&self, applied: f32) -> Option<f32> {
         let asked = f32::from_bits(self.asked.load(Ordering::Relaxed));
         ((asked - applied).abs() >= 1e-5).then_some(asked)
+    }
+}
+
+/// A level asked for a stream, kept until the stream has the controls to take it: until then,
+/// PipeWire drops the controls it is given, with only a warning in its own log, and the
+/// remote's first level, told as soon as home's stream opens, would be lost.
+#[derive(Default)]
+struct Asked(Cell<Option<Level>>);
+
+impl Asked {
+    fn ask(&self, level: Level) {
+        self.0.set(Some(level));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.get().is_none()
+    }
+
+    /// The level to apply now, once the stream is `ready`; kept for later until then.
+    fn take(&self, ready: bool) -> Option<Level> {
+        if ready { self.0.take() } else { None }
     }
 }
 
@@ -525,7 +548,14 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
         }
         Command::SetLevel(id, level) => {
             if let Some(open) = streams.borrow().get(&id) {
-                set_level(&open.stream, level);
+                open.asked.ask(level);
+                if !apply_level(open) {
+                    eprintln!(
+                        "navette: audio: {} has no volume yet, {} kept for when it has",
+                        open.stream.name(),
+                        super::shown(level)
+                    );
+                }
             }
         }
         Command::Quit => quit.quit(),
@@ -543,6 +573,7 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
     let _ = rates.update_timer(Some(RATE_EVERY), Some(RATE_EVERY));
     let levels = mainloop.loop_().add_timer(move |_| {
         for open in mixed.borrow_mut().values_mut() {
+            apply_level(open);
             if let Some((pending, on_level)) = &mut open.level
                 && let Some(level) = pending.take()
             {
@@ -819,6 +850,7 @@ fn open_sink(
         level: Some((pending, on_level)),
         _module: None,
         _monitor: Some(Box::new(monitor)),
+        asked: Asked::default(),
     })
 }
 
@@ -841,10 +873,39 @@ fn set_control(stream: &pw::stream::StreamRc, id: u32, value: f32) -> bool {
     result >= 0
 }
 
+/// Applies the level asked for `open`, if any, once its stream has the controls to take it;
+/// false while it does not.
+fn apply_level(open: &Open) -> bool {
+    if open.asked.is_empty() {
+        return true;
+    }
+    let ready = [
+        spa::sys::SPA_PROP_volume,
+        spa::sys::SPA_PROP_channelVolumes,
+        spa::sys::SPA_PROP_mute,
+    ]
+    .into_iter()
+    // SAFETY: a live stream, used on its loop's thread; the control is only checked for null.
+    .all(|id| unsafe { !pw::sys::pw_stream_get_control(open.stream.as_raw_ptr(), id).is_null() });
+    let Some(level) = open.asked.take(ready) else {
+        return false;
+    };
+    let name = open.stream.name();
+    if set_level(&open.stream, level) {
+        eprintln!("navette: audio: {name} set to {}", super::shown(level));
+    } else {
+        eprintln!(
+            "navette: audio: could not set {name} to {}",
+            super::shown(level)
+        );
+    }
+    true
+}
+
 /// Sets the volume and mute of a stream of ours, as a mixer would, in one change: told back
 /// by its controls all at once, never half of it. The level is all in the gains of the
 /// channels, the overall volume at unity, so that the level told back is the one set.
-fn set_level(stream: &pw::stream::StreamRc, level: Level) {
+fn set_level(stream: &pw::stream::StreamRc, level: Level) -> bool {
     let unity = [1.0f32];
     let channels = [level.left, level.right];
     let muted = [if level.muted { 1.0f32 } else { 0.0 }];
@@ -865,9 +926,7 @@ fn set_level(stream: &pw::stream::StreamRc, level: Level) {
             0u32,
         )
     };
-    if result < 0 {
-        eprintln!("navette: audio: could not set the volume of the remote's sound");
-    }
+    result >= 0
 }
 
 fn open_playback(
@@ -1007,6 +1066,7 @@ fn recording(
         level: None,
         _module: None,
         _monitor: None,
+        asked: Asked::default(),
     })
 }
 
@@ -1072,6 +1132,7 @@ fn playing(
         level: on_level.map(|on_level| (pending, on_level)),
         _module: None,
         _monitor: None,
+        asked: Asked::default(),
     })
 }
 
@@ -1278,6 +1339,23 @@ mod tests {
         let pipewire = loops.pipewire();
         assert!(pipewire.set_default_node(Device::Sink, None).is_err());
         assert!(loops.log().contains(&"0: quit".to_owned()));
+    }
+
+    #[test]
+    fn a_level_asked_before_the_stream_has_its_controls_is_applied_once_it_has_them() {
+        let level = |left| Level {
+            left,
+            right: left,
+            muted: false,
+        };
+        let asked = Asked::default();
+        asked.ask(level(0.008));
+        assert_eq!(asked.take(false), None);
+        assert_eq!(asked.take(false), None);
+        // The last one asked is the one that counts.
+        asked.ask(level(0.216));
+        assert_eq!(asked.take(true), Some(level(0.216)));
+        assert_eq!(asked.take(true), None, "applied once");
     }
 
     #[test]
