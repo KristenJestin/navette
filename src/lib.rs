@@ -3,6 +3,7 @@
 
 pub mod audio;
 pub mod clipboard;
+pub mod corner;
 pub mod desk;
 pub mod display;
 pub mod frame;
