@@ -715,13 +715,14 @@ impl State {
                     frame.stride,
                     frame.modifier,
                 );
-                let (buffer, _) = params.create_immed(
+                let (buffer, params) = params.create_immed(
                     frame.width as i32,
                     frame.height as i32,
                     frame.fourcc as u32,
                     zwp_linux_buffer_params_v1::Flags::empty(),
                     &qh,
                 );
+                params.destroy();
                 surface.attach(Some(&buffer), 0, 0);
                 self.shown_dmabuf
                     .insert(buffer.id(), (buffer, Picture::Dmabuf(frame)));
