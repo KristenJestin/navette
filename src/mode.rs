@@ -183,6 +183,8 @@ struct Active {
     name: Option<String>,
     /// What was stopped to start this one, said with the answer to `navette mode start`.
     switched: Option<String>,
+    /// Said to the remote with the start, and back with its answers.
+    generation: u32,
     /// The monitors given, left to right: monitor `i` shows output `i`.
     monitors: Vec<String>,
     /// The home monitor that takes the home windows the cover would hide; none when every
@@ -222,11 +224,34 @@ impl Active {
         }
     }
 
+    /// A start that failed, said with what the switch that led to it already did.
+    fn start_error(&self, e: io::Error) -> io::Error {
+        switch_error(self.switched.as_deref(), &self.title(), e)
+    }
+
     /// `DP-2 is back home`, once the monitors are given back.
     fn given_back(&self) -> String {
         let verb = if self.monitors.len() > 1 { "are" } else { "is" };
         format!("{} {verb} back home", self.label())
     }
+}
+
+/// An answer of the remote for a mode other than the running one: `generation` is the one it
+/// started. An agent that does not number its answers is taken at its word.
+fn is_stale(active: Option<&Active>, generation: Option<u32>) -> bool {
+    generation.is_some_and(|g| active.is_none_or(|a| a.generation != g))
+}
+
+/// A start that failed after a switch said "nothing was changed" of the new mode only: it also
+/// says that the first one was stopped and given back.
+fn switch_error(switched: Option<&str>, title: &str, e: io::Error) -> io::Error {
+    let Some(switched) = switched else { return e };
+    let text = e.to_string();
+    let why = text.strip_suffix("; nothing was changed").unwrap_or(&text);
+    io::Error::new(
+        e.kind(),
+        format!("{switched}; {title} could not start: {why}"),
+    )
 }
 
 /// What `navette status` says: the mode, and whether the remote machine is there for the next.
@@ -250,6 +275,8 @@ pub async fn serve(
 ) {
     let mut peer: Option<Peer> = None;
     let mut active: Option<Active> = None;
+    // Each start has its own, said to the remote and back: see `Display::Start`.
+    let mut generation: u32 = 0;
     loop {
         let deadline = active
             .as_ref()
@@ -269,7 +296,11 @@ pub async fn serve(
                     peer = None;
                     link_lost(&mut active, "the link to the remote machine dropped").await;
                 }
-                Heard::Msg(Incoming::Display(Display::Started { output, others, closed_lid })) => {
+                // The answer of a mode that is no longer the running one (a switch, a stop).
+                Heard::Msg(Incoming::Display(
+                    Display::Started { generation, .. } | Display::Failed { generation, .. },
+                )) if is_stale(active.as_ref(), generation) => {}
+                Heard::Msg(Incoming::Display(Display::Started { output, others, closed_lid, .. })) => {
                     let mut outputs = vec![output];
                     outputs.extend(others.unwrap_or_default());
                     let short = active
@@ -308,13 +339,14 @@ pub async fn serve(
                         let _ = reply.send(Ok(text));
                     }
                 }
-                Heard::Msg(Incoming::Display(Display::Failed { reason })) => {
+                Heard::Msg(Incoming::Display(Display::Failed { reason, .. })) => {
                     if let Some(mut a) = active.take() {
                         match a.starting.take() {
                             Some((reply, _)) => {
-                                let _ = reply.send(Err(io::Error::other(format!(
+                                let e = io::Error::other(format!(
                                     "the remote machine could not make its output: {reason}"
-                                ))));
+                                ));
+                                let _ = reply.send(Err(a.start_error(e)));
                             }
                             None => eprintln!(
                                 "navette: {} given back, the remote machine ended the mode: \
@@ -352,7 +384,10 @@ pub async fn serve(
             },
             order = orders.recv() => match order {
                 Some(Order::Start(name, reply)) => {
-                    match start(&home, peer.as_ref(), name.as_deref(), &mut active).await {
+                    generation = generation.wrapping_add(1);
+                    let started =
+                        start(&home, peer.as_ref(), name.as_deref(), generation, &mut active);
+                    match started.await {
                         Ok(()) => {
                             if let Some(a) = &mut active {
                                 let wait = start_timeout(a.monitors.len());
@@ -430,10 +465,11 @@ pub async fn serve(
                 }
                 if let Some(mut a) = active.take() {
                     if let Some((reply, _)) = a.starting.take() {
-                        let _ = reply.send(Err(io::Error::new(
+                        let e = io::Error::new(
                             io::ErrorKind::TimedOut,
                             "the remote machine did not answer in time",
-                        )));
+                        );
+                        let _ = reply.send(Err(a.start_error(e)));
                     }
                     release(a).await;
                 }
@@ -532,6 +568,7 @@ async fn start(
     home: &Home,
     peer: Option<&Peer>,
     name: Option<&str>,
+    generation: u32,
     active: &mut Option<Active>,
 ) -> io::Result<()> {
     let (plan, peer) = check(home, peer, name).await?;
@@ -543,12 +580,31 @@ async fn start(
                 format!("{} is already running on {}", a.title(), a.label()),
             ));
         }
+        // The remote's answers carry no more than a generation: while it still owes one for
+        // this mode, a stop and a start would leave nothing to tell what it says next.
+        if a.starting.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                format!(
+                    "{} is still starting on {}: wait for it, or `navette mode stop`; \
+                     nothing was changed",
+                    a.title(),
+                    a.label()
+                ),
+            ));
+        }
         switched = Some(format!("{} stopped, {}", a.title(), a.given_back()));
         peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
         let to = plan.mode.name.as_deref().unwrap_or("the unnamed mode");
         stop(active, &format!("switching to {to}")).await;
     }
-    launch(home, peer, plan, switched, active).await
+    let title = match &plan.mode.name {
+        Some(name) => format!("mode `{name}`"),
+        None => "the mode".to_string(),
+    };
+    launch(home, peer, plan, (switched.clone(), generation), active)
+        .await
+        .map_err(|e| switch_error(switched.as_deref(), &title, e))
 }
 
 async fn launch(
@@ -559,7 +615,7 @@ async fn launch(
         given,
         monitors,
     }: Plan,
-    switched: Option<String>,
+    (switched, generation): (Option<String>, u32),
     active: &mut Option<Active>,
 ) -> io::Result<()> {
     let hotkey = mode.release;
@@ -638,6 +694,7 @@ async fn launch(
             caps,
             others: (!others.is_empty()).then_some(others),
             closed_lid: Some(closed_lid),
+            generation: Some(generation),
         }),
         Vec::new(),
     );
@@ -648,6 +705,7 @@ async fn launch(
         _sound: sound,
         name: mode.name,
         switched,
+        generation,
         monitors: names,
         home_monitor,
         seen,
@@ -785,7 +843,8 @@ fn desk_error(e: DeskError) -> io::Error {
 async fn stop(active: &mut Option<Active>, why: &str) {
     if let Some(mut a) = active.take() {
         if let Some((reply, _)) = a.starting.take() {
-            let _ = reply.send(Err(io::Error::other(format!("the mode ended: {why}"))));
+            let e = io::Error::other(format!("the mode ended: {why}"));
+            let _ = reply.send(Err(a.start_error(e)));
         }
         eprintln!("navette: {} given back ({why})", a.label());
         release(a).await;
@@ -802,6 +861,7 @@ async fn link_lost(active: &mut Option<Active>, why: &str) {
     };
     let a = active.take().expect("just seen");
     eprintln!("navette: {} given back ({why})", a.label());
+    let (switched, title) = (a.switched.clone(), a.title());
     let desk = a.desk.clone();
     // The covers and the rest go first, as in `release`; the undo is then ours to read.
     release(a).await;
@@ -813,7 +873,8 @@ async fn link_lost(active: &mut Option<Active>, why: &str) {
             "; the home desk could not be given back ({e}): it is restored at the next start"
         )),
     }
-    let _ = reply.send(Err(io::Error::new(io::ErrorKind::ConnectionAborted, text)));
+    let e = io::Error::new(io::ErrorKind::ConnectionAborted, text);
+    let _ = reply.send(Err(switch_error(switched.as_deref(), &title, e)));
 }
 
 /// Drops a mode off the executor (the threads are joined, the desk undone), and waits for it.
@@ -975,6 +1036,8 @@ mod tests {
         releases: Arc<Mutex<Vec<Released>>>,
         /// Runs each time a screen opens: the link can drop while the covers go up.
         on_open: Arc<Mutex<OnOpen>>,
+        /// The monitors whose cover cannot go up.
+        refuse: Arc<Mutex<Vec<String>>>,
     }
 
     struct FakeScreen {
@@ -991,6 +1054,9 @@ mod tests {
             (hotkey, released): (Option<Hotkey>, Released),
             ended: Ended,
         ) -> io::Result<Box<dyn Screen>> {
+            if self.refuse.lock().unwrap().iter().any(|m| m == monitor) {
+                return Err(io::Error::other("no layer shell"));
+            }
             self.inputs
                 .lock()
                 .unwrap()
@@ -1087,6 +1153,7 @@ mod tests {
         inputs: Arc<Mutex<Vec<(String, input::Queue)>>>,
         releases: Arc<Mutex<Vec<Released>>>,
         on_open: Arc<Mutex<OnOpen>>,
+        refuse: Arc<Mutex<Vec<String>>>,
         peers: UnboundedSender<Peer>,
         orders: UnboundedSender<Order>,
         events: UnboundedSender<hypr::Event>,
@@ -1120,6 +1187,7 @@ mod tests {
         let hotkeys = screens.hotkeys.clone();
         let releases = screens.releases.clone();
         let on_open = screens.on_open.clone();
+        let refuse = screens.refuse.clone();
         let cursors = screens.cursors.clone();
         let inputs = screens.inputs.clone();
         let (peers, peers_rx) = mpsc::unbounded_channel();
@@ -1145,6 +1213,7 @@ mod tests {
             hotkeys,
             releases,
             on_open,
+            refuse,
             cursors,
             inputs,
             peers,
@@ -1262,6 +1331,7 @@ mod tests {
         remote
             .to_home
             .try_send(Incoming::Display(Display::Started {
+                generation: None,
                 output: "NAVETTE-1".into(),
                 others: None,
                 closed_lid: None,
@@ -1313,6 +1383,7 @@ mod tests {
         remote
             .to_home
             .try_send(Incoming::Display(Display::Started {
+                generation: None,
                 output: "NAVETTE-1".into(),
                 others: None,
                 closed_lid: None,
@@ -1528,6 +1599,7 @@ mod tests {
         remote
             .to_home
             .try_send(Incoming::Display(Display::Started {
+                generation: None,
                 output: "NAVETTE-1".into(),
                 others: None,
                 closed_lid: None,
@@ -1595,6 +1667,7 @@ mod tests {
         remote
             .to_home
             .try_send(Incoming::Display(Display::Started {
+                generation: None,
                 output: "NAVETTE-1".into(),
                 others: Some(vec!["NAVETTE-2".into()]),
                 closed_lid: None,
@@ -1911,6 +1984,7 @@ mod tests {
         remote
             .to_home
             .try_send(Incoming::Display(Display::Started {
+                generation: None,
                 output: "NAVETTE-1".into(),
                 others: None,
                 closed_lid: said,
@@ -1997,6 +2071,7 @@ mod tests {
         remote
             .to_home
             .try_send(Incoming::Display(Display::Started {
+                generation: None,
                 output: "NAVETTE-1".into(),
                 others: None,
                 closed_lid: None,
@@ -2021,6 +2096,7 @@ mod tests {
         remote
             .to_home
             .try_send(Incoming::Display(Display::Failed {
+                generation: None,
                 reason: "no encoder".into(),
             }))
             .unwrap();
@@ -2038,6 +2114,7 @@ mod tests {
         remote
             .to_home
             .try_send(Incoming::Display(Display::Started {
+                generation: None,
                 output: "NAVETTE-1".into(),
                 others: None,
                 closed_lid: None,
@@ -2327,6 +2404,7 @@ mod tests {
         remote
             .to_home
             .try_send(Incoming::Display(Display::Started {
+                generation: None,
                 output: outputs[0].into(),
                 others: (!others.is_empty()).then_some(others),
                 closed_lid: None,
@@ -2459,10 +2537,31 @@ mod tests {
 
     /// Answers the remote's side of a start: the output it made, once home asked for it.
     async fn made(remote: &Remote, asked: usize) {
+        made_for(remote, asked, None).await;
+    }
+
+    /// The generation home gave its `nth` start (from 0).
+    fn generation_of(remote: &Remote, nth: usize) -> u32 {
+        remote
+            .outbox
+            .queued()
+            .into_iter()
+            .filter_map(|m| match m {
+                Msg::Display(Display::Start { generation, .. }) => generation,
+                _ => None,
+            })
+            .nth(nth)
+            .expect("home numbers its starts")
+    }
+
+    /// The remote made its output for the start of this generation (none: an agent that does
+    /// not number its answers).
+    async fn made_for(remote: &Remote, asked: usize, generation: Option<u32>) {
         until(|| starts(remote).len() == asked).await;
         remote
             .to_home
             .try_send(Incoming::Display(Display::Started {
+                generation,
                 output: "NAVETTE-1".into(),
                 others: None,
                 closed_lid: None,
@@ -2686,6 +2785,200 @@ mod tests {
         assert_eq!(
             status_of(&desk).await,
             "the mode runs on DP-1; the remote machine is connected"
+        );
+    }
+
+    fn failure_of(generation: Option<u32>, reason: &str) -> Incoming {
+        Incoming::Display(Display::Failed {
+            reason: reason.into(),
+            generation,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_switch_is_refused_while_the_running_mode_is_still_starting() {
+        let desk = desk_with(two_modes());
+        let remote = connect(&desk);
+        let first = ask_mode(&desk, "office").await;
+        until(|| starts(&remote).len() == 1).await;
+        let queued = remote.outbox.queued().len();
+
+        let error = answer(ask_mode(&desk, "travel").await).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ResourceBusy);
+        let text = error.to_string();
+        assert!(text.contains("mode `office` is still starting"), "{text}");
+        assert!(text.contains("navette mode stop"), "{text}");
+        assert_eq!(*desk.covered.lock().unwrap(), ["DP-1"]);
+        assert_eq!(
+            remote.outbox.queued().len(),
+            queued,
+            "the remote is told nothing"
+        );
+
+        // The first start goes on, and the switch is possible once it is up.
+        made_for(&remote, 1, Some(generation_of(&remote, 0))).await;
+        answer(first).await.unwrap();
+        let second = ask_mode(&desk, "travel").await;
+        until(|| starts(&remote).len() == 2).await;
+        made_for(&remote, 2, Some(generation_of(&remote, 1))).await;
+        answer(second).await.unwrap();
+        assert_eq!(*desk.covered.lock().unwrap(), ["DP-2"]);
+    }
+
+    #[tokio::test]
+    async fn the_failure_of_the_stopped_mode_does_not_end_the_one_that_replaced_it() {
+        let desk = desk_with(two_modes());
+        let remote = connect(&desk);
+        let first = ask_mode(&desk, "office").await;
+        made_for(&remote, 1, None).await;
+        answer(first).await.unwrap();
+        let before = generation_of(&remote, 0);
+
+        let second = ask_mode(&desk, "travel").await;
+        until(|| starts(&remote).len() == 2).await;
+        let after = generation_of(&remote, 1);
+        assert_ne!(before, after);
+        // The old mode ended on the remote just before it heard the stop.
+        remote
+            .to_home
+            .try_send(failure_of(Some(before), "the picture of NAVETTE-1 failed"))
+            .unwrap();
+        made_for(&remote, 2, Some(after)).await;
+        answer(second).await.unwrap();
+        assert_eq!(*desk.covered.lock().unwrap(), ["DP-2"]);
+        assert!(
+            status_of(&desk)
+                .await
+                .starts_with("mode `travel` runs on DP-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_failure_of_the_running_mode_still_ends_it() {
+        let desk = desk_with(two_modes());
+        let remote = connect(&desk);
+        let first = ask_mode(&desk, "office").await;
+        made_for(&remote, 1, None).await;
+        answer(first).await.unwrap();
+        let running = generation_of(&remote, 0);
+
+        remote
+            .to_home
+            .try_send(failure_of(Some(running), "the picture of NAVETTE-1 failed"))
+            .unwrap();
+        until(|| desk.covered.lock().unwrap().is_empty()).await;
+        assert!(status_of(&desk).await.starts_with("no mode is running"));
+    }
+
+    #[tokio::test]
+    async fn the_answers_of_a_mode_stopped_while_it_started_do_not_confirm_the_next_one() {
+        let desk = desk_with(two_modes());
+        let remote = connect(&desk);
+        let first = ask_mode(&desk, "office").await;
+        until(|| starts(&remote).len() == 1).await;
+        let before = generation_of(&remote, 0);
+        answer(ask(&desk, false).await).await.unwrap();
+        answer(first).await.unwrap_err();
+
+        let mut second = ask_mode(&desk, "travel").await;
+        until(|| starts(&remote).len() == 2).await;
+        // What the remote made for the first one, late: neither a confirmation nor an error.
+        made_for(&remote, 2, Some(before)).await;
+        remote
+            .to_home
+            .try_send(failure_of(Some(before), "NAVETTE-1: no encoder"))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            second.try_recv().is_err(),
+            "the second start is still waiting"
+        );
+        assert!(
+            status_of(&desk)
+                .await
+                .starts_with("mode `travel` is starting")
+        );
+
+        let current = generation_of(&remote, 1);
+        made_for(&remote, 2, Some(current)).await;
+        assert_eq!(
+            answer(second).await.unwrap(),
+            "DP-2 shows the remote machine's NAVETTE-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_whose_start_fails_says_the_first_mode_was_stopped_and_why_the_second_did_not_start()
+     {
+        let desk = desk_with(two_modes());
+        let remote = connect(&desk);
+        let first = ask_mode(&desk, "office").await;
+        made(&remote, 1).await;
+        answer(first).await.unwrap();
+        desk.refuse.lock().unwrap().push("DP-2".into());
+
+        let error = answer(ask_mode(&desk, "travel").await).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mode `office` stopped, DP-1 is back home; \
+             mode `travel` could not start: no layer shell"
+        );
+        // The first mode really is given back, and the second left nothing.
+        assert!(desk.covered.lock().unwrap().is_empty());
+        assert_eq!(mic_log(&desk), ["start", "stop"]);
+        assert!(status_of(&desk).await.starts_with("no mode is running"));
+        let stops = remote
+            .outbox
+            .queued()
+            .into_iter()
+            .filter(|m| matches!(m, Msg::Display(Display::Stop)))
+            .count();
+        assert_eq!(stops, 1);
+        assert_eq!(
+            starts(&remote).len(),
+            1,
+            "the remote was never asked for the second"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_whose_remote_cannot_make_its_output_says_so_too() {
+        let desk = desk_with(two_modes());
+        let remote = connect(&desk);
+        let first = ask_mode(&desk, "office").await;
+        made(&remote, 1).await;
+        answer(first).await.unwrap();
+
+        let second = ask_mode(&desk, "travel").await;
+        until(|| starts(&remote).len() == 2).await;
+        let generation = Some(generation_of(&remote, 1));
+        remote
+            .to_home
+            .try_send(failure_of(generation, "NAVETTE-1: no encoder"))
+            .unwrap();
+        let error = answer(second).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mode `office` stopped, DP-1 is back home; mode `travel` could not start: \
+             the remote machine could not make its output: NAVETTE-1: no encoder"
+        );
+    }
+
+    #[test]
+    fn an_error_of_a_switch_drops_the_nothing_was_changed_of_the_new_mode_only() {
+        let switched = Some("mode `a` stopped, DP-1 is back home");
+        let error = io::Error::new(io::ErrorKind::NotFound, "no monitor X; nothing was changed");
+        let said = switch_error(switched, "mode `b`", error);
+        assert_eq!(said.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            said.to_string(),
+            "mode `a` stopped, DP-1 is back home; mode `b` could not start: no monitor X"
+        );
+        // No switch: the error is the one it was.
+        let error = io::Error::other("no monitor X; nothing was changed");
+        assert_eq!(
+            switch_error(None, "mode `b`", error).to_string(),
+            "no monitor X; nothing was changed"
         );
     }
 

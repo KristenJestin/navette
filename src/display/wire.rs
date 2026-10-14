@@ -88,6 +88,11 @@ pub enum Display {
         /// closed while the mode runs (`crate::lid`). An agent that does not know it ignores it.
         #[n(3)]
         closed_lid: Option<bool>,
+        /// Which mode this is, said back in `Started` and `Failed` so that home can tell the
+        /// answer of a mode it already stopped (a switch) from the new one's. An agent that
+        /// does not know it ignores it and never says it back.
+        #[n(4)]
+        generation: Option<u32>,
     },
     /// Home to remote: stop streaming and remove the output.
     #[n(1)]
@@ -103,12 +108,19 @@ pub enum Display {
         /// `Some(true)` when `closed_lid` was asked: an agent that does not know it never says.
         #[n(2)]
         closed_lid: Option<bool>,
+        /// The `generation` of the `Start` it answers, when it had one.
+        #[n(3)]
+        generation: Option<u32>,
     },
-    /// Remote to home: the output could not be made; nothing was left behind.
+    /// Remote to home: the output could not be made, or the mode ended on the remote; nothing
+    /// was left behind.
     #[n(3)]
     Failed {
         #[n(0)]
         reason: String,
+        /// The `generation` of the `Start` of the mode that failed, when it had one.
+        #[n(1)]
+        generation: Option<u32>,
     },
 }
 

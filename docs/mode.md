@@ -69,7 +69,13 @@ navette status              # mode `call` runs on DP-2; the remote machine is co
 `mode start <other>` while a mode runs checks the other one first: when it fails (a name that is
 not defined, a monitor that is not there, a description that fits two), the running mode is left
 as it is. Otherwise the running mode stops as `mode stop` does, everything is given back, and the
-answer says so before it says what the new mode shows. `navette status` says which mode runs
+answer says so before it says what the new mode shows. A switch is refused, with nothing
+changed, while the running mode is itself still starting (wait for its answer, or `mode stop`).
+If the new mode then cannot start (its cover cannot go up, the remote cannot make its outputs),
+the answer says both: the first mode was stopped and its monitors are back home, and why the
+second did not start; no mode runs. Home numbers each start and the remote says the number back
+in its answers, so that an answer of a mode already stopped never ends or confirms the next one
+(an agent too old to say it back is taken at its word). `navette status` says which mode runs
 (`no mode is running` otherwise), on which monitors, and whether the remote machine is connected.
 `mode list` reads the file and does not need `navette serve`.
 
