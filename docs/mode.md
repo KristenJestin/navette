@@ -163,8 +163,8 @@ While a mode runs, every home monitor shows, at its top left, what it is and whe
   Anywhere else the pointer goes to the remote machine as before.
 - **On each of home's own monitors**, at the same place, below home's bar (the compositor places
   it after the space the bar reserves), or at the height [`home_bar`](#the-corners-tags-and-offset)
-  sets, over it: a red glow, a `HOME` tag and the mic button while the
-  mic is home; the mic button alone, dimmed, while the mic is on the remote machine.
+  sets, over it: a red glow, a `HOME` tag and the mic button, wherever the mic is. As on the
+  reserved monitors, only the button tells where the mic is.
 - **The mic button** shows a mic and a round check. On the side that has the mic the check
   draws in and the button turns green; on the other it wipes out (350 ms). A click switches the
   mic, as the hotkey and `navette mic toggle` do; hovering it shows the hotkey. Without
