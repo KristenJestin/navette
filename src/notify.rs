@@ -1,4 +1,5 @@
-//! Desktop notifications, behind a port: the mic says where it went at each switch (#54).
+//! Short messages, behind a port: the desktop's notifications say when a mode starts and stops
+//! (#69), and the corners say where the mic went at each switch ([`crate::corner::Board`]).
 //!
 //! The real port runs `notify-send` (libnotify), which talks to whatever notification service
 //! the desktop runs. It runs on a thread of its own, one notification at a time and in order:

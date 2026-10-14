@@ -64,17 +64,14 @@ the bar and `navette mic` still switch the mic.
 
 ## Saying where it went
 
-At each switch, `navette serve` shows a short notification through the desktop's notification
-service (it runs `notify-send`, from libnotify 0.8 or later): `Mic → remote` or `Mic → home`.
-That covers the hotkey, the bar, `navette mic` and a mode starting or stopping. A mode that
-stops with the mic already home moves nothing, and says nothing. A mic that cannot go where it
-should shows `Mic failed` with why, and a switch that does not happen (no mode running, the
-mic failed, PipeWire refusing) shows `Mic not switched` with why, since a hotkey has no
-terminal to print it to.
-
-Each notification replaces the previous one of the mic, so they do not pile up. Without a
-notification service, or without `notify-send`, the mic switches all the same, and `navette
-serve` says once that nothing will be shown.
+Every home monitor shows where the mic is, in its corner ([the corner](mode.md#the-corner)),
+with a button that switches it. At each switch, the corners say it for two seconds:
+`Mic → remote` or `Mic → home`. That covers the hotkey, the corner's button, the bar, `navette
+mic` and a mode starting or stopping. A mode that stops with the mic already home moves
+nothing, and says nothing. A mic that cannot go where it should says `Mic failed: <why>`, and a
+switch that does not happen (the mic failed, PipeWire refusing) says `Mic not switched: <why>`,
+since a hotkey has no terminal to print it to. With no mode running there is no corner:
+`navette mic` prints why instead.
 
 ## Showing it in a bar
 
@@ -128,9 +125,9 @@ never is.
 3. Start a call on the laptop, with the home speakers playing it: speak, and the other side
    hears you, without its own voice coming back (ask them).
 4. Press `SUPER + CTRL + M` with the pointer over the work monitor: `navette mic status` says
-   `home`, the call hears silence, and a notification says `Mic → home`. Press it again over a
-   home monitor: they hear you again, and the same notification, replaced, says `Mic → remote`.
-   Do the same with the bar item, mid-call.
+   `home`, the call hears silence, and the corners say `Mic → home`. Press it again over a
+   home monitor: they hear you again, and the corners say `Mic → remote`. Do the same with the
+   corner's button and with the bar item, mid-call.
 5. Meanwhile, at home, `wpctl status` shows *Mic away (Navette)* as the default source while
    the mic is remote, and the home mic again while it is home; a home app recording from the
    default hears silence, then the mic.

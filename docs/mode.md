@@ -140,6 +140,42 @@ While the mode runs:
   on the remote machine's own output again once it stops ([the sound](audio.md)).
 - **The home mic**, with `navette serve --audio`, goes to the remote machine while the mode runs,
   and the hotkey switches it either way ([the mic](mic.md)).
+- **A notification** says when the mode is up and when it stops, once each, on both machines:
+  at home `DP-2, DP-3 show the remote machine`, then `DP-2, DP-3 are back home`; on the remote
+  machine `2 screens driven from home (NAVETTE-1, NAVETTE-2)`, then `2 screens driven from home
+  stopped (NAVETTE-1, NAVETTE-2)`. A start that fails says nothing there: `mode start` says why.
+  They go through the desktop's notification service (`notify-send`); without one, the mode
+  runs all the same.
+
+## The corner
+
+While a mode runs, every home monitor shows, at its top left, what it is and where the mic is
+(nothing of it with no mode):
+
+- **On each reserved monitor**, over the remote's picture: a warm orange glow from the corner,
+  a `PRO` tag and the mic button. It starts 26 pixels down, below the remote's bar (the height
+  of Omarchy's bar), so that the bar's menu and workspaces stay in sight. It is drawn at home
+  over the picture and never sent: the remote machine never sees it, and the pointer over its
+  button is home's, so a click there stays home. Passing over the button is not leaving the
+  monitor: the keyboard stays with the remote machine, the keys held stay held there, and a
+  keyboard given back by the release hotkey stays home; only the pointer's moves stop until it
+  is back over the picture. A drag that passes over the button goes on to the remote machine.
+  Anywhere else the pointer goes to the remote machine as before.
+- **On each of home's own monitors**, at the same place, below home's bar (the compositor places
+  it after the space the bar reserves): a red glow, a `MAISON` tag and the mic button while the
+  mic is home; the mic button alone, dimmed, while the mic is on the remote machine.
+- **The mic button** shows a mic and a round check. On the side that has the mic the check
+  draws in and the button turns green; on the other it wipes out (350 ms). A click switches the
+  mic, as the hotkey and `navette mic toggle` do; hovering it shows the hotkey. Without
+  `navette serve --audio` there is no mic to switch, and no button.
+- **Messages** show under the button for two seconds: `Mic → remote`, `Mic → home`,
+  `Mic failed: <why>`, `Mic not switched: <why>`, and `Keyboard → home` when the release hotkey
+  gives the keyboard back, `Keyboard → remote` the next time a reserved monitor takes it (once,
+  whichever reserved monitor it is).
+
+The corners are drawn in software, again only when they change and while the check moves.
+Home's corner is a layer surface of its own on the overlay layer (namespace `navette-corner`),
+with no keyboard; the one over the remote's picture is part of the surface that shows it.
 
 ## The remote's workspaces
 
@@ -259,7 +295,8 @@ other monitor they stay home.
   back as it was. A modifier counts as the key pressed, even
   when a keyboard option makes it something else (Shift while Caps Lock is on, with
   Omarchy's `shift:both_capslock_cancel`). Moving the pointer off the monitor and back
-  captures it again. Choose another chord (modifiers and one key), or
+  captures it again. The corner says both moves, `Keyboard → home` and `Keyboard → remote`
+  ([the corner](#the-corner)). Choose another chord (modifiers and one key), or
   none (`release = none`, or `release =` left empty), in `mode.conf`, where `#` starts a
   comment:
 

@@ -32,6 +32,7 @@ use crate::display::wire::{Display, Incoming, MAX_OUTPUTS, Msg, Outbox, OutputCo
 use crate::hypr::{self, Hypr};
 use crate::input::{self, Inject, Injectors};
 use crate::lid::{self, Logind};
+use crate::notify::Notifier;
 
 /// The first wait before a lost stream is started again, doubled after each failure up to
 /// [`LONGEST_WAIT`].
@@ -119,6 +120,8 @@ pub struct Ports {
     pub logind: Arc<dyn Logind>,
     pub lid_record: Option<std::path::PathBuf>,
     pub lid_poll: Duration,
+    /// Says, once each, that home started driving the outputs and stopped.
+    pub notifier: Arc<dyn Notifier>,
 }
 
 /// Puts the laptop's screen back if a record says the agent disabled it.
@@ -173,6 +176,8 @@ struct Active {
     closed_lid: bool,
     /// The start's generation, said back in `Started` and `Failed`.
     generation: Option<u32>,
+    /// The outputs, once the user was told home drives them: told again when the mode stops.
+    told: Option<Vec<String>>,
 }
 
 struct Output {
@@ -430,6 +435,8 @@ pub async fn serve_peer(
                                     generation: mode.generation,
                                 };
                                 peer.outbox.send(Msg::Display(started), Vec::new());
+                                ports.notifier.show(&driven(&names, ""), "");
+                                mode.told = Some(names);
                             }
                         }
                         Err(e) if mode.starting => {
@@ -523,6 +530,7 @@ fn start(copies: Vec<OutputCopy>, caps: ClientCaps) -> Result<Active, String> {
         lid: None,
         closed_lid: false,
         generation: None,
+        told: None,
     })
 }
 
@@ -653,6 +661,7 @@ async fn stop(active: &mut Option<Active>, ports: &Ports) {
     let Some(mut mode) = active.take() else {
         return;
     };
+    let told = mode.told.take();
     // A start cannot be cut short: removed now, its output would be made again after.
     let starting = match mode.up.take() {
         Some((_, start)) => start.await.ok(),
@@ -677,6 +686,20 @@ async fn stop(active: &mut Option<Active>, ports: &Ports) {
             eprintln!("navette: could not remove the remote outputs: {e}");
         }
     }
+    if let Some(names) = told {
+        ports.notifier.show(&driven(&names, " stopped"), "");
+    }
+}
+
+/// What the agent says when home starts driving its outputs, `2 screens driven from home
+/// (NAVETTE-1, NAVETTE-2)`, and with ` stopped` when it stops.
+fn driven(names: &[String], then: &str) -> String {
+    let screens = if names.len() > 1 { "screens" } else { "screen" };
+    format!(
+        "{} {screens} driven from home{then} ({})",
+        names.len(),
+        names.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -961,6 +984,7 @@ mod tests {
         refuse_input: Arc<Mutex<bool>>,
         logind: Arc<FakeLogind>,
         record: std::path::PathBuf,
+        notices: Arc<crate::notify::Fake>,
         _dir: tempfile::TempDir,
         task: tokio::task::JoinHandle<()>,
     }
@@ -993,6 +1017,7 @@ mod tests {
         let logind = Arc::new(FakeLogind::default());
         let dir = tempfile::tempdir().unwrap();
         let record = dir.path().join("navette").join("lid");
+        let notices = Arc::new(crate::notify::Fake::default());
         let ports = Ports {
             hypr: hypr.clone(),
             streams: streams.clone(),
@@ -1004,6 +1029,7 @@ mod tests {
             logind: logind.clone(),
             lid_record: Some(record.clone()),
             lid_poll: poll,
+            notifier: notices.clone(),
         };
         let task = tokio::spawn(async move {
             serve_peer(peer, &ports, &mut events_rx).await;
@@ -1019,6 +1045,7 @@ mod tests {
             refuse_input,
             logind,
             record,
+            notices,
             _dir: dir,
             task,
         }
@@ -1087,6 +1114,36 @@ mod tests {
         // Dropping the injector releases what it holds; the output was still there for it.
         assert_eq!(injected.lock().unwrap()[0].dropped, Some(true));
         assert!(hypr.monitor(FIRST).is_none());
+    }
+
+    #[tokio::test]
+    async fn starting_and_stopping_a_mode_notifies_each_machine_once() {
+        let agent = agent();
+        agent.inbox.try_send(start_of(vec![copy()])).unwrap();
+        let driven = "2 screens driven from home (NAVETTE-1, NAVETTE-2)";
+        until(|| agent.notices.summaries() == [driven]).await;
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        let stopped = "2 screens driven from home stopped (NAVETTE-1, NAVETTE-2)";
+        until(|| agent.notices.summaries() == [driven, stopped]).await;
+        // A stop with no mode, and a start that fails, say nothing.
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        *agent.streams.refuse.lock().unwrap() = true;
+        agent.inbox.try_send(start()).unwrap();
+        until(|| {
+            agent
+                .outbox
+                .queued()
+                .iter()
+                .any(|m| matches!(m, Msg::Display(Display::Failed { .. })))
+        })
+        .await;
+        assert_eq!(agent.notices.summaries(), [driven, stopped]);
     }
 
     #[tokio::test]
@@ -1504,6 +1561,7 @@ mod tests {
             logind: Arc::new(FakeLogind::default()),
             lid_record: record.map(std::path::Path::to_path_buf),
             lid_poll: LID_POLL,
+            notifier: Arc::new(crate::notify::Fake::default()),
         }
     }
 

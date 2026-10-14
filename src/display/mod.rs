@@ -1,6 +1,7 @@
 //! The picture path for a mode: on the remote, a headless output copying a home monitor,
 //! captured, encoded and streamed; at home, decoded and shown on that monitor.
 
+pub mod corner;
 pub mod decode;
 pub mod output;
 // gliff's copy, kept as is: it was written for a binary crate, where this lint does not fire.
@@ -24,6 +25,14 @@ pub const REMOTE_CURSOR: bool = false;
 /// decode): the mode then ends.
 pub type Ended = tokio::sync::mpsc::UnboundedSender<String>;
 
-/// Where the surface says the release hotkey gave the keyboard back: home then gives it to the
-/// home window that had it last.
-pub type Released = tokio::sync::mpsc::UnboundedSender<()>;
+/// Where the keyboard goes, as the surface tells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keyboard {
+    /// The release hotkey gave it back: home then gives it to the home window that had it last.
+    Home,
+    /// A surface took it again, the pointer having come back after a release.
+    Remote,
+}
+
+/// Where the surface says the keyboard went.
+pub type Released = tokio::sync::mpsc::UnboundedSender<Keyboard>;

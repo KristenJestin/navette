@@ -23,6 +23,12 @@
 //! as gliff's client does (gliff, MIT, see `LICENSES/gliff-MIT.txt`); before the first one, or
 //! for one with nothing to show, the pointer is the default arrow. While
 //! [`super::REMOTE_CURSOR`] is off, it is always the default arrow.
+//!
+//! The corner (#69) is a subsurface at the top left, under the remote's bar: drawn at home over
+//! the picture, never part of it. Its input region is the mic button: the pointer over it is
+//! over the corner, not the picture, and what it does there stays home. Going from the picture
+//! to the button and back is no leave of the monitor: the keyboard, the shortcuts and what is
+//! held stay with the remote; only the motion stops while over the button.
 
 use std::collections::HashMap;
 use std::io;
@@ -36,9 +42,9 @@ use std::time::Duration;
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::dmabuf::{DmabufFeedback, DmabufHandler, DmabufState};
-use smithay_client_toolkit::output::{OutputHandler, OutputState};
-use smithay_client_toolkit::reexports::calloop::EventLoop;
+use smithay_client_toolkit::output::{OutputHandler, OutputInfo, OutputState};
 use smithay_client_toolkit::reexports::calloop::channel::{self, Channel, Event as ChannelEvent};
+use smithay_client_toolkit::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::shell::WaylandSurface;
@@ -48,14 +54,15 @@ use smithay_client_toolkit::shell::wlr_layer::{
 };
 use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
+use smithay_client_toolkit::subcompositor::SubcompositorState;
 use smithay_client_toolkit::{
     delegate_compositor, delegate_dmabuf, delegate_layer, delegate_output, delegate_registry,
-    delegate_shm, registry_handlers,
+    delegate_shm, delegate_subcompositor, registry_handlers,
 };
 use wayland_client::backend::ObjectId;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{
-    wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
+    wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_subsurface, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols::wp::cursor_shape::v1::client::{
@@ -72,9 +79,11 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 use super::REMOTE_CURSOR;
+use super::corner::{BTN_LEFT, Painter, Shows, draw_again, listen};
 use super::decode::Picture;
 use super::wire::{Cursor, MAX_CURSOR, Pointer};
 use super::{Ended, Released};
+use crate::corner::{Corner, Feed, REMOTE_BAR, Side};
 use crate::input::{self, Capture, Grab, Hotkey, Seat};
 
 /// How long the compositor has to place the surface.
@@ -247,15 +256,17 @@ pub struct Surface {
 impl Surface {
     /// Puts the surface on `output` and waits until the compositor has placed it. Home's input
     /// over it goes to `input`; `hotkey` gives the keyboard back. `ended` hears it if the
-    /// surface goes away on its own: the monitor unplugged, the compositor gone.
+    /// surface goes away on its own: the monitor unplugged, the compositor gone. Its corner
+    /// shows what `feed` tells.
     pub fn open(
         output: &str,
         input: input::Queue,
         (hotkey, released): (Option<Hotkey>, Released),
         ended: Ended,
+        feed: Feed,
     ) -> io::Result<Self> {
         let capture = (input, hotkey, Some(released));
-        Self::open_on(compositor()?, output, capture, PLACE_TIMEOUT, ended)
+        Self::open_on(compositor()?, output, capture, PLACE_TIMEOUT, (ended, feed))
     }
 
     fn open_on(
@@ -263,7 +274,7 @@ impl Surface {
         output: &str,
         (input, hotkey, released): (input::Queue, Option<Hotkey>, Option<Released>),
         wait: Duration,
-        ended: Ended,
+        (ended, feed): (Ended, Feed),
     ) -> io::Result<Self> {
         let shutdown = socket.try_clone()?;
         let conn = Connection::from_socket(socket).map_err(wayland)?;
@@ -289,7 +300,7 @@ impl Surface {
                     conn,
                     &output,
                     (channel, newest),
-                    (capture, imports),
+                    (capture, imports, feed),
                     &ready_tx,
                 ) {
                     Ok(None) => return,
@@ -373,7 +384,7 @@ impl Drop for Surface {
 
 /// The compositor's socket: `WAYLAND_DISPLAY`, else the running Hyprland's, as after a
 /// restart of Hyprland the inherited name may be gone.
-fn compositor() -> io::Result<UnixStream> {
+pub(super) fn compositor() -> io::Result<UnixStream> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("XDG_RUNTIME_DIR is not set"))?;
@@ -405,7 +416,7 @@ fn run(
     conn: Connection,
     output_name: &str,
     (pictures, pointer): (Channel<Show>, Newest<Pointer>),
-    (capture, imports): (Capture, Imports),
+    (capture, imports, feed): (Capture, Imports, Feed),
     ready: &std::sync::mpsc::Sender<Ready>,
 ) -> io::Result<Option<String>> {
     let (globals, queue) = registry_queue_init::<State>(&conn).map_err(wayland)?;
@@ -422,6 +433,11 @@ fn run(
         .map_err(|_| io::Error::other("the compositor has no seat"))?;
     let inhibit: Option<ZwpKeyboardShortcutsInhibitManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
     let shapes: Option<WpCursorShapeManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
+    // No corner without subsurfaces: the picture is shown all the same.
+    let subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh)
+        .map_err(|e| tracing::warn!("no corner over the remote's picture: {e}"))
+        .ok();
+    let mut event_loop: EventLoop<'static, State> = EventLoop::try_new()?;
     if inhibit.is_none() {
         eprintln!(
             "navette: the compositor cannot inhibit its shortcuts: they stay home over the \
@@ -465,13 +481,24 @@ fn run(
         cursor_hidden: false,
         entered: None,
         physical_width: None,
+        monitor: None,
+        corner: subcompositor.map(|sub| CornerSlot {
+            subcompositor: sub,
+            feed,
+            painter: None,
+            subsurface: None,
+            timer: None,
+        }),
+        hover: Hover::default(),
+        handle: event_loop.handle(),
+        viewporter: viewporter.clone(),
+        compositor,
     };
     state.cursor_viewport = Some(viewporter.get_viewport(&state.cursor_surface, &qh, ()));
 
     if state.dmabuf.version().is_some_and(|v| v >= 4) {
         let _ = state.dmabuf.get_default_feedback(&qh);
     }
-    let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
     WaylandSource::new(conn.clone(), queue)
         .insert(event_loop.handle())
         .map_err(|e| wayland(e.error))?;
@@ -510,18 +537,8 @@ fn run(
         .info(&output)
         .map(|i| i.transform)
         .unwrap_or(wl_output::Transform::Normal);
-    // The monitor's width in pixels as laid out: with the surface's logical width, its scale.
-    state.physical_width = state.outputs.info(&output).and_then(|info| {
-        let (width, height) = info.modes.iter().find(|m| m.current)?.dimensions;
-        let turned = matches!(
-            info.transform,
-            wl_output::Transform::_90
-                | wl_output::Transform::_270
-                | wl_output::Transform::Flipped90
-                | wl_output::Transform::Flipped270
-        );
-        Some(if turned { height } else { width } as f64)
-    });
+    state.physical_width = state.outputs.info(&output).and_then(|i| pixels_wide(&i));
+    state.monitor = Some(output.clone());
     // Where the monitor stands in home's layout: a drag carried past the surface's edge goes on
     // to the work monitor beside it.
     if let Some(info) = state.outputs.info(&output) {
@@ -529,7 +546,7 @@ fn run(
         state.capture.at(x, y);
     }
 
-    let surface = compositor.create_surface(&qh);
+    let surface = state.compositor.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(
         &qh,
         surface.clone(),
@@ -548,7 +565,7 @@ fn run(
 
     event_loop
         .handle()
-        .insert_source(pictures, |event, _, state| match event {
+        .insert_source(pictures, move |event, _, state| match event {
             ChannelEvent::Msg(Show::Picture(picture)) => {
                 // An older picture still waiting is dropped here.
                 state.pending = Some(picture);
@@ -622,6 +639,212 @@ struct State {
     entered: Option<u32>,
     /// The monitor's width in pixels, turned as laid out.
     physical_width: Option<f64>,
+    /// The monitor the surface is on.
+    monitor: Option<wl_output::WlOutput>,
+    /// None when the compositor has no subsurfaces.
+    corner: Option<CornerSlot>,
+    hover: Hover,
+    handle: LoopHandle<'static, State>,
+    viewporter: wp_viewporter::WpViewporter,
+    compositor: CompositorState,
+}
+
+/// The corner over the picture: a subsurface, made once the surface is placed.
+struct CornerSlot {
+    subcompositor: SubcompositorState,
+    feed: Feed,
+    painter: Option<Painter>,
+    subsurface: Option<wl_subsurface::WlSubsurface>,
+    timer: Option<RegistrationToken>,
+}
+
+/// What the pointer is over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Over {
+    Picture,
+    /// The corner's mic button, its input region.
+    Corner,
+}
+
+/// Where the pointer is, as far as the seat goes.
+#[derive(Default)]
+struct Hover {
+    /// What the pointer is over, while it is over the surface or its corner.
+    over: Option<Over>,
+    /// The pointer came over the picture and has not left the monitor since: over the corner,
+    /// the keyboard and what is held stay with the remote.
+    inside: bool,
+    /// It left the picture or the corner in this frame: it left the monitor, unless the other
+    /// one takes it in the same frame.
+    leaving: bool,
+    /// The keyboard left the picture or the corner: it left the monitor, unless the other one
+    /// takes it in the same batch of events. The compositor moves it with the pointer, the
+    /// keyboard's leave and enter first (measured on Hyprland 0.56.2).
+    typing_away: bool,
+}
+
+/// The keyboard's focus on the picture or its corner.
+#[derive(Clone, Copy, Debug)]
+enum Typing<'a> {
+    /// With the keys already held at home.
+    Enter {
+        keys: &'a [u32],
+    },
+    Leave,
+    /// The events the compositor sent together are all handled.
+    Settled,
+}
+
+/// The keyboard's focus going between the picture and its corner is no leave of the monitor:
+/// the keys held stay held on the remote.
+fn type_on(hover: &mut Hover, capture: &mut Capture, grab: &mut dyn Grab, event: Typing) {
+    match event {
+        Typing::Enter { keys } => {
+            if !std::mem::take(&mut hover.typing_away) {
+                input::handle(capture, grab, Seat::KeyboardEnter { keys });
+            }
+        }
+        Typing::Leave => hover.typing_away = true,
+        Typing::Settled => {
+            if std::mem::take(&mut hover.typing_away) {
+                input::handle(capture, grab, Seat::KeyboardLeave { ours: true });
+            }
+        }
+    }
+}
+
+/// A pointer event, as far as where it goes matters.
+#[derive(Clone, Copy, Debug)]
+enum Pointing {
+    Enter {
+        over: Over,
+        x: f64,
+        y: f64,
+    },
+    Leave {
+        over: Over,
+    },
+    Motion {
+        x: f64,
+        y: f64,
+    },
+    Button {
+        button: u32,
+        pressed: bool,
+    },
+    Axis {
+        axis: gliff_proto::Axis,
+        value: f64,
+        discrete: Option<i32>,
+        stop: bool,
+    },
+    /// The end of a group of events, a leave and an enter going together.
+    Frame,
+}
+
+/// Hands a pointer event to what the pointer is over: the picture's to the capture, which sends
+/// them to the remote; the corner's to the corner, which keeps them home, a press of the left
+/// button switching the mic. The compositor sends the leave of one and the enter of the other in
+/// one frame: the monitor is left only at the end of a frame that took the pointer off both.
+/// True when the corner must be drawn again.
+fn point(
+    hover: &mut Hover,
+    capture: &mut Capture,
+    grab: &mut dyn Grab,
+    corner: Option<(&mut Corner, &Feed)>,
+    event: Pointing,
+) -> bool {
+    match event {
+        Pointing::Enter {
+            over: Over::Picture,
+            x,
+            y,
+        } => {
+            hover.over = Some(Over::Picture);
+            hover.leaving = false;
+            if std::mem::replace(&mut hover.inside, true) {
+                capture.motion(x, y);
+            } else {
+                input::handle(capture, grab, Seat::PointerEnter { x, y });
+            }
+            false
+        }
+        Pointing::Enter {
+            over: Over::Corner, ..
+        } => {
+            hover.over = Some(Over::Corner);
+            hover.leaving = false;
+            corner.is_some_and(|(c, _)| c.hover(true))
+        }
+        Pointing::Leave { over } => {
+            hover.over = None;
+            hover.leaving = hover.inside;
+            over == Over::Corner && corner.is_some_and(|(c, _)| c.hover(false))
+        }
+        Pointing::Frame => {
+            if std::mem::take(&mut hover.leaving) {
+                hover.inside = false;
+                input::handle(capture, grab, Seat::PointerLeave);
+            }
+            false
+        }
+        _ if hover.over == Some(Over::Corner) => {
+            if let (
+                Pointing::Button {
+                    button: BTN_LEFT,
+                    pressed: true,
+                },
+                Some((_, feed)),
+            ) = (event, corner)
+            {
+                feed.click();
+            }
+            false
+        }
+        Pointing::Motion { x, y } => {
+            capture.motion(x, y);
+            false
+        }
+        Pointing::Button { button, pressed } => {
+            capture.button(button, pressed);
+            false
+        }
+        Pointing::Axis {
+            axis,
+            value,
+            discrete,
+            stop,
+        } => {
+            capture.axis(axis, value, discrete, stop);
+            false
+        }
+    }
+}
+
+/// The monitor's width in pixels as laid out: with the surface's logical width, its scale.
+fn pixels_wide(info: &OutputInfo) -> Option<f64> {
+    let (width, height) = info.modes.iter().find(|m| m.current)?.dimensions;
+    let turned = matches!(
+        info.transform,
+        wl_output::Transform::_90
+            | wl_output::Transform::_270
+            | wl_output::Transform::Flipped90
+            | wl_output::Transform::Flipped270
+    );
+    Some(if turned { height } else { width } as f64)
+}
+
+/// Pixels per logical pixel, from the monitor's width in pixels and the surface's size.
+fn scale(physical_width: Option<f64>, size: Option<(u32, u32)>) -> f64 {
+    match (physical_width, size) {
+        (Some(pixels), Some((width, _))) if width > 0 => pixels / width as f64,
+        _ => 1.0,
+    }
+}
+
+/// Whether the corner, drawn at `drawn` (never, when `None`), must be drawn again at `scale`.
+fn again(drawn: Option<f64>, scale: f64) -> bool {
+    drawn.is_some_and(|drawn| drawn != scale)
 }
 
 /// The layer surface's hold on the keyboard; nothing before the surface is mapped.
@@ -688,11 +911,89 @@ impl State {
         self.surface() == Some(surface)
     }
 
+    /// What `surface` is of this client's: the picture, its corner, or neither.
+    fn over(&self, surface: &wl_surface::WlSurface) -> Option<Over> {
+        if self.ours(surface) {
+            return Some(Over::Picture);
+        }
+        let corner = self.corner.as_ref()?.painter.as_ref()?;
+        (corner.surface() == surface).then_some(Over::Corner)
+    }
+
+    /// The keyboard's focus on the picture or its corner.
+    fn type_on(&mut self, event: Typing) {
+        let mut grab = LayerGrab {
+            layer: self.layer.as_ref(),
+            inhibit: self.inhibit.as_ref(),
+            inhibitor: &mut self.inhibitor,
+            seat: &self.seat,
+            qh: &self.qh,
+        };
+        type_on(&mut self.hover, &mut self.capture, &mut grab, event);
+    }
+
+    /// A pointer event goes where the pointer is.
+    fn point(&mut self, event: Pointing) {
+        let mut grab = LayerGrab {
+            layer: self.layer.as_ref(),
+            inhibit: self.inhibit.as_ref(),
+            inhibitor: &mut self.inhibitor,
+            seat: &self.seat,
+            qh: &self.qh,
+        };
+        let corner = self.corner.as_mut().and_then(|slot| {
+            let painter = slot.painter.as_mut()?;
+            Some((&mut painter.corner, &slot.feed))
+        });
+        if point(&mut self.hover, &mut self.capture, &mut grab, corner, event) {
+            self.show_corner();
+        }
+    }
+
+    /// Puts the corner over the picture, under the remote's bar, once the surface is placed.
+    fn open_corner(&mut self) {
+        let parent = match self.surface() {
+            Some(surface) => surface.clone(),
+            None => return,
+        };
+        let Some(slot) = &mut self.corner else { return };
+        let (subsurface, surface) = slot.subcompositor.create_subsurface(parent, &self.qh);
+        subsurface.set_position(0, REMOTE_BAR);
+        // Drawn when it changes, whatever the pictures do.
+        subsurface.set_desync();
+        let viewport = self.viewporter.get_viewport(&surface, &self.qh, ());
+        slot.painter = Some(Painter::new(
+            slot.feed.corner(Side::Remote),
+            surface,
+            viewport,
+        ));
+        slot.subsurface = Some(subsurface);
+        let feed = slot.feed.clone();
+        let heard = listen(&feed, &self.handle, |state: &mut State, update| {
+            if let Some(painter) = state.corner.as_mut().and_then(|c| c.painter.as_mut()) {
+                painter.corner.update(update, std::time::Instant::now());
+            }
+            state.show_corner();
+        });
+        if let Err(e) = heard {
+            tracing::warn!("the corner hears nothing: {e}");
+        }
+    }
+
     /// The monitor's scale: its pixels per logical pixel.
     fn scale(&self) -> f64 {
-        match (self.physical_width, self.size) {
-            (Some(pixels), Some((width, _))) if width > 0 => pixels / width as f64,
-            _ => 1.0,
+        scale(self.physical_width, self.size)
+    }
+
+    /// The surface's size or its monitor changed: the corner is drawn again if its scale did.
+    fn rescale(&mut self) {
+        let scale = self.scale();
+        let drawn = self
+            .corner
+            .as_ref()
+            .and_then(|c| c.painter.as_ref()?.scale());
+        if again(drawn, scale) {
+            self.show_corner();
         }
     }
 
@@ -933,7 +1234,12 @@ impl LayerShellHandler for State {
             self.capture.area(size.0, size.1);
         }
         self.size = Some(size);
+        if !first {
+            self.rescale();
+        }
         if first {
+            // Before the surface's commit below, which places it.
+            self.open_corner();
             // Black until the first picture, so the monitor shows at once that it is taken.
             if let Some(buffer) = self.shm_buffer(1, 1, |canvas| canvas.fill(0))
                 && let Some(surface) = self.surface().cloned()
@@ -953,6 +1259,36 @@ impl LayerShellHandler for State {
                 let _ = ready.send(Ok((size, modifiers)));
             }
         }
+    }
+}
+
+impl Shows for State {
+    fn timer(&mut self) -> &mut Option<RegistrationToken> {
+        match &mut self.corner {
+            Some(slot) => &mut slot.timer,
+            None => unreachable!("a corner's timer runs only with a corner"),
+        }
+    }
+
+    fn handle(&self) -> LoopHandle<'static, Self> {
+        self.handle.clone()
+    }
+
+    fn show_corner(&mut self) {
+        let scale = self.scale();
+        let Some(painter) = self.corner.as_mut().and_then(|c| c.painter.as_mut()) else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if painter
+            .paint(now, scale, &self.shm, &self.compositor)
+            .is_none()
+        {
+            return;
+        }
+        painter.surface().commit();
+        let next = painter.corner.next_draw(now);
+        draw_again(self, next);
     }
 }
 
@@ -1039,7 +1375,17 @@ impl OutputHandler for State {
 
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        if self.monitor.as_ref() == Some(&output) {
+            self.physical_width = self.outputs.info(&output).and_then(|i| pixels_wide(&i));
+            self.rescale();
+        }
+    }
 
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
@@ -1058,6 +1404,7 @@ impl ProvidesRegistryState for State {
 }
 
 delegate_compositor!(State);
+delegate_subcompositor!(State);
 delegate_output!(State);
 delegate_shm!(State);
 delegate_dmabuf!(State);
@@ -1101,7 +1448,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
 impl Dispatch<wl_pointer::WlPointer, ()> for State {
     fn event(
         state: &mut Self,
-        _: &wl_pointer::WlPointer,
+        pointer: &wl_pointer::WlPointer,
         event: wl_pointer::Event,
         _: &(),
         _: &Connection,
@@ -1114,30 +1461,61 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 surface,
                 surface_x,
                 surface_y,
-            } if state.ours(&surface) => {
-                state.entered = Some(serial);
-                state.set_cursor();
-                state.seat(Seat::PointerEnter {
-                    x: surface_x,
-                    y: surface_y,
-                });
+            } => match state.over(&surface) {
+                Some(Over::Picture) => {
+                    state.entered = Some(serial);
+                    state.set_cursor();
+                    state.point(Pointing::Enter {
+                        over: Over::Picture,
+                        x: surface_x,
+                        y: surface_y,
+                    });
+                }
+                Some(Over::Corner) => {
+                    if let Some(shape) = &state.shape {
+                        shape.set_shape(serial, wp_cursor_shape_device_v1::Shape::Pointer);
+                    }
+                    state.point(Pointing::Enter {
+                        over: Over::Corner,
+                        x: surface_x,
+                        y: surface_y,
+                    });
+                }
+                None => {}
+            },
+            Event::Leave { surface, .. } => {
+                match state.over(&surface) {
+                    Some(Over::Picture) => {
+                        state.entered = None;
+                        state.point(Pointing::Leave {
+                            over: Over::Picture,
+                        });
+                    }
+                    Some(over) => state.point(Pointing::Leave { over }),
+                    None => {}
+                }
+                // Before version 5, no frames: each leave is a leave of the monitor.
+                if pointer.version() < 5 {
+                    state.point(Pointing::Frame);
+                }
             }
-            Event::Leave { surface, .. } if state.ours(&surface) => {
-                state.entered = None;
-                state.seat(Seat::PointerLeave);
-            }
+            Event::Frame => state.point(Pointing::Frame),
             Event::Motion {
                 surface_x,
                 surface_y,
                 ..
-            } => state.capture.motion(surface_x, surface_y),
+            } => state.point(Pointing::Motion {
+                x: surface_x,
+                y: surface_y,
+            }),
             Event::Button {
                 button,
                 state: WEnum::Value(pressed),
                 ..
-            } => state
-                .capture
-                .button(button, pressed == wl_pointer::ButtonState::Pressed),
+            } => state.point(Pointing::Button {
+                button,
+                pressed: pressed == wl_pointer::ButtonState::Pressed,
+            }),
             Event::AxisDiscrete { discrete, .. } => state.discrete = Some(discrete),
             Event::Axis {
                 axis: WEnum::Value(axis),
@@ -1145,12 +1523,22 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 ..
             } => {
                 let discrete = state.discrete.take();
-                state.capture.axis(axis_of(axis), value, discrete, false);
+                state.point(Pointing::Axis {
+                    axis: axis_of(axis),
+                    value,
+                    discrete,
+                    stop: false,
+                });
             }
             Event::AxisStop {
                 axis: WEnum::Value(axis),
                 ..
-            } => state.capture.axis(axis_of(axis), 0.0, None, true),
+            } => state.point(Pointing::Axis {
+                axis: axis_of(axis),
+                value: 0.0,
+                discrete: None,
+                stop: true,
+            }),
             _ => {}
         }
     }
@@ -1182,10 +1570,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 Ok(text) => state.seat(Seat::Keymap(text)),
                 Err(e) => tracing::warn!("cannot read home's keymap: {e}"),
             },
-            Event::Enter { surface, keys, .. } if state.ours(&surface) => {
+            Event::Enter { surface, keys, .. } if state.over(&surface).is_some() => {
                 let (codes, _) = keys.as_chunks::<4>();
                 let codes: Vec<u32> = codes.iter().map(|code| u32::from_ne_bytes(*code)).collect();
-                state.seat(Seat::KeyboardEnter { keys: &codes });
+                state.type_on(Typing::Enter { keys: &codes });
             }
             Event::Modifiers {
                 mods_depressed,
@@ -1199,9 +1587,14 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 locked: mods_locked,
                 group,
             }),
-            Event::Leave { surface, .. } => state.seat(Seat::KeyboardLeave {
-                ours: state.ours(&surface),
-            }),
+            Event::Leave { surface, .. } if state.over(&surface).is_some() => {
+                state.type_on(Typing::Leave);
+                // After the enter that may come with it, sent at once.
+                state
+                    .handle
+                    .insert_idle(|state| state.type_on(Typing::Settled));
+            }
+            Event::Leave { .. } => state.seat(Seat::KeyboardLeave { ours: false }),
             Event::Key {
                 key,
                 state: WEnum::Value(pressed),
@@ -1237,6 +1630,374 @@ mod tests {
 
     const BLOCK_LINEAR: u64 = 0x0300_0000_0060_6015;
 
+    fn feed() -> Feed {
+        Feed::new(Arc::default(), None)
+    }
+
+    /// A hold on the keyboard that holds nothing.
+    struct NoGrab;
+
+    impl Grab for NoGrab {
+        fn interactive(&mut self, _: bool) {}
+        fn inhibit(&mut self) {}
+        fn uninhibit(&mut self) {}
+        fn commit(&mut self) {}
+    }
+
+    #[test]
+    fn a_click_on_the_mic_button_switches_the_mic_and_is_not_sent_to_the_remote() {
+        let board = Arc::new(crate::corner::Board::default());
+        let (clicked, clicks) = std::sync::mpsc::channel();
+        let clicked = Mutex::new(clicked);
+        board.on_click(move || clicked.lock().unwrap().send(()).unwrap());
+        let feed = Feed::new(board, Some("SUPER + CTRL + M".into()));
+        let mut corner = feed.corner(Side::Remote);
+        let queue = input::Queue::default();
+        let mut capture = Capture::new(queue.clone(), None);
+        let mut hover = Hover::default();
+        let events = [
+            Pointing::Enter {
+                over: Over::Corner,
+                x: 70.0,
+                y: 20.0,
+            },
+            Pointing::Motion { x: 72.0, y: 21.0 },
+            Pointing::Button {
+                button: BTN_LEFT,
+                pressed: true,
+            },
+            Pointing::Button {
+                button: BTN_LEFT,
+                pressed: false,
+            },
+            Pointing::Axis {
+                axis: gliff_proto::Axis::Vertical,
+                value: 10.0,
+                discrete: Some(1),
+                stop: false,
+            },
+        ];
+        let mut redraws = 0;
+        for event in events {
+            if point(
+                &mut hover,
+                &mut capture,
+                &mut NoGrab,
+                Some((&mut corner, &feed)),
+                event,
+            ) {
+                redraws += 1;
+            }
+        }
+        clicks
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the mic switched");
+        assert!(clicks.try_recv().is_err(), "once, on the press");
+        assert_eq!(queue.queued(), [], "nothing for the remote");
+        assert_eq!(redraws, 1, "drawn again with the hotkey shown");
+        // Back over the picture, the pointer goes to the remote again.
+        point(
+            &mut hover,
+            &mut capture,
+            &mut NoGrab,
+            Some((&mut corner, &feed)),
+            Pointing::Leave { over: Over::Corner },
+        );
+        let back = Pointing::Enter {
+            over: Over::Picture,
+            x: 5.0,
+            y: 300.0,
+        };
+        point(
+            &mut hover,
+            &mut capture,
+            &mut NoGrab,
+            Some((&mut corner, &feed)),
+            back,
+        );
+        let press = Pointing::Button {
+            button: BTN_LEFT,
+            pressed: true,
+        };
+        point(
+            &mut hover,
+            &mut capture,
+            &mut NoGrab,
+            Some((&mut corner, &feed)),
+            press,
+        );
+        assert_eq!(
+            queue.queued(),
+            [
+                input::Event::Motion { x: 5.0, y: 300.0 },
+                input::Event::Button {
+                    button: BTN_LEFT,
+                    pressed: true
+                }
+            ]
+        );
+    }
+
+    const KEY_LEFTSHIFT: u32 = 42;
+    const KEY_ESC: u32 = 1;
+    const KEY_T: u32 = 20;
+
+    /// The surface's hold on the keyboard, as calls.
+    #[derive(Default)]
+    struct Holds(Vec<&'static str>);
+
+    impl Grab for Holds {
+        fn interactive(&mut self, on: bool) {
+            self.0.push(if on { "on_demand" } else { "none" });
+        }
+        fn inhibit(&mut self) {
+            self.0.push("inhibit");
+        }
+        fn uninhibit(&mut self) {
+            self.0.push("uninhibit");
+        }
+        fn commit(&mut self) {}
+    }
+
+    /// The pointer over the picture of a reserved monitor, with its corner, the keyboard taken.
+    struct Desk {
+        hover: Hover,
+        capture: Capture,
+        holds: Holds,
+        queue: input::Queue,
+        feed: Feed,
+        corner: Corner,
+        /// How many of the queue's events were looked at.
+        seen: usize,
+    }
+
+    impl Desk {
+        fn new() -> Self {
+            let queue = input::Queue::default();
+            let mut capture = Capture::new(
+                queue.clone(),
+                input::Hotkey::parse(input::DEFAULT_HOTKEY).unwrap(),
+            );
+            let us = hypr_input::keymap_from_names(&hypr_input::KeymapNames {
+                layout: "us".into(),
+                ..Default::default()
+            })
+            .unwrap();
+            capture.keymap(us);
+            let feed = feed();
+            let corner = feed.corner(Side::Remote);
+            let mut desk = Self {
+                hover: Hover::default(),
+                capture,
+                holds: Holds::default(),
+                queue,
+                feed,
+                corner,
+                seen: 0,
+            };
+            desk.point(&[Pointing::Enter {
+                over: Over::Picture,
+                x: 300.0,
+                y: 300.0,
+            }]);
+            desk.sent();
+            desk.holds.0.clear();
+            desk
+        }
+
+        fn point(&mut self, events: &[Pointing]) {
+            for &event in events {
+                point(
+                    &mut self.hover,
+                    &mut self.capture,
+                    &mut self.holds,
+                    Some((&mut self.corner, &self.feed)),
+                    event,
+                );
+            }
+        }
+
+        fn key(&mut self, code: u32, pressed: bool) {
+            input::handle(
+                &mut self.capture,
+                &mut self.holds,
+                Seat::Key { code, pressed },
+            );
+        }
+
+        fn type_on(&mut self, events: &[Typing]) {
+            for &event in events {
+                type_on(&mut self.hover, &mut self.capture, &mut self.holds, event);
+            }
+        }
+
+        /// The keyboard follows the pointer from one of the client's surfaces to the other,
+        /// the keys held at home with it, before the pointer's events (Hyprland 0.56.2).
+        fn keyboard_moves(&mut self, held: &[u32]) {
+            self.type_on(&[Typing::Leave, Typing::Enter { keys: held }]);
+        }
+
+        /// To the button and back, as the compositor says it: each leave and enter in a frame,
+        /// with the keyboard's focus.
+        fn over_the_button_and_back(&mut self, held: &[u32]) {
+            self.point(&[Pointing::Motion { x: 60.0, y: 40.0 }, Pointing::Frame]);
+            self.keyboard_moves(held);
+            self.point(&[
+                Pointing::Leave {
+                    over: Over::Picture,
+                },
+                Pointing::Enter {
+                    over: Over::Corner,
+                    x: 50.0,
+                    y: 14.0,
+                },
+                Pointing::Frame,
+                Pointing::Motion { x: 52.0, y: 15.0 },
+                Pointing::Frame,
+            ]);
+            self.type_on(&[Typing::Settled]);
+            self.key(KEY_T, true);
+            self.key(KEY_T, false);
+            self.keyboard_moves(held);
+            self.point(&[
+                Pointing::Leave { over: Over::Corner },
+                Pointing::Enter {
+                    over: Over::Picture,
+                    x: 60.0,
+                    y: 80.0,
+                },
+                Pointing::Frame,
+            ]);
+            self.type_on(&[Typing::Settled]);
+        }
+
+        /// What went to the remote since last asked.
+        fn sent(&mut self) -> Vec<input::Event> {
+            let queued = self.queue.queued();
+            let new = queued[self.seen..].to_vec();
+            self.seen = queued.len();
+            new.into_iter()
+                .filter(|e| !matches!(e, input::Event::Keymap(_)))
+                .collect()
+        }
+    }
+
+    fn key(code: u32, pressed: bool) -> input::Event {
+        input::Event::Key { code, pressed }
+    }
+
+    #[test]
+    fn a_held_modifier_survives_a_pass_over_the_mic_button() {
+        let mut desk = Desk::new();
+        desk.key(KEY_LEFTSHIFT, true);
+        desk.over_the_button_and_back(&[KEY_LEFTSHIFT]);
+        desk.key(KEY_LEFTSHIFT, false);
+        assert_eq!(
+            desk.sent(),
+            [
+                key(KEY_LEFTSHIFT, true),
+                input::Event::Motion { x: 60.0, y: 40.0 },
+                key(KEY_T, true),
+                key(KEY_T, false),
+                input::Event::Motion { x: 60.0, y: 80.0 },
+                key(KEY_LEFTSHIFT, false),
+            ],
+            "no release, no motion over the button"
+        );
+    }
+
+    #[test]
+    fn the_keyboard_stays_with_the_remote_over_the_mic_button() {
+        let mut desk = Desk::new();
+        desk.over_the_button_and_back(&[]);
+        assert_eq!(desk.holds.0, [] as [&str; 0], "neither given nor taken");
+        assert!(desk.sent().contains(&key(KEY_T, true)));
+    }
+
+    #[test]
+    fn a_release_by_the_hotkey_is_not_undone_by_a_pass_over_the_mic_button() {
+        let mut desk = Desk::new();
+        desk.key(KEY_LEFTSHIFT, true);
+        desk.key(KEY_ESC, true);
+        desk.key(KEY_ESC, false);
+        desk.key(KEY_LEFTSHIFT, false);
+        assert_eq!(desk.holds.0, ["none", "uninhibit"]);
+        desk.sent();
+        desk.over_the_button_and_back(&[]);
+        assert_eq!(desk.holds.0, ["none", "uninhibit"], "not taken back");
+        assert!(
+            !desk
+                .sent()
+                .iter()
+                .any(|e| matches!(e, input::Event::Key { .. })),
+            "the keys stay home"
+        );
+    }
+
+    #[test]
+    fn leaving_the_monitor_still_releases_everything() {
+        // From the picture.
+        let mut desk = Desk::new();
+        desk.key(KEY_LEFTSHIFT, true);
+        desk.type_on(&[Typing::Leave]);
+        desk.point(&[
+            Pointing::Leave {
+                over: Over::Picture,
+            },
+            Pointing::Frame,
+        ]);
+        desk.type_on(&[Typing::Settled]);
+        assert_eq!(
+            desk.sent(),
+            [key(KEY_LEFTSHIFT, true), input::Event::ReleaseAll]
+        );
+        assert_eq!(desk.holds.0, ["none", "uninhibit"]);
+        // From the button.
+        let mut desk = Desk::new();
+        desk.key(KEY_LEFTSHIFT, true);
+        desk.keyboard_moves(&[KEY_LEFTSHIFT]);
+        desk.point(&[
+            Pointing::Leave {
+                over: Over::Picture,
+            },
+            Pointing::Enter {
+                over: Over::Corner,
+                x: 50.0,
+                y: 14.0,
+            },
+            Pointing::Frame,
+        ]);
+        desk.type_on(&[Typing::Settled, Typing::Leave]);
+        desk.point(&[Pointing::Leave { over: Over::Corner }, Pointing::Frame]);
+        desk.type_on(&[Typing::Settled]);
+        assert_eq!(
+            desk.sent(),
+            [key(KEY_LEFTSHIFT, true), input::Event::ReleaseAll]
+        );
+        assert_eq!(desk.holds.0, ["none", "uninhibit"]);
+        // Back over the picture, the keyboard is taken again.
+        desk.point(&[Pointing::Enter {
+            over: Over::Picture,
+            x: 5.0,
+            y: 5.0,
+        }]);
+        assert_eq!(desk.holds.0, ["none", "uninhibit", "on_demand", "inhibit"]);
+    }
+
+    #[test]
+    fn the_remote_corner_is_drawn_again_when_the_scale_or_the_size_changes() {
+        // Drawn on a 3840 px monitor at scale 2.
+        let drawn = scale(Some(3840.0), Some((1920, 1080)));
+        assert_eq!(drawn, 2.0);
+        assert!(!again(Some(drawn), drawn), "nothing changed");
+        // Home's monitor set to scale 1.5: the surface is configured smaller.
+        assert!(again(Some(drawn), scale(Some(3840.0), Some((2560, 1440)))));
+        // Its mode changed, the surface's logical size not.
+        assert!(again(Some(drawn), scale(Some(2560.0), Some((1920, 1080)))));
+        // Not drawn yet: it is drawn when it opens.
+        assert!(!again(None, 1.5));
+    }
+
     #[test]
     fn a_compositor_that_never_places_the_surface_does_not_hold_the_start() {
         let (ours, _silent) = UnixStream::pair().unwrap();
@@ -1246,7 +2007,7 @@ mod tests {
             "DP-1",
             Default::default(),
             std::time::Duration::from_millis(300),
-            tokio::sync::mpsc::unbounded_channel().0,
+            (tokio::sync::mpsc::unbounded_channel().0, feed()),
         )
         .err()
         .expect("no surface");

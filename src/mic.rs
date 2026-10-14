@@ -113,7 +113,7 @@ struct Shared<G: Graph> {
     /// Held only briefly, so that orders and the checks are answered while the link waits.
     state: Mutex<State<G>>,
     status: watch::Sender<Status>,
-    /// Says where the mic went, at each switch.
+    /// Says where the mic went, at each switch: the corners.
     notifier: Arc<dyn Notifier>,
 }
 
@@ -286,7 +286,7 @@ impl<G: Graph> Shared<G> {
     }
 
     /// A switch that did not happen: the user pressed a key and nothing on screen says why,
-    /// so the notification does.
+    /// so the corner does.
     fn refused(&self, why: io::Error) -> io::Error {
         self.notifier.show("Mic not switched", &why.to_string());
         why

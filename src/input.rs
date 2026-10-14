@@ -27,12 +27,15 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gliff_proto::Axis;
 use minicbor::{Decode, Encode};
 use tokio::sync::Notify;
 use xkbcommon::xkb;
+
+use crate::display::Keyboard;
 
 /// Events waiting in one direction before the queue is cut to a `ReleaseAll`: several seconds
 /// of typing and scrolling, far more than a link that keeps up ever holds.
@@ -114,6 +117,10 @@ struct Shared {
     carried: Mutex<BTreeSet<u32>>,
     /// Where each output's surface stands in home's layout, for a drag that leaves it.
     places: Mutex<BTreeMap<u8, Place>>,
+    /// The release hotkey gave the keyboard back, and no surface has taken it since: the next
+    /// one to, on any output, says so. A flag of the link, not of a surface, so that moving
+    /// between two reserved monitors with no release says nothing.
+    at_home: AtomicBool,
 }
 
 /// A surface's rectangle in home's layout, in logical pixels.
@@ -460,7 +467,8 @@ pub struct Capture {
     released: bool,
     /// The locks last sent since the keyboard came; `None` sends them at the next modifiers.
     locks_sent: Option<Vec<String>>,
-    /// Hears each time the hotkey gives the keyboard back.
+    /// Hears each time the keyboard goes home by the hotkey, and the first time a surface takes
+    /// it back after.
     on_release: Option<crate::display::Released>,
     /// The surface's origin in home's layout, and its size.
     at: Option<(i32, i32)>,
@@ -469,6 +477,8 @@ pub struct Capture {
 
 impl Capture {
     pub fn new(queue: Queue, hotkey: Option<Hotkey>) -> Self {
+        // A release of a mode that stopped is not this one's.
+        queue.shared.at_home.store(false, Ordering::Relaxed);
         Self {
             queue,
             hotkey,
@@ -484,7 +494,7 @@ impl Capture {
         }
     }
 
-    /// `released` hears each time the hotkey gives the keyboard back.
+    /// `released` hears each time the hotkey gives the keyboard back, and when it comes back.
     pub fn on_release(mut self, released: crate::display::Released) -> Self {
         self.on_release = Some(released);
         self
@@ -532,6 +542,9 @@ impl Capture {
     /// The pointer came over the surface: the keyboard follows it.
     pub fn enter(&mut self, x: f64, y: f64) -> Focus {
         self.released = false;
+        if self.queue.shared.at_home.swap(false, Ordering::Relaxed) {
+            self.said(Keyboard::Remote);
+        }
         self.queue.push(Event::Motion { x, y });
         Focus::Take
     }
@@ -648,9 +661,8 @@ impl Capture {
                     tracing::info!("the release hotkey: the keyboard goes home");
                     self.release();
                     self.released = true;
-                    if let Some(on_release) = &self.on_release {
-                        let _ = on_release.send(());
-                    }
+                    self.queue.shared.at_home.store(true, Ordering::Relaxed);
+                    self.said(Keyboard::Home);
                     return Some(Focus::Give);
                 }
                 Some(Chord::OtherMods(held)) => tracing::debug!(
@@ -675,6 +687,12 @@ impl Capture {
             carried.insert(code);
         }
         None
+    }
+
+    fn said(&self, keyboard: Keyboard) {
+        if let Some(on_release) = &self.on_release {
+            let _ = on_release.send(keyboard);
+        }
     }
 
     fn release(&mut self) {
@@ -982,6 +1000,100 @@ mod tests {
         assert_eq!(capture.enter(1.0, 1.0), Focus::Take);
         capture.key(KEY_T, true);
         assert_eq!(sent(&queue), [Event::ReleaseAll, key(KEY_T, true)]);
+    }
+
+    type News = tokio::sync::mpsc::UnboundedReceiver<crate::display::Keyboard>;
+
+    /// A surface over the reserved monitor `output`, its news of the keyboard going to `news`.
+    fn hearing(
+        queue: &Queue,
+        output: u8,
+        news: &tokio::sync::mpsc::UnboundedSender<Keyboard>,
+    ) -> Capture {
+        let mut capture = Capture::new(queue.on(output), Hotkey::parse(DEFAULT_HOTKEY).unwrap())
+            .on_release(news.clone());
+        capture.keymap(us());
+        capture
+    }
+
+    fn heard(news: &mut News) -> Vec<Keyboard> {
+        std::iter::from_fn(|| news.try_recv().ok()).collect()
+    }
+
+    fn release_hotkey(capture: &mut Capture) {
+        capture.key(KEY_LEFTSHIFT, true);
+        assert_eq!(capture.key(KEY_ESC, true), Some(Focus::Give));
+    }
+
+    #[test]
+    fn the_release_hotkey_says_the_keyboard_is_home() {
+        let (news, mut heard_by) = tokio::sync::mpsc::unbounded_channel();
+        let mut capture = hearing(&Queue::default(), 0, &news);
+        capture.enter(10.0, 10.0);
+        assert_eq!(heard(&mut heard_by), []);
+        release_hotkey(&mut capture);
+        assert_eq!(heard(&mut heard_by), [Keyboard::Home]);
+        // Keys typed at home afterwards say nothing more.
+        capture.key(KEY_T, true);
+        assert_eq!(heard(&mut heard_by), []);
+    }
+
+    #[test]
+    fn the_keyboard_going_back_to_the_remote_says_so_once() {
+        let (news, mut heard_by) = tokio::sync::mpsc::unbounded_channel();
+        let mut capture = hearing(&Queue::default(), 0, &news);
+        capture.enter(10.0, 10.0);
+        release_hotkey(&mut capture);
+        // The pointer leaves, which changes nothing about where the keyboard is.
+        capture.leave();
+        assert_eq!(heard(&mut heard_by), [Keyboard::Home]);
+        capture.enter(10.0, 10.0);
+        assert_eq!(heard(&mut heard_by), [Keyboard::Remote]);
+        // Moving off and back, with no release between, says nothing.
+        capture.leave();
+        capture.enter(10.0, 10.0);
+        assert_eq!(heard(&mut heard_by), []);
+    }
+
+    #[test]
+    fn the_keyboard_released_on_one_monitor_comes_back_on_the_next_one() {
+        let queue = Queue::default();
+        let (news, mut heard_by) = tokio::sync::mpsc::unbounded_channel();
+        let mut first = hearing(&queue, 0, &news);
+        let mut second = hearing(&queue, 1, &news);
+        first.enter(10.0, 10.0);
+        release_hotkey(&mut first);
+        first.leave();
+        second.enter(10.0, 10.0);
+        assert_eq!(heard(&mut heard_by), [Keyboard::Home, Keyboard::Remote]);
+    }
+
+    #[test]
+    fn moving_between_reserved_monitors_without_a_release_shows_nothing() {
+        let queue = Queue::default();
+        let (news, mut heard_by) = tokio::sync::mpsc::unbounded_channel();
+        let mut first = hearing(&queue, 0, &news);
+        let mut second = hearing(&queue, 1, &news);
+        first.enter(10.0, 10.0);
+        first.leave();
+        second.enter(10.0, 10.0);
+        second.leave();
+        first.enter(10.0, 10.0);
+        assert_eq!(heard(&mut heard_by), []);
+    }
+
+    #[test]
+    fn a_release_left_from_a_mode_that_stopped_does_not_speak_in_the_next_one() {
+        let queue = Queue::default();
+        let (news, mut heard_by) = tokio::sync::mpsc::unbounded_channel();
+        let mut capture = hearing(&queue, 0, &news);
+        capture.enter(10.0, 10.0);
+        release_hotkey(&mut capture);
+        drop(capture);
+        // The mode starts again on the same link.
+        let mut capture = hearing(&queue, 0, &news);
+        capture.enter(10.0, 10.0);
+        assert_eq!(heard(&mut heard_by), [Keyboard::Home]);
     }
 
     // The us keymap's modifier masks.
