@@ -41,7 +41,7 @@ stops the start with a message that names them, and nothing is changed.
 
 A `[name]` section in `mode.conf` defines a mode of its own. The keys before the first section
 are the default of every mode: `release`, `mic_hotkey` and the corner's
-`remote_label`, `home_label` and `remote_bar` (a section may set its own), and a `monitor` among them is the one unnamed mode, so a file with no sections keeps
+`remote_label`, `home_label`, `remote_bar` and `home_bar` (a section may set its own), and a `monitor` among them is the one unnamed mode, so a file with no sections keeps
 working, and `navette mode start` with no name starts it.
 
 ```
@@ -162,7 +162,8 @@ While a mode runs, every home monitor shows, at its top left, what it is and whe
   is back over the picture. A drag that passes over the button goes on to the remote machine.
   Anywhere else the pointer goes to the remote machine as before.
 - **On each of home's own monitors**, at the same place, below home's bar (the compositor places
-  it after the space the bar reserves): a red glow, a `HOME` tag and the mic button while the
+  it after the space the bar reserves), or at the height [`home_bar`](#the-corners-tags-and-offset)
+  sets, over it: a red glow, a `HOME` tag and the mic button while the
   mic is home; the mic button alone, dimmed, while the mic is on the remote machine.
 - **The mic button** shows a mic and a round check. On the side that has the mic the check
   draws in and the button turns green; on the other it wipes out (350 ms). A click switches the
@@ -183,18 +184,24 @@ with no keyboard; the one over the remote's picture is part of the surface that 
 
 ### The corner's tags and offset
 
-Three keys of `mode.conf`, global or per `[name]` section like `release`:
+Four keys of `mode.conf`, global or per `[name]` section like `release`:
 
 ```
 remote_label = REMOTE   # the tag on the reserved monitors
 home_label = HOME       # the tag on home's own monitors
 remote_bar = 26         # logical pixels; 0 for a remote without a top bar
+home_bar = auto         # below home's bar, or logical pixels from the top, over it
 ```
 
 A label is printable ASCII (what the corner's font draws), 12 characters at most; anything else
 stops the start with a message, and nothing is changed. `remote_bar` is how far below the top of
 a reserved monitor the corner starts: the height of the remote desktop's bar. The defaults are
 the ones shown, so a remote whose bar is not 26 pixels high sets it.
+
+`home_bar` places the corner on home's own monitors. With `auto` the compositor puts it below
+the space home's bars reserve at the top. A number puts it that many logical pixels from the top
+of the monitor, ignoring that space: `0` for the very top, over a bar that leaves its left end
+free. Anything else stops the start with a message, and nothing is changed.
 
 ## The remote's workspaces
 

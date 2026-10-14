@@ -6,8 +6,8 @@
 //!   remote never captures it, and a click on it stays home.
 //! - **On each of home's own monitors**: the same corner, red with a `HOME` tag while the mic
 //!   is home, shrunk to the mic button alone, dimmed, while it is on the remote.
-//! - **The tags and the bar's height** are the mode's to set (`remote_label`, `home_label`,
-//!   `remote_bar`): see [`Look`].
+//! - **The tags and the bars' heights** are the mode's to set (`remote_label`, `home_label`,
+//!   `remote_bar`, `home_bar`): see [`Look`].
 //! - **The mic button** is a mic and a round check: on the side that has the mic, the check draws
 //!   in and the button turns green; on the other, it wipes out. A click switches the mic, as the
 //!   hotkey and `navette mic toggle` do; hovering it shows the hotkey.
@@ -199,6 +199,9 @@ pub struct Look {
     /// height of the remote's bar, whose left end holds the menu and the workspaces. 26 is
     /// one desktop's default bar; a remote without a top bar sets 0.
     pub remote_bar: i32,
+    /// How far below the top of each of home's own monitors its corner starts, in logical
+    /// pixels, over home's bars; with none, the compositor places it below them.
+    pub home_bar: Option<i32>,
 }
 
 impl Default for Look {
@@ -207,6 +210,7 @@ impl Default for Look {
             remote_label: "REMOTE".into(),
             home_label: "HOME".into(),
             remote_bar: 26,
+            home_bar: None,
         }
     }
 }

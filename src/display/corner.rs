@@ -5,7 +5,7 @@
 //! On a reserved monitor it is a subsurface of the remote's picture ([`super::surface`]); on each
 //! of home's own monitors, a small layer surface of its own, [`HomeCorner`]: on the overlay
 //! layer, anchored top left, with no keyboard, placed by the compositor below the exclusive zones
-//! at the top (home's bar).
+//! at the top (home's bar), or `home_bar` pixels from the top over them.
 
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -214,6 +214,34 @@ pub(super) fn scale_of(info: &OutputInfo) -> f64 {
     }
 }
 
+/// Where home's corner sits on its monitor: its layer surface's anchor, exclusive zone and top
+/// margin.
+#[derive(Debug, PartialEq)]
+struct Place {
+    anchor: Anchor,
+    exclusive: i32,
+    top: i32,
+}
+
+/// Where home's corner sits with `home_bar` (see [`crate::corner::Look`]).
+fn place(home_bar: Option<i32>) -> Place {
+    let anchor = Anchor::TOP | Anchor::LEFT;
+    match home_bar {
+        // An exclusive zone of 0: the compositor places it after the space the bars reserve.
+        None => Place {
+            anchor,
+            exclusive: 0,
+            top: 0,
+        },
+        // -1: the space the bars reserve is ignored, the margin counts from the monitor's top.
+        Some(bar) => Place {
+            anchor,
+            exclusive: -1,
+            top: bar,
+        },
+    }
+}
+
 /// The corner on one of home's own monitors, on its own thread. Dropping it removes it.
 pub struct HomeCorner {
     stop: Option<channel::Sender<()>>,
@@ -339,7 +367,10 @@ fn run(
         Some(NAMESPACE),
         Some(&output),
     );
-    layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+    let place = place(feed.look().home_bar);
+    layer.set_anchor(place.anchor);
+    layer.set_exclusive_zone(place.exclusive);
+    layer.set_margin(place.top, 0, 0, 0);
     let (width, height) = state.painter.corner.size(Instant::now());
     layer.set_size(width, height);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
@@ -610,5 +641,28 @@ mod tests {
         assert!(begin.elapsed() < Duration::from_millis(500));
         drop(corner);
         assert!(begin.elapsed() < Duration::from_secs(1), "nor its stop");
+    }
+
+    #[test]
+    fn home_s_corner_sits_below_home_s_bars_with_auto_and_over_them_with_a_height() {
+        let top_left = Anchor::TOP | Anchor::LEFT;
+        assert_eq!(
+            place(None),
+            Place {
+                anchor: top_left,
+                exclusive: 0,
+                top: 0
+            }
+        );
+        for bar in [0, 38] {
+            assert_eq!(
+                place(Some(bar)),
+                Place {
+                    anchor: top_left,
+                    exclusive: -1,
+                    top: bar
+                }
+            );
+        }
     }
 }

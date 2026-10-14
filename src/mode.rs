@@ -2472,6 +2472,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn home_s_corner_starts_where_the_mode_sets_it() {
+        let top = desk_with("monitor = DP-2\nhome_bar = 0\n");
+        let _remote = started(&top).await;
+        let feeds = top.feeds.lock().unwrap().clone();
+        assert!(!feeds.is_empty());
+        for (_, feed) in feeds {
+            assert_eq!(feed.look().home_bar, Some(0));
+        }
+        let default = desk("DP-2");
+        let _remote = started(&default).await;
+        for (_, feed) in default.feeds.lock().unwrap().iter() {
+            assert_eq!(feed.look().home_bar, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_home_bar_that_is_neither_auto_nor_pixels_fails_clearly_and_changes_nothing() {
+        let desk = desk_with("monitor = DP-2\nhome_bar = high\n");
+        let remote = connect(&desk);
+        let error = answer(ask(&desk, true).await).await.unwrap_err();
+        assert!(error.to_string().contains("home_bar"), "{error}");
+        assert!(desk.covered.lock().unwrap().is_empty());
+        assert!(remote.outbox.queued().is_empty());
+        assert!(desk.hypr.changes().is_empty());
+        assert_eq!(corners(&desk), []);
+    }
+
+    #[tokio::test]
     async fn a_release_hotkey_with_no_known_key_fails_clearly_and_changes_nothing() {
         let desk = desk_with("monitor = DP-2\nrelease = shift+nokey\n");
         let remote = connect(&desk);
