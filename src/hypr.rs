@@ -354,7 +354,7 @@ pub fn send_home(
                 hypr,
                 &format!(
                     "eval hl.dispatch(hl.dsp.workspace.move({{ workspace = {}, monitor = {} }}))",
-                    lua_string(&format!("name:{name}")),
+                    lua_string(&workspace_selector(id, name)),
                     lua_string(home)
                 ),
             )?;
@@ -389,6 +389,7 @@ pub fn send_home(
 /// A workspace with windows on a monitor a mode takes, as the mode starts.
 #[derive(Debug)]
 pub struct Held {
+    pub id: i64,
     pub name: String,
     pub monitor: String,
     /// The monitor shows it.
@@ -418,9 +419,10 @@ pub fn held_workspaces(hypr: &dyn Hypr, given: &[String]) -> io::Result<Vec<Held
         .iter()
         .filter(|w| w["windows"].as_u64().is_some_and(|n| n > 0))
         .filter_map(|w| {
-            let name = w["name"].as_str()?;
+            let (id, name) = (w["id"].as_i64()?, w["name"].as_str()?);
             let monitor = w["monitor"].as_str()?;
             (given.iter().any(|g| g == monitor) && !name.starts_with("special:")).then(|| Held {
+                id,
                 name: name.to_owned(),
                 monitor: monitor.to_owned(),
                 shown: shows(monitor, &w["id"]),
@@ -431,8 +433,8 @@ pub fn held_workspaces(hypr: &dyn Hypr, given: &[String]) -> io::Result<Vec<Held
     Ok(held)
 }
 
-/// The name of the workspace `monitor` shows.
-pub fn shown_workspace(hypr: &dyn Hypr, monitor: &str) -> io::Result<Option<String>> {
+/// The id of the workspace `monitor` shows.
+pub fn shown_workspace(hypr: &dyn Hypr, monitor: &str) -> io::Result<Option<i64>> {
     let reply = hypr.request("j/monitors all")?;
     let monitors: serde_json::Value = serde_json::from_str(&reply).map_err(|e| {
         io::Error::new(
@@ -445,20 +447,35 @@ pub fn shown_workspace(hypr: &dyn Hypr, monitor: &str) -> io::Result<Option<Stri
         .into_iter()
         .flatten()
         .find(|m| m["name"] == monitor)
-        .and_then(|m| m["activeWorkspace"]["name"].as_str())
-        .map(str::to_owned))
+        .and_then(|m| m["activeWorkspace"]["id"].as_i64()))
 }
 
-/// `monitor` shows the workspace `name`, without the focus: a runtime chunk for
-/// [`crate::desk`] and [`dispatch`]. Hyprland makes the workspace when it is missing, but one
-/// on another monitor must be moved first: it would be shown there while still on its own.
-/// `set_workspace` takes the bare name: `name:` makes it do nothing (both measured on
-/// Hyprland 0.56.2).
-pub fn show_workspace(monitor: &str, name: &str) -> String {
+/// How a dispatcher finds the workspace `id` named `name`. Names repeat across monitors (a desk
+/// may name each monitor's workspaces 1 to 10), and `name:` picks the first workspace with the
+/// name, so it goes by id (#93). A named workspace's id is negative, which a dispatcher reads as
+/// relative and moves nothing: that one goes by name (measured on Hyprland 0.56.2).
+pub fn workspace_selector(id: i64, name: &str) -> String {
+    if id > 0 {
+        id.to_string()
+    } else {
+        format!("name:{name}")
+    }
+}
+
+/// `monitor` shows the workspace `id`, without the focus, when it is there: a runtime chunk for
+/// [`crate::desk`] and [`dispatch`]. One on another monitor must be moved first: it would be
+/// shown there while still on its own. `set_workspace` finds a workspace by name only, and
+/// names repeat (#93): the workspace is renamed to a name of its own for the call, then given
+/// its name back. A name it does not find does nothing (all measured on Hyprland 0.56.2).
+pub fn show_workspace(monitor: &str, id: i64) -> String {
+    let unique = lua_string("navette:show");
     format!(
-        "local m = hl.get_monitor({}) if m then m:set_workspace({{ workspace = {} }}) end",
-        lua_string(monitor),
-        lua_string(name)
+        "local m = hl.get_monitor({}) local w = hl.get_workspace({id}) if m and w then \
+         local name = w.name \
+         hl.dispatch(hl.dsp.workspace.rename({{ workspace = w, name = {unique} }})) \
+         m:set_workspace({{ workspace = {unique} }}) \
+         hl.dispatch(hl.dsp.workspace.rename({{ workspace = w, name = name }})) end",
+        lua_string(monitor)
     )
 }
 
@@ -648,6 +665,12 @@ pub mod fake {
             }
         }
 
+        fn name_of(&self, id: i64) -> String {
+            let all = self.all_workspaces();
+            let found = all.into_iter().find(|(i, _, _)| *i == id);
+            found.map_or_else(|| id.to_string(), |(_, name, _)| name)
+        }
+
         /// Every workspace: id, name, monitor.
         fn all_workspaces(&self) -> Vec<(i64, String, String)> {
             let mut all = self.workspaces.clone();
@@ -752,6 +775,19 @@ pub mod fake {
         pub fn bind_workspace(&self, id: i64, monitor: &str) {
             let mut state = self.state.lock().unwrap();
             state.bound.push((id, monitor.into()));
+        }
+
+        /// Every workspace with windows, by id, with its monitor.
+        pub fn workspace_ids(&self) -> Vec<(i64, String)> {
+            let state = self.state.lock().unwrap();
+            let mut all: Vec<(i64, String)> = state
+                .all_workspaces()
+                .into_iter()
+                .filter(|(id, _, _)| state.windows.iter().any(|w| state.workspace_of(w) == *id))
+                .map(|(id, _, monitor)| (id, monitor))
+                .collect();
+            all.sort();
+            all
         }
 
         /// Every workspace with windows, by name, with its monitor.
@@ -909,7 +945,7 @@ pub mod fake {
                         format!(
                             r#"{{"id":{id},"name":"{}","description":"{}","width":{},"height":{},"refreshRate":{},"x":{},"y":{},"scale":{},"transform":{},"focused":false,"disabled":{},"activeWorkspace":{{"id":{},"name":"{}"}}}}"#,
                             m.name, m.description, m.width, m.height, m.refresh, m.x, m.y, m.scale, m.transform,
-                            m.disabled, state.shown(&m.name), state.shown(&m.name)
+                            m.disabled, state.shown(&m.name), state.name_of(state.shown(&m.name))
                         )
                     })
                     .collect();
@@ -1013,9 +1049,18 @@ pub mod fake {
                 else {
                     return Ok("error: hl.workspace.move: expected a table".into());
                 };
-                let name = name.trim_start_matches("name:");
+                // As Hyprland reads a selector: a number is an id (a negative one relative, so
+                // never found here), `name:` the first workspace with that name.
                 let all = state.all_workspaces();
-                match all.into_iter().find(|(_, n, _)| n == name) {
+                let found = match name.strip_prefix("name:") {
+                    Some(name) => all.into_iter().find(|(_, n, _)| n == name),
+                    None => name
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|id| *id > 0)
+                        .and_then(|id| all.into_iter().find(|(i, _, _)| *i == id)),
+                };
+                match found {
                     Some((id, name, from)) => state.move_workspace(id, name, from, &to),
                     None if !guarded => {
                         return Ok("warning: =[C]:-1: Workspace not found".into());
@@ -1027,34 +1072,27 @@ pub mod fake {
                     return Ok("ok".into());
                 }
             }
-            // `local m = hl.get_monitor("X") if m then m:set_workspace({ workspace = "N" }) end`,
-            // maybe after a move: the monitor shows workspace N, made when missing, without the
-            // focus. One on another monitor is not moved: shown there all the same, and still
-            // listed on its own (measured on Hyprland 0.56.2).
+            // `local m = hl.get_monitor("X") local w = hl.get_workspace(ID) if m and w then ...
+            // m:set_workspace(...) ... end`, maybe after a move: the monitor shows workspace ID,
+            // when there, without the focus. One on another monitor is not moved: shown there all
+            // the same, and still listed on its own (measured on Hyprland 0.56.2).
             if let Some(lua) = command.strip_prefix("eval ")
                 && let Some(at) = lua.find("local m = hl.get_monitor(")
             {
                 let lua = &lua[at..];
-                let (Some(monitor), Some(name)) = (
-                    lua.split('"').nth(1).map(str::to_string),
-                    quoted(lua, "workspace"),
-                ) else {
+                let id = lua
+                    .split_once("hl.get_workspace(")
+                    .and_then(|(_, rest)| rest.split_once(')'))
+                    .and_then(|(id, _)| id.parse::<i64>().ok());
+                let (Some(monitor), Some(id)) = (lua.split('"').nth(1).map(str::to_string), id)
+                else {
                     return Ok("error: set_workspace: expected a table".into());
                 };
-                if !state.monitors.iter().any(|m| m.name == monitor) {
-                    return Ok("ok".into());
+                let there = state.all_workspaces().iter().any(|(i, _, _)| *i == id);
+                if there && state.monitors.iter().any(|m| m.name == monitor) {
+                    state.shown.retain(|(m, _)| *m != monitor);
+                    state.shown.push((monitor, id));
                 }
-                let all = state.all_workspaces();
-                let id = match all.into_iter().find(|(_, n, _)| *n == name) {
-                    Some((id, _, _)) => id,
-                    None => {
-                        let id = name.parse().unwrap_or(-2000);
-                        state.workspaces.push((id, name, monitor.clone()));
-                        id
-                    }
-                };
-                state.shown.retain(|(m, _)| *m != monitor);
-                state.shown.push((monitor, id));
                 return Ok("ok".into());
             }
             if let Some(lua) = command.strip_prefix("eval hl.config({ cursor = { invisible = ") {
@@ -1447,6 +1485,18 @@ mod port_tests {
         assert_eq!(hypr.place("0xb2"), ("DP-1".to_string(), -1337));
         assert_eq!(hypr.shown("DP-1"), -1337);
         assert_ne!(hypr.shown("DP-2"), -1337);
+    }
+
+    #[test]
+    fn a_workspace_named_like_one_of_home_s_goes_home_itself() {
+        let hypr = home_with_windows(&[FakeWindow::new("0xa1", "DP-1", 1).on_workspace(3)]);
+        hypr.add_workspace(3, "3", "DP-1");
+        hypr.add_workspace(23, "3", "DP-2");
+        hypr.add_window(FakeWindow::new("0xc3", "DP-2", 0).on_workspace(23));
+        let sent = send_home(&hypr, &dp2(), "DP-1", &mut Vec::new()).unwrap();
+        assert_eq!(sent, ["workspace 3"]);
+        assert_eq!(hypr.place("0xc3"), ("DP-1".to_string(), 23));
+        assert_eq!(hypr.place("0xa1"), ("DP-1".to_string(), 3));
     }
 
     #[test]

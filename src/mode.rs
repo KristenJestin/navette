@@ -882,14 +882,14 @@ async fn open_desk(
             let held = hypr::held_workspaces(&*hypr, &given)?;
             let home_shows = hypr::shown_workspace(&*hypr, other)?;
             for workspace in &held {
-                let (name, from) = (&workspace.name, &workspace.monitor);
-                let change = Change::move_workspace(name, from, other, workspace.shown);
+                let (id, name, from) = (workspace.id, &workspace.name, &workspace.monitor);
+                let change = Change::move_workspace(id, name, from, other, workspace.shown);
                 desk.apply(change).map_err(desk_error)?;
             }
             // The workspace a monitor with the focus shows is shown where it goes (measured
             // on Hyprland 0.56.2): home shows again what it showed.
             if let Some(shows) = home_shows.filter(|_| held.iter().any(|w| w.shown)) {
-                let lua = hypr::show_workspace(other, &shows);
+                let lua = hypr::show_workspace(other, shows);
                 if let Err(e) = hypr::dispatch(&*hypr, &format!("eval {lua}")) {
                     eprintln!("navette: {other} may show another workspace than it did: {e}");
                 }
@@ -2033,6 +2033,10 @@ mod tests {
     /// workspaces (1, 11, 21), with windows on several workspaces of each, and a workspace that
     /// the user's config binds to its monitor (1-10, 11-20, 21-30).
     fn per_monitor_desk(config_text: &str) -> Desk {
+        per_monitor_desk_named(config_text, |id| id.to_string())
+    }
+
+    fn per_monitor_desk_named(config_text: &str, name: fn(i64) -> String) -> Desk {
         let monitors = vec![
             FakeMonitor::new("DP-3", 1920, 1080, 0),
             FakeMonitor::new("DP-1", 2560, 1440, 1920),
@@ -2046,7 +2050,7 @@ mod tests {
             ("DP-2", 21, [21, 22, 23]),
         ] {
             for id in ids {
-                hypr.add_workspace(id, &id.to_string(), monitor);
+                hypr.add_workspace(id, &name(id), monitor);
                 hypr.bind_workspace(id, monitor);
             }
             hypr.show(monitor, shown);
@@ -2080,6 +2084,71 @@ mod tests {
             .iter()
             .map(|n| (n.to_string(), monitor.to_string()))
             .collect()
+    }
+
+    /// The issue's desk (#93): the same, but each monitor names its workspaces 1, 2, 3, and
+    /// the third of each has a window too.
+    fn repeated_names_desk(config_text: &str) -> Desk {
+        let desk = per_monitor_desk_named(config_text, |id| (id % 10).to_string());
+        desk.hypr
+            .add_window(FakeWindow::new("0x3a", "DP-3", 10).on_workspace(3));
+        desk.hypr
+            .add_window(FakeWindow::new("0x23a", "DP-2", 11).on_workspace(23));
+        desk
+    }
+
+    /// Where each workspace with windows is, by id, and what each monitor shows.
+    fn placement_by_id(desk: &Desk) -> (Vec<(i64, String)>, [i64; 3]) {
+        let hypr = &desk.hypr;
+        (
+            hypr.workspace_ids(),
+            [hypr.shown("DP-3"), hypr.shown("DP-1"), hypr.shown("DP-2")],
+        )
+    }
+
+    fn ids_on(monitor: &str, ids: &[i64]) -> Vec<(i64, String)> {
+        ids.iter().map(|id| (*id, monitor.to_string())).collect()
+    }
+
+    #[tokio::test]
+    async fn workspaces_named_alike_on_two_monitors_each_move_and_come_back_by_id() {
+        let desk = repeated_names_desk("monitor = DP-1\n");
+        let before = placement_by_id(&desk);
+        let _remote = started(&desk).await;
+        let mut running = ids_on("DP-3", &[1, 2, 3, 11, 12, 13]);
+        running.extend(ids_on("DP-2", &[21, 22, 23]));
+        assert_eq!(desk.hypr.workspace_ids(), running);
+        assert_eq!(desk.hypr.shown("DP-3"), 1);
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(placement_by_id(&desk), before);
+    }
+
+    #[tokio::test]
+    async fn workspaces_named_alike_on_three_monitors_each_move_and_come_back_by_id() {
+        let desk = repeated_names_desk("monitor = DP-1, DP-2\n");
+        let before = placement_by_id(&desk);
+        let (_remote, text) = started_with(&desk, &["NAVETTE-1", "NAVETTE-2"]).await;
+        text.unwrap();
+        let running = ids_on("DP-3", &[1, 2, 3, 11, 12, 13, 21, 22, 23]);
+        assert_eq!(desk.hypr.workspace_ids(), running);
+        assert_eq!(desk.hypr.shown("DP-3"), 1);
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(placement_by_id(&desk), before);
+    }
+
+    #[tokio::test]
+    async fn a_named_workspace_a_reserved_monitor_shows_moves_and_comes_back() {
+        let desk = repeated_names_desk("monitor = DP-1\n");
+        desk.hypr.add_workspace(-1337, "mail", "DP-1");
+        desk.hypr
+            .add_window(FakeWindow::new("0xa1", "DP-1", 12).on_workspace(-1337));
+        desk.hypr.show("DP-1", -1337);
+        let before = placement_by_id(&desk);
+        let _remote = started(&desk).await;
+        assert_eq!(desk.hypr.place("0xa1"), ("DP-3".to_string(), -1337));
+        assert_eq!(desk.hypr.shown("DP-3"), 1);
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(placement_by_id(&desk), before);
     }
 
     #[tokio::test]
