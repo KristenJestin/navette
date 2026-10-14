@@ -1,9 +1,10 @@
 //! Home's surface on the reserved monitor (the kind chosen in #2): a layer-shell surface on the
 //! overlay layer, bound to that output, anchored on every edge, above the bar. A GPU picture is
-//! a dmabuf handed to the compositor as is (linux-dmabuf), with no copy; a CPU picture goes
-//! through shared memory, as does a GPU picture when the compositor does not take the decoder's
-//! linear dmabufs (Hyprland on an NVIDIA GPU lists only tiled ones), or when the decoder's GPU
-//! is not the compositor's. The newest picture wins: one is shown per frame callback, and an
+//! a dmabuf handed to the compositor as is (linux-dmabuf), with no copy: linear when the
+//! compositor takes linear XRGB8888, else in one of the tiled layouts it lists (Hyprland on an
+//! NVIDIA GPU lists only tiled ones). A CPU picture goes through shared memory, as does a GPU
+//! picture when the decoder can write none of those layouts, or when the decoder's GPU is not
+//! the compositor's. The newest picture wins: one is shown per frame callback, and an
 //! older one still waiting is dropped, which gives its image back to the decoder.
 //!
 //! Focus follows the pointer (#7): the surface takes the keyboard (`on_demand`) and a shortcuts
@@ -28,6 +29,7 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -79,11 +81,65 @@ use crate::input::{self, Capture, Grab, Hotkey, Seat};
 const PLACE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const XRGB8888: u32 = drm_fourcc::DrmFourcc::Xrgb8888 as u32;
-const LINEAR: u64 = 0;
+/// `DRM_FORMAT_MOD_INVALID`: a buffer whose layout the driver keeps to itself, which an
+/// exported image never has.
+const INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
-/// Whether the compositor's formats, as (fourcc, modifier), hold the decoder's linear XRGB8888.
-fn takes_linear_xrgb(formats: impl IntoIterator<Item = (u32, u64)>) -> bool {
-    formats.into_iter().any(|f| f == (XRGB8888, LINEAR))
+/// The layouts in which the compositor's formats, as (fourcc, modifier), take the decoder's
+/// XRGB8888, each once.
+fn xrgb_modifiers(formats: impl IntoIterator<Item = (u32, u64)>) -> Vec<u64> {
+    let mut modifiers = Vec::new();
+    for (format, modifier) in formats {
+        if format == XRGB8888 && modifier != INVALID && !modifiers.contains(&modifier) {
+            modifiers.push(modifier);
+        }
+    }
+    modifiers
+}
+
+/// How a dmabuf picture is handed to the compositor.
+#[derive(Debug, PartialEq)]
+enum Import {
+    /// With `create_immed`: the compositor took this layout already.
+    Immediate,
+    /// With `create`, waiting for `created` or `failed`.
+    Ask,
+    /// Not at all: the compositor refused one, the pictures are copied.
+    Copy,
+}
+
+/// What the compositor said of the decoder's dmabuf layouts. A buffer refused after
+/// `create_immed` is a protocol error that ends the connection, and the cover with it: each
+/// layout is asked first with `create`, whose refusal is only an event. One refusal and the
+/// pictures are copied for the rest of the mode.
+#[derive(Default)]
+struct Imports {
+    taken: Vec<u64>,
+    /// Shared with the decoder, which reads the pictures back once it is set.
+    refused: Arc<AtomicBool>,
+}
+
+impl Imports {
+    fn import(&self, modifier: u64) -> Import {
+        if self.refused.load(Ordering::Relaxed) {
+            Import::Copy
+        } else if self.taken.contains(&modifier) {
+            Import::Immediate
+        } else {
+            Import::Ask
+        }
+    }
+
+    fn created(&mut self, modifier: u64) {
+        if !self.taken.contains(&modifier) {
+            self.taken.push(modifier);
+        }
+    }
+
+    /// Whether this is the first refusal.
+    fn failed(&mut self) -> bool {
+        !self.refused.swap(true, Ordering::Relaxed)
+    }
 }
 
 /// The layer surface's namespace, for layer rules.
@@ -179,8 +235,10 @@ fn shown(pointer: Pointer) -> Pointer {
 
 /// The surface, on its own thread. Dropping it removes the surface.
 pub struct Surface {
-    /// The compositor takes the decoder's linear XRGB8888 dmabuf.
-    linear_dmabuf: bool,
+    /// The layouts in which the compositor takes the decoder's XRGB8888 dmabufs.
+    modifiers: Vec<u64>,
+    /// Set once the compositor refused a dmabuf.
+    refused: Arc<AtomicBool>,
     pictures: Option<channel::Sender<Show>>,
     pointer: Newest<Pointer>,
     thread: Option<JoinHandle<()>>,
@@ -214,6 +272,11 @@ impl Surface {
         let (ready_tx, ready) = std::sync::mpsc::channel();
         let output = output.to_string();
         let newest = pointer.clone();
+        let refused = Arc::new(AtomicBool::new(false));
+        let imports = Imports {
+            taken: Vec::new(),
+            refused: refused.clone(),
+        };
         let thread = std::thread::Builder::new()
             .name("navette-surface".into())
             .spawn(move || {
@@ -222,7 +285,13 @@ impl Surface {
                     Some(released) => capture.on_release(released),
                     None => capture,
                 };
-                let why = match run(conn, &output, (channel, newest), capture, &ready_tx) {
+                let why = match run(
+                    conn,
+                    &output,
+                    (channel, newest),
+                    (capture, imports),
+                    &ready_tx,
+                ) {
                     Ok(None) => return,
                     Ok(Some(why)) => why,
                     Err(e) => {
@@ -234,15 +303,16 @@ impl Surface {
                 let _ = ended.send(why);
             })?;
         let mut surface = Self {
-            linear_dmabuf: false,
+            modifiers: Vec::new(),
+            refused,
             pictures: Some(pictures),
             pointer,
             thread: Some(thread),
         };
         match ready.recv_timeout(wait) {
-            Ok(Ok((size, linear_dmabuf))) => {
-                tracing::debug!(?size, linear_dmabuf, "surface placed");
-                surface.linear_dmabuf = linear_dmabuf;
+            Ok(Ok((size, modifiers))) => {
+                tracing::debug!(?size, ?modifiers, "surface placed");
+                surface.modifiers = modifiers;
                 Ok(surface)
             }
             Ok(Err(e)) => Err(e),
@@ -263,9 +333,15 @@ impl Surface {
         }
     }
 
-    /// Whether a GPU picture can be handed over as is; otherwise it is read back first.
-    pub fn takes_linear_dmabuf(&self) -> bool {
-        self.linear_dmabuf
+    /// The layouts in which a GPU picture can be handed over as is; with none, it is read back
+    /// first.
+    pub fn dmabuf_modifiers(&self) -> Vec<u64> {
+        self.modifiers.clone()
+    }
+
+    /// Set once the compositor refused a dmabuf: the GPU's pictures are read back from then on.
+    pub fn dmabuf_refused(&self) -> Arc<AtomicBool> {
+        self.refused.clone()
     }
 
     /// Where the decoder sends its pictures.
@@ -316,8 +392,9 @@ fn compositor() -> io::Result<UnixStream> {
     }
 }
 
-/// The surface's size once placed, and whether the compositor takes linear dmabufs.
-type Ready = io::Result<((u32, u32), bool)>;
+/// The surface's size once placed, and the layouts in which the compositor takes the decoder's
+/// dmabufs.
+type Ready = io::Result<((u32, u32), Vec<u64>)>;
 
 fn wayland(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("wayland: {e}"))
@@ -328,7 +405,7 @@ fn run(
     conn: Connection,
     output_name: &str,
     (pictures, pointer): (Channel<Show>, Newest<Pointer>),
-    capture: Capture,
+    (capture, imports): (Capture, Imports),
     ready: &std::sync::mpsc::Sender<Ready>,
 ) -> io::Result<Option<String>> {
     let (globals, queue) = registry_queue_init::<State>(&conn).map_err(wayland)?;
@@ -362,9 +439,11 @@ fn run(
         transform: wl_output::Transform::Normal,
         size: None,
         ready: Some(ready.clone()),
-        linear_dmabuf: None,
+        modifiers: None,
         render_node: hypr_capture::render_node(None),
         pending: None,
+        imports,
+        asking: None,
         waiting_frame: false,
         shown_shm: None,
         shown_dmabuf: HashMap::new(),
@@ -402,7 +481,7 @@ fn run(
     event_loop.dispatch(Some(Duration::from_millis(100)), &mut state)?;
     // Version 4's feedback comes once complete: no guess before its `done`.
     for _ in 0..10 {
-        if state.linear_dmabuf.is_some() || state.dmabuf.version().is_none_or(|v| v < 4) {
+        if state.modifiers.is_some() || state.dmabuf.version().is_none_or(|v| v < 4) {
             break;
         }
         conn.roundtrip().map_err(wayland)?;
@@ -410,15 +489,15 @@ fn run(
     }
 
     // Before version 4, the formats came as a list, with no main device.
-    if state.linear_dmabuf.is_none() {
-        let linear = takes_linear_xrgb(
+    if state.modifiers.is_none() {
+        let modifiers = xrgb_modifiers(
             state
                 .dmabuf
                 .modifiers()
                 .iter()
                 .map(|f| (f.format, f.modifier)),
         );
-        state.linear_dmabuf = Some(linear);
+        state.modifiers = Some(modifiers);
     }
 
     let output = state
@@ -505,11 +584,14 @@ struct State {
     /// The surface's size in logical pixels, once configured.
     size: Option<(u32, u32)>,
     ready: Option<std::sync::mpsc::Sender<Ready>>,
-    /// From the compositor's dmabuf feedback (version 4 and up).
-    linear_dmabuf: Option<bool>,
+    /// The XRGB8888 layouts the compositor takes from the decoder's GPU, once known.
+    modifiers: Option<Vec<u64>>,
     /// The decoder's GPU, compared with the compositor's main device.
     render_node: PathBuf,
     pending: Option<Picture>,
+    imports: Imports,
+    /// A dmabuf picture whose buffer the compositor is asked for, with its params.
+    asking: Option<(zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, Picture)>,
     /// A picture was committed and its frame callback has not come yet.
     waiting_frame: bool,
     shown_shm: Option<Buffer>,
@@ -678,10 +760,7 @@ impl State {
 
     /// Shows the waiting picture if the compositor is ready for one.
     fn present(&mut self) {
-        let Some((width, height)) = self.size else {
-            return;
-        };
-        if self.waiting_frame {
+        if self.size.is_none() || self.waiting_frame || self.asking.is_some() {
             return;
         }
         let Some(picture) = self.pending.take() else {
@@ -693,6 +772,11 @@ impl State {
         };
         match picture {
             Picture::Dmabuf(frame) => {
+                let import = self.imports.import(frame.modifier);
+                if import == Import::Copy {
+                    // Dropped: the decoder reads the next ones back.
+                    return;
+                }
                 let Ok(params) = self.dmabuf.create_params(&qh) else {
                     return;
                 };
@@ -703,13 +787,18 @@ impl State {
                     frame.stride,
                     frame.modifier,
                 );
-                let (buffer, _) = params.create_immed(
-                    frame.width as i32,
-                    frame.height as i32,
+                let (width, height) = (frame.width as i32, frame.height as i32);
+                let (format, flags) = (
                     frame.fourcc as u32,
                     zwp_linux_buffer_params_v1::Flags::empty(),
-                    &qh,
                 );
+                if import == Import::Ask {
+                    let params = params.create(width, height, format, flags);
+                    self.asking = Some((params, Picture::Dmabuf(frame)));
+                    return;
+                }
+                let (buffer, params) = params.create_immed(width, height, format, flags, &qh);
+                params.destroy();
                 surface.attach(Some(&buffer), 0, 0);
                 self.shown_dmabuf
                     .insert(buffer.id(), (buffer, Picture::Dmabuf(frame)));
@@ -724,6 +813,14 @@ impl State {
                 self.shown_shm = Some(buffer);
             }
         }
+        self.commit_picture(&surface);
+    }
+
+    /// Commits the attached picture, and asks to hear when the compositor wants the next one.
+    fn commit_picture(&mut self, surface: &wl_surface::WlSurface) {
+        let Some((width, height)) = self.size else {
+            return;
+        };
         // The picture is in the monitor's mode, unturned, like the screen it was captured from:
         // the compositor applies the monitor's transform, flips and half turns included.
         surface.set_buffer_transform(self.transform);
@@ -731,7 +828,7 @@ impl State {
             viewport.set_destination(width as i32, height as i32);
         }
         surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-        surface.frame(&qh, surface.clone());
+        surface.frame(&self.qh, surface.clone());
         surface.commit();
         self.waiting_frame = true;
     }
@@ -852,7 +949,8 @@ impl LayerShellHandler for State {
                 self.shown_shm = Some(buffer);
             }
             if let Some(ready) = self.ready.take() {
-                let _ = ready.send(Ok((size, self.linear_dmabuf.unwrap_or(false))));
+                let modifiers = self.modifiers.clone().unwrap_or_default();
+                let _ = ready.send(Ok((size, modifiers)));
             }
         }
     }
@@ -871,32 +969,60 @@ impl DmabufHandler for State {
         feedback: DmabufFeedback,
     ) {
         let table = feedback.format_table();
-        let linear = takes_linear_xrgb(feedback.tranches().iter().flat_map(|tranche| {
+        let modifiers = xrgb_modifiers(feedback.tranches().iter().flat_map(|tranche| {
             tranche
                 .formats
                 .iter()
                 .filter_map(|&i| table.get(i as usize))
                 .map(|f| (f.format, f.modifier))
         }));
-        self.linear_dmabuf = Some(linear && same_gpu(feedback.main_device(), &self.render_node));
+        self.modifiers = Some(if same_gpu(feedback.main_device(), &self.render_node) {
+            modifiers
+        } else {
+            Vec::new()
+        });
     }
 
     fn created(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
-        _: wl_buffer::WlBuffer,
+        params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        buffer: wl_buffer::WlBuffer,
     ) {
+        params.destroy();
+        let Some((_, picture)) = self.asking.take() else {
+            buffer.destroy();
+            return;
+        };
+        if let Picture::Dmabuf(frame) = &picture {
+            self.imports.created(frame.modifier);
+        }
+        let Some(surface) = self.surface().cloned() else {
+            buffer.destroy();
+            return;
+        };
+        surface.attach(Some(&buffer), 0, 0);
+        self.shown_dmabuf.insert(buffer.id(), (buffer, picture));
+        self.commit_picture(&surface);
     }
 
     fn failed(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
     ) {
-        tracing::warn!("the compositor refused a decoded picture");
+        params.destroy();
+        // The picture goes back to the decoder.
+        self.asking = None;
+        if self.imports.failed() {
+            eprintln!(
+                "navette: the compositor refused the decoded picture; the pictures are copied \
+                 for the rest of the mode"
+            );
+        }
+        self.present();
     }
 
     fn released(&mut self, _: &Connection, _: &QueueHandle<Self>, buffer: &wl_buffer::WlBuffer) {
@@ -1184,19 +1310,51 @@ mod tests {
         assert_eq!(char_device((256 << 12) | (226 << 8) | 44), "226:300");
     }
 
+    const ARGB8888: u32 = drm_fourcc::DrmFourcc::Argb8888 as u32;
+
     #[test]
-    fn a_compositor_with_only_tiled_dmabufs_gets_a_copy() {
-        assert!(!takes_linear_xrgb([
+    fn a_compositor_with_only_tiled_dmabufs_is_offered_its_tiled_layouts() {
+        let modifiers = xrgb_modifiers([
             (XRGB8888, BLOCK_LINEAR),
-            (XRGB8888, 0x00ff_ffff_ffff_ffff)
-        ]));
+            (ARGB8888, 0x0300_0000_0060_6014),
+            (XRGB8888, INVALID),
+            (XRGB8888, BLOCK_LINEAR),
+        ]);
+        assert_eq!(modifiers, [BLOCK_LINEAR]);
     }
 
     #[test]
     fn a_compositor_that_takes_linear_xrgb_gets_the_dmabuf() {
-        assert!(takes_linear_xrgb([
-            (XRGB8888, BLOCK_LINEAR),
-            (XRGB8888, LINEAR)
-        ]));
+        let modifiers = xrgb_modifiers([(XRGB8888, BLOCK_LINEAR), (XRGB8888, 0)]);
+        assert_eq!(modifiers, [BLOCK_LINEAR, 0]);
+    }
+
+    #[test]
+    fn a_compositor_that_refuses_the_tiled_picture_gets_copies_for_the_rest_of_the_mode() {
+        let mut imports = Imports::default();
+        let refused = imports.refused.clone();
+        assert_eq!(imports.import(BLOCK_LINEAR), Import::Ask);
+        assert!(imports.failed(), "the first refusal is told");
+        assert!(refused.load(Ordering::Relaxed), "the decoder hears it");
+        assert_eq!(imports.import(BLOCK_LINEAR), Import::Copy);
+        assert!(!imports.failed(), "told once");
+    }
+
+    #[test]
+    fn a_layout_the_compositor_took_once_is_handed_over_at_once() {
+        let mut imports = Imports::default();
+        assert_eq!(imports.import(BLOCK_LINEAR), Import::Ask);
+        imports.created(BLOCK_LINEAR);
+        assert_eq!(imports.import(BLOCK_LINEAR), Import::Immediate);
+        assert_eq!(
+            imports.import(0),
+            Import::Ask,
+            "a new layout is asked again"
+        );
+    }
+
+    #[test]
+    fn a_compositor_without_xrgb_dmabufs_gets_a_copy() {
+        assert!(xrgb_modifiers([(ARGB8888, 0), (XRGB8888, INVALID)]).is_empty());
     }
 }

@@ -18,6 +18,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -114,8 +115,10 @@ pub trait Screen: Send {
     fn pictures(&self) -> Box<dyn FnMut(Picture) + Send>;
     /// The remote pointer: its image, shown at home's pointer over the cover.
     fn cursor(&self, pointer: Pointer);
-    /// The GPU's pictures can be handed over as dmabufs, with no copy.
-    fn takes_dmabuf(&self) -> bool;
+    /// The layouts in which the GPU's pictures can be handed over as dmabufs, with no copy.
+    fn dmabuf_modifiers(&self) -> Vec<u64>;
+    /// Set once the compositor refused a dmabuf: the GPU's pictures are read back from then on.
+    fn dmabuf_refused(&self) -> Arc<AtomicBool>;
 }
 
 /// The real cover: a layer surface on the monitor.
@@ -144,8 +147,12 @@ impl Screen for crate::display::surface::Surface {
         crate::display::surface::Surface::cursor(self, pointer)
     }
 
-    fn takes_dmabuf(&self) -> bool {
-        self.takes_linear_dmabuf()
+    fn dmabuf_modifiers(&self) -> Vec<u64> {
+        crate::display::surface::Surface::dmabuf_modifiers(self)
+    }
+
+    fn dmabuf_refused(&self) -> Arc<AtomicBool> {
+        crate::display::surface::Surface::dmabuf_refused(self)
     }
 }
 
@@ -661,7 +668,7 @@ async fn launch(
             )?;
             let decoding = Decoding::start(
                 gpu,
-                screen.takes_dmabuf(),
+                (screen.dmabuf_modifiers(), screen.dmabuf_refused()),
                 outbox.on(output),
                 screen.pictures(),
                 ended_tx.clone(),
@@ -1081,8 +1088,12 @@ mod tests {
             Box::new(|_| {})
         }
 
-        fn takes_dmabuf(&self) -> bool {
-            false
+        fn dmabuf_modifiers(&self) -> Vec<u64> {
+            Vec::new()
+        }
+
+        fn dmabuf_refused(&self) -> Arc<AtomicBool> {
+            Arc::default()
         }
 
         fn cursor(&self, pointer: Pointer) {
