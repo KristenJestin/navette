@@ -237,11 +237,39 @@ impl Staging {
     }
 
     /// Moves each top-level entry into the inbox under its own name, or the name with a suffix
-    /// when one is already there; their paths there.
+    /// when one is already there; their paths there. All of them or none: when one cannot be
+    /// moved, those already moved come back, to go with this folder.
     pub fn finish<'a>(self, tops: impl Iterator<Item = &'a str>) -> io::Result<Vec<PathBuf>> {
-        tops.map(|top| place(&self.path_of(top)?, &self.inbox, OsStr::new(top)))
-            .collect()
+        let mut placed = Vec::new();
+        for top in tops {
+            let to = self
+                .path_of(top)
+                .and_then(|from| Ok((place(&from, &self.inbox, OsStr::new(top))?, from)));
+            match to {
+                Ok(moved) => placed.push(moved),
+                Err(e) => return Err(unplace(placed, e)),
+            }
+        }
+        Ok(placed.into_iter().map(|(to, _)| to).collect())
     }
+}
+
+/// Moves the entries placed back where they came from, after `e`; what could not be is named
+/// in the error the user reads.
+fn unplace(placed: Vec<(PathBuf, PathBuf)>, e: io::Error) -> io::Error {
+    let stayed: Vec<String> = placed
+        .into_iter()
+        // Back into the staging folder, the paste's alone: nothing there to overwrite.
+        .filter(|(to, from)| std::fs::rename(to, from).is_err())
+        .map(|(to, _)| to.display().to_string())
+        .collect();
+    if stayed.is_empty() {
+        return e;
+    }
+    io::Error::new(
+        e.kind(),
+        format!("{e}; left in place: {}", stayed.join(", ")),
+    )
 }
 
 impl Drop for Staging {
@@ -477,6 +505,18 @@ mod tests {
         assert_eq!(std::fs::read(&placed[0]).unwrap(), b"new");
         // The staging folder went with the paste.
         assert_eq!(std::fs::read_dir(&inbox.dir).unwrap().count(), 5);
+    }
+
+    #[test]
+    fn a_paste_whose_later_entry_cannot_be_placed_places_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = Inbox::new(tmp.path().into());
+        let staging = Staging::create_in(&inbox).unwrap();
+        std::fs::write(staging.path_of("first.txt").unwrap(), b"one").unwrap();
+        // The second entry is not in the staging folder: it cannot be moved.
+        let failed = staging.finish(["first.txt", "second.txt"].into_iter());
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 
     #[test]
