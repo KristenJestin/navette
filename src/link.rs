@@ -1533,7 +1533,11 @@ pub(crate) mod tests {
                 code: 125,
                 pressed: true,
             },
-            input::Event::Motion { x: 10.0, y: 20.0 },
+            input::Event::Motion {
+                x: 10.0,
+                y: 20.0,
+                delta: None,
+            },
             input::Event::ReleaseAll,
         ];
         for event in events.clone() {

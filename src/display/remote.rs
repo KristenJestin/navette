@@ -1096,6 +1096,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_middle_button_drag_from_home_reaches_the_remote_injector_in_order() {
+        const BTN_MIDDLE: u32 = 0x112;
+        let agent = agent();
+        agent.inbox.try_send(start()).unwrap();
+        until(|| started(&agent.outbox)).await;
+        let drag = [
+            input::Event::Button {
+                button: BTN_MIDDLE,
+                pressed: true,
+            },
+            input::Event::Motion {
+                x: 650.0,
+                y: 360.0,
+                delta: Some((10.0, 0.0)),
+            },
+            input::Event::Button {
+                button: BTN_MIDDLE,
+                pressed: false,
+            },
+        ];
+        for event in &drag {
+            agent.input.push(event.clone());
+        }
+        until(|| agent.injected(0).is_some_and(|(_, _, e)| e.len() == 3)).await;
+        assert_eq!(agent.injected(0).unwrap().2, drag);
+    }
+
+    #[tokio::test]
     async fn a_dropped_link_releases_everything_before_the_output_goes() {
         let agent = agent();
         agent.inbox.try_send(start()).unwrap();

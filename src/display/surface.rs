@@ -1729,7 +1729,11 @@ mod tests {
         assert_eq!(
             queue.queued(),
             [
-                input::Event::Motion { x: 5.0, y: 300.0 },
+                input::Event::Motion {
+                    x: 5.0,
+                    y: 300.0,
+                    delta: None
+                },
                 input::Event::Button {
                     button: BTN_LEFT,
                     pressed: true
@@ -1896,10 +1900,19 @@ mod tests {
             desk.sent(),
             [
                 key(KEY_LEFTSHIFT, true),
-                input::Event::Motion { x: 60.0, y: 40.0 },
+                input::Event::Motion {
+                    x: 60.0,
+                    y: 40.0,
+                    delta: Some((-240.0, -260.0))
+                },
                 key(KEY_T, true),
                 key(KEY_T, false),
-                input::Event::Motion { x: 60.0, y: 80.0 },
+                // What the pointer went over the button counts, never sent while it was there.
+                input::Event::Motion {
+                    x: 60.0,
+                    y: 80.0,
+                    delta: Some((0.0, 40.0))
+                },
                 key(KEY_LEFTSHIFT, false),
             ],
             "no release, no motion over the button"

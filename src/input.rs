@@ -5,7 +5,10 @@
 //!
 //! Positions are the surface's own (home's logical pixels) and the remote pointer's extent is
 //! the surface's size: the virtual pointer's absolute motion is a fraction of its output, so
-//! the position lands at the same place whatever scale Hyprland chose on either side.
+//! the position lands at the same place whatever scale Hyprland chose on either side. Each
+//! motion also carries how far it moved, injected as relative motion before the position: a
+//! client that locks the pointer (a 3D view orbiting while the middle button is held, a game)
+//! sees only relative motion, and Hyprland sends none for an absolute one.
 //!
 //! **The queue.** Each direction has one bounded queue, which never blocks its writer (the
 //! surface's thread at home, the link's reader on the remote). Its policy keeps a held key from
@@ -62,6 +65,10 @@ pub enum Event {
         x: f64,
         #[n(1)]
         y: f64,
+        /// How far the pointer moved since the motion before, in the same pixels: what a
+        /// client that locks the pointer sees. None for the motion that comes onto the surface.
+        #[n(2)]
+        delta: Option<(f64, f64)>,
     },
     /// `button` is an evdev `BTN_*` code.
     #[n(2)]
@@ -182,7 +189,18 @@ impl Queue {
             && matches!(events.back(), Some((o, Event::Motion { .. })) if *o == output);
         let full = events.len() >= QUEUE;
         match events.back_mut() {
-            Some((_, last)) if follows_a_motion => *last = event,
+            Some((_, last)) if follows_a_motion => {
+                let (Event::Motion { delta: before, .. }, Event::Motion { x, y, delta }) =
+                    (&*last, event)
+                else {
+                    unreachable!("both are motions")
+                };
+                let delta = match (*before, delta) {
+                    (Some((a, b)), Some((c, d))) => Some((a + c, b + d)),
+                    (one, other) => one.or(other),
+                };
+                *last = Event::Motion { x, y, delta };
+            }
             _ if full => {
                 // A keymap coming now replaces the one queued.
                 let keymap = events
@@ -472,6 +490,8 @@ pub struct Capture {
     on_release: Option<crate::display::Released>,
     /// The surface's origin in home's layout, and its size.
     at: Option<(i32, i32)>,
+    /// The position of the pointer's last motion, the one its next is measured from.
+    last: Option<(f64, f64)>,
     size: Option<(u32, u32)>,
 }
 
@@ -490,6 +510,7 @@ impl Capture {
             locks_sent: None,
             on_release: None,
             at: None,
+            last: None,
             size: None,
         }
     }
@@ -545,7 +566,8 @@ impl Capture {
         if self.queue.shared.at_home.swap(false, Ordering::Relaxed) {
             self.said(Keyboard::Remote);
         }
-        self.queue.push(Event::Motion { x, y });
+        self.last = Some((x, y));
+        self.queue.push(Event::Motion { x, y, delta: None });
         Focus::Take
     }
 
@@ -608,12 +630,14 @@ impl Capture {
     /// and the motion on another's as one drag. Off every work monitor, the drag stops at the
     /// nearest edge, so a remote window never goes where home shows no remote output.
     pub fn motion(&mut self, x: f64, y: f64) {
+        let delta = self.last.map(|(last_x, last_y)| (x - last_x, y - last_y));
+        self.last = Some((x, y));
         let (output, x, y) = if self.held_buttons.is_empty() {
             (self.queue.output, x, y)
         } else {
             self.across(x, y)
         };
-        self.queue.on(output).push(Event::Motion { x, y });
+        self.queue.on(output).push(Event::Motion { x, y, delta });
     }
 
     /// The output under the surface's position (`x`, `y`), and the position on it.
@@ -855,32 +879,48 @@ impl Injectors for LiveInjectors {
 
 impl Inject for hypr_input::Input {
     fn send(&self, event: &Event) {
-        use hypr_input::InputCmd;
-        let cmd = match event.clone() {
-            Event::Key { code, pressed } => InputCmd::Key { code, pressed },
-            Event::Motion { x, y } => InputCmd::Motion { x, y },
-            Event::Button { button, pressed } => InputCmd::Button { button, pressed },
-            Event::Axis {
-                axis,
-                value,
-                discrete,
-                stop,
-            } => InputCmd::Axis {
-                axis: match axis {
-                    Axis::Vertical => hypr_input::Axis::Vertical,
-                    Axis::Horizontal => hypr_input::Axis::Horizontal,
-                },
-                value,
-                discrete,
-                stop,
-            },
-            Event::Keymap(text) => InputCmd::SetKeymap(text),
-            Event::Area { width, height } => InputCmd::SetExtent { width, height },
-            Event::ReleaseAll => InputCmd::ReleaseAll,
-            Event::Locked(names) => InputCmd::SetLocked(names),
-        };
-        let _ = hypr_input::Input::send(self, cmd);
+        for cmd in commands(event.clone()) {
+            let _ = hypr_input::Input::send(self, cmd);
+        }
     }
+}
+
+/// What the virtual keyboard and pointer are told for `event`.
+fn commands(event: Event) -> Vec<hypr_input::InputCmd> {
+    use hypr_input::InputCmd;
+    let cmd = match event {
+        Event::Key { code, pressed } => InputCmd::Key { code, pressed },
+        Event::Motion { x, y, delta } => {
+            let motion = InputCmd::Motion { x, y };
+            return match delta {
+                // The relative motion first, so the position puts the pointer where home's is.
+                Some((dx, dy)) if (dx, dy) != (0.0, 0.0) => {
+                    vec![InputCmd::Relative { dx, dy }, motion]
+                }
+                _ => vec![motion],
+            };
+        }
+        Event::Button { button, pressed } => InputCmd::Button { button, pressed },
+        Event::Axis {
+            axis,
+            value,
+            discrete,
+            stop,
+        } => InputCmd::Axis {
+            axis: match axis {
+                Axis::Vertical => hypr_input::Axis::Vertical,
+                Axis::Horizontal => hypr_input::Axis::Horizontal,
+            },
+            value,
+            discrete,
+            stop,
+        },
+        Event::Keymap(text) => InputCmd::SetKeymap(text),
+        Event::Area { width, height } => InputCmd::SetExtent { width, height },
+        Event::ReleaseAll => InputCmd::ReleaseAll,
+        Event::Locked(names) => InputCmd::SetLocked(names),
+    };
+    vec![cmd]
 }
 
 #[cfg(test)]
@@ -892,6 +932,7 @@ mod tests {
     const KEY_ESC: u32 = 1;
     const KEY_T: u32 = 20;
     const BTN_LEFT: u32 = 0x110;
+    const BTN_MIDDLE: u32 = 0x112;
 
     fn us() -> String {
         hypr_input::keymap_from_names(&hypr_input::KeymapNames {
@@ -936,7 +977,81 @@ mod tests {
     }
 
     fn motion(x: f64, y: f64) -> Event {
-        Event::Motion { x, y }
+        Event::Motion { x, y, delta: None }
+    }
+
+    fn moved(x: f64, y: f64, dx: f64, dy: f64) -> Event {
+        Event::Motion {
+            x,
+            y,
+            delta: Some((dx, dy)),
+        }
+    }
+
+    /// Everything queued, the queue emptied.
+    fn taken(queue: &Queue) -> Vec<Event> {
+        let events = queue.queued();
+        queue.shared.waiting.lock().unwrap().events.clear();
+        events
+    }
+
+    #[test]
+    fn a_middle_button_drag_goes_out_as_press_motions_and_release_in_order() {
+        let (mut capture, queue) = armed(DEFAULT_HOTKEY);
+        taken(&queue);
+        capture.button(BTN_MIDDLE, true);
+        assert_eq!(taken(&queue), [button(BTN_MIDDLE, true)]);
+        capture.motion(15.0, 12.0);
+        assert_eq!(taken(&queue), [moved(15.0, 12.0, 5.0, 2.0)]);
+        capture.motion(25.0, 8.0);
+        assert_eq!(taken(&queue), [moved(25.0, 8.0, 10.0, -4.0)]);
+        capture.button(BTN_MIDDLE, false);
+        assert_eq!(taken(&queue), [button(BTN_MIDDLE, false)]);
+    }
+
+    #[test]
+    fn the_motion_coming_onto_the_surface_moves_nothing_relative() {
+        let (mut capture, queue) = armed(DEFAULT_HOTKEY);
+        taken(&queue);
+        capture.leave();
+        capture.enter(300.0, 200.0);
+        assert_eq!(taken(&queue), [Event::ReleaseAll, motion(300.0, 200.0)]);
+        capture.motion(301.0, 200.0);
+        assert_eq!(taken(&queue), [moved(301.0, 200.0, 1.0, 0.0)]);
+    }
+
+    #[test]
+    fn motions_merged_in_the_queue_keep_the_sum_of_their_deltas() {
+        let queue = Queue::default();
+        queue.push(motion(1.0, 1.0));
+        queue.push(moved(4.0, 3.0, 3.0, 2.0));
+        queue.push(moved(2.0, 3.0, -2.0, 0.0));
+        assert_eq!(queue.queued(), [moved(2.0, 3.0, 1.0, 2.0)]);
+    }
+
+    #[test]
+    fn a_motion_with_a_delta_is_injected_as_relative_motion_then_the_position() {
+        let injected = |event| {
+            commands(event)
+                .into_iter()
+                .map(|cmd| format!("{cmd:?}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            injected(moved(15.0, 12.0, 5.0, -2.0)),
+            [
+                "Relative { dx: 5.0, dy: -2.0 }",
+                "Motion { x: 15.0, y: 12.0 }"
+            ]
+        );
+        assert_eq!(
+            injected(motion(15.0, 12.0)),
+            ["Motion { x: 15.0, y: 12.0 }"]
+        );
+        assert_eq!(
+            injected(moved(15.0, 12.0, 0.0, 0.0)),
+            ["Motion { x: 15.0, y: 12.0 }"]
+        );
     }
 
     #[test]
@@ -1373,16 +1488,29 @@ mod tests {
             queue.push(Event::Motion {
                 x: x as f64,
                 y: 0.0,
+                delta: None,
             });
         }
         queue.push(key(KEY_T, true));
-        queue.push(Event::Motion { x: 1.0, y: 1.0 });
+        queue.push(Event::Motion {
+            x: 1.0,
+            y: 1.0,
+            delta: None,
+        });
         assert_eq!(
             queue.queued(),
             [
-                Event::Motion { x: 99.0, y: 0.0 },
+                Event::Motion {
+                    x: 99.0,
+                    y: 0.0,
+                    delta: None
+                },
                 key(KEY_T, true),
-                Event::Motion { x: 1.0, y: 1.0 }
+                Event::Motion {
+                    x: 1.0,
+                    y: 1.0,
+                    delta: None
+                }
             ]
         );
     }
@@ -1443,7 +1571,12 @@ mod tests {
     fn every_input_event_survives_the_trip_through_the_link() {
         let events = [
             key(KEY_T, true),
-            Event::Motion { x: 1.5, y: 2.25 },
+            Event::Motion {
+                x: 1.5,
+                y: 2.25,
+                delta: None,
+            },
+            moved(1.5, 2.25, 0.5, -1.0),
             Event::Button {
                 button: BTN_LEFT,
                 pressed: false,
@@ -1474,18 +1607,55 @@ mod tests {
     fn a_motion_on_the_next_output_does_not_replace_the_last_one_on_the_first() {
         let queue = Queue::default();
         let (left, right) = (queue.on(0), queue.on(1));
-        left.push(Event::Motion { x: 1.0, y: 1.0 });
+        left.push(Event::Motion {
+            x: 1.0,
+            y: 1.0,
+            delta: None,
+        });
         left.push(Event::ReleaseAll);
-        left.push(Event::Motion { x: 1919.0, y: 5.0 });
-        right.push(Event::Motion { x: 0.0, y: 5.0 });
-        right.push(Event::Motion { x: 3.0, y: 5.0 });
+        left.push(Event::Motion {
+            x: 1919.0,
+            y: 5.0,
+            delta: None,
+        });
+        right.push(Event::Motion {
+            x: 0.0,
+            y: 5.0,
+            delta: None,
+        });
+        right.push(Event::Motion {
+            x: 3.0,
+            y: 5.0,
+            delta: None,
+        });
         assert_eq!(
             queue.queued_on(),
             [
-                (0, Event::Motion { x: 1.0, y: 1.0 }),
+                (
+                    0,
+                    Event::Motion {
+                        x: 1.0,
+                        y: 1.0,
+                        delta: None
+                    }
+                ),
                 (0, Event::ReleaseAll),
-                (0, Event::Motion { x: 1919.0, y: 5.0 }),
-                (1, Event::Motion { x: 3.0, y: 5.0 }),
+                (
+                    0,
+                    Event::Motion {
+                        x: 1919.0,
+                        y: 5.0,
+                        delta: None
+                    }
+                ),
+                (
+                    1,
+                    Event::Motion {
+                        x: 3.0,
+                        y: 5.0,
+                        delta: None
+                    }
+                ),
             ]
         );
     }
@@ -1604,8 +1774,24 @@ mod tests {
             [
                 (0, motion(1800.0, 500.0)),
                 (0, button(BTN_LEFT, true)),
-                (0, motion(1919.0, 500.0)),
-                (1, motion(100.0, 510.0)),
+                (0, moved(1919.0, 500.0, 119.0, 0.0)),
+                (1, moved(100.0, 510.0, 101.0, 10.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_drag_carried_to_the_next_monitor_keeps_moving_relative() {
+        let (queue, mut first, _second) = two_work_monitors();
+        first.enter(1900.0, 500.0);
+        first.button(BTN_MIDDLE, true);
+        first.motion(1910.0, 500.0);
+        first.motion(1950.0, 505.0);
+        assert_eq!(
+            queue.queued_on()[2..],
+            [
+                (0, moved(1910.0, 500.0, 10.0, 0.0)),
+                (1, moved(30.0, 505.0, 40.0, 5.0)),
             ]
         );
     }
@@ -1616,7 +1802,10 @@ mod tests {
         second.enter(10.0, 500.0);
         second.button(BTN_LEFT, true);
         second.motion(-50.0, 500.0);
-        assert_eq!(queue.queued_on().last(), Some(&(0, motion(1870.0, 500.0))));
+        assert_eq!(
+            queue.queued_on().last(),
+            Some(&(0, moved(1870.0, 500.0, -60.0, 0.0)))
+        );
     }
 
     #[test]
@@ -1626,16 +1815,25 @@ mod tests {
         first.enter(10.0, 500.0);
         first.button(BTN_LEFT, true);
         first.motion(-300.0, 500.0);
-        assert_eq!(queue.queued_on().last(), Some(&(0, motion(0.0, 500.0))));
+        assert_eq!(
+            queue.queued_on().last(),
+            Some(&(0, moved(0.0, 500.0, -310.0, 0.0)))
+        );
         first.button(BTN_LEFT, false);
         first.leave();
         // Past the second's right edge, and below the first, which is shorter than the second.
         second.enter(2500.0, 700.0);
         second.button(BTN_LEFT, true);
         second.motion(2900.0, 1600.0);
-        assert_eq!(queue.queued_on().last(), Some(&(1, motion(2560.0, 1440.0))));
+        assert_eq!(
+            queue.queued_on().last(),
+            Some(&(1, moved(2560.0, 1440.0, 400.0, 900.0)))
+        );
         second.motion(-100.0, 1100.0);
-        assert_eq!(queue.queued_on().last(), Some(&(0, motion(1820.0, 1080.0))));
+        assert_eq!(
+            queue.queued_on().last(),
+            Some(&(0, moved(1820.0, 1080.0, -3000.0, -500.0)))
+        );
     }
 
     #[test]
@@ -1655,16 +1853,20 @@ mod tests {
             [
                 (0, motion(1800.0, 500.0)),
                 (0, button(BTN_LEFT, true)),
-                (1, motion(100.0, 500.0)),
+                // The drag's last motion and the next surface's first, merged.
+                (1, moved(100.0, 500.0, 220.0, 0.0)),
                 (0, button(BTN_LEFT, false)),
                 (0, Event::ReleaseAll),
-                (1, motion(110.0, 500.0)),
+                (1, moved(110.0, 500.0, 10.0, 0.0)),
             ]
         );
         // No button held: its positions are its own again.
         first.enter(5.0, 5.0);
         first.motion(-20.0, 5.0);
-        assert_eq!(queue.queued_on().last(), Some(&(0, motion(-20.0, 5.0))));
+        assert_eq!(
+            queue.queued_on().last(),
+            Some(&(0, moved(-20.0, 5.0, -25.0, 0.0)))
+        );
     }
 
     #[test]
@@ -1674,6 +1876,9 @@ mod tests {
         first.enter(1800.0, 500.0);
         first.button(BTN_LEFT, true);
         first.motion(2020.0, 500.0);
-        assert_eq!(queue.queued_on().last(), Some(&(0, motion(1920.0, 500.0))));
+        assert_eq!(
+            queue.queued_on().last(),
+            Some(&(0, moved(1920.0, 500.0, 220.0, 0.0)))
+        );
     }
 }
