@@ -547,7 +547,11 @@ mod tests {
     fn a_home_corner_the_compositor_never_places_does_not_hold_the_start() {
         let (ours, _silent) = UnixStream::pair().unwrap();
         let begin = Instant::now();
-        let corner = HomeCorner::open_on(ours, "DP-2", Feed::new(Arc::default(), None));
+        let corner = HomeCorner::open_on(
+            ours,
+            "DP-2",
+            Feed::new(Arc::default(), None, Default::default()),
+        );
         assert!(corner.is_ok(), "it goes up on its own time");
         assert!(begin.elapsed() < Duration::from_millis(500));
         drop(corner);

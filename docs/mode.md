@@ -40,8 +40,8 @@ stops the start with a message that names them, and nothing is changed.
 ## Named modes
 
 A `[name]` section in `mode.conf` defines a mode of its own. The keys before the first section
-are the default of every mode: `release`, `closed_lid` and `mic_hotkey` (a section may set its
-own), and a `monitor` among them is the one unnamed mode, so a file with no sections keeps
+are the default of every mode: `release`, `closed_lid`, `mic_hotkey` and the corner's
+`remote_label`, `home_label` and `remote_bar` (a section may set its own), and a `monitor` among them is the one unnamed mode, so a file with no sections keeps
 working, and `navette mode start` with no name starts it.
 
 ```
@@ -153,8 +153,9 @@ While a mode runs, every home monitor shows, at its top left, what it is and whe
 (nothing of it with no mode):
 
 - **On each reserved monitor**, over the remote's picture: a warm orange glow from the corner,
-  a `PRO` tag and the mic button. It starts 26 pixels down, below the remote's bar (the height
-  of Omarchy's bar), so that the bar's menu and workspaces stay in sight. It is drawn at home
+  a `REMOTE` tag and the mic button. It starts 26 pixels down, below the remote's bar, so that
+  the bar's menu and workspaces stay in sight ([`remote_bar`](#the-corners-tags-and-offset)
+  sets that height). It is drawn at home
   over the picture and never sent: the remote machine never sees it, and the pointer over its
   button is home's, so a click there stays home. Passing over the button is not leaving the
   monitor: the keyboard stays with the remote machine, the keys held stay held there, and a
@@ -162,7 +163,7 @@ While a mode runs, every home monitor shows, at its top left, what it is and whe
   is back over the picture. A drag that passes over the button goes on to the remote machine.
   Anywhere else the pointer goes to the remote machine as before.
 - **On each of home's own monitors**, at the same place, below home's bar (the compositor places
-  it after the space the bar reserves): a red glow, a `MAISON` tag and the mic button while the
+  it after the space the bar reserves): a red glow, a `HOME` tag and the mic button while the
   mic is home; the mic button alone, dimmed, while the mic is on the remote machine.
 - **The mic button** shows a mic and a round check. On the side that has the mic the check
   draws in and the button turns green; on the other it wipes out (350 ms). A click switches the
@@ -176,6 +177,21 @@ While a mode runs, every home monitor shows, at its top left, what it is and whe
 The corners are drawn in software, again only when they change and while the check moves.
 Home's corner is a layer surface of its own on the overlay layer (namespace `navette-corner`),
 with no keyboard; the one over the remote's picture is part of the surface that shows it.
+
+### The corner's tags and offset
+
+Three keys of `mode.conf`, global or per `[name]` section like `release`:
+
+```
+remote_label = REMOTE   # the tag on the reserved monitors
+home_label = HOME       # the tag on home's own monitors
+remote_bar = 26         # logical pixels; 0 for a remote without a top bar
+```
+
+A label is printable ASCII (what the corner's font draws), 12 characters at most; anything else
+stops the start with a message, and nothing is changed. `remote_bar` is how far below the top of
+a reserved monitor the corner starts: the height of the remote desktop's bar. The defaults are
+the ones shown, so a remote whose bar is not 26 pixels high sets it.
 
 ## The remote's workspaces
 

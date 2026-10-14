@@ -2,11 +2,13 @@
 //! remote machine takes. Keys before any `[section]` are the default of every mode, and a
 //! `monitor` among them is the one unnamed mode, so a file written before modes had names keeps
 //! working. A `[name]` section is a named mode: its `monitor`, and any of `release`,
-//! `closed_lid`, `mic_hotkey` it wants other than the default. `#` starts a comment.
+//! `closed_lid`, `mic_hotkey`, `remote_label`, `home_label`, `remote_bar` it wants other than
+//! the default. `#` starts a comment.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::corner::{self, Look};
 use crate::display::wire::MAX_OUTPUTS;
 use crate::hypr::Monitor;
 use crate::input::{self, Hotkey};
@@ -30,6 +32,7 @@ pub struct Mode {
     pub release: Option<Hotkey>,
     pub closed_lid: bool,
     pub mic_hotkey: String,
+    pub look: Look,
 }
 
 /// The settings of one section; the first one, before any `[name]`, has no name.
@@ -191,12 +194,38 @@ impl File {
             .filter(|keys| !keys.is_empty())
             .unwrap_or(MIC_HOTKEY)
             .to_string();
+        let fallback = Look::default();
+        let label = |key: &str, default: String| match value(key).filter(|v| !v.is_empty()) {
+            None => Ok(default),
+            Some(label) => corner::check_label(label)
+                .map(|()| label.to_string())
+                .map_err(|e| {
+                    invalid(format!(
+                        "{path}: `{key} = {label}`: {e}; nothing was changed"
+                    ))
+                }),
+        };
+        let remote_bar = match value("remote_bar") {
+            None => fallback.remote_bar,
+            Some(bar) => bar.parse::<u16>().map(i32::from).map_err(|_| {
+                invalid(format!(
+                    "{path}: `remote_bar = {bar}`: a height in pixels, 0 or more; \
+                     nothing was changed"
+                ))
+            })?,
+        };
+        let look = Look {
+            remote_label: label("remote_label", fallback.remote_label)?,
+            home_label: label("home_label", fallback.home_label)?,
+            remote_bar,
+        };
         Ok(Mode {
             name: section.name.clone(),
             monitors,
             release,
             closed_lid,
             mic_hotkey,
+            look,
         })
     }
 }
@@ -377,6 +406,70 @@ mod tests {
         assert_eq!(travel.release, None);
         assert!(!travel.closed_lid);
         assert_eq!(travel.mic_hotkey, "SUPER + F10");
+    }
+
+    #[test]
+    fn the_corner_tags_are_neutral_by_default() {
+        let look = mode("monitor = DP-2\n", None).unwrap().look;
+        assert_eq!(look, Look::default());
+        assert_eq!(look.remote_label, "REMOTE");
+        assert_eq!(look.home_label, "HOME");
+        assert_eq!(look.remote_bar, 26);
+    }
+
+    #[test]
+    fn a_mode_names_its_own_corner_labels() {
+        let text = "remote_label = FAR\nhome_label = NEAR\nremote_bar = 30\n\
+                    [office]\nmonitor = DP-1\n\
+                    [travel]\nmonitor = DP-2\nremote_label = AWAY\nremote_bar = 0\n";
+        let office = mode(text, Some("office")).unwrap().look;
+        assert_eq!(
+            (office.remote_label.as_str(), office.home_label.as_str()),
+            ("FAR", "NEAR")
+        );
+        assert_eq!(office.remote_bar, 30);
+        let travel = mode(text, Some("travel")).unwrap().look;
+        assert_eq!(
+            (travel.remote_label.as_str(), travel.home_label.as_str()),
+            ("AWAY", "NEAR")
+        );
+        assert_eq!(travel.remote_bar, 0);
+        // The longest label there is.
+        assert!(mode("monitor = DP-2\nhome_label = ABCDEFGHIJKL\n", None).is_ok());
+    }
+
+    #[test]
+    fn a_label_the_corner_cannot_draw_fails_clearly_and_changes_nothing() {
+        for (line, wants) in [
+            ("remote_label = Café", "remote_label"),
+            ("home_label = tab\there", "home_label"),
+            ("home_label = ABCDEFGHIJKLM", "12 characters"),
+            ("remote_label = 日本", "printable ASCII"),
+        ] {
+            let error = mode(&format!("monitor = DP-2\n{line}\n"), None).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{line}");
+            let error = error.to_string();
+            assert!(error.contains(wants), "{line}: {error}");
+            assert!(error.contains("nothing was changed"), "{line}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_remote_corner_starts_below_the_bar_height_the_mode_sets() {
+        assert_eq!(
+            mode("monitor = DP-2\nremote_bar = 48\n", None)
+                .unwrap()
+                .look
+                .remote_bar,
+            48
+        );
+        for bad in ["-1", "tall", "2.5"] {
+            let error = mode(&format!("monitor = DP-2\nremote_bar = {bad}\n"), None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("remote_bar"), "{bad}: {error}");
+            assert!(error.contains("nothing was changed"), "{bad}: {error}");
+        }
     }
 
     #[test]

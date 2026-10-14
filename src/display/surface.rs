@@ -83,7 +83,7 @@ use super::corner::{BTN_LEFT, Painter, Shows, draw_again, listen};
 use super::decode::Picture;
 use super::wire::{Cursor, MAX_CURSOR, Pointer};
 use super::{Ended, Released};
-use crate::corner::{Corner, Feed, REMOTE_BAR, Side};
+use crate::corner::{Corner, Feed, Side};
 use crate::input::{self, Capture, Grab, Hotkey, Seat};
 
 /// How long the compositor has to place the surface.
@@ -958,7 +958,7 @@ impl State {
         };
         let Some(slot) = &mut self.corner else { return };
         let (subsurface, surface) = slot.subcompositor.create_subsurface(parent, &self.qh);
-        subsurface.set_position(0, REMOTE_BAR);
+        subsurface.set_position(0, slot.feed.look().remote_bar);
         // Drawn when it changes, whatever the pictures do.
         subsurface.set_desync();
         let viewport = self.viewporter.get_viewport(&surface, &self.qh, ());
@@ -1631,7 +1631,7 @@ mod tests {
     const BLOCK_LINEAR: u64 = 0x0300_0000_0060_6015;
 
     fn feed() -> Feed {
-        Feed::new(Arc::default(), None)
+        Feed::new(Arc::default(), None, Default::default())
     }
 
     /// A hold on the keyboard that holds nothing.
@@ -1650,7 +1650,7 @@ mod tests {
         let (clicked, clicks) = std::sync::mpsc::channel();
         let clicked = Mutex::new(clicked);
         board.on_click(move || clicked.lock().unwrap().send(()).unwrap());
-        let feed = Feed::new(board, Some("SUPER + CTRL + M".into()));
+        let feed = Feed::new(board, Some("SUPER + CTRL + M".into()), Default::default());
         let mut corner = feed.corner(Side::Remote);
         let queue = input::Queue::default();
         let mut capture = Capture::new(queue.clone(), None);
