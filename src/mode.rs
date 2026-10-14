@@ -1449,6 +1449,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_picture_home_cannot_decode_any_more_gives_the_monitor_back() {
+        use gliff_proto::{ChromaMode, Codec, ServerMsg};
+        let desk = desk("DP-2");
+        let remote = started(&desk).await;
+        let video = |msg| Incoming::Video {
+            output: 0,
+            msg,
+            main: bytes::Bytes::from_static(&[0, 0, 0, 1, 0x65, 0xff, 0xff, 0xff, 0xff]),
+            aux: bytes::Bytes::new(),
+        };
+        remote
+            .to_home
+            .try_send(video(ServerMsg::StreamConfig {
+                codec: Codec::H264,
+                chroma: ChromaMode::Single420,
+                pipeline: None,
+                width: 320,
+                height: 240,
+                scale_milli: 1000,
+                extradata: Vec::new(),
+                aux_extradata: None,
+                view_width: 320,
+                view_height: 240,
+                fps_cap: 60,
+            }))
+            .unwrap();
+        // Home has no GPU here: the CPU decoder is the last, and a keyframe it fails ends it.
+        remote
+            .to_home
+            .try_send(video(ServerMsg::VideoFrame {
+                frame_id: 0,
+                pts_us: 0,
+                keyframe: true,
+                damage: Vec::new(),
+                data_len: 9,
+                aux_len: 0,
+            }))
+            .unwrap();
+        until(|| desk.covered.lock().unwrap().is_empty()).await;
+        assert_eq!(
+            remote.outbox.queued().last(),
+            Some(&Msg::Display(Display::Stop))
+        );
+    }
+
+    #[tokio::test]
     async fn a_start_right_after_a_stop_finds_home_given_back() {
         let desk = desk("DP-2");
         let remote = started(&desk).await;

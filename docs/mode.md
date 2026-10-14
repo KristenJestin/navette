@@ -257,6 +257,10 @@ draws with. With several outputs, each one decodes on a device of its own, opene
 same GPU, never shared between two decoders; when one cannot be opened, `navette mode start`
 fails and names its monitor: the CPU does not decode the streams offered for a GPU.
 Without a usable GPU, or with `GLIFF_VIDEO=cpu`, home decodes on the CPU (OpenH264).
+A decoder that fails three times in a row, or on a keyframe (a GPU device lost does that), is
+given up: a GPU decoder for a new one on the GPU opened again, once, then for the CPU, each time
+with a keyframe asked of the remote; when the CPU decoder fails too, the mode ends with the
+reason and the monitor is given back. The report counts the decoders lost.
 `navette serve` says which path it took, and every ten seconds prints, for each remote output,
 the frames, the frame rate, the decode time and the time from capture to decoded picture, on
 stderr.
