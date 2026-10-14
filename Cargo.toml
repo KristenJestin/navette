@@ -23,6 +23,7 @@ hypr-capture = { git = "https://github.com/KristenJestin/navette-gliff", branch 
 hypr-input = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
 hypr-ipc = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
 hypr-wl = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
+libc = "0.2"
 minicbor = { version = "2", features = ["derive", "alloc"] }
 opus = "0.4"
 pipewire = { version = "0.10", features = ["v0_3_49"] }

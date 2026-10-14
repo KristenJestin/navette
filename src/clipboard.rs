@@ -25,6 +25,8 @@
 //! end of the bridge ends every transfer and paste it started; the compositor calls that block
 //! run on other threads, so they never hold up the link's heartbeats.
 
+pub mod files;
+
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::io;
@@ -40,9 +42,7 @@ use gliff_proto::clipboard::{
     parse_uri_list, resolve_mime,
 };
 use gliff_proto::{ClipboardFile, ClipboardItem, ClipboardMsg};
-use gliff_transport::clipboard::files::{
-    LocalFiles, Spool, fetch_files, list_files, open_source, retire, write_body,
-};
+use gliff_transport::clipboard::files::{LocalFiles, Spool, fetch_files, retire, write_body};
 use gliff_transport::clipboard::progress::{Jobs, Progress, State, describe_files, describe_mime};
 use gliff_transport::clipboard::{Event, ReadSource, Side, Transfers, WriteSink};
 use hypr_input::{Clipboard, ClipboardEvent, Target};
@@ -233,8 +233,8 @@ impl<C: Compositor> Bridge<C> {
                 };
                 let transfers = self.transfers.clone();
                 tokio::task::spawn_local(async move {
-                    match open_source(&path).await {
-                        Ok(src) => transfers.serve(id, src),
+                    match files::open_copied(&path) {
+                        Ok(src) => transfers.serve(id, ReadSource(src)),
                         Err(e) => {
                             log(format_args!("cannot open a copied file: {e}"));
                             transfers.refuse(id);
@@ -376,8 +376,8 @@ async fn local_files_from_pipe(mut rx: pipe::Receiver) -> LocalFiles {
     if paths.is_empty() {
         return LocalFiles::default();
     }
-    match tokio::task::spawn_blocking(move || list_files(&paths)).await {
-        Ok(Ok(files)) => files,
+    match tokio::task::spawn_blocking(move || files::list(&paths)).await {
+        Ok(Ok(copied)) => copied.files,
         Ok(Err(e)) => {
             log(format_args!("the copied files are not offered: {e}"));
             LocalFiles::default()

@@ -987,6 +987,7 @@ dependencies = [
  "hypr-input",
  "hypr-ipc",
  "hypr-wl",
+ "libc",
  "minicbor",
  "opus",
  "pipewire",
