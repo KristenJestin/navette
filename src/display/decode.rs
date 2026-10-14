@@ -28,6 +28,9 @@ const REPORT_EVERY: Duration = Duration::from_secs(10);
 /// Frames waiting for the decoder; past this, home has fallen behind and drops frames until a
 /// keyframe rather than queue them without end.
 const QUEUE: usize = 4;
+/// Decodes failing in a row before a decoder is given up for a new one; a failed keyframe
+/// gives it up at once, as nothing before it can explain the failure.
+const BROKEN: u32 = 3;
 
 /// A decoded picture, for the surface.
 pub enum Picture {
@@ -90,9 +93,6 @@ pub struct Decoding {
     thread: Option<JoinHandle<()>>,
 }
 
-/// Makes the CPU decoder (a port, so a test can make it fail).
-type CpuDecoder = fn(bool) -> Result<gliff_sw::Decoder, String>;
-
 impl Decoding {
     /// `dmabuf`: the surface takes the GPU's pictures as dmabufs; otherwise they are read back.
     /// `ended` hears why decoding cannot go on.
@@ -103,18 +103,14 @@ impl Decoding {
         show: Box<dyn FnMut(Picture) + Send>,
         ended: Ended,
     ) -> std::io::Result<Self> {
-        Self::start_with(gpu, dmabuf, outbox, show, ended, |dual| {
-            gliff_sw::Decoder::new(dual).map_err(|e| e.to_string())
-        })
+        Self::start_with(Box::new(Real { gpu, dmabuf }), outbox, show, ended)
     }
 
     fn start_with(
-        gpu: Option<Arc<Gpu>>,
-        dmabuf: bool,
+        decoders: Box<dyn Decoders>,
         outbox: Outbox,
         show: Box<dyn FnMut(Picture) + Send>,
         ended: Ended,
-        cpu: CpuDecoder,
     ) -> std::io::Result<Self> {
         let (video, rx) = std::sync::mpsc::channel();
         let queued = Arc::new(AtomicUsize::new(0));
@@ -124,9 +120,8 @@ impl Decoding {
                 .name("navette-decode".into())
                 .spawn(move || {
                     let thread = Thread {
-                        gpu,
-                        dmabuf,
-                        cpu,
+                        decoders,
+                        on_gpu: true,
                         outbox,
                         queued,
                         ended,
@@ -187,75 +182,139 @@ impl Drop for Decoding {
     }
 }
 
-enum VideoDecoder {
-    Gpu(Box<Decoder>),
-    Cpu(Box<gliff_sw::Decoder>),
+/// One stream's decoder (a port, so a test can make one that fails).
+trait Decode {
+    /// `GPU` or `CPU`, for the logs.
+    fn tier(&self) -> &'static str;
+    /// How its pictures reach the surface, for the logs.
+    fn handover(&self) -> &'static str {
+        "copied to the surface"
+    }
+    fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<Picture>, String>;
+    /// The picture it still holds after an idle time, if any.
+    fn drain(&mut self) -> Option<Picture> {
+        None
+    }
 }
 
-impl VideoDecoder {
-    fn new(
-        gpu: &Option<Arc<Gpu>>,
-        cpu: CpuDecoder,
-        chroma: ChromaMode,
-        width: u32,
-        height: u32,
-    ) -> Result<Self, String> {
-        let dual = chroma != ChromaMode::Single420;
-        if let Some(gpu) = gpu {
-            match Decoder::new(gpu, dual, width, height) {
-                Ok(d) => return Ok(Self::Gpu(Box::new(d))),
-                Err(e) => eprintln!("navette: cannot create the GPU decoder ({e}); using the CPU"),
-            }
-        }
-        cpu(dual)
-            .map(|d| Self::Cpu(Box::new(d)))
-            .map_err(|e| format!("home cannot decode the picture: {e}"))
-    }
-
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Gpu(_) => "GPU",
-            Self::Cpu(_) => "CPU",
-        }
-    }
-
-    fn decode(
+/// Makes the decoders (a port, so a test can make fakes).
+trait Decoders: Send {
+    /// A decoder on the GPU, none without a GPU. `fresh`: on the device opened again, the one
+    /// before being lost.
+    fn gpu(
         &mut self,
-        main: &[u8],
-        aux: &[u8],
-        dmabuf: bool,
-        (width, height): (u32, u32),
-    ) -> Result<Option<Picture>, String> {
-        match self {
-            Self::Gpu(d) if dmabuf => d
-                .decode(main, aux)
-                .map(|f| f.map(Picture::Dmabuf))
-                .map_err(|e| e.to_string()),
-            Self::Gpu(d) => d
-                .decode_to_bgra(main, aux)
-                .map(|f| {
-                    f.map(|pixels| {
-                        Picture::Bgra(gliff_sw::BgraFrame {
-                            width,
-                            height,
-                            pixels,
-                        })
-                    })
+        fresh: bool,
+        dual: bool,
+        size: (u32, u32),
+    ) -> Option<Result<Box<dyn Decode>, String>>;
+    fn cpu(&mut self, dual: bool) -> Result<Box<dyn Decode>, String>;
+}
+
+/// The decoders of gliff-vk and gliff-sw.
+struct Real {
+    gpu: Option<Arc<Gpu>>,
+    dmabuf: bool,
+}
+
+impl Decoders for Real {
+    fn gpu(
+        &mut self,
+        fresh: bool,
+        dual: bool,
+        size: (u32, u32),
+    ) -> Option<Result<Box<dyn Decode>, String>> {
+        if fresh {
+            self.gpu = open_gpu();
+        }
+        let gpu = self.gpu.as_ref()?;
+        Some(
+            Decoder::new(gpu, dual, size.0, size.1)
+                .map(|decoder| {
+                    Box::new(GpuDecoder {
+                        decoder,
+                        dmabuf: self.dmabuf,
+                        size,
+                    }) as Box<dyn Decode>
                 })
                 .map_err(|e| e.to_string()),
-            Self::Cpu(d) => d
-                .decode(main, aux)
-                .map(|f| f.map(Picture::Bgra))
-                .map_err(|e| e.to_string()),
+        )
+    }
+
+    fn cpu(&mut self, dual: bool) -> Result<Box<dyn Decode>, String> {
+        gliff_sw::Decoder::new(dual)
+            .map(|d| Box::new(d) as Box<dyn Decode>)
+            .map_err(|e| e.to_string())
+    }
+}
+
+struct GpuDecoder {
+    decoder: Decoder,
+    /// The surface takes the pictures as dmabufs; otherwise they are read back.
+    dmabuf: bool,
+    size: (u32, u32),
+}
+
+impl Decode for GpuDecoder {
+    fn tier(&self) -> &'static str {
+        "GPU"
+    }
+
+    fn handover(&self) -> &'static str {
+        if self.dmabuf {
+            "shown as a dmabuf"
+        } else {
+            "copied to the surface"
         }
+    }
+
+    fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<Picture>, String> {
+        let (width, height) = self.size;
+        if self.dmabuf {
+            return self
+                .decoder
+                .decode(main, aux)
+                .map(|f| f.map(Picture::Dmabuf))
+                .map_err(|e| e.to_string());
+        }
+        self.decoder
+            .decode_to_bgra(main, aux)
+            .map(|f| {
+                f.map(|pixels| {
+                    Picture::Bgra(gliff_sw::BgraFrame {
+                        width,
+                        height,
+                        pixels,
+                    })
+                })
+            })
+            .map_err(|e| e.to_string())
+    }
+}
+
+impl Decode for gliff_sw::Decoder {
+    fn tier(&self) -> &'static str {
+        "CPU"
+    }
+
+    fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<Picture>, String> {
+        gliff_sw::Decoder::decode(self, main, aux)
+            .map(|f| f.map(Picture::Bgra))
+            .map_err(|e| e.to_string())
+    }
+
+    fn drain(&mut self) -> Option<Picture> {
+        if !self.has_pending() {
+            return None;
+        }
+        self.flush().ok().flatten().map(Picture::Bgra)
     }
 }
 
 /// What the decode thread owns.
 struct Thread {
-    gpu: Option<Arc<Gpu>>,
-    dmabuf: bool,
-    cpu: CpuDecoder,
+    decoders: Box<dyn Decoders>,
+    /// The GPU is tried; false once it showed it cannot decode here.
+    on_gpu: bool,
     outbox: Outbox,
     queued: Arc<AtomicUsize>,
     ended: Ended,
@@ -267,33 +326,50 @@ impl Thread {
     }
 
     /// A decoder, or the mode is told it cannot go on.
-    fn decoder(&self, chroma: ChromaMode, width: u32, height: u32) -> Option<VideoDecoder> {
-        match VideoDecoder::new(&self.gpu, self.cpu, chroma, width, height) {
+    fn decoder(
+        &mut self,
+        (width, height, chroma): (u32, u32, ChromaMode),
+        fresh: bool,
+    ) -> Option<Box<dyn Decode>> {
+        let dual = chroma != ChromaMode::Single420;
+        if self.on_gpu {
+            match self.decoders.gpu(fresh, dual, (width, height)) {
+                Some(Ok(d)) => return Some(d),
+                Some(Err(e)) => {
+                    eprintln!("navette: cannot create the GPU decoder ({e}); using the CPU")
+                }
+                None => {}
+            }
+        }
+        match self.decoders.cpu(dual) {
             Ok(d) => Some(d),
             Err(e) => {
-                eprintln!("navette: {e}");
-                let _ = self.ended.send(e);
+                let why = format!("home cannot decode the picture: {e}");
+                eprintln!("navette: {why}");
+                let _ = self.ended.send(why);
                 None
             }
         }
     }
 
     fn run(mut self, mut show: Box<dyn FnMut(Picture) + Send>, rx: Receiver<Video>) {
-        let mut decoder: Option<VideoDecoder> = None;
+        let mut decoder: Option<Box<dyn Decode>> = None;
         let mut config = (0, 0, ChromaMode::Single420);
         let mut gpu_decoded = false;
+        // The GPU decoder was made again once already.
+        let mut renewed = false;
+        let mut failures = 0;
+        // A new decoder has nothing to refer to before a keyframe.
+        let mut wait_key = false;
         let mut stats = Stats::new(self.outbox.output());
         loop {
             let video = match rx.recv_timeout(IDLE_DRAIN) {
                 Ok(video) => video,
                 Err(RecvTimeoutError::Timeout) => {
-                    if let Some(VideoDecoder::Cpu(d)) = &mut decoder
-                        && d.has_pending()
-                        && let Ok(Some(frame)) = d.flush()
-                    {
-                        show(Picture::Bgra(frame));
+                    if let Some(picture) = decoder.as_mut().and_then(|d| d.drain()) {
+                        show(picture);
                     }
-                    stats.report_if_due(decoder.as_ref().map(VideoDecoder::label));
+                    stats.report_if_due(decoder.as_ref().map(|d| d.tier()));
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -308,24 +384,25 @@ impl Thread {
                     // A pace-only change must not reset the decoder.
                     if (width, height, chroma) != config || decoder.is_none() {
                         config = (width, height, chroma);
-                        decoder = self.decoder(chroma, width, height);
+                        failures = 0;
+                        decoder = self.decoder(config, false);
                         if let Some(d) = &decoder {
-                            let handover = match d {
-                                VideoDecoder::Gpu(_) if self.dmabuf => "shown as a dmabuf",
-                                _ => "copied to the surface",
-                            };
                             eprintln!(
-                                "navette: decoding {width}x{height} {chroma:?} on the {}, {handover}",
-                                d.label()
+                                "navette: decoding {width}x{height} {chroma:?} on the {}, {}",
+                                d.tier(),
+                                d.handover()
                             );
                         }
                     }
                 }
                 ServerMsg::VideoFrame {
-                    frame_id, pts_us, ..
+                    frame_id,
+                    pts_us,
+                    keyframe,
+                    ..
                 } => {
                     self.queued.fetch_sub(1, Ordering::Relaxed);
-                    let Some(d) = &mut decoder else {
+                    let Some(d) = decoder.as_mut().filter(|_| keyframe || !wait_key) else {
                         // Acked all the same, so the remote keeps pacing until the mode ends.
                         self.feedback(ClientMsg::FrameAck {
                             frame_id,
@@ -333,9 +410,9 @@ impl Thread {
                         });
                         continue;
                     };
+                    wait_key = false;
                     let t0 = Instant::now();
-                    let decoded =
-                        d.decode(&video.main, &video.aux, self.dmabuf, (config.0, config.1));
+                    let decoded = d.decode(&video.main, &video.aux);
                     let decode_ms = t0.elapsed().as_secs_f32() * 1000.0;
                     // Ack at once so the remote keeps pacing.
                     self.feedback(ClientMsg::FrameAck {
@@ -344,30 +421,69 @@ impl Thread {
                     });
                     match decoded {
                         Ok(Some(picture)) => {
-                            gpu_decoded |= matches!(d, VideoDecoder::Gpu(_));
+                            failures = 0;
+                            gpu_decoded |= d.tier() == "GPU";
                             stats.note(decode_ms, now_us().saturating_sub(pts_us));
                             show(picture);
                         }
-                        Ok(None) => {}
-                        Err(e) if matches!(d, VideoDecoder::Gpu(_)) && !gpu_decoded => {
+                        Ok(None) => failures = 0,
+                        Err(e) if d.tier() == "GPU" && !gpu_decoded => {
                             // A driver path that cannot work here: the CPU takes over for good.
                             eprintln!("navette: the GPU decode failed ({e}); decoding on the CPU");
-                            self.gpu = None;
-                            decoder = self.decoder(config.2, config.0, config.1);
+                            self.on_gpu = false;
+                            decoder = self.decoder(config, false);
+                            self.feedback(ClientMsg::RequestKeyframe);
+                        }
+                        Err(e) if !keyframe && failures + 1 < BROKEN => {
+                            failures += 1;
+                            tracing::warn!(error = %e, "decode error; requesting a keyframe");
                             self.feedback(ClientMsg::RequestKeyframe);
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "decode error; requesting a keyframe");
-                            self.feedback(ClientMsg::RequestKeyframe);
+                            // A lost device fails every decode: the decoder is given up, for
+                            // a new one on the GPU once, then the CPU, then the mode ends.
+                            let tier = d.tier();
+                            let output = super::output::name(usize::from(self.outbox.output()));
+                            failures = 0;
+                            stats.lost();
+                            decoder = None;
+                            if tier == "GPU" && !renewed {
+                                eprintln!(
+                                    "navette: {output}: the GPU decoder failed ({e}); a new one \
+                                     on the GPU opened again"
+                                );
+                                renewed = true;
+                                gpu_decoded = false;
+                                decoder = self.decoder(config, true);
+                            } else if tier == "GPU" {
+                                eprintln!(
+                                    "navette: {output}: the GPU decoder failed again ({e}); \
+                                     decoding on the CPU"
+                                );
+                                self.on_gpu = false;
+                                decoder = self.decoder(config, false);
+                            } else {
+                                let why = format!(
+                                    "home cannot decode {output} any more, {} decoder(s) lost, \
+                                     the CPU's last: {e}",
+                                    stats.lost
+                                );
+                                eprintln!("navette: {why}");
+                                let _ = self.ended.send(why);
+                            }
+                            if decoder.is_some() {
+                                wait_key = true;
+                                self.feedback(ClientMsg::RequestKeyframe);
+                            }
                         }
                     }
                 }
                 ServerMsg::Ping { t } => self.feedback(ClientMsg::Pong { t }),
                 _ => {}
             }
-            stats.report_if_due(decoder.as_ref().map(VideoDecoder::label));
+            stats.report_if_due(decoder.as_ref().map(|d| d.tier()));
         }
-        stats.report(decoder.as_ref().map(VideoDecoder::label));
+        stats.report(decoder.as_ref().map(|d| d.tier()));
     }
 }
 
@@ -387,6 +503,8 @@ struct Stats {
     total: u64,
     decode_ms: Vec<f32>,
     latency_ms: Vec<f32>,
+    /// Decoders given up since the stream began.
+    lost: u32,
 }
 
 impl Stats {
@@ -397,7 +515,12 @@ impl Stats {
             total: 0,
             decode_ms: Vec::new(),
             latency_ms: Vec::new(),
+            lost: 0,
         }
+    }
+
+    fn lost(&mut self) {
+        self.lost += 1;
     }
 
     fn note(&mut self, decode_ms: f32, latency_us: u64) {
@@ -413,11 +536,24 @@ impl Stats {
     }
 
     fn report(&mut self, tier: Option<&str>) {
+        if let Some(line) = self.line(tier) {
+            eprintln!("navette: {line}");
+        }
+    }
+
+    /// What the report says, none without a decoded frame; the period starts again.
+    fn line(&mut self, tier: Option<&str>) -> Option<String> {
         let secs = self.since.elapsed().as_secs_f32();
+        let mut line = None;
         if !self.decode_ms.is_empty() {
-            eprintln!(
-                "navette: {}: {} frames in {secs:.1} s ({:.1} fps) on the {}, {} total; decode \
-                 p50 {:.2} ms p95 {:.2} ms; encode-to-decoded p50 {:.1} ms p95 {:.1} ms",
+            let lost = match self.lost {
+                0 => String::new(),
+                1 => "; 1 decoder lost".into(),
+                n => format!("; {n} decoders lost"),
+            };
+            line = Some(format!(
+                "{}: {} frames in {secs:.1} s ({:.1} fps) on the {}, {} total; decode \
+                 p50 {:.2} ms p95 {:.2} ms; encode-to-decoded p50 {:.1} ms p95 {:.1} ms{lost}",
                 super::output::name(usize::from(self.output)),
                 self.decode_ms.len(),
                 self.decode_ms.len() as f32 / secs,
@@ -427,11 +563,12 @@ impl Stats {
                 percentile(&mut self.decode_ms, 0.95),
                 percentile(&mut self.latency_ms, 0.5),
                 percentile(&mut self.latency_ms, 0.95),
-            );
+            ));
         }
         self.since = Instant::now();
         self.decode_ms.clear();
         self.latency_ms.clear();
+        line
     }
 }
 
@@ -555,6 +692,67 @@ mod tests {
         assert_eq!(acks, frames);
     }
 
+    /// A decoder that shows a picture for each frame until its `fails_after`th, then fails.
+    struct Fake {
+        tier: &'static str,
+        decoded: usize,
+        fails_after: Option<usize>,
+    }
+
+    impl Decode for Fake {
+        fn tier(&self) -> &'static str {
+            self.tier
+        }
+
+        fn decode(&mut self, _: &[u8], _: &[u8]) -> Result<Option<Picture>, String> {
+            if self.fails_after.is_some_and(|n| self.decoded >= n) {
+                return Err("logical device has been lost".into());
+            }
+            self.decoded += 1;
+            Ok(Some(Picture::Bgra(gliff_sw::BgraFrame {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 4],
+            })))
+        }
+    }
+
+    /// The decoders home can make: one GPU decoder per entry of `gpus`, failing after so many
+    /// frames, and a CPU one when `cpu` says so. Each one made is written down.
+    #[derive(Default)]
+    struct Fakes {
+        gpus: std::collections::VecDeque<Option<usize>>,
+        cpu: Option<Option<usize>>,
+        made: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Decoders for Fakes {
+        fn gpu(
+            &mut self,
+            _: bool,
+            _: bool,
+            _: (u32, u32),
+        ) -> Option<Result<Box<dyn Decode>, String>> {
+            let fails_after = self.gpus.pop_front()?;
+            self.made.lock().unwrap().push("GPU");
+            Some(Ok(Box::new(Fake {
+                tier: "GPU",
+                decoded: 0,
+                fails_after,
+            })))
+        }
+
+        fn cpu(&mut self, _: bool) -> Result<Box<dyn Decode>, String> {
+            let fails_after = self.cpu.ok_or("no OpenH264")?;
+            self.made.lock().unwrap().push("CPU");
+            Ok(Box::new(Fake {
+                tier: "CPU",
+                decoded: 0,
+                fails_after,
+            }))
+        }
+    }
+
     fn acks(outbox: &Outbox) -> usize {
         outbox
             .queued()
@@ -599,11 +797,13 @@ mod tests {
         let size = (320, 240);
         let outbox = Outbox::default();
         let (ended, mut why) = tokio::sync::mpsc::unbounded_channel();
-        let decoding =
-            Decoding::start_with(None, false, outbox.clone(), Box::new(|_| {}), ended, |_| {
-                Err("no OpenH264".into())
-            })
-            .unwrap();
+        let decoding = Decoding::start_with(
+            Box::new(Fakes::default()),
+            outbox.clone(),
+            Box::new(|_| {}),
+            ended,
+        )
+        .unwrap();
         decoding.video(config(size.0, size.1));
         let mut encoder = encoder(size);
         for id in 0..3 {
@@ -654,6 +854,137 @@ mod tests {
         // Every frame is acked, decoded or dropped, so the remote keeps its pace.
         assert_eq!(acks(&outbox), frames);
         assert!(*shown.lock().unwrap() < frames);
+    }
+
+    /// A frame for a fake decoder, which does not look at its bytes.
+    fn frame(id: u64, keyframe: bool) -> Video {
+        Video {
+            msg: ServerMsg::VideoFrame {
+                frame_id: id,
+                pts_us: now_us(),
+                keyframe,
+                damage: Vec::new(),
+                data_len: 0,
+                aux_len: 0,
+            },
+            main: Bytes::new(),
+            aux: Bytes::new(),
+        }
+    }
+
+    /// Plays `frames` (`k` a keyframe, `p` not) to decoders made by `fakes`, one at a time.
+    /// Returns the pictures shown, the decoders made, the keyframes asked for and why the mode
+    /// was told to end, if it was.
+    fn play(fakes: Fakes, frames: &str) -> (usize, Vec<&'static str>, usize, Option<String>) {
+        let made = fakes.made.clone();
+        let outbox = Outbox::default();
+        let shown = Arc::new(AtomicUsize::new(0));
+        let (ended, mut why) = tokio::sync::mpsc::unbounded_channel();
+        let decoding = {
+            let shown = shown.clone();
+            Decoding::start_with(
+                Box::new(fakes),
+                outbox.clone(),
+                Box::new(move |_| {
+                    shown.fetch_add(1, Ordering::Relaxed);
+                }),
+                ended,
+            )
+            .unwrap()
+        };
+        decoding.video(config(320, 240));
+        for (id, kind) in frames.chars().enumerate() {
+            decoding.video(frame(id as u64, kind == 'k'));
+            // One at a time, so none is dropped for a full queue.
+            for _ in 0..500 {
+                if acks(&outbox) > id {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        drop(decoding);
+        assert_eq!(acks(&outbox), frames.len(), "every frame is acked");
+        let keyframes = outbox
+            .queued()
+            .into_iter()
+            .filter(|m| matches!(m, Msg::Feedback(ClientMsg::RequestKeyframe)))
+            .count();
+        let made = made.lock().unwrap().clone();
+        (
+            shown.load(Ordering::Relaxed),
+            made,
+            keyframes,
+            why.try_recv().ok(),
+        )
+    }
+
+    #[test]
+    fn a_lost_gpu_decoder_is_replaced_by_a_new_one_and_a_keyframe_asked_for() {
+        let fakes = Fakes {
+            gpus: [Some(5), None].into(),
+            ..Fakes::default()
+        };
+        // Five pictures, three failures in a row, then a frame before the keyframe.
+        let (shown, made, keyframes, ended) = play(fakes, "kppppppppkp");
+        assert_eq!(made, ["GPU", "GPU"]);
+        assert!(keyframes >= 1);
+        // The frame between the new decoder and the keyframe is not decoded.
+        assert_eq!(shown, 5 + 2);
+        assert_eq!(ended, None);
+    }
+
+    #[test]
+    fn a_keyframe_the_gpu_decoder_cannot_decode_gives_it_up_at_once() {
+        let fakes = Fakes {
+            gpus: [Some(2), None].into(),
+            ..Fakes::default()
+        };
+        let (shown, made, _, ended) = play(fakes, "kpkk");
+        assert_eq!(made, ["GPU", "GPU"]);
+        assert_eq!(shown, 3);
+        assert_eq!(ended, None);
+    }
+
+    #[test]
+    fn a_gpu_decoder_lost_twice_hands_over_to_the_cpu() {
+        let fakes = Fakes {
+            gpus: [Some(1), Some(1), None].into(),
+            cpu: Some(None),
+            ..Fakes::default()
+        };
+        let (shown, made, keyframes, ended) = play(fakes, "kkkkkpp");
+        assert_eq!(made, ["GPU", "GPU", "CPU"]);
+        assert!(keyframes >= 2);
+        assert_eq!(shown, 1 + 1 + 3);
+        assert_eq!(ended, None);
+    }
+
+    #[test]
+    fn decoders_lost_on_the_gpu_and_the_cpu_end_the_mode_with_the_reason() {
+        let fakes = Fakes {
+            gpus: [Some(1), Some(1)].into(),
+            cpu: Some(Some(1)),
+            ..Fakes::default()
+        };
+        let (shown, made, _, ended) = play(fakes, "kkkkkkpp");
+        assert_eq!(made, ["GPU", "GPU", "CPU"]);
+        assert_eq!(shown, 3);
+        let why = ended.expect("the mode is told");
+        assert!(why.contains("logical device has been lost"), "{why}");
+    }
+
+    #[test]
+    fn the_decode_report_says_how_many_decoders_were_lost() {
+        let mut stats = Stats::new(0);
+        stats.note(2.0, 10_000);
+        assert!(!stats.line(Some("GPU")).unwrap().contains("lost"));
+        stats.lost();
+        stats.lost();
+        stats.note(2.0, 10_000);
+        let line = stats.line(Some("CPU")).unwrap();
+        assert!(line.contains("on the CPU"), "{line}");
+        assert!(line.contains("2 decoders lost"), "{line}");
     }
 
     #[test]
