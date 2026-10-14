@@ -43,7 +43,10 @@ connected. `mode stop` answers once the monitors are back. The two commands reac
 While the mode runs:
 
 - **On the remote machine**, the outputs are called `NAVETTE-1`, `NAVETTE-2`…, from left to
-  right, placed right of its own monitors, side by side. Each one lives on its own: when its
+  right, placed right of its own monitors, side by side. The name follows the place and
+  nothing else: the n-th reserved monitor from the left is `NAVETTE-n` on every start, after a
+  Hyprland restart there, and whatever the last mode was (the names are
+  [listed for your config](#the-remotes-workspaces)). Each one lives on its own: when its
   picture stops (a Hyprland restart there), the picture starts again on it, or on a new one in
   the same place if it is gone, after a wait that doubles from one second up to thirty; after
   six failures in a row of any one of them, every output is removed and the mode ends at home
@@ -79,6 +82,51 @@ While the mode runs:
   on the remote machine's own output again once it stops ([the sound](audio.md)).
 - **The home mic**, with `navette serve --audio`, goes to the remote machine while the mode runs,
   and the hotkey switches it either way ([the mic](mic.md)).
+
+## The remote's workspaces
+
+The outputs have fixed names so that the remote machine's Hyprland config can name them. With
+no rule, Hyprland gives a new output the next free workspace number, the bar shows no current
+workspace for it, and a bind that sends a window to a monitor by name fails with
+`Invalid monitor`. On a config that keeps one range of workspaces per monitor, add the outputs
+to it. Here a laptop screen `eDP-1` has workspaces 1 to 10, and a mode with two reserved
+monitors adds 11 to 20 on `NAVETTE-1` and 21 to 30 on `NAVETTE-2`, in Hyprland's Lua config
+(0.56):
+
+```lua
+for i = 1, 10 do
+  hl.workspace_rule({ workspace = tostring(i), monitor = "eDP-1" })
+end
+for i = 11, 20 do
+  hl.workspace_rule({ workspace = tostring(i), monitor = "NAVETTE-1", default = (i == 11) })
+end
+for i = 21, 30 do
+  hl.workspace_rule({ workspace = tostring(i), monitor = "NAVETTE-2", default = (i == 21) })
+end
+
+-- Send the focused window to a monitor by name.
+hl.bind("SUPER + SHIFT + F1", hl.dsp.window.move({ monitor = "NAVETTE-1" }))
+hl.bind("SUPER + SHIFT + F2", hl.dsp.window.move({ monitor = "NAVETTE-2" }))
+```
+
+`NAVETTE-1` is the leftmost reserved monitor at home, `NAVETTE-2` the next one, and so on:
+list as many as the most monitors you will reserve. Hyprland creates each output with
+the exact name Navette asks for (measured on 0.56.2: removing an output and creating it again,
+in any order, never gives it a suffix), so the rules find it as soon as it appears, and its
+first workspace is the `default` one.
+
+When no mode runs, these outputs do not exist, and nothing in the config fails:
+
+- A rule for a missing monitor is ignored, and the workspace it names opens on a monitor that
+  is there, such as the laptop screen. A window left on workspace 11 goes to `NAVETTE-1` with
+  its workspace when the output appears, and comes back to the laptop screen when the mode
+  stops.
+- A bind that names a missing monitor does nothing: Hyprland answers
+  `Invalid monitor / monitor doesn't exist`, as it does for any bind to a monitor that is not
+  plugged in. Navette does not try to run it for you.
+
+Navette never writes this config: it declares each output's mode, place and scale at run time
+(`hl.monitor`), and those rules are not workspace rules.
 
 ## Closing the remote laptop
 
