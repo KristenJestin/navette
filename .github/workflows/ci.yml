@@ -2,6 +2,8 @@ name: ci
 
 on:
   pull_request:
+    # `edited`: a title fixed after a failed check is checked again (a re-run replays the old title).
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main, dev]
   workflow_dispatch:
@@ -23,14 +25,15 @@ jobs:
           else
             tools/commit-message.sh --range "$base..$head"
           fi
-      # A pull request is squashed: its title becomes the commit subject.
+      # A pull request is squashed: its title, with " (#<number>)" appended, becomes the commit subject.
       - name: Check the title of the pull request
         if: github.event_name == 'pull_request'
         env:
           TITLE: ${{ github.event.pull_request.title }}
+          NUMBER: ${{ github.event.pull_request.number }}
         run: |
           printf '%s\n' "$TITLE" > "$RUNNER_TEMP/title"
-          tools/commit-message.sh "$RUNNER_TEMP/title"
+          tools/commit-message.sh --pull-request "$NUMBER" "$RUNNER_TEMP/title"
 
   # No Hyprland, no PipeWire and no second machine here: the suites run against fakes (see AGENTS.md, Testing).
   verify:
