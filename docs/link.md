@@ -68,6 +68,14 @@ refuses a request against an offer that a newer copy has replaced.
   cannot rename without replacing, a file is linked in then unlinked, a folder replaces an
   empty one made for it. The application that pasted gets their paths once they are all
   complete. A second paste of the same copy points at the same files.
+- **A file manager that stops waiting.** A file manager reads the clipboard as soon as it
+  changes, and gives up when the answer is slow: Omarchy's, flea, waits two seconds for each
+  of the two file-list types, so about four seconds in all, which a large paste over the LAN
+  outlasts (with a mode running, the picture leaves the clipboard a few megabytes a second).
+  It then holds a copy with no file in it, and its paste does nothing. When the files are in and the application
+  that asked for them had stopped waiting, the copy is put on the clipboard again, once: the
+  file manager reads it again and gets them at once. Never over a copy made on this machine
+  since.
 - **On the link**, a file's chunks go after the picture, the sound and the input, and gliff's
   window (four chunks of 256 KiB in flight per transfer) keeps a transfer from piling up more:
   a large file never holds a frame back for longer than the chunk already on the line. When

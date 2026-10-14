@@ -134,6 +134,12 @@ struct RemoteOffer {
     /// Where the files are once pasted; filled at most once per offer, so a second paste of
     /// the same copy points at the same files.
     received: Rc<OnceCell<Vec<PathBuf>>>,
+    /// The mime types it is offered as on this machine.
+    advertised: Vec<String>,
+    /// Whether it is still this machine's selection: no copy here replaced it.
+    selected: bool,
+    /// Whether it was offered again once its files were in.
+    offered_again: bool,
 }
 
 /// The two ends of one link's clipboard: the peer's messages in, the compositor's events in.
@@ -219,6 +225,8 @@ impl<C: Compositor> Bridge<C> {
         *self.remote.borrow_mut() = RemoteOffer {
             serial,
             files,
+            advertised: advertise.clone(),
+            selected: true,
             ..RemoteOffer::default()
         };
         self.compositor.get().offer(advertise);
@@ -320,6 +328,7 @@ impl<C: Compositor> Bridge<C> {
     fn on_selection(&self, mime_types: Vec<String>) {
         let generation = self.selection_gen.get() + 1;
         self.selection_gen.set(generation);
+        self.remote.borrow_mut().selected = false;
         {
             let mut local = self.local.borrow_mut();
             local.serial = generation as u32;
@@ -413,6 +422,7 @@ impl<C: Compositor> Bridge<C> {
             let done = Meter::default();
             let (meter, progress, notifier) =
                 (done.clone(), self.progress.clone(), self.notifier.clone());
+            let (remote, compositor) = (self.remote.clone(), self.compositor.get().clone());
             // Filled before the task first runs: nothing runs before this call returns.
             let run = Rc::new(Cell::new(0));
             let its_run = run.clone();
@@ -450,7 +460,9 @@ impl<C: Compositor> Bridge<C> {
                         }
                         let body = file_list_body(&mime_type, paths).unwrap_or_default();
                         // An application that closed its end early is not the paste's failure.
-                        let _ = write_body(WriteSink(target), body).await;
+                        if write_body(WriteSink(target), body).await.is_err() {
+                            offer_again(&remote, serial, &*compositor);
+                        }
                     }
                     Err(e) => {
                         log(format_args!(
@@ -481,6 +493,23 @@ impl<C: Compositor> Bridge<C> {
                 });
         }
     }
+}
+
+/// The application that pasted the peer's offer `serial` stopped waiting before its files were
+/// in: a file manager reads the clipboard when it changes, and gives up after a few seconds
+/// (two for Omarchy's), which a paste over the LAN outlasts. The offer goes on the clipboard
+/// again, so the file manager reads it once more and gets the files at once. Only once, and
+/// only while it is still the selection here: a copy made here since is never replaced.
+fn offer_again(remote: &RefCell<RemoteOffer>, serial: u32, compositor: &impl Compositor) {
+    let mut remote = remote.borrow_mut();
+    if remote.serial != serial || !remote.selected || remote.offered_again {
+        return;
+    }
+    remote.offered_again = true;
+    log(format_args!(
+        "offer {serial}: the application stopped waiting for its files, offering them again"
+    ));
+    compositor.offer(remote.advertised.clone());
 }
 
 /// Fetches every entry of the peer's offer into a staging folder of the inbox, then moves the
@@ -916,6 +945,19 @@ mod tests {
                 .expect("the paste in time")
                 .unwrap();
             data
+        }
+
+        /// An application asks for `mime_type` and stops waiting before any answer, like a
+        /// file manager whose clipboard read gives up after two seconds.
+        fn paste_and_give_up(&self, mime_type: &str) {
+            let (reader, writer) = std::io::pipe().unwrap();
+            drop(reader);
+            self.events
+                .send(Selected::Paste {
+                    mime_type: mime_type.into(),
+                    fd: writer.into(),
+                })
+                .unwrap();
         }
 
         /// The bridge has offered the peer's copy on this machine `count` times.
@@ -1683,6 +1725,52 @@ mod tests {
                 // A second paste of the same copy points at the same files, and says nothing.
                 remote.paste(URI_LIST).await;
                 assert_eq!(remote.seen.notes.summaries(), ["Files pasted"]);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn files_that_arrive_after_the_application_stopped_waiting_are_offered_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("report.bin");
+        std::fs::write(&copied, b"figures").unwrap();
+        let list = uri_list_of(std::slice::from_ref(&copied));
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                remote.copy(&[(URI_LIST, list.as_bytes())]);
+                let first = home.offered(1).await;
+                home.paste_and_give_up(URI_LIST);
+                home.seen.told("Files pasted").await;
+                // The clipboard changes again, so a file manager that watches it reads it again,
+                // and this time gets the files at once.
+                assert_eq!(home.offered(2).await, first);
+                let pasted = String::from_utf8(home.paste(URI_LIST).await).unwrap();
+                assert_eq!(
+                    parse_uri_list(&pasted),
+                    [tmp.path().join("home/report.bin")]
+                );
+                assert_eq!(home.clipboard.offered.lock().unwrap().len(), 2);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn files_that_arrive_after_a_new_copy_here_never_replace_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("report.bin");
+        std::fs::write(&copied, b"figures").unwrap();
+        let list = uri_list_of(std::slice::from_ref(&copied));
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                remote.copy(&[(URI_LIST, list.as_bytes())]);
+                home.offered(1).await;
+                home.paste_and_give_up(URI_LIST);
+                home.copy(&[(TEXT, b"a note")]);
+                home.seen.told("Files pasted").await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(home.clipboard.offered.lock().unwrap().len(), 1);
             })
             .await;
     }
