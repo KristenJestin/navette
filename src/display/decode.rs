@@ -694,14 +694,75 @@ mod tests {
 
     #[test]
     fn frames_encoded_on_the_cpu_are_decoded_shown_and_acked() {
+        let real = Real {
+            gpu: None,
+            handover: Handover::Copy,
+            refused: Arc::default(),
+        };
+        cpu_round_trip(Box::new(real));
+    }
+
+    #[test]
+    fn a_slow_cpu_decoder_loses_no_picture_when_fed_at_its_pace() {
+        cpu_round_trip(Box::new(SlowCpu(Duration::from_millis(60))));
+    }
+
+    /// The real CPU decoder, slowed down as a busy runner slows it.
+    struct SlowCpu(Duration);
+
+    struct SlowDecoder(gliff_sw::Decoder, Duration);
+
+    impl Decode for SlowDecoder {
+        fn tier(&self) -> &'static str {
+            "CPU"
+        }
+
+        fn decode(&mut self, main: &[u8], aux: &[u8]) -> Result<Option<Picture>, String> {
+            std::thread::sleep(self.1);
+            Decode::decode(&mut self.0, main, aux)
+        }
+
+        fn drain(&mut self) -> Option<Picture> {
+            Decode::drain(&mut self.0)
+        }
+    }
+
+    impl Decoders for SlowCpu {
+        fn gpu(
+            &mut self,
+            _: bool,
+            _: bool,
+            _: (u32, u32),
+        ) -> Option<Result<Box<dyn Decode>, String>> {
+            None
+        }
+
+        fn cpu(&mut self, dual: bool) -> Result<Box<dyn Decode>, String> {
+            let inner = gliff_sw::Decoder::new(dual).map_err(|e| e.to_string())?;
+            Ok(Box::new(SlowDecoder(inner, self.0)))
+        }
+    }
+
+    /// Waits for `done` up to a deadline no healthy run comes near, so a slow runner is waited
+    /// for and a real loss still fails the test.
+    fn wait_until(done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Encodes ten pictures, hands them to `decoders` and checks that all ten are decoded, shown
+    /// and acked. Each frame is handed over once the one before was taken: home drops frames it
+    /// cannot keep up with, so a feed faster than the decoder would lose some on a slow runner.
+    fn cpu_round_trip(decoders: Box<dyn Decoders>) {
         let (width, height) = (320u32, 240u32);
         let shown = Arc::new(Mutex::new(Vec::new()));
         let outbox = Outbox::default();
         let decoding = {
             let shown = shown.clone();
-            Decoding::start(
-                None,
-                Default::default(),
+            Decoding::start_with(
+                decoders,
                 outbox.clone(),
                 Box::new(move |p| {
                     if let Picture::Bgra(f) = p {
@@ -712,42 +773,15 @@ mod tests {
             )
             .unwrap()
         };
-        let mut encoder = gliff_sw::Encoder::new(
-            gliff_sw::EncoderSettings {
-                width,
-                height,
-                bitrate: 4_000_000,
-                framerate: 30,
-            },
-            false,
-        )
-        .unwrap();
+        let mut encoder = encoder((width, height));
         decoding.video(config(width, height));
         let frames = 10;
         for id in 0..frames {
-            let encoded = encoder
-                .encode_bgra(&picture(width as usize, height as usize, id), id == 0)
-                .unwrap();
-            decoding.video(Video {
-                msg: ServerMsg::VideoFrame {
-                    frame_id: id as u64,
-                    pts_us: now_us(),
-                    keyframe: encoded.keyframe,
-                    damage: Vec::new(),
-                    data_len: encoded.main.len() as u32,
-                    aux_len: 0,
-                },
-                main: Bytes::from(encoded.main),
-                aux: Bytes::new(),
-            });
+            decoding.video(encoded(&mut encoder, id, (width, height)));
+            wait_until(|| acks(&outbox) > id);
         }
-        // The last picture comes out of the idle drain.
-        for _ in 0..200 {
-            if shown.lock().unwrap().len() == frames {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // The last picture may come out of the idle drain.
+        wait_until(|| shown.lock().unwrap().len() == frames);
         let shown = shown.lock().unwrap();
         assert_eq!(shown.len(), frames);
         let (w, h, pixels) = &shown[frames - 1];
@@ -760,12 +794,7 @@ mod tests {
             .filter(|(a, b)| (a[1] as i32 - b[1] as i32).abs() < 24)
             .count();
         assert!(close * 100 / (width * height) as usize >= 95, "{close}");
-        let acks = outbox
-            .queued()
-            .into_iter()
-            .filter(|m| matches!(m, Msg::Feedback(ClientMsg::FrameAck { .. })))
-            .count();
-        assert_eq!(acks, frames);
+        assert_eq!(acks(&outbox), frames);
     }
 
     /// A decoder that shows a picture for each frame until its `fails_after`th, then fails.
