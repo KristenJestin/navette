@@ -1,9 +1,9 @@
 //! `navette`: the work-from-home mode. The machine with the monitors ("home") pairs once with
 //! the work laptop ("remote"), then `navette serve` at home and `navette agent` on the laptop
-//! keep an authenticated link between them. `navette mode start` gives one home monitor to the
-//! remote machine, `navette mode stop` gives it back; `navette serve --audio` brings the remote
-//! machine's sound home and sends the home mic there while a mode runs;
-//! `navette mic` switches it.
+//! keep an authenticated link between them. `navette mode start [name]` gives the home monitors
+//! of a mode to the remote machine, `navette mode stop` gives them back, `navette status` says
+//! what runs; `navette serve --audio` brings the remote machine's sound home and sends the home
+//! mic there while a mode runs; `navette mic` switches it.
 
 use std::io::BufRead;
 use std::net::SocketAddr;
@@ -75,16 +75,21 @@ enum Command {
     },
     /// Remote: dial the paired home machine and keep the link up (a systemd user service).
     Agent,
-    /// Home: give the configured monitor to the remote machine, or take it back.
+    /// Home: give the configured monitors to the remote machine, or take them back.
     ///
-    /// The monitor is named in `mode.conf` in the config directory: `monitor = <output name>`.
-    /// Over it, the keyboard and every shortcut go to the remote machine; `release = <chord>`
-    /// (default `shift+escape`, or `none`) gives the keyboard back. `navette serve` must be
-    /// running.
+    /// The monitors are named in `mode.conf` in the config directory: `monitor = <output name>`,
+    /// or `monitor = desc:<start of the monitor's description>`. A `[name]` section defines a
+    /// mode of its own, started by name. Over the monitors, the keyboard and every shortcut go
+    /// to the remote machine; `release = <chord>` (default `shift+escape`, or `none`) gives the
+    /// keyboard back. `navette serve` must be running, except for `list`.
     Mode {
         #[command(subcommand)]
         action: ModeAction,
     },
+    /// Home: say which mode runs, and whether the remote machine is connected.
+    ///
+    /// `navette serve` must be running.
+    Status,
     /// Home: send the home mic to the remote machine or keep it home, while a mode runs.
     ///
     /// A mode sends it to the remote machine when it starts, and brings it home when it stops.
@@ -119,10 +124,17 @@ enum MicAction {
 
 #[derive(Subcommand)]
 enum ModeAction {
-    /// The remote machine takes the monitor.
-    Start,
-    /// The monitor comes back home.
+    /// The remote machine takes the monitors of the mode called NAME (the only one, or the
+    /// unnamed one, with no name). A mode already running is stopped first, and its monitors
+    /// given back.
+    Start {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// The monitors come back home.
     Stop,
+    /// Say the modes `mode.conf` defines and their monitors.
+    List,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -341,10 +353,18 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         }
         Command::Mode { action } => {
             let order = match action {
-                ModeAction::Start => "start",
-                ModeAction::Stop => "stop",
+                ModeAction::Start { name } => mode::start_order(name.as_deref())?,
+                ModeAction::Stop => "stop".to_string(),
+                ModeAction::List => {
+                    println!("{}", mode::list(store.dir())?);
+                    return Ok(());
+                }
             };
-            println!("{}", mode::order(&mode::control_path()?, order).await?);
+            println!("{}", mode::order(&mode::control_path()?, &order).await?);
+            Ok(())
+        }
+        Command::Status => {
+            println!("{}", mode::order(&mode::control_path()?, "status").await?);
             Ok(())
         }
         Command::Mic { action } => {
