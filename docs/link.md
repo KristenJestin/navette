@@ -68,6 +68,14 @@ refuses a request against an offer that a newer copy has replaced.
   cannot rename without replacing, a file is linked in then unlinked, a folder replaces an
   empty one made for it. The application that pasted gets their paths once they are all
   complete. A second paste of the same copy points at the same files.
+- **A file manager that stops waiting.** A file manager reads the clipboard as soon as it
+  changes, and gives up when the answer is slow: Omarchy's, flea, waits two seconds for each
+  of the two file-list types, so about four seconds in all, which a large paste over the LAN
+  outlasts (with a mode running, the picture leaves the clipboard a few megabytes a second).
+  It then holds a copy with no file in it, and its paste does nothing. When the files are in and the application
+  that asked for them had stopped waiting, the copy is put on the clipboard again, once: the
+  file manager reads it again and gets them at once. Never over a copy made on this machine
+  since.
 - **On the link**, a file's chunks go after the picture, the sound and the input, and gliff's
   window (four chunks of 256 KiB in flight per transfer) keeps a transfer from piling up more:
   a large file never holds a frame back for longer than the chunk already on the line. When
@@ -82,8 +90,13 @@ refuses a request against an offer that a newer copy has replaced.
   how it ended in a desktop notification: `Files pasted` with their folder, `Paste failed`
   with why (no room, the other machine stopped it…), or `Paste cancelled`.
 - **When the link drops**, every paste and transfer in flight ends at once, and what it had
-  written is removed; the files already pasted stay. A paste of text or a picture that fails
-  is written to the journal ("a paste failed: ..."), with no content.
+  written is removed; the files already pasted stay.
+- **The journal** follows each copy by its offer number, one line per step and on both
+  machines: the offer sent and received with its file count, each paste asked and as what
+  type, the files fetched, pasted (with how long it took) or failed with why, the files
+  served, and each request refused with why ("this machine copied again"). It never holds
+  what was copied: a paste of text or a picture that fails says only "a paste failed: ...",
+  a paste of files names the file it failed on.
 
 ## The home firewall
 
