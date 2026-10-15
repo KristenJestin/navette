@@ -29,6 +29,7 @@
 
 pub mod files;
 pub mod progress;
+pub mod vfs;
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
