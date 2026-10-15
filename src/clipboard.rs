@@ -75,6 +75,9 @@ const COMPOSITOR_RETRY: Duration = Duration::from_secs(5);
 /// be reading them through its virtual folder.
 const OLDER_SERVED: usize = 8;
 
+/// How often the virtual folder lets go of the replaced copies whose transfer is over.
+const TIDY: Duration = Duration::from_secs(5);
+
 /// The machine's clipboard, as the bridge needs it (a port: tests use a fake). Starting it,
 /// [`Compositor::receive`] and dropping it may block: the bridge does them on other threads.
 pub trait Compositor: Send + Sync + 'static {
@@ -259,6 +262,8 @@ struct Reads {
     running: usize,
     /// The bytes fetched of all its files, from the first read: what its bar shows.
     done: Meter,
+    /// The copy went from the folder: these reads go with their last fetch.
+    gone: bool,
 }
 
 impl<C: Compositor> Bridge<C> {
@@ -699,17 +704,14 @@ impl<C: Compositor> Bridge<C> {
                 total,
                 content,
             } => self.fetch_read(serial, index, total, content),
-            // Its last bytes are in: its fetches end on their own, at the peer's end.
-            vfs::Asked::Gone {
-                unfinished: false, ..
-            } => {}
-            vfs::Asked::Gone { serial, .. } => {
-                if self.progress.stop(Crossing::Read(serial)) {
-                    log(format_args!(
-                        "offer {serial}: replaced, and no file of it is open: its fetches end"
-                    ));
+            // Its transfer is over: a fetch still running has its bytes, and ends on its own
+            // at the peer's end.
+            vfs::Asked::Gone { serial } => {
+                let mut reads = self.reads.borrow_mut();
+                match reads.get_mut(&serial) {
+                    Some(read) if read.running > 0 => read.gone = true,
+                    _ => drop(reads.remove(&serial)),
                 }
-                self.reads.borrow_mut().remove(&serial);
             }
         }
     }
@@ -801,13 +803,16 @@ impl Drop for ReadEnding {
     fn drop(&mut self) {
         // A fetch dropped before its end: stopped by the user, its copy gone, or the mode.
         self.content.end(Err(libc::ECANCELED));
-        let mut reads = self.reads.borrow_mut();
-        let Some(reads) = reads.get_mut(&self.serial) else {
+        let mut all = self.reads.borrow_mut();
+        let Some(reads) = all.get_mut(&self.serial) else {
             return;
         };
         reads.running -= 1;
         if reads.running == 0 {
             self.progress.end(Crossing::Read(self.serial), self.run);
+            if reads.gone {
+                all.remove(&self.serial);
+            }
         }
     }
 }
@@ -1085,6 +1090,8 @@ async fn bridge<C: Compositor>(
             // A click before this bridge stops nothing of it.
             cancel.borrow_and_update();
             let mut cancel_open = true;
+            let folder = mounted.as_ref().map(|m| m.folder.clone());
+            let mut tidy = tokio::time::interval(TIDY);
             loop {
                 tokio::select! {
                     // A stop is seen before what the peer sent after it.
@@ -1102,6 +1109,9 @@ async fn bridge<C: Compositor>(
                         None => return Ended::Link,
                     },
                     Some(asked) = next_asked(&mut asked) => bridge.on_asked(asked),
+                    now = tidy.tick(), if folder.is_some() => {
+                        folder.as_ref().unwrap().tidy(now.into_std());
+                    }
                     event = events.recv() => match event {
                         Some(event) => bridge.on_compositor_event(event),
                         None => {
@@ -4121,6 +4131,69 @@ mod tests {
             })
             .await;
     }
+    /// The peer offers the folder `photos` of `count` files of `size` bytes as copy `serial`;
+    /// the machine pastes it: the folder's path.
+    async fn offer_a_folder(
+        machine: &Machine,
+        peer: &mut Framed<tokio::io::DuplexStream>,
+        serial: u32,
+        count: usize,
+        size: u64,
+    ) -> std::path::PathBuf {
+        let mut files = vec![ClipboardFile {
+            path: "photos".into(),
+            size: 0,
+            dir: true,
+        }];
+        files.extend((0..count).map(|n| ClipboardFile {
+            path: format!("photos/{n}.bin"),
+            size,
+            dir: false,
+        }));
+        let offer = LinkMsg::ClipboardOffer {
+            serial,
+            mime_types: Vec::new(),
+            files,
+        };
+        peer.write_msg(&offer).await.unwrap();
+        machine.offered(1).await;
+        let pasted = machine.paste(URI_LIST).await;
+        parse_uri_list(&String::from_utf8(pasted).unwrap())[0].clone()
+    }
+
+    #[tokio::test]
+    async fn a_newer_copy_between_two_files_of_a_folder_pasted_stops_none_of_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let contents: Vec<_> = (0..3).map(|n| bytes_of(CHUNK + 10, n)).collect();
+        LocalSet::new()
+            .run_until(async {
+                let (home, mut remote, mount) = alone_reading(Side::Client, tmp.path());
+                let size = contents[0].len() as u64;
+                let photos = offer_a_folder(&home, &mut remote, 6, 3, size).await;
+                let folder = mount.folder().await;
+                // A file manager copies the folder, one file after the other.
+                for (n, content) in contents.iter().enumerate() {
+                    let path = photos.join(format!("{n}.bin"));
+                    let read = tokio::task::spawn_local(read_file(folder.clone(), path));
+                    let (id, item) = next_request(&mut remote).await;
+                    assert_eq!(item, ClipboardItem::File(n as u32 + 1));
+                    send_rest(&mut remote, id, content, 0).await;
+                    assert!(within("a file", read).await.unwrap().unwrap() == *content);
+                    if n == 0 {
+                        // Something else is copied on the remote meanwhile.
+                        let newer = LinkMsg::ClipboardOffer {
+                            serial: 8,
+                            mime_types: vec![TEXT.into()],
+                            files: Vec::new(),
+                        };
+                        remote.write_msg(&newer).await.unwrap();
+                        home.offered(2).await;
+                    }
+                }
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn the_bar_of_a_copy_counts_the_bytes_read_of_all_its_files() {
         let tmp = tempfile::tempdir().unwrap();

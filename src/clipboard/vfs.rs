@@ -8,7 +8,10 @@
 //! The first read of a file asks the bridge to fetch it whole, in order, into a cache file of
 //! the receiving folder (unlinked at once, so it goes with its last handle); each read waits
 //! for its range, so an application may read in any order. A copy that a newer one replaced
-//! stays while a file of it is open, then goes, its fetches with it.
+//! stays while something of it is open, and while its transfer is under way: from the first
+//! read of one of its files until it is cancelled, or until every file read is whole and
+//! nothing of it was opened for [`LINGER`], since a file manager copying a folder opens its
+//! files one after the other, with nothing open between two.
 //!
 //! The kernel's requests run on one thread of `fuser`'s, which never waits: a read whose bytes
 //! are not here yet waits on a thread of its own, so a stuck read holds up neither the other
@@ -21,7 +24,7 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use gliff_proto::ClipboardFile;
 use gliff_proto::clipboard::safe_relative_path;
@@ -32,6 +35,10 @@ const ROOT: u64 = 1;
 
 /// How long the kernel keeps what it was told of a name or a file.
 const TTL: Duration = Duration::from_secs(1);
+
+/// How long a replaced copy whose files were read stays once nothing of it is open: the next
+/// file of a folder being copied comes well within it.
+pub const LINGER: Duration = Duration::from_secs(30);
 
 /// What the folder asks of the bridge.
 #[derive(Debug)]
@@ -44,10 +51,8 @@ pub enum Asked {
         total: u64,
         content: Arc<Content>,
     },
-    /// The copy `serial` went: a newer one replaced it and none of its files is open. Its
-    /// fetches stop when one of them had not got all its bytes yet: a reader that closed its
-    /// file early wants no more of it.
-    Gone { serial: u32, unfinished: bool },
+    /// The copy `serial` went: a newer one replaced it, and its transfer is over.
+    Gone { serial: u32 },
 }
 
 /// What a name in the folder is.
@@ -210,8 +215,12 @@ struct Offer {
     inodes: Vec<u64>,
     /// Still the peer's copy: no newer one replaced it.
     current: bool,
-    /// Its files open now.
+    /// Its files and folders open now.
     open: usize,
+    /// When one of them was last opened or closed.
+    touched: Instant,
+    /// One of its files was read: its transfer started.
+    read: bool,
     /// The user stopped its reads.
     stopped: bool,
     contents: HashMap<u32, Arc<Content>>,
@@ -263,9 +272,10 @@ impl Folder {
             .copied()
             .filter(|s| *s != serial)
             .collect();
+        let now = Instant::now();
         for older in replaced {
             tree.offers.get_mut(&older).unwrap().current = false;
-            self.prune(&mut tree, older);
+            self.prune(&mut tree, older, now);
         }
         tree.offers.get_mut(&serial).unwrap().current = true;
         let dir = self.path.join(serial.to_string());
@@ -274,19 +284,20 @@ impl Folder {
             .collect()
     }
 
-    /// Removes the copy `serial` when it was replaced and none of its files is open.
-    fn prune(&self, tree: &mut Tree, serial: u32) {
-        if tree
-            .offers
-            .get(&serial)
-            .is_some_and(|o| !o.current && o.open == 0)
-        {
-            let unfinished = tree.offers[&serial]
-                .contents
-                .values()
-                .any(|content| !content.complete());
+    /// Removes the copy `serial` when it was replaced and its transfer is over at `now`.
+    fn prune(&self, tree: &mut Tree, serial: u32, now: Instant) {
+        if tree.offers.get(&serial).is_some_and(|o| o.over(now)) {
             tree.remove(serial);
-            let _ = self.asked.send(Asked::Gone { serial, unfinished });
+            let _ = self.asked.send(Asked::Gone { serial });
+        }
+    }
+
+    /// Removes the replaced copies whose transfer is over at `now`: called now and then.
+    pub fn tidy(&self, now: Instant) {
+        let mut tree = self.tree.lock().unwrap();
+        let serials: Vec<u32> = tree.offers.keys().copied().collect();
+        for serial in serials {
+            self.prune(&mut tree, serial, now);
         }
     }
 
@@ -331,19 +342,36 @@ impl Folder {
         };
         let offer = tree.offers.get_mut(&serial).ok_or(libc::ENOENT)?;
         offer.open += 1;
+        offer.touched = Instant::now();
         Ok(())
     }
 
-    /// An application closed the file `ino`.
+    /// An application opens the folder `ino`: its copy stays until it is closed.
+    pub fn open_dir(&self, ino: u64) -> Result<(), i32> {
+        let mut tree = self.tree.lock().unwrap();
+        let node = tree.node(ino)?;
+        let (Kind::Dir(_), serial) = (&node.kind, node.serial) else {
+            return Err(libc::ENOTDIR);
+        };
+        if let Some(offer) = serial.and_then(|s| tree.offers.get_mut(&s)) {
+            offer.open += 1;
+            offer.touched = Instant::now();
+        }
+        Ok(())
+    }
+
+    /// An application closed the file or folder `ino`.
     pub fn release(&self, ino: u64) {
         let mut tree = self.tree.lock().unwrap();
         let Some(serial) = tree.nodes.get(&ino).and_then(|n| n.serial) else {
             return;
         };
+        let now = Instant::now();
         if let Some(offer) = tree.offers.get_mut(&serial) {
             offer.open = offer.open.saturating_sub(1);
+            offer.touched = now;
         }
-        self.prune(&mut tree, serial);
+        self.prune(&mut tree, serial, now);
     }
 
     /// Reads `size` bytes at `offset` of the file `ino`, and hands them to `reply`: at once
@@ -403,6 +431,7 @@ impl Folder {
         })?;
         let content = Arc::new(content);
         offer.contents.insert(index, content.clone());
+        offer.read = true;
         let total = crate::clipboard::files::total(&offer.files).unwrap_or(u64::MAX);
         let asked = Asked::Fetch {
             serial,
@@ -436,6 +465,19 @@ impl Folder {
                 content.end(Err(libc::EIO));
             }
         }
+    }
+}
+
+impl Offer {
+    /// Whether it may go at `now`: replaced, nothing of it open, and its transfer over:
+    /// none, cancelled, or every file read whole and nothing opened for [`LINGER`].
+    fn over(&self, now: Instant) -> bool {
+        !self.current
+            && self.open == 0
+            && (!self.read
+                || self.stopped
+                || (self.contents.values().all(|c| c.complete())
+                    && now.saturating_duration_since(self.touched) >= LINGER))
     }
 }
 
@@ -528,6 +570,8 @@ impl Tree {
             inodes: (first..self.next).collect(),
             current: true,
             open: 0,
+            touched: Instant::now(),
+            read: false,
             stopped: false,
             contents: HashMap::new(),
             made: SystemTime::now(),
@@ -780,6 +824,31 @@ impl fuser::Filesystem for Kernel {
         }
     }
 
+    fn opendir(
+        &self,
+        _req: &fuser::Request,
+        ino: fuser::INodeNo,
+        _flags: fuser::OpenFlags,
+        reply: fuser::ReplyOpen,
+    ) {
+        match self.0.open_dir(ino.0) {
+            Ok(()) => reply.opened(fuser::FileHandle(0), fuser::FopenFlags::empty()),
+            Err(e) => reply.error(errno(e)),
+        }
+    }
+
+    fn releasedir(
+        &self,
+        _req: &fuser::Request,
+        ino: fuser::INodeNo,
+        _fh: fuser::FileHandle,
+        _flags: fuser::OpenFlags,
+        reply: fuser::ReplyEmpty,
+    ) {
+        self.0.release(ino.0);
+        reply.ok();
+    }
+
     fn read(
         &self,
         _req: &fuser::Request,
@@ -945,64 +1014,82 @@ mod tests {
         assert!(asked.try_recv().is_err());
         folder.release(a);
         assert_eq!(at(&folder, "7").err(), Some(libc::ENOENT));
-        assert!(matches!(
-            asked.try_recv(),
-            Ok(Asked::Gone {
-                serial: 7,
-                unfinished: false
-            })
-        ));
+        assert!(matches!(asked.try_recv(), Ok(Asked::Gone { serial: 7 })));
         // A copy replaced with nothing open goes at once.
         folder.offer(9, &[]);
         assert_eq!(at(&folder, "8").err(), Some(libc::ENOENT));
     }
 
-    /// A reader of a replaced copy that closes its file: whether its fetch must stop.
-    fn closed_after(written: &[u8]) -> Asked {
+    #[test]
+    fn a_replaced_copy_stays_while_a_folder_of_it_is_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (folder, _asked) = folder(tmp.path());
+        folder.offer(7, &[dir("d"), file("d/a.txt", 4)]);
+        let d = at(&folder, "7/d").unwrap().ino;
+        folder.open_dir(d).unwrap();
+        folder.offer(8, &[]);
+        assert!(at(&folder, "7/d/a.txt").is_ok());
+        folder.release(d);
+        assert_eq!(at(&folder, "7").err(), Some(libc::ENOENT));
+    }
+
+    type Replaced = (Arc<Folder>, UnboundedReceiver<Asked>, tempfile::TempDir);
+
+    /// Copy 7 of files of `sizes`, its first file read whole and closed, then replaced.
+    fn replaced_after_a_first_file(sizes: &[u64]) -> Replaced {
         let tmp = tempfile::tempdir().unwrap();
         let (folder, mut asked) = folder(tmp.path());
-        folder.offer(7, &[file("a.txt", 4)]);
-        let a = at(&folder, "7/a.txt").unwrap().ino;
-        folder.open(a).unwrap();
-        folder.read(a, 0, 4, |_| {});
+        let files: Vec<_> = (0..sizes.len())
+            .map(|n| file(&format!("{n}.bin"), sizes[n]))
+            .collect();
+        folder.offer(7, &files);
+        let first = at(&folder, "7/0.bin").unwrap().ino;
+        folder.open(first).unwrap();
+        folder.read(first, 0, 4096, |_| {});
         let Ok(Asked::Fetch { content, .. }) = asked.try_recv() else {
             panic!("a fetch");
         };
-        content.write_at(written, 0).unwrap();
+        content.write_at(&vec![1; sizes[0] as usize], 0).unwrap();
+        content.end(Ok(()));
+        folder.release(first);
         folder.offer(8, &[]);
-        folder.release(a);
-        asked.try_recv().unwrap()
+        (folder, asked, tmp)
     }
 
     #[test]
-    fn a_replaced_copy_closed_once_its_bytes_are_in_lets_its_fetch_end() {
-        // The peer's end of the transfer is still on its way.
-        let gone = closed_after(b"abcd");
-        assert!(
-            matches!(
-                gone,
-                Asked::Gone {
-                    unfinished: false,
-                    ..
-                }
-            ),
-            "{gone:?}"
-        );
+    fn a_replaced_copy_being_read_stays_between_two_files() {
+        let (folder, mut asked, _tmp) = replaced_after_a_first_file(&[4, 4]);
+        let next = at(&folder, "7/1.bin").unwrap().ino;
+        folder.open(next).unwrap();
+        folder.read(next, 0, 4, |_| {});
+        assert!(matches!(
+            asked.try_recv(),
+            Ok(Asked::Fetch {
+                serial: 7,
+                index: 1,
+                ..
+            })
+        ));
     }
 
     #[test]
-    fn a_replaced_copy_closed_in_the_middle_of_a_file_stops_its_fetch() {
-        let gone = closed_after(b"ab");
-        assert!(
-            matches!(
-                gone,
-                Asked::Gone {
-                    unfinished: true,
-                    ..
-                }
-            ),
-            "{gone:?}"
-        );
+    fn a_replaced_copy_read_whole_goes_once_nothing_of_it_was_opened_for_a_while() {
+        let (folder, mut asked, _tmp) = replaced_after_a_first_file(&[4, 4]);
+        let now = Instant::now();
+        folder.tidy(now + LINGER / 2);
+        assert!(at(&folder, "7/1.bin").is_ok());
+        assert!(asked.try_recv().is_err());
+        folder.tidy(now + LINGER);
+        assert_eq!(at(&folder, "7").err(), Some(libc::ENOENT));
+        assert!(matches!(asked.try_recv(), Ok(Asked::Gone { serial: 7 })));
+    }
+
+    #[test]
+    fn a_replaced_copy_whose_reads_were_cancelled_goes_once_closed() {
+        let (folder, _asked, _tmp) = replaced_after_a_first_file(&[4, 4]);
+        folder.stop(7);
+        folder.tidy(Instant::now());
+        assert_eq!(at(&folder, "7").err(), Some(libc::ENOENT));
     }
 
     #[test]
