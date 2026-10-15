@@ -36,8 +36,9 @@ output keeps the level it was last set to, which the user chose. The level is to
 linear gain, so a slider at 50 % (0.125) is set as 0.125 on the other side.
 
 A level applied from the other side is not sent back: each side remembers the level the other
-side holds, and what its own mixer said when that level was applied, until its mixer says
-something else. Until the sink has said home's level, nothing it says is told, so the level
+side holds, what its own mixer said when that level was applied, and the levels applied since its
+mixer last said the other side's, which a held volume key sends faster than a mixer may say
+them, until its mixer says something else. Until the sink has said home's level, nothing it says is told, so the level
 the session manager restored it at is never taken for the user moving it. A remote one beta
 older, which tells its sink's level as the session starts, has it set on home's output the
 same way. If both machines move the level within the same few milliseconds, each may end at
