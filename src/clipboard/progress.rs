@@ -1,7 +1,7 @@
-//! What the user sees of the files crossing, both ways: one bar for all of them, at home in
-//! the corner, and a notification when a paste fails or is stopped; and how they stop them all,
-//! by a click on the bar. The pasting side counts the bytes it writes, the copying side the
-//! bytes it serves: home shows both, whichever machine pasted.
+//! What the user sees of the files crossing, both ways: one bar per transfer, at home in the
+//! corner, and a notification when a paste fails or is stopped; and how they stop one, by a
+//! click on its bar. The pasting side counts the bytes it writes, the copying side the bytes it
+//! serves: home shows both, whichever machine pasted.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -22,9 +22,11 @@ use crate::notify::Notifier;
 /// How often the bar moves while files cross.
 pub const CADENCE: Duration = Duration::from_millis(250);
 
-/// The files crossing now: bytes done of the bytes they hold.
+/// One transfer of files crossing now: bytes done of the bytes it holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bar {
+    /// Which transfer: what a click on its bar names.
+    pub id: u64,
     pub done: u64,
     pub total: u64,
 }
@@ -35,16 +37,26 @@ impl Bar {
     }
 }
 
+/// A click on the bar of a transfer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cancel {
+    /// Counts the clicks, so that two on the same bar are two changes.
+    pub clicks: u64,
+    /// The [`Bar::id`] clicked.
+    pub transfer: u64,
+}
+
 /// Where the bridge shows the files crossing, and hears the user stop them.
 #[derive(Clone)]
 pub struct Shown {
-    /// The bar of every file crossing, both ways; none once they are all done.
-    pub bar: Arc<dyn Fn(Option<Bar>) + Send + Sync>,
+    /// The bars of the transfers crossing, both ways, in the order they started; none once
+    /// they are all done.
+    pub bar: Arc<dyn Fn(Vec<Bar>) + Send + Sync>,
     /// A paste's failure or cancel, on the machine that pasted; what a copy left out, on the
     /// machine that copied.
     pub notifier: Arc<dyn Notifier>,
-    /// Each change stops every file crossing.
-    pub cancel: watch::Receiver<u64>,
+    /// Each change stops the transfer it names.
+    pub cancel: watch::Receiver<Cancel>,
 }
 
 impl Shown {
@@ -54,24 +66,40 @@ impl Shown {
         Self {
             bar: Arc::new(|_| {}),
             notifier,
-            cancel: watch::channel(0).1,
+            cancel: watch::channel(Cancel::default()).1,
         }
     }
 }
 
-/// One set of files crossing.
+/// One set of files crossing: a transfer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Crossing {
     /// A paste on this machine, by its own number.
     Paste(u32),
     /// The peer pasting the copy of this serial, served from here.
     Serve(u32),
+    /// Applications here reading the files of the peer's copy of this serial.
+    Read(u32),
+}
+
+impl Crossing {
+    /// Its bar's [`Bar::id`].
+    pub fn id(self) -> u64 {
+        let (serial, kind) = match self {
+            Crossing::Paste(n) => (n, 0),
+            Crossing::Serve(serial) => (serial, 1),
+            Crossing::Read(serial) => (serial, 2),
+        };
+        u64::from(serial) << 2 | kind
+    }
 }
 
 /// How a crossing is stopped.
 pub enum Stop {
     /// The paste's task is dropped: its fetch tells the peer, its staging folder goes.
     Task(AbortHandle),
+    /// Each fetch of the reads is dropped, those to come with them.
+    Tasks(Rc<RefCell<Vec<AbortHandle>>>),
     /// The served file's next read fails: gliff's engine tells the peer.
     Source(Rc<Cell<bool>>),
 }
@@ -90,7 +118,7 @@ struct Running {
 #[derive(Clone)]
 pub struct Progress {
     running: Rc<RefCell<HashMap<Crossing, Running>>>,
-    bar: Arc<dyn Fn(Option<Bar>) + Send + Sync>,
+    bar: Arc<dyn Fn(Vec<Bar>) + Send + Sync>,
     ticking: Rc<Cell<bool>>,
     runs: Rc<Cell<u64>>,
     /// The copies whose serving the user stopped: the peer's next requests for them are
@@ -99,7 +127,7 @@ pub struct Progress {
 }
 
 impl Progress {
-    pub fn new(bar: Arc<dyn Fn(Option<Bar>) + Send + Sync>) -> Self {
+    pub fn new(bar: Arc<dyn Fn(Vec<Bar>) + Send + Sync>) -> Self {
         Self {
             running: Rc::default(),
             bar,
@@ -128,9 +156,10 @@ impl Progress {
             let progress = self.clone();
             tokio::task::spawn_local(async move {
                 loop {
-                    let bar = progress.now();
-                    (progress.bar)(bar);
-                    if bar.is_none() {
+                    let bars = progress.now();
+                    let done = bars.is_empty();
+                    (progress.bar)(bars);
+                    if done {
                         progress.ticking.set(false);
                         return;
                     }
@@ -172,8 +201,8 @@ impl Progress {
         self.stopped.borrow_mut().remove(&serial);
     }
 
-    /// Stops the paste `crossing` if it still runs, as a click on the bar would but alone and
-    /// without a word; whether it ran.
+    /// Stops the paste `crossing` if it still runs, as a click on the bar would but without a
+    /// word; whether it ran.
     pub fn stop(&self, crossing: Crossing) -> bool {
         let removed = self.running.borrow_mut().remove(&crossing);
         let Some(Running {
@@ -187,6 +216,20 @@ impl Progress {
         true
     }
 
+    /// The meter, the fetches and the run of the reads of the peer's copy `serial`, started
+    /// now with `total` bytes to read unless they run already.
+    pub fn reading(&self, serial: u32, total: u64) -> (Meter, Rc<RefCell<Vec<AbortHandle>>>, u64) {
+        let crossing = Crossing::Read(serial);
+        if let Some(running) = self.running.borrow().get(&crossing)
+            && let Stop::Tasks(tasks) = &running.stop
+        {
+            return (running.done.clone(), tasks.clone(), running.run);
+        }
+        let (done, tasks) = (Meter::default(), Rc::new(RefCell::new(Vec::new())));
+        let run = self.start(crossing, total, done.clone(), Stop::Tasks(tasks.clone()));
+        (done, tasks, run)
+    }
+
     /// `crossing`'s `run` served a file whole and waits for the peer to ask for the next one:
     /// it ends unless one comes within gliff's idle timeout, the peer's paste gone.
     fn idle(&self, crossing: Crossing, run: u64) {
@@ -197,39 +240,38 @@ impl Progress {
         }
     }
 
-    /// Stops every crossing; the pastes stopped.
-    pub fn cancel(&self) -> Vec<Crossing> {
-        let stopped: Vec<_> = self.running.borrow_mut().drain().collect();
-        if !stopped.is_empty() {
-            (self.bar)(None);
+    /// Stops the crossing whose bar is `id`, the others going on; the crossing stopped.
+    pub fn cancel(&self, id: u64) -> Option<Crossing> {
+        let crossing = *self.running.borrow().keys().find(|c| c.id() == id)?;
+        let running = self.running.borrow_mut().remove(&crossing)?;
+        (self.bar)(self.now());
+        match running.stop {
+            Stop::Task(task) => task.abort(),
+            Stop::Tasks(tasks) => tasks.borrow().iter().for_each(AbortHandle::abort),
+            Stop::Source(stopped) => stopped.set(true),
         }
-        stopped
-            .into_iter()
-            .filter_map(|(crossing, running)| {
-                match running.stop {
-                    Stop::Task(task) => task.abort(),
-                    Stop::Source(stopped) => stopped.set(true),
-                }
-                if let Crossing::Serve(serial) = crossing {
-                    self.stopped.borrow_mut().insert(serial);
-                }
-                matches!(crossing, Crossing::Paste(_)).then_some(crossing)
-            })
-            .collect()
+        if let Crossing::Serve(serial) = crossing {
+            self.stopped.borrow_mut().insert(serial);
+        }
+        Some(crossing)
     }
 
-    fn now(&self) -> Option<Bar> {
+    fn now(&self) -> Vec<Bar> {
         let mut running = self.running.borrow_mut();
         running.retain(|_, r| r.idle.is_none_or(|since| since.elapsed() < IDLE_TIMEOUT));
-        (!running.is_empty()).then(|| Bar {
-            // Each total is counted, not their sum: several near the limit saturate it.
-            done: running
-                .values()
-                .fold(0, |sum, r| sum.saturating_add(r.done.get())),
-            total: running
-                .values()
-                .fold(0, |sum, r| sum.saturating_add(r.total)),
-        })
+        let mut bars: Vec<_> = running
+            .iter()
+            .map(|(crossing, r)| {
+                let bar = Bar {
+                    id: crossing.id(),
+                    done: r.done.get(),
+                    total: r.total,
+                };
+                (r.run, bar)
+            })
+            .collect();
+        bars.sort_unstable_by_key(|(run, _)| *run);
+        bars.into_iter().map(|(_, bar)| bar).collect()
     }
 }
 
@@ -309,7 +351,7 @@ mod tests {
     }
 
     /// The bars shown, and the bridge's tracker that shows them.
-    fn tracker() -> (Progress, Arc<Mutex<Vec<Option<Bar>>>>) {
+    fn tracker() -> (Progress, Arc<Mutex<Vec<Vec<Bar>>>>) {
         let bars = Arc::new(Mutex::new(Vec::new()));
         let shown = bars.clone();
         let progress = Progress::new(Arc::new(move |bar| shown.lock().unwrap().push(bar)));
@@ -335,8 +377,18 @@ mod tests {
         while served.next().await.unwrap().is_some() {}
     }
 
-    fn last(bars: &Mutex<Vec<Option<Bar>>>) -> Option<Bar> {
-        *bars.lock().unwrap().last().unwrap()
+    fn last(bars: &Mutex<Vec<Vec<Bar>>>) -> Vec<Bar> {
+        bars.lock().unwrap().last().unwrap().clone()
+    }
+
+    /// The bar of copy 1 served, at `done` bytes of 10.
+    fn served(done: u64) -> Vec<Bar> {
+        let id = Crossing::Serve(1).id();
+        vec![Bar {
+            id,
+            done,
+            total: 10,
+        }]
     }
 
     #[tokio::test(start_paused = true)]
@@ -347,7 +399,7 @@ mod tests {
                 // Offered at 10 bytes, 4 left when the peer asks: its paste fails there.
                 serve(&progress, 10, 10, 4).await;
                 tokio::time::sleep(CADENCE * 2).await;
-                assert_eq!(last(&bars), None);
+                assert_eq!(last(&bars), []);
             })
             .await;
     }
@@ -360,9 +412,9 @@ mod tests {
                 // The first of two files is served whole, then the peer asks for nothing more.
                 serve(&progress, 4, 10, 4).await;
                 tokio::time::sleep(CADENCE * 2).await;
-                assert_eq!(last(&bars), Some(Bar { done: 4, total: 10 }));
+                assert_eq!(last(&bars), served(4));
                 tokio::time::sleep(IDLE_TIMEOUT).await;
-                assert_eq!(last(&bars), None);
+                assert_eq!(last(&bars), []);
             })
             .await;
     }
@@ -376,7 +428,51 @@ mod tests {
                 tokio::time::sleep(IDLE_TIMEOUT / 2).await;
                 let (_done, _stopped, _run) = progress.serving(1, 10).unwrap();
                 tokio::time::sleep(IDLE_TIMEOUT).await;
-                assert_eq!(last(&bars), Some(Bar { done: 4, total: 10 }));
+                assert_eq!(last(&bars), served(4));
+            })
+            .await;
+    }
+    #[tokio::test(start_paused = true)]
+    async fn two_transfers_have_a_bar_each_and_a_cancel_stops_only_its_own() {
+        LocalSet::new()
+            .run_until(async {
+                let (progress, bars) = tracker();
+                let (first, first_stopped, _) = progress.serving(1, 10).unwrap();
+                let (second, _, _) = progress.serving(2, 20).unwrap();
+                first.add(3);
+                second.add(5);
+                tokio::time::sleep(CADENCE * 2).await;
+                let (one, two) = (Crossing::Serve(1).id(), Crossing::Serve(2).id());
+                assert_eq!(
+                    last(&bars),
+                    [
+                        Bar {
+                            id: one,
+                            done: 3,
+                            total: 10
+                        },
+                        Bar {
+                            id: two,
+                            done: 5,
+                            total: 20
+                        }
+                    ]
+                );
+                assert_eq!(progress.cancel(one), Some(Crossing::Serve(1)));
+                assert!(first_stopped.get());
+                tokio::time::sleep(CADENCE * 2).await;
+                assert_eq!(
+                    last(&bars),
+                    [Bar {
+                        id: two,
+                        done: 5,
+                        total: 20
+                    }]
+                );
+                assert!(
+                    progress.serving(1, 10).is_none(),
+                    "its next file is refused"
+                );
             })
             .await;
     }

@@ -13,8 +13,8 @@
 //!   hotkey and `navette mic toggle` do; hovering it shows the hotkey.
 //! - **Messages** (`Mic → remote`, `Keyboard → home`, …) show under the button for two seconds,
 //!   in place of desktop notifications.
-//! - **Files crossing** the clipboard, either way, show as a bar under the tag, with what is
-//!   left; a click on it stops them all.
+//! - **Files crossing** the clipboard, either way, show as one bar per transfer under the tag,
+//!   with what is left; a click on a bar stops its transfer, the others going on.
 //!
 //! [`Board`] carries the mic's place and the messages to every corner open; [`Corner`] is one
 //! corner, drawn in software into ARGB pixels. Its text uses a 5×8 bitmap font of its own, so
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use crate::clipboard::files::human_bytes;
-use crate::clipboard::progress::Bar;
+use crate::clipboard::progress::{Bar, Cancel};
 use crate::mic::Status;
 use crate::notify::Notifier;
 
@@ -36,6 +36,8 @@ pub const MESSAGE: Duration = Duration::from_secs(2);
 pub const CHECK: Duration = Duration::from_millis(350);
 /// The most characters a tag holds.
 pub const LABEL_LONGEST: usize = 12;
+/// The most bars of transfers a corner shows: the first ones started.
+pub const BARS_SHOWN: usize = 3;
 
 /// When a corner is drawn again with nothing new heard.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -53,8 +55,8 @@ pub enum Update {
     Mic(Status),
     /// A message to show under the button.
     Say(String),
-    /// The files crossing the clipboard; none once they are done.
-    Files(Option<Bar>),
+    /// The transfers of files crossing the clipboard; none once they are done.
+    Files(Vec<Bar>),
 }
 
 /// What a click on the corner does.
@@ -62,8 +64,8 @@ pub enum Update {
 pub enum Press {
     /// Switches the mic.
     Mic,
-    /// Stops the files crossing.
-    Cancel,
+    /// Stops the transfer of this [`Bar::id`].
+    Cancel(u64),
 }
 
 type Listener = Box<dyn FnMut(&Update) -> bool + Send>;
@@ -74,13 +76,13 @@ pub struct Board {
     inner: Mutex<Inner>,
     /// What a click on the mic button does.
     toggle: OnceLock<Box<dyn Fn() + Send + Sync>>,
-    /// Bumped by a click on the bar: the clipboard stops every file crossing.
-    cancel: watch::Sender<u64>,
+    /// Changed by a click on a bar: the clipboard stops its transfer.
+    cancel: watch::Sender<Cancel>,
 }
 
 struct Inner {
     mic: Status,
-    files: Option<Bar>,
+    files: Vec<Bar>,
     /// Each returns false once its corner is gone.
     listeners: Vec<Listener>,
 }
@@ -90,11 +92,11 @@ impl Default for Board {
         Self {
             inner: Mutex::new(Inner {
                 mic: Status::Off,
-                files: None,
+                files: Vec::new(),
                 listeners: Vec::new(),
             }),
             toggle: OnceLock::new(),
-            cancel: watch::channel(0).0,
+            cancel: watch::channel(Cancel::default()).0,
         }
     }
 }
@@ -117,17 +119,17 @@ impl Board {
             .tell(&Update::Say(text.to_owned()));
     }
 
-    /// The files crossing the clipboard: every corner shows their bar, or no more.
-    pub fn files(&self, bar: Option<Bar>) {
+    /// The transfers of files crossing the clipboard: every corner shows their bars, or no more.
+    pub fn files(&self, bars: Vec<Bar>) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.files != bar {
-            inner.files = bar;
-            inner.tell(&Update::Files(bar));
+        if inner.files != bars {
+            inner.files = bars.clone();
+            inner.tell(&Update::Files(bars));
         }
     }
 
-    /// Changes at each click on the bar.
-    pub fn cancels(&self) -> watch::Receiver<u64> {
+    /// Changes at each click on a bar, naming its transfer.
+    pub fn cancels(&self) -> watch::Receiver<Cancel> {
         self.cancel.subscribe()
     }
 
@@ -135,8 +137,9 @@ impl Board {
     /// message, until it returns false.
     pub fn listen(&self, mut listener: impl FnMut(&Update) -> bool + Send + 'static) {
         let mut inner = self.inner.lock().unwrap();
-        let files = inner.files;
-        if listener(&Update::Mic(inner.mic)) && (files.is_none() || listener(&Update::Files(files)))
+        let files = inner.files.clone();
+        if listener(&Update::Mic(inner.mic))
+            && (files.is_empty() || listener(&Update::Files(files)))
         {
             inner.listeners.push(Box::new(listener));
         }
@@ -261,7 +264,10 @@ impl Feed {
     pub fn press(&self, press: Press) {
         match press {
             Press::Mic => self.board.click(),
-            Press::Cancel => self.board.cancel.send_modify(|n| *n = n.wrapping_add(1)),
+            Press::Cancel(transfer) => self.board.cancel.send_modify(|cancel| {
+                cancel.clicks = cancel.clicks.wrapping_add(1);
+                cancel.transfer = transfer;
+            }),
         }
     }
 }
@@ -398,7 +404,7 @@ const GLOW: (f64, f64) = (150.0, 80.0);
 const DOT: f64 = 2.0;
 /// The longest message shown, in characters; a longer one ends with `…`.
 const LONGEST: usize = 64;
-/// The narrowest the bar of the files crossing is.
+/// The narrowest a bar of files crossing is.
 const BAR_WIDTH: f64 = 160.0;
 
 /// One corner: what it shows, and how it is drawn.
@@ -412,7 +418,7 @@ pub struct Corner {
     check: (f64, f64, Option<Instant>),
     message: Option<(String, Instant)>,
     hover: bool,
-    files: Option<Bar>,
+    files: Vec<Bar>,
     /// Where the pointer is over the corner, in its logical pixels.
     pointer: Option<(f64, f64)>,
 }
@@ -427,7 +433,7 @@ impl Corner {
             check: (0.0, 0.0, None),
             message: None,
             hover: false,
-            files: None,
+            files: Vec::new(),
             pointer: None,
         }
     }
@@ -456,13 +462,16 @@ impl Corner {
         self.pointer = Some((x, y));
     }
 
-    /// What a click where the pointer is does: on the bar, it stops the files; anywhere else,
-    /// it switches the mic.
+    /// What a click where the pointer is does: on a bar, it stops its transfer; anywhere
+    /// else, it switches the mic.
     pub fn press(&self) -> Press {
-        match (self.bar(), self.pointer) {
-            (Some(bar), Some((x, y))) if bar.holds(x, y) => Press::Cancel,
-            _ => Press::Mic,
-        }
+        let Some((x, y)) = self.pointer else {
+            return Press::Mic;
+        };
+        self.bars()
+            .into_iter()
+            .find(|(rect, _)| rect.holds(x, y))
+            .map_or(Press::Mic, |(_, bar)| Press::Cancel(bar.id))
     }
 
     /// The pointer is over the button, or not; true when that changes what is shown.
@@ -540,30 +549,30 @@ impl Corner {
         })
     }
 
-    /// The bar of the files crossing, under the tag: where a click stops them.
-    pub fn bar(&self) -> Option<Rect> {
-        let text = self.bar_text()?;
-        Some(Rect {
-            x: PAD,
-            y: PAD + ROW + 6.0,
-            width: (text_width(&text) + 2.0 * 6.0).max(BAR_WIDTH),
-            height: ROW,
-        })
+    /// The bars of the transfers shown, one under the other below the tag: where a click
+    /// stops one.
+    pub fn bars(&self) -> Vec<(Rect, Bar)> {
+        let mut y = PAD;
+        self.files
+            .iter()
+            .take(BARS_SHOWN)
+            .map(|bar| {
+                y += ROW + 6.0;
+                let rect = Rect {
+                    x: PAD,
+                    y,
+                    width: (text_width(&bar_text(bar)) + 2.0 * 6.0).max(BAR_WIDTH),
+                    height: ROW,
+                };
+                (rect, *bar)
+            })
+            .collect()
     }
 
-    fn bar_text(&self) -> Option<String> {
-        let bar = self.files?;
-        let percent = (bar.done as u128 * 100 / bar.total.max(1) as u128).min(100);
-        Some(format!(
-            "Files {percent}%, {} left  x",
-            human_bytes(bar.left())
-        ))
-    }
-
-    /// The top of the line under the button: under the bar when there is one.
+    /// The top of the line under the button: under the bars when there are some.
     fn line_y(&self) -> f64 {
-        let rows = if self.bar().is_some() { 2.0 } else { 1.0 };
-        PAD + rows * (ROW + 6.0)
+        let rows = 1 + self.files.len().min(BARS_SHOWN);
+        PAD + rows as f64 * (ROW + 6.0)
     }
 
     /// The line under the button: the message, else the hint while hovered.
@@ -590,7 +599,7 @@ impl Corner {
             right = button.x + button.width;
         }
         let mut bottom = PAD + ROW;
-        if let Some(bar) = self.bar() {
+        for (bar, _) in self.bars() {
             right = right.max(bar.x + bar.width);
             bottom = bar.y + bar.height;
         }
@@ -603,18 +612,17 @@ impl Corner {
     }
 
     /// The most room the corner takes whatever it shows, in logical pixels: its longest line,
-    /// under the bar of the files crossing.
+    /// under the most bars of files crossing it shows.
     pub fn room(&self) -> (u32, u32) {
         let now = Instant::now();
         let mut widest = Corner::new(self.side, None, self.label.clone());
         widest.update(Update::Mic(Status::Home), now);
-        widest.update(
-            Update::Files(Some(Bar {
-                done: 0,
-                total: u64::MAX,
-            })),
-            now,
-        );
+        let bar = Bar {
+            id: 0,
+            done: 0,
+            total: u64::MAX,
+        };
+        widest.update(Update::Files(vec![bar; BARS_SHOWN]), now);
         widest.update(Update::Say("M".repeat(LONGEST)), now);
         widest.size(now)
     }
@@ -656,7 +664,7 @@ impl Corner {
             pen.ring(cx, cy, 7.0, accent);
             pen.check(cx, cy, check, accent);
         }
-        if let (Some(bar), Some(files), Some(text)) = (self.bar(), self.files, self.bar_text()) {
+        for (bar, files) in self.bars() {
             pen.rounded(bar, 5.0, PILL);
             let part = (files.done as f64 / files.total.max(1) as f64).min(1.0);
             if part > 0.0 {
@@ -667,6 +675,7 @@ impl Corner {
                 pen.rounded(done, 5.0, FILL);
             }
             pen.rounded_outline(bar, 5.0, BORDER);
+            let text = bar_text(&files);
             pen.text(bar.x + 6.0, bar.y + (ROW - 7.0 * DOT) / 2.0, &text, LABEL);
         }
         if let Some(line) = self.line(now) {
@@ -681,6 +690,12 @@ impl Corner {
         }
         canvas
     }
+}
+
+/// What a bar of files crossing says.
+fn bar_text(bar: &Bar) -> String {
+    let percent = (bar.done as u128 * 100 / bar.total.max(1) as u128).min(100);
+    format!("Files {percent}%, {} left  x", human_bytes(bar.left()))
 }
 
 /// Draws in logical pixels on a canvas of physical ones.
@@ -1189,15 +1204,13 @@ mod tests {
         let now = Instant::now();
         let mut pro = corner(Side::Remote, Status::Remote, now);
         let files = Bar {
+            id: 1,
             done: 1 << 30,
             total: 3 << 30,
         };
-        pro.update(Update::Files(Some(files)), now);
-        assert_eq!(
-            pro.bar_text().as_deref(),
-            Some("Files 33%, 2.0 GiB left  x")
-        );
-        let bar = pro.bar().expect("the bar");
+        pro.update(Update::Files(vec![files]), now);
+        assert_eq!(bar_text(&files), "Files 33%, 2.0 GiB left  x");
+        let (bar, _) = pro.bars()[0];
         let (width, height) = pro.size(now);
         assert!(f64::from(width) >= bar.x + bar.width && f64::from(height) >= bar.y + bar.height);
         let drawn = pro.draw(now, 1.0);
@@ -1212,12 +1225,12 @@ mod tests {
         pro.update(Update::Say("Mic → remote".into()), now);
         assert!(pro.line_y() >= bar.y + bar.height);
 
-        pro.update(Update::Files(None), now);
-        assert_eq!(pro.bar(), None);
+        pro.update(Update::Files(Vec::new()), now);
+        assert_eq!(pro.bars(), []);
     }
 
     #[test]
-    fn a_click_on_the_bar_stops_the_files_and_anywhere_else_switches_the_mic() {
+    fn a_click_on_a_bar_stops_its_transfer_and_anywhere_else_switches_the_mic() {
         let now = Instant::now();
         let board = Arc::new(Board::default());
         let (clicked, clicks) = std::sync::mpsc::channel();
@@ -1227,14 +1240,20 @@ mod tests {
         let feed = Feed::new(board, None, Look::default());
         let mut pro = feed.corner(Side::Remote);
         pro.update(Update::Mic(Status::Remote), now);
-        pro.update(Update::Files(Some(Bar { done: 0, total: 10 })), now);
-        let (bar, button) = (pro.bar().unwrap(), pro.button().unwrap());
+        let bar = |id| Bar {
+            id,
+            done: 0,
+            total: 10,
+        };
+        pro.update(Update::Files(vec![bar(5), bar(9)]), now);
+        let (second, button) = (pro.bars()[1].0, pro.button().unwrap());
+        assert!(second.y >= pro.bars()[0].0.y + ROW, "one under the other");
 
-        pro.point_at(bar.x + bar.width / 2.0, bar.y + 4.0);
-        assert_eq!(pro.press(), Press::Cancel);
+        pro.point_at(second.x + second.width / 2.0, second.y + 4.0);
+        assert_eq!(pro.press(), Press::Cancel(9));
         feed.press(pro.press());
-        assert!(cancels.has_changed().unwrap(), "the files are stopped");
-        cancels.borrow_and_update();
+        assert!(cancels.has_changed().unwrap(), "a transfer is stopped");
+        assert_eq!(cancels.borrow_and_update().transfer, 9, "the one clicked");
 
         pro.point_at(button.x + 4.0, button.y + 4.0);
         assert_eq!(pro.press(), Press::Mic);
@@ -1248,15 +1267,22 @@ mod tests {
     #[test]
     fn a_corner_opened_while_files_cross_shows_their_bar() {
         let board = Board::default();
-        let files = Some(Bar { done: 1, total: 2 });
-        board.files(files);
+        let files = vec![Bar {
+            id: 1,
+            done: 1,
+            total: 2,
+        }];
+        board.files(files.clone());
         let heard = listening(&board);
         assert_eq!(
             *heard[0].lock().unwrap(),
             [Update::Mic(Status::Off), Update::Files(files)]
         );
-        board.files(None);
-        assert_eq!(heard[1].lock().unwrap().last(), Some(&Update::Files(None)));
+        board.files(Vec::new());
+        assert_eq!(
+            heard[1].lock().unwrap().last(),
+            Some(&Update::Files(Vec::new()))
+        );
     }
 
     /// Two corners listening to `board`, the updates each heard, as a corner would take them.

@@ -270,9 +270,9 @@ impl<C: Compositor> Bridge<C> {
         }
     }
 
-    /// Stops every file crossing, both ways.
-    pub fn cancel(&self) {
-        if !self.progress.cancel().is_empty() {
+    /// Stops the transfer whose bar is `transfer`, whichever way it crosses.
+    pub fn cancel(&self, transfer: u64) {
+        if let Some(Crossing::Paste(_)) = self.progress.cancel(transfer) {
             self.notifier.show("Paste cancelled", "");
         }
     }
@@ -871,7 +871,7 @@ async fn bridge<C: Compositor>(
                         return Ended::Mode;
                     }
                     changed = cancel.changed(), if cancel_open => match changed {
-                        Ok(()) => bridge.cancel(),
+                        Ok(()) => bridge.cancel(cancel.borrow_and_update().transfer),
                         Err(_) => cancel_open = false,
                     },
                     clip = wire.from_peer.recv() => match clip {
@@ -1038,7 +1038,7 @@ mod tests {
     use tokio::task::LocalSet;
 
     use super::*;
-    use crate::clipboard::progress::{Bar, CADENCE};
+    use crate::clipboard::progress::{Bar, CADENCE, Cancel};
     use crate::link::{self, Heartbeat};
     use crate::notify;
     use crate::wire::LinkMsg;
@@ -1049,9 +1049,9 @@ mod tests {
     /// What a machine showed of the files crossing, and its cancel.
     #[derive(Clone)]
     struct Seen {
-        bars: Arc<Mutex<Vec<Option<Bar>>>>,
+        bars: Arc<Mutex<Vec<Vec<Bar>>>>,
         notes: Arc<notify::Fake>,
-        cancel: Arc<tokio::sync::watch::Sender<u64>>,
+        cancel: Arc<tokio::sync::watch::Sender<Cancel>>,
     }
 
     impl Seen {
@@ -1059,7 +1059,7 @@ mod tests {
             Self {
                 bars: Arc::default(),
                 notes: Arc::default(),
-                cancel: Arc::new(tokio::sync::watch::channel(0).0),
+                cancel: Arc::new(tokio::sync::watch::channel(Cancel::default()).0),
             }
         }
 
@@ -1072,13 +1072,21 @@ mod tests {
             }
         }
 
-        /// The user clicks the bar.
-        fn click(&self) {
-            self.cancel.send_modify(|n| *n += 1);
+        /// The user clicks the bar of `transfer`.
+        fn click(&self, transfer: u64) {
+            self.cancel.send_modify(|cancel| {
+                cancel.clicks += 1;
+                cancel.transfer = transfer;
+            });
         }
 
-        fn bars(&self) -> Vec<Option<Bar>> {
+        fn bars(&self) -> Vec<Vec<Bar>> {
             self.bars.lock().unwrap().clone()
+        }
+
+        /// Whether the last bars shown are none.
+        fn no_bar(&self) -> bool {
+            self.bars().last().is_some_and(Vec::is_empty)
         }
 
         /// Waits for a notification whose summary starts with `start`.
@@ -2474,7 +2482,7 @@ mod tests {
     /// Waits until the bar is gone after showing `total` bytes.
     async fn the_bar_went(seen: &Seen, total: u64) {
         within("the bar gone", async {
-            while seen.bars().last() != Some(&None) {
+            while !seen.no_bar() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -2484,7 +2492,7 @@ mod tests {
             bars.iter().flatten().all(|bar| bar.total == total),
             "{bars:?}"
         );
-        assert!(bars.iter().any(Option::is_some), "{bars:?}");
+        assert!(bars.iter().any(|bars| !bars.is_empty()), "{bars:?}");
     }
 
     /// Home copies the files `names` of `tmp/copied` the way a file manager does: the file
@@ -2835,10 +2843,10 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let mut paste = a_large_paste_under_way(&folder).await;
-                paste.seen.click();
+                paste.seen.click(Crossing::Paste(1).id());
                 the_paste_stopped(&mut paste, &folder).await;
                 paste.seen.told("Paste cancelled").await;
-                assert_eq!(paste.seen.bars().last(), Some(&None));
+                assert!(paste.seen.no_bar());
             })
             .await;
     }
@@ -2858,7 +2866,7 @@ mod tests {
                 paste.peer.send((newer, Bytes::new())).await.unwrap();
                 the_paste_stopped(&mut paste, &folder).await;
                 within("the bar gone", async {
-                    while paste.seen.bars().last() != Some(&None) {
+                    while !paste.seen.no_bar() {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 })
@@ -2911,7 +2919,7 @@ mod tests {
                     }
                 })
                 .await;
-                bridge.cancel();
+                bridge.cancel(Crossing::Serve(serial).id());
                 let ack = ClipboardMsg::Ack {
                     id: 2,
                     received: CHUNK as u64,
@@ -2921,7 +2929,7 @@ mod tests {
                     next_sent(&mut sent, |m| !matches!(m, ClipboardMsg::Data { .. })).await,
                     ClipboardMsg::Abort { id: 2 },
                 );
-                assert_eq!(seen.bars().last(), Some(&None));
+                assert!(seen.no_bar());
                 // Nothing this machine pasted was stopped: it says nothing.
                 assert!(seen.notes.shown().is_empty());
             })
@@ -2964,7 +2972,7 @@ mod tests {
                 bridge.on_peer_msg(request(2), Bytes::new());
                 next_sent(&mut sent, |m| matches!(m, ClipboardMsg::Data { .. })).await;
                 // The user stops it while it crosses, then copies the same files again.
-                bridge.cancel();
+                bridge.cancel(Crossing::Serve(serial).id());
                 assert_eq!(copy(&mut sent).await, serial, "the same copy, unchanged");
                 bridge.on_peer_msg(request(4), Bytes::new());
                 let served = next_sent(&mut sent, |m| {
@@ -3021,14 +3029,14 @@ mod tests {
                 .await;
                 // The first file is served whole; the user clicks before the peer asks for the
                 // second.
-                bridge.cancel();
+                bridge.cancel(Crossing::Serve(serial).id());
                 bridge.on_peer_msg(request(4, 1), Bytes::new());
                 assert_eq!(
                     next_sent(&mut sent, |_| true).await,
                     ClipboardMsg::Abort { id: 4 },
                 );
                 tokio::time::sleep(CADENCE * 2).await;
-                assert_eq!(seen.bars().last(), Some(&None));
+                assert!(seen.no_bar());
             })
             .await;
     }

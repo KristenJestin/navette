@@ -175,10 +175,11 @@ While a mode runs, every home monitor shows, at its top left, what it is and whe
   `Mic failed: <why>`, `Mic not switched: <why>`, and `Keyboard → home` when the release hotkey
   gives the keyboard back, `Keyboard → remote` the next time a reserved monitor takes it (once,
   whichever reserved monitor it is).
-- **Files crossing the clipboard**, either way, show as a bar under the tag in every corner:
-  `Files 42%, 1.2 GiB left  x`, home counting what it serves and what it writes. A click on
-  the bar stops them all ([the clipboard](link.md#the-clipboard)); a click anywhere else on the
-  corner still switches the mic.
+- **Files crossing the clipboard**, either way, show as one bar per transfer under the tag in
+  every corner, one under the other (the first three started): `Files 42%, 1.2 GiB left  x`,
+  home counting what it serves and what it writes. A click on a bar stops that transfer, the
+  others going on ([the clipboard](link.md#the-clipboard)); a click anywhere else on the corner
+  still switches the mic.
 
 The corners are drawn in software, again only when they change and while the check moves.
 Home's corner is a layer surface of its own on the overlay layer (namespace `navette-corner`),

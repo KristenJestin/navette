@@ -107,8 +107,9 @@ refuses a request against an offer that a newer copy has replaced.
   a large file never holds a frame back for longer than the chunk already on the line. When
   the picture keeps the link busy, the clipboard still gets one message in every eight frames,
   so a paste never stalls into gliff's 30 s idle timeout.
-- **Progress and cancel.** While files cross, either way, home's corners show a bar with what
-  is left ([the corner](mode.md#the-corner)); a click on it stops every transfer: the half
+- **Progress and cancel.** While files cross, either way, home's corners show a bar per
+  transfer with what is left ([the corner](mode.md#the-corner)); a click on one stops that
+  transfer, the others going on: the half
   of a paste already written is removed, nothing is left behind, and the copy whose paste was
   stopped serves no more files (copy again to paste it). The bar loses a paste served from
   here when its last byte goes, when a file is not the size the copy said, or when the other
