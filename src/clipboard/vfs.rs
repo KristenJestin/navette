@@ -599,6 +599,32 @@ impl Mounter for Fuse {
     }
 }
 
+/// The unmounts running, beside the link's thread.
+static UNMOUNTING: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Drops the mount `handle` on a thread of its own: an unmount runs `fusermount3`.
+pub fn unmount_later(handle: Option<Box<dyn Send>>) {
+    let Some(handle) = handle else { return };
+    let mut unmounting = UNMOUNTING.lock().unwrap();
+    unmounting.retain(|thread| !thread.is_finished());
+    match std::thread::Builder::new()
+        .name("navette-unmount".into())
+        .spawn(move || drop(handle))
+    {
+        Ok(thread) => unmounting.push(thread),
+        Err(e) => eprintln!("navette: clipboard: the virtual folder stays mounted: {e}"),
+    }
+}
+
+/// Waits for the unmounts running, before the process ends: a mount left behind would hold
+/// its folder until the next start. Blocks.
+pub fn unmounted() {
+    let threads = std::mem::take(&mut *UNMOUNTING.lock().unwrap());
+    for thread in threads {
+        let _ = thread.join();
+    }
+}
+
 /// A mount, undone when dropped.
 struct Mounted(Option<fuser::BackgroundSession>);
 

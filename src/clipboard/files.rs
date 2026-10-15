@@ -13,11 +13,14 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use gliff_proto::ClipboardFile;
 use gliff_proto::clipboard::{MAX_FILE_ENTRIES, MAX_FILE_PATH_BYTES, safe_relative_path};
 use gliff_transport::clipboard::files::LocalFiles;
+
+use super::vfs::{Fuse, Mounter};
 
 /// What a copy of files offers the peer, and what it leaves out.
 #[derive(Debug, Default)]
@@ -138,6 +141,9 @@ pub struct Inbox {
     pub dir: PathBuf,
     /// The bytes free for the user on the disk that holds a folder.
     pub free: fn(&Path) -> io::Result<u64>,
+    /// The virtual folder where the peer's files show, fetched as they are read; with none,
+    /// or when it cannot be mounted, a paste fetches them all into `dir` first.
+    pub mount: Option<Arc<dyn Mounter>>,
 }
 
 impl Inbox {
@@ -145,21 +151,34 @@ impl Inbox {
         Self {
             dir,
             free: free_space,
+            mount: None,
         }
     }
 
     /// The machine's own: `navette/clipboard` in `$XDG_RUNTIME_DIR` (per user, 0700, cleared at
-    /// logout), else a folder of the user's in the temporary directory.
+    /// logout), else a folder of the user's in the temporary directory. The virtual folder is
+    /// `navette/files` beside it, in `$XDG_RUNTIME_DIR` only: a mount point in the shared
+    /// temporary directory is not this user's alone.
     pub fn of_this_user() -> Self {
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|d| !d.is_empty())
             .map(PathBuf::from);
-        Self::new(folder_in(runtime.as_deref(), &std::env::temp_dir(), euid()))
+        let mount = runtime
+            .as_deref()
+            .filter(|runtime| runtime.is_absolute())
+            .map(|runtime| {
+                let fuse = Fuse::at(runtime.join("navette").join("files"));
+                Arc::new(fuse) as Arc<dyn Mounter>
+            });
+        Self {
+            mount,
+            ..Self::new(folder_in(runtime.as_deref(), &std::env::temp_dir(), euid()))
+        }
     }
 
     /// Makes the folder, the user's alone, or says why it cannot be trusted: the temporary
     /// directory is shared, so another user may have made the name first, or put a link there.
-    fn prepare(&self) -> io::Result<()> {
+    pub fn prepare(&self) -> io::Result<()> {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -634,6 +653,7 @@ mod tests {
         let inbox = Inbox {
             dir: tmp.path().join("Navette"),
             free: |_| Ok(1 << 20),
+            mount: None,
         };
         let error = inbox.check_room(2 << 30).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);

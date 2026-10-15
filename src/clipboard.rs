@@ -6,7 +6,9 @@
 //! requests are refused, on both sides, whatever the other side asks.
 //!
 //! The transfer engine is gliff's (`gliff-transport`): lazy (nothing moves until an
-//! application pastes), typed, chunked, files included. The compositor side is
+//! application pastes), typed, chunked, files included. The peer's files show in a virtual
+//! folder ([`vfs`]) and cross only when an application reads them; where it cannot be mounted,
+//! a paste fetches them all first. The compositor side is
 //! `ext-data-control` through `hypr-input`, on both machines since Navette has no GTK. This
 //! file adapts gliff's `crates/gliff-server/src/clipboard.rs`, so it keeps its notice:
 //!
@@ -68,6 +70,10 @@ const URI_LIST_MAX: usize = 1024 * 1024;
 
 /// How long to wait before looking for the compositor again when it is not there, or went.
 const COMPOSITOR_RETRY: Duration = Duration::from_secs(5);
+
+/// How many copies of files made before the current one still serve their files: the peer may
+/// be reading them through its virtual folder.
+const OLDER_SERVED: usize = 8;
 
 /// The machine's clipboard, as the bridge needs it (a port: tests use a fake). Starting it,
 /// [`Compositor::receive`] and dropping it may block: the bridge does them on other threads.
@@ -196,6 +202,9 @@ struct LocalOffer {
     files: LocalFiles,
     /// The links and special files the copy left out; named once, at the first paste.
     skipped: Vec<String>,
+    /// The copies of files made before, by serial, the latest last: their files are still
+    /// served, not their other types.
+    older: std::collections::VecDeque<(u32, LocalFiles)>,
 }
 
 #[derive(Default)]
@@ -213,6 +222,8 @@ struct RemoteOffer {
     offered_again: bool,
     /// Its pastes on this machine, stopped when a newer copy replaces it.
     pastes: Vec<Crossing>,
+    /// Where its files show in the virtual folder, when it is mounted.
+    in_folder: Option<Vec<PathBuf>>,
 }
 
 /// The two ends of one link's clipboard: the peer's messages in, the compositor's events in.
@@ -235,6 +246,19 @@ pub struct Bridge<C: Compositor> {
     pastes: Cell<u32>,
     /// The copy whose files the peer last asked for: its crossing is logged once.
     serving: Cell<Option<u32>>,
+    /// The virtual folder of the peer's files, when it is mounted.
+    folder: Option<Arc<vfs::Folder>>,
+    /// The reads of each copy read through the folder.
+    reads: Rc<RefCell<std::collections::HashMap<u32, Reads>>>,
+}
+
+/// The reads of one copy of the peer's through the virtual folder.
+#[derive(Default)]
+struct Reads {
+    /// Its fetches running.
+    running: usize,
+    /// The bytes fetched of all its files, from the first read: what its bar shows.
+    done: Meter,
 }
 
 impl<C: Compositor> Bridge<C> {
@@ -259,6 +283,8 @@ impl<C: Compositor> Bridge<C> {
             notifier: shown.notifier.clone(),
             pastes: Cell::new(0),
             serving: Cell::new(None),
+            folder: None,
+            reads: Rc::default(),
         }
     }
 
@@ -273,8 +299,16 @@ impl<C: Compositor> Bridge<C> {
 
     /// Stops the transfer whose bar is `transfer`, whichever way it crosses.
     pub fn cancel(&self, transfer: u64) {
-        if let Some(Crossing::Paste(_)) = self.progress.cancel(transfer) {
-            self.notifier.show("Paste cancelled", "");
+        match self.progress.cancel(transfer) {
+            Some(Crossing::Paste(_)) => self.notifier.show("Paste cancelled", ""),
+            Some(Crossing::Read(serial)) => {
+                log(format_args!("offer {serial}: its reads stopped"));
+                if let Some(folder) = &self.folder {
+                    folder.stop(serial);
+                }
+                self.notifier.show("Paste cancelled", "");
+            }
+            _ => {}
         }
     }
 
@@ -319,10 +353,21 @@ impl<C: Compositor> Bridge<C> {
                 "offer {replaced}: its paste stopped, offer {serial} replaced it"
             ));
         }
-        let received = self.kept.received(serial, &files);
+        // In the virtual folder, the copies it replaces stay while they are read.
+        let valid = files::validate(&files).is_ok();
+        let in_folder = self.folder.as_ref().and_then(|folder| {
+            // A copy refused shows nothing, but still replaces those before it.
+            let shown = folder.offer(serial, if valid { &files } else { &[] });
+            valid.then_some(shown)
+        });
+        let received = match in_folder {
+            Some(_) => None,
+            None => self.kept.received(serial, &files),
+        };
         // Only the files of the current offer are kept: a paste of it in progress copies from
         // them until it is replaced. The same copy offered again points at the same files.
         if received.is_none()
+            && self.folder.is_none()
             && let Some(inbox) = &self.inbox
         {
             inbox.empty();
@@ -338,6 +383,7 @@ impl<C: Compositor> Bridge<C> {
             received: Rc::new(OnceCell::new_with(received)),
             advertised: advertise.clone(),
             selected: true,
+            in_folder,
             ..RemoteOffer::default()
         };
         self.compositor.get().offer(advertise);
@@ -345,7 +391,10 @@ impl<C: Compositor> Bridge<C> {
 
     fn on_request(&self, id: u32, serial: u32, item: ClipboardItem) {
         let current = self.local.borrow().serial;
-        if serial != current {
+        let older = matches!(item, ClipboardItem::File(_))
+            && serial != current
+            && self.local.borrow().older.iter().any(|(s, _)| *s == serial);
+        if serial != current && !older {
             // The selection moved on since the peer saw the offer: refuse, so its paste fails
             // on its own, rather than serve data it did not ask for.
             log(format_args!(
@@ -379,17 +428,25 @@ impl<C: Compositor> Bridge<C> {
             ClipboardItem::File(index) => {
                 let (path, size, total, skipped) = {
                     let mut local = self.local.borrow_mut();
-                    let Some(path) = local.files.path_for(&item).map(PathBuf::from) else {
+                    let copied = match older {
+                        false => &local.files,
+                        true => &local.older.iter().find(|(s, _)| *s == serial).unwrap().1,
+                    };
+                    let Some(path) = copied.path_for(&item).map(PathBuf::from) else {
                         log(format_args!(
                             "offer {serial}: file {index} refused, not in the copy"
                         ));
                         self.transfers.refuse(id);
                         return;
                     };
-                    let size = local.files.entries[index as usize].size;
+                    let size = copied.entries[index as usize].size;
                     // Listed and validated: the sum is counted.
-                    let total = files::total(&local.files.entries).unwrap_or(u64::MAX);
-                    (path, size, total, std::mem::take(&mut local.skipped))
+                    let total = files::total(&copied.entries).unwrap_or(u64::MAX);
+                    let skipped = match older {
+                        false => std::mem::take(&mut local.skipped),
+                        true => Vec::new(),
+                    };
+                    (path, size, total, skipped)
                 };
                 if !skipped.is_empty() {
                     self.notifier
@@ -442,9 +499,17 @@ impl<C: Compositor> Bridge<C> {
         self.remote.borrow_mut().selected = false;
         {
             let mut local = self.local.borrow_mut();
+            let files = std::mem::take(&mut local.files);
+            if !files.entries.is_empty() {
+                let serial = local.serial;
+                local.older.retain(|(s, _)| *s != serial);
+                local.older.push_back((serial, files));
+                if local.older.len() > OLDER_SERVED {
+                    local.older.pop_front();
+                }
+            }
             local.serial = generation as u32;
             local.mime_types = mime_types.clone();
-            local.files = LocalFiles::default();
             local.skipped = Vec::new();
         }
         let mut offered = forwardable_mimes(&mime_types);
@@ -527,6 +592,15 @@ impl<C: Compositor> Bridge<C> {
                 }
                 (remote.serial, remote.files.clone(), remote.received.clone())
             };
+            if let Some(paths) = self.remote.borrow().in_folder.clone() {
+                // Nothing crosses: each file comes when an application reads it.
+                log(format_args!(
+                    "offer {serial}: pasted as {mime_type}, from the virtual folder"
+                ));
+                let body = files_body(&mime_type, &paths);
+                tokio::task::spawn_local(write_body(WriteSink(target), body));
+                return;
+            }
             log(format_args!("offer {serial}: pasted as {mime_type}"));
             let Some(inbox) = self.inbox.clone() else {
                 log(format_args!("no folder for pasted files"));
@@ -612,6 +686,146 @@ impl<C: Compositor> Bridge<C> {
                         .map(|_| ())
                 });
         }
+    }
+}
+
+impl<C: Compositor> Bridge<C> {
+    /// What the virtual folder asks: a file read, to fetch, or a copy gone, whose fetches stop.
+    pub fn on_asked(&self, asked: vfs::Asked) {
+        match asked {
+            vfs::Asked::Fetch {
+                serial,
+                index,
+                total,
+                content,
+            } => self.fetch_read(serial, index, total, content),
+            vfs::Asked::Gone { serial } => {
+                if self.progress.stop(Crossing::Read(serial)) {
+                    log(format_args!(
+                        "offer {serial}: replaced and closed, its reads stopped"
+                    ));
+                }
+                self.reads.borrow_mut().remove(&serial);
+            }
+        }
+    }
+
+    /// Fetches file `index` of the peer's copy `serial` into `content`, for the applications
+    /// that read it: one transfer per copy, whose bar counts the bytes of all its files.
+    fn fetch_read(&self, serial: u32, index: u32, total: u64, content: Arc<vfs::Content>) {
+        let size = content.size;
+        if let Some(inbox) = &self.inbox
+            && let Err(e) = inbox.check_room(size)
+        {
+            log(format_args!("offer {serial}: file {index} not read: {e}"));
+            self.notifier.show("Paste failed", &e.to_string());
+            content.end(Err(libc::ENOSPC));
+            return;
+        }
+        let (first, done) = {
+            let mut reads = self.reads.borrow_mut();
+            let reads = reads.entry(serial).or_default();
+            reads.running += 1;
+            (reads.running == 1, reads.done.clone())
+        };
+        let (meter, tasks, run) = self.progress.reading(serial, total, done);
+        if first {
+            log(format_args!(
+                "offer {serial}: an application reads its files, fetching them as read ({})",
+                human_bytes(total)
+            ));
+        }
+        let transfers = self.transfers.clone();
+        let (progress, notifier, reads) = (
+            self.progress.clone(),
+            self.notifier.clone(),
+            self.reads.clone(),
+        );
+        let task = tokio::task::spawn_local(async move {
+            // Ends the read and the transfer however the fetch ends, stopped included.
+            let _ending = ReadEnding {
+                content: content.clone(),
+                serial,
+                run,
+                progress,
+                reads,
+            };
+            let sink = meter.wrap(ContentSink {
+                content: content.clone(),
+                offset: 0,
+            });
+            let started = std::time::Instant::now();
+            let fetched = transfers
+                .fetch(ClipboardItem::File(index), serial, sink, Some(size))
+                .await;
+            match fetched {
+                Ok(got) if got == size => {
+                    content.end(Ok(()));
+                    log(format_args!(
+                        "offer {serial}: file {index} read in {} ms",
+                        started.elapsed().as_millis()
+                    ));
+                }
+                Ok(got) => {
+                    content.end(Err(libc::EIO));
+                    log(format_args!(
+                        "offer {serial}: file {index}: got {got} of {size} bytes"
+                    ));
+                }
+                Err(e) => {
+                    content.end(Err(libc::EIO));
+                    log(format_args!("offer {serial}: file {index} not read: {e}"));
+                    notifier.show("Paste failed", &why(&e));
+                }
+            }
+        });
+        tasks.borrow_mut().push(task.abort_handle());
+    }
+}
+
+/// Ends a read of the virtual folder when its fetch ends or is dropped: its readers get what
+/// came, or fail; the transfer of its copy ends with its last fetch.
+struct ReadEnding {
+    content: Arc<vfs::Content>,
+    serial: u32,
+    run: u64,
+    progress: progress::Progress,
+    reads: Rc<RefCell<std::collections::HashMap<u32, Reads>>>,
+}
+
+impl Drop for ReadEnding {
+    fn drop(&mut self) {
+        // A fetch dropped before its end: stopped by the user, its copy gone, or the mode.
+        self.content.end(Err(libc::ECANCELED));
+        let mut reads = self.reads.borrow_mut();
+        let Some(reads) = reads.get_mut(&self.serial) else {
+            return;
+        };
+        reads.running -= 1;
+        if reads.running == 0 {
+            self.progress.end(Crossing::Read(self.serial), self.run);
+        }
+    }
+}
+
+/// Where a file read through the virtual folder is fetched: its cache, written beside the
+/// link's thread.
+struct ContentSink {
+    content: Arc<vfs::Content>,
+    offset: u64,
+}
+
+impl gliff_transport::clipboard::ChunkSink for ContentSink {
+    async fn write(&mut self, chunk: Bytes) -> io::Result<()> {
+        let (content, offset) = (self.content.clone(), self.offset);
+        self.offset += chunk.len() as u64;
+        tokio::task::spawn_blocking(move || content.write_at(&chunk, offset))
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    async fn finish(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -849,9 +1063,11 @@ async fn bridge<C: Compositor>(
     // this future is dropped. Only a compositor that went away leaves them, since the link and
     // the offer they belong to are still up.
     let mut leaving = Emptying(inbox.clone());
+    // Declared after the tasks: dropped first, so its reads fail before their fetches go.
+    let (mounted, mut asked) = mount(inbox.as_ref()).await.unzip();
     tasks
         .run_until(async {
-            let bridge = Bridge::new(
+            let mut bridge = Bridge::new(
                 Transfers::new(wire.to_peer.clone(), side),
                 Jobs::new(report),
                 compositor,
@@ -859,6 +1075,8 @@ async fn bridge<C: Compositor>(
                 kept,
                 &shown,
             );
+            bridge.folder = mounted.as_ref().map(|m| m.folder.clone());
+            let bridge = bridge;
             let mut cancel = shown.cancel.clone();
             // A click before this bridge stops nothing of it.
             cancel.borrow_and_update();
@@ -879,6 +1097,7 @@ async fn bridge<C: Compositor>(
                         Some((msg, payload)) => bridge.on_peer_msg(msg, payload),
                         None => return Ended::Link,
                     },
+                    Some(asked) = next_asked(&mut asked) => bridge.on_asked(asked),
                     event = events.recv() => match event {
                         Some(event) => bridge.on_compositor_event(event),
                         None => {
@@ -890,6 +1109,62 @@ async fn bridge<C: Compositor>(
             }
         })
         .await
+}
+
+/// The virtual folder of a mode's bridge, mounted. Dropped, its reads fail, then it is
+/// unmounted, beside the link's thread.
+struct Mounted {
+    folder: Arc<vfs::Folder>,
+    handle: Option<Box<dyn Send>>,
+}
+
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        self.folder.close();
+        vfs::unmount_later(self.handle.take());
+    }
+}
+
+/// What the virtual folder asks next; never anything without one.
+async fn next_asked(asked: &mut Option<UnboundedReceiver<vfs::Asked>>) -> Option<vfs::Asked> {
+    match asked {
+        Some(asked) => asked.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Mounts the virtual folder of `inbox`, if it has one, on a blocking thread; with what it
+/// asks of the bridge. When it cannot be mounted, the bridge fetches the files of a paste
+/// first, as without one, and says so once.
+async fn mount(inbox: Option<&Inbox>) -> Option<(Mounted, UnboundedReceiver<vfs::Asked>)> {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let inbox = inbox?.clone();
+    let mounter = inbox.mount.clone()?;
+    let (asked, rx) = tokio::sync::mpsc::unbounded_channel();
+    let folder = vfs::Folder::new(mounter.path().to_owned(), inbox.dir.clone(), asked);
+    let mounting = folder.clone();
+    let mounted = tokio::task::spawn_blocking(move || {
+        inbox.prepare()?;
+        mounter.mount(mounting)
+    })
+    .await
+    .map_err(io::Error::other)
+    .flatten();
+    match mounted {
+        Ok(handle) => {
+            log(format_args!("the virtual folder is mounted"));
+            let handle = Some(handle);
+            Some((Mounted { folder, handle }, rx))
+        }
+        Err(e) => {
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log(format_args!(
+                    "no virtual folder ({e}): a paste of files fetches them all first"
+                ));
+            }
+            None
+        }
+    }
 }
 
 /// Empties the folder of the files received over a link when dropped.
@@ -957,8 +1232,11 @@ where
     S: Fn(UnboundedSender<Selected>) -> io::Result<C> + Clone + Send + 'static,
 {
     let inbox = Inbox::of_this_user();
-    // Left behind by a process that died before it emptied its folder.
+    // Left behind by a process that died before it emptied its folder, or unmounted its own.
     inbox.empty();
+    if let Some(mount) = inbox.mount.clone() {
+        let _ = tokio::task::spawn_blocking(move || mount.clean()).await;
+    }
     let mut warned = false;
     loop {
         let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
@@ -1040,6 +1318,7 @@ mod tests {
 
     use super::*;
     use crate::clipboard::progress::{Bar, CADENCE, Cancel};
+    use crate::clipboard::vfs;
     use crate::link::{self, Heartbeat};
     use crate::notify;
     use crate::wire::LinkMsg;
@@ -2370,6 +2649,7 @@ mod tests {
                 let full = Inbox {
                     dir: folder.clone(),
                     free: |_| Ok(1024),
+                    mount: None,
                 };
                 let remote = machine(Side::Server, remote_end, full);
                 home.copy(&[(URI_LIST, list.as_bytes())]);
@@ -3303,6 +3583,583 @@ mod tests {
                     seen.push(serial);
                 }
                 assert_ne!(seen[0], seen[1], "the peer may still request the first");
+            })
+            .await;
+    }
+    /// A mount that is none: the test reads the folder the way the kernel would.
+    struct FakeMount {
+        path: std::path::PathBuf,
+        folders: Mutex<Vec<Arc<vfs::Folder>>>,
+        /// The folders mounted now.
+        mounted: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// A mount, until it is dropped.
+    struct Unmounts(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for Unmounts {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl std::fmt::Debug for FakeMount {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.debug_tuple("FakeMount").field(&self.path).finish()
+        }
+    }
+
+    impl vfs::Mounter for FakeMount {
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+
+        fn mount(&self, folder: Arc<vfs::Folder>) -> io::Result<Box<dyn Send>> {
+            self.folders.lock().unwrap().push(folder);
+            self.mounted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(Unmounts(self.mounted.clone())))
+        }
+
+        fn clean(&self) {}
+    }
+
+    impl FakeMount {
+        /// The folder mounted last, once it is.
+        async fn folder(&self) -> Arc<vfs::Folder> {
+            within("the mount", async {
+                loop {
+                    if let Some(folder) = self.folders.lock().unwrap().last() {
+                        return folder.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+        }
+
+        fn mounted(&self) -> usize {
+            self.mounted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A receiving folder `inbox` in `folder`, with a virtual folder `files` beside it.
+    fn reading(folder: &std::path::Path) -> (Inbox, Arc<FakeMount>) {
+        let mount = Arc::new(FakeMount {
+            path: folder.join("files"),
+            folders: Mutex::default(),
+            mounted: Arc::default(),
+        });
+        let inbox = Inbox {
+            mount: Some(mount.clone()),
+            ..Inbox::new(folder.join("inbox"))
+        };
+        (inbox, mount)
+    }
+
+    /// A machine that reads the peer's files through a virtual folder, and the raw end of its
+    /// link, where a test plays the peer; a mode runs.
+    fn alone_reading(
+        side: Side,
+        folder: &std::path::Path,
+    ) -> (Machine, Framed<tokio::io::DuplexStream>, Arc<FakeMount>) {
+        let (end, peer) = tokio::io::duplex(64 * 1024);
+        let (inbox, mount) = reading(folder);
+        let machine = machine(side, end, inbox);
+        (machine, Framed::new(peer), mount)
+    }
+
+    /// Home and the remote machine, each reading the other's files through a virtual folder.
+    fn desk_reading(
+        folders: &std::path::Path,
+    ) -> (Machine, Machine, Arc<FakeMount>, Arc<FakeMount>) {
+        let (home_end, remote_end) = tokio::io::duplex(64 * 1024);
+        let (home_inbox, home_mount) = reading(&folders.join("home"));
+        let (remote_inbox, remote_mount) = reading(&folders.join("remote"));
+        let home = machine(Side::Client, home_end, home_inbox);
+        let remote = machine(Side::Server, remote_end, remote_inbox);
+        (home, remote, home_mount, remote_mount)
+    }
+
+    /// An application reads `path` of `folder` whole, as the kernel asks for it.
+    async fn read_file(folder: Arc<vfs::Folder>, path: std::path::PathBuf) -> Result<Vec<u8>, i32> {
+        let rel = path.strip_prefix(folder.path()).map_err(|_| libc::ENOENT)?;
+        let mut ino = 1;
+        for name in rel {
+            ino = folder.lookup(ino, name)?.ino;
+        }
+        folder.open(ino)?;
+        let mut bytes = Vec::new();
+        let read = loop {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            folder.read(ino, bytes.len() as u64, 128 * 1024, move |read| {
+                let _ = tx.send(read);
+            });
+            match rx.await {
+                Ok(Ok(piece)) if piece.is_empty() => break Ok(()),
+                Ok(Ok(piece)) => bytes.extend(piece),
+                Ok(Err(e)) => break Err(e),
+                Err(_) => break Err(libc::EIO),
+            }
+        };
+        folder.release(ino);
+        read.map(|()| bytes)
+    }
+
+    /// The peer's next request, past the acks; its id and what it asks.
+    async fn next_request(peer: &mut Framed<tokio::io::DuplexStream>) -> (u32, ClipboardItem) {
+        loop {
+            match next_clip(peer).await {
+                LinkMsg::ClipboardRequest { id, item, .. } => return (id, item),
+                LinkMsg::ClipboardAck { .. } => {}
+                msg => panic!("a request, not {msg:?}"),
+            }
+        }
+    }
+
+    /// The peer's next message that is not an ack.
+    async fn next_not_ack(peer: &mut Framed<tokio::io::DuplexStream>) -> LinkMsg {
+        loop {
+            match next_clip(peer).await {
+                LinkMsg::ClipboardAck { .. } => {}
+                msg => return msg,
+            }
+        }
+    }
+
+    /// Nothing more crosses from the machine to the peer, but acks.
+    async fn nothing_more(peer: &mut Framed<tokio::io::DuplexStream>) {
+        let more = tokio::time::timeout(Duration::from_millis(300), next_not_ack(peer)).await;
+        assert!(more.is_err(), "{more:?}");
+    }
+
+    /// The peer sends `bytes` of its transfer `id` at `offset`, and its end when `done`.
+    async fn send_data(
+        peer: &mut Framed<tokio::io::DuplexStream>,
+        id: u32,
+        offset: u64,
+        bytes: &[u8],
+        done: bool,
+    ) {
+        let data = LinkMsg::ClipboardData {
+            id,
+            offset,
+            data_len: bytes.len() as u32,
+            done: false,
+        };
+        peer.write_msg_with_payloads(&data, &[bytes]).await.unwrap();
+        if done {
+            let end = LinkMsg::ClipboardData {
+                id,
+                offset: offset + bytes.len() as u64,
+                data_len: 0,
+                done: true,
+            };
+            peer.write_msg(&end).await.unwrap();
+        }
+    }
+
+    /// The peer sends the rest of its transfer `id` of `bytes`, from `offset`, a chunk at a
+    /// time, then its end.
+    async fn send_rest(
+        peer: &mut Framed<tokio::io::DuplexStream>,
+        id: u32,
+        bytes: &[u8],
+        offset: usize,
+    ) {
+        let pieces: Vec<_> = bytes[offset..].chunks(CHUNK).collect();
+        for (n, piece) in pieces.iter().enumerate() {
+            let at = (offset + n * CHUNK) as u64;
+            send_data(peer, id, at, piece, n + 1 == pieces.len()).await;
+        }
+    }
+
+    /// The peer offers one file, `name`, of `size` bytes, as copy `serial`; the machine pastes
+    /// its file list: the path it reads.
+    async fn offer_a_file(
+        machine: &Machine,
+        peer: &mut Framed<tokio::io::DuplexStream>,
+        serial: u32,
+        name: &str,
+        size: u64,
+        offers: usize,
+    ) -> std::path::PathBuf {
+        let offer = LinkMsg::ClipboardOffer {
+            serial,
+            mime_types: Vec::new(),
+            files: vec![ClipboardFile {
+                path: name.into(),
+                size,
+                dir: false,
+            }],
+        };
+        peer.write_msg(&offer).await.unwrap();
+        machine.offered(offers).await;
+        let pasted = machine.paste(URI_LIST).await;
+        let paths = parse_uri_list(&String::from_utf8(pasted).unwrap());
+        assert_eq!(paths.len(), 1);
+        paths[0].clone()
+    }
+
+    /// Bytes that tell their offsets apart.
+    fn bytes_of(size: usize, seed: u8) -> Vec<u8> {
+        (0..size).map(|i| (i % 251) as u8 ^ seed).collect()
+    }
+
+    #[tokio::test]
+    async fn copying_files_sends_no_file_bytes_over_the_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("big.bin");
+        std::fs::write(&copied, vec![1; 4 * CHUNK]).unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home, mut peer) = alone(Side::Client, &tmp.path().join("inbox"));
+                home.mode(true);
+                home.copy(&[(URI_LIST, uri_list_of(&[copied]).as_bytes())]);
+                let LinkMsg::ClipboardOffer { files, .. } = next_clip(&mut peer).await else {
+                    panic!("an offer");
+                };
+                assert_eq!(files.len(), 1);
+                nothing_more(&mut peer).await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reading_the_list_sends_no_file_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (remote, mut home, mount) = alone_reading(Side::Server, tmp.path());
+                let offer = LinkMsg::ClipboardOffer {
+                    serial: 4,
+                    mime_types: vec![TEXT.into()],
+                    files: vec![
+                        ClipboardFile {
+                            path: "a.txt".into(),
+                            size: 5,
+                            dir: false,
+                        },
+                        ClipboardFile {
+                            path: "big.bin".into(),
+                            size: 3 * CHUNK as u64,
+                            dir: false,
+                        },
+                    ],
+                };
+                home.write_msg(&offer).await.unwrap();
+                remote.offered(1).await;
+                // A file manager reads the list, in each type, and gets it at once.
+                let pasted = remote.paste_for(URI_LIST, Duration::from_millis(500)).await;
+                let paths = parse_uri_list(&String::from_utf8(pasted).unwrap());
+                let folder = mount.folder().await;
+                let copy = folder.path().join("4");
+                assert_eq!(paths, [copy.join("a.txt"), copy.join("big.bin")]);
+                let text = remote.paste_for(TEXT, Duration::from_millis(500)).await;
+                assert_eq!(
+                    String::from_utf8(text).unwrap(),
+                    format!("{}\n{}", paths[0].display(), paths[1].display())
+                );
+                nothing_more(&mut home).await;
+                assert!(remote.seen.bars().iter().all(Vec::is_empty));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reading_a_file_fetches_exactly_its_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = bytes_of(CHUNK + 1000, 3);
+        LocalSet::new()
+            .run_until(async {
+                let (remote, mut home, mount) = alone_reading(Side::Server, tmp.path());
+                let offer = LinkMsg::ClipboardOffer {
+                    serial: 4,
+                    mime_types: Vec::new(),
+                    files: vec![
+                        ClipboardFile {
+                            path: "a.txt".into(),
+                            size: 5,
+                            dir: false,
+                        },
+                        ClipboardFile {
+                            path: "b.bin".into(),
+                            size: content.len() as u64,
+                            dir: false,
+                        },
+                    ],
+                };
+                home.write_msg(&offer).await.unwrap();
+                remote.offered(1).await;
+                let pasted = remote.paste(URI_LIST).await;
+                let paths = parse_uri_list(&String::from_utf8(pasted).unwrap());
+                let read =
+                    tokio::task::spawn_local(read_file(mount.folder().await, paths[1].clone()));
+                let (id, item) = next_request(&mut home).await;
+                assert_eq!(item, ClipboardItem::File(1), "that file alone");
+                send_rest(&mut home, id, &content, 0).await;
+                assert!(within("the read", read).await.unwrap().unwrap() == content);
+                nothing_more(&mut home).await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_newer_copy_during_a_transfer_does_not_stop_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = bytes_of(4 * CHUNK, 7);
+        LocalSet::new()
+            .run_until(async {
+                let (home, mut remote, mount) = alone_reading(Side::Client, tmp.path());
+                let size = content.len() as u64;
+                let path = offer_a_file(&home, &mut remote, 6, "big.bin", size, 1).await;
+                let read = tokio::task::spawn_local(read_file(mount.folder().await, path));
+                let (id, _) = next_request(&mut remote).await;
+                send_data(&mut remote, id, 0, &content[..CHUNK], false).await;
+                // Something else is copied on the remote meanwhile.
+                let newer = LinkMsg::ClipboardOffer {
+                    serial: 8,
+                    mime_types: vec![TEXT.into()],
+                    files: Vec::new(),
+                };
+                remote.write_msg(&newer).await.unwrap();
+                home.offered(2).await;
+                send_rest(&mut remote, id, &content, CHUNK).await;
+                assert!(within("the read", read).await.unwrap().unwrap() == content);
+                nothing_more(&mut remote).await;
+            })
+            .await;
+    }
+
+    /// Home reads two files of two copies of the remote's, each one chunk in: the two reads,
+    /// their transfers, and the peer's end.
+    async fn two_reads_under_way(
+        home: &Machine,
+        remote: &mut Framed<tokio::io::DuplexStream>,
+        mount: &FakeMount,
+        first: &[u8],
+        second: &[u8],
+    ) -> [(tokio::task::JoinHandle<Result<Vec<u8>, i32>>, u32); 2] {
+        let a = offer_a_file(home, remote, 6, "a.bin", first.len() as u64, 1).await;
+        let read_a = tokio::task::spawn_local(read_file(mount.folder().await, a));
+        let (a_id, _) = next_request(remote).await;
+        send_data(remote, a_id, 0, &first[..CHUNK], false).await;
+        let b = offer_a_file(home, remote, 7, "b.bin", second.len() as u64, 2).await;
+        let read_b = tokio::task::spawn_local(read_file(mount.folder().await, b));
+        let (b_id, _) = next_request(remote).await;
+        send_data(remote, b_id, 0, &second[..CHUNK], false).await;
+        [(read_a, a_id), (read_b, b_id)]
+    }
+
+    /// The bars of the two transfers of copies 6 and 7, once home shows both.
+    async fn two_bars(seen: &Seen) -> Vec<Bar> {
+        let ids = [Crossing::Read(6).id(), Crossing::Read(7).id()];
+        within("two bars", async {
+            loop {
+                if let Some(bars) = seen.bars().last()
+                    && bars.iter().map(|b| b.id).eq(ids)
+                    && bars.iter().all(|b| b.done >= CHUNK as u64)
+                {
+                    return bars.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn two_transfers_at_once_both_complete_each_with_its_own_bar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (first, second) = (bytes_of(2 * CHUNK, 1), bytes_of(3 * CHUNK, 2));
+        LocalSet::new()
+            .run_until(async {
+                let (home, mut remote, mount) = alone_reading(Side::Client, tmp.path());
+                let [(read_a, a), (read_b, b)] =
+                    two_reads_under_way(&home, &mut remote, &mount, &first, &second).await;
+                let bars = two_bars(&home.seen).await;
+                assert_eq!(
+                    (bars[0].total, bars[1].total),
+                    (2 * CHUNK as u64, 3 * CHUNK as u64)
+                );
+                send_rest(&mut remote, b, &second, CHUNK).await;
+                send_rest(&mut remote, a, &first, CHUNK).await;
+                assert!(within("the first read", read_a).await.unwrap().unwrap() == first);
+                assert!(within("the second read", read_b).await.unwrap().unwrap() == second);
+                within("the bars gone", async {
+                    while !home.seen.no_bar() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_one_transfer_and_leaves_the_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (first, second) = (bytes_of(2 * CHUNK, 1), bytes_of(2 * CHUNK, 2));
+        LocalSet::new()
+            .run_until(async {
+                let (home, mut remote, mount) = alone_reading(Side::Client, tmp.path());
+                let [(read_a, a), (read_b, b)] =
+                    two_reads_under_way(&home, &mut remote, &mount, &first, &second).await;
+                two_bars(&home.seen).await;
+                home.seen.click(Crossing::Read(6).id());
+                assert_eq!(
+                    next_not_ack(&mut remote).await,
+                    LinkMsg::ClipboardAbort { id: a },
+                    "the remote is told to stop serving the first"
+                );
+                assert_eq!(
+                    within("the first read", read_a).await.unwrap(),
+                    Err(libc::ECANCELED)
+                );
+                home.seen.told("Paste cancelled").await;
+                send_rest(&mut remote, b, &second, CHUNK).await;
+                assert!(within("the second read", read_b).await.unwrap().unwrap() == second);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn mode_stop_ends_every_transfer_and_unmounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = bytes_of(2 * CHUNK, 5);
+        LocalSet::new()
+            .run_until(async {
+                let (home, mut remote, mount) = alone_reading(Side::Client, tmp.path());
+                let size = content.len() as u64;
+                let path = offer_a_file(&home, &mut remote, 6, "a.bin", size, 1).await;
+                let read = tokio::task::spawn_local(read_file(mount.folder().await, path));
+                let (id, _) = next_request(&mut remote).await;
+                send_data(&mut remote, id, 0, &content[..CHUNK], false).await;
+                assert_eq!(mount.mounted(), 1);
+                // The remote's mode stops as well: its bridge, and what it serves, end with it.
+                home.mode(false);
+                assert_eq!(within("the read", read).await.unwrap(), Err(libc::EIO));
+                within("the unmount", async {
+                    while mount.mounted() != 0 {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await;
+            })
+            .await;
+    }
+
+    async fn a_file_crosses_through_the_virtual_folder(copy_at_home: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("report.bin");
+        let content = bytes_of(300_000, 9);
+        std::fs::write(&copied, &content).unwrap();
+        let list = uri_list_of(std::slice::from_ref(&copied));
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote, home_mount, remote_mount) = desk_reading(tmp.path());
+                let (source, target, mount) = if copy_at_home {
+                    (&home, &remote, &remote_mount)
+                } else {
+                    (&remote, &home, &home_mount)
+                };
+                source.copy(&[(URI_LIST, list.as_bytes())]);
+                target.offered(1).await;
+                let pasted = target.paste(URI_LIST).await;
+                let paths = parse_uri_list(&String::from_utf8(pasted).unwrap());
+                let folder = mount.folder().await;
+                assert_eq!(paths.len(), 1);
+                assert!(paths[0].starts_with(folder.path()), "{paths:?}");
+                let read = read_file(folder, paths[0].clone()).await.unwrap();
+                assert!(read == content);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_file_copied_at_home_is_read_on_the_remote_through_the_virtual_folder() {
+        a_file_crosses_through_the_virtual_folder(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_file_copied_on_the_remote_is_read_at_home_through_the_virtual_folder() {
+        a_file_crosses_through_the_virtual_folder(false).await;
+    }
+
+    #[tokio::test]
+    async fn the_files_of_an_older_copy_are_still_served_after_a_newer_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (older, newer) = (tmp.path().join("older.bin"), tmp.path().join("newer.txt"));
+        let content = bytes_of(100_000, 4);
+        std::fs::write(&older, &content).unwrap();
+        std::fs::write(&newer, b"newer").unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote, _, remote_mount) = desk_reading(tmp.path());
+                home.copy(&[(URI_LIST, uri_list_of(&[older]).as_bytes())]);
+                remote.offered(1).await;
+                let pasted = remote.paste(URI_LIST).await;
+                let paths = parse_uri_list(&String::from_utf8(pasted).unwrap());
+                let folder = remote_mount.folder().await;
+                // The file manager opened it, then something else is copied at home.
+                let rel = paths[0].strip_prefix(folder.path()).unwrap();
+                let dir = folder.lookup(1, rel.iter().next().unwrap()).unwrap();
+                let ino = folder
+                    .lookup(dir.ino, rel.iter().nth(1).unwrap())
+                    .unwrap()
+                    .ino;
+                folder.open(ino).unwrap();
+                home.copy(&[(URI_LIST, uri_list_of(&[newer]).as_bytes())]);
+                remote.offered(2).await;
+                let read = read_file(folder.clone(), paths[0].clone()).await.unwrap();
+                assert!(read == content);
+                folder.release(ino);
+            })
+            .await;
+    }
+    #[tokio::test]
+    async fn the_bar_of_a_copy_counts_the_bytes_read_of_all_its_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (first, second) = (bytes_of(2 * CHUNK, 1), bytes_of(2 * CHUNK, 2));
+        LocalSet::new()
+            .run_until(async {
+                let (home, mut remote, mount) = alone_reading(Side::Client, tmp.path());
+                let file = |path: &str| ClipboardFile {
+                    path: path.into(),
+                    size: 2 * CHUNK as u64,
+                    dir: false,
+                };
+                let offer = LinkMsg::ClipboardOffer {
+                    serial: 6,
+                    mime_types: Vec::new(),
+                    files: vec![file("a.bin"), file("b.bin")],
+                };
+                remote.write_msg(&offer).await.unwrap();
+                home.offered(1).await;
+                let pasted = home.paste(URI_LIST).await;
+                let paths = parse_uri_list(&String::from_utf8(pasted).unwrap());
+                let folder = mount.folder().await;
+                let read_a = tokio::task::spawn_local(read_file(folder.clone(), paths[0].clone()));
+                let (a, _) = next_request(&mut remote).await;
+                send_rest(&mut remote, a, &first, 0).await;
+                assert!(within("the first file", read_a).await.unwrap().unwrap() == first);
+                let read_b = tokio::task::spawn_local(read_file(folder, paths[1].clone()));
+                let (b, _) = next_request(&mut remote).await;
+                send_data(&mut remote, b, 0, &second[..CHUNK], false).await;
+                let id = Crossing::Read(6).id();
+                let three_of_four = Bar {
+                    id,
+                    done: 3 * CHUNK as u64,
+                    total: 4 * CHUNK as u64,
+                };
+                within("the bar at three chunks of four", async {
+                    while home.seen.bars().last() != Some(&vec![three_of_four]) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await;
+                send_rest(&mut remote, b, &second, CHUNK).await;
+                assert!(within("the second file", read_b).await.unwrap().unwrap() == second);
             })
             .await;
     }

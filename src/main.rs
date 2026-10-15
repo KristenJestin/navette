@@ -298,6 +298,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             }
             // Closing every way in ends the mode, which gives the monitor back.
             drop(local);
+            tokio::task::spawn_blocking(clipboard::vfs::unmounted).await?;
             control.abort();
             let _ = control.await;
             let _ = modes.await;
@@ -371,8 +372,10 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 }
             }
             // The link is dropped: the display removes its output, and the audio thread removes
-            // its sink and puts the previous default output back; the process waits for both.
+            // its sink and puts the previous default output back; the process waits for both,
+            // and for the clipboard's virtual folder to be unmounted.
             drop(local);
+            tokio::task::spawn_blocking(clipboard::vfs::unmounted).await?;
             let _ = display.await;
             let latest = audio_thread.lock().unwrap().take();
             tokio::task::spawn_blocking(move || {

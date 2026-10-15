@@ -201,31 +201,33 @@ impl Progress {
         self.stopped.borrow_mut().remove(&serial);
     }
 
-    /// Stops the paste `crossing` if it still runs, as a click on the bar would but without a
-    /// word; whether it ran.
+    /// Stops the paste or the reads `crossing` if they still run, as a click on the bar would
+    /// but without a word; whether they ran.
     pub fn stop(&self, crossing: Crossing) -> bool {
         let removed = self.running.borrow_mut().remove(&crossing);
-        let Some(Running {
-            stop: Stop::Task(task),
-            ..
-        }) = removed
-        else {
-            return false;
-        };
-        task.abort();
+        match removed.map(|running| running.stop) {
+            Some(Stop::Task(task)) => task.abort(),
+            Some(Stop::Tasks(tasks)) => tasks.borrow().iter().for_each(AbortHandle::abort),
+            _ => return false,
+        }
         true
     }
 
     /// The meter, the fetches and the run of the reads of the peer's copy `serial`, started
-    /// now with `total` bytes to read unless they run already.
-    pub fn reading(&self, serial: u32, total: u64) -> (Meter, Rc<RefCell<Vec<AbortHandle>>>, u64) {
+    /// now with `total` bytes to read, `done` of them already, unless they run already.
+    pub fn reading(
+        &self,
+        serial: u32,
+        total: u64,
+        done: Meter,
+    ) -> (Meter, Rc<RefCell<Vec<AbortHandle>>>, u64) {
         let crossing = Crossing::Read(serial);
         if let Some(running) = self.running.borrow().get(&crossing)
             && let Stop::Tasks(tasks) = &running.stop
         {
             return (running.done.clone(), tasks.clone(), running.run);
         }
-        let (done, tasks) = (Meter::default(), Rc::new(RefCell::new(Vec::new())));
+        let tasks = Rc::new(RefCell::new(Vec::new()));
         let run = self.start(crossing, total, done.clone(), Stop::Tasks(tasks.clone()));
         (done, tasks, run)
     }
