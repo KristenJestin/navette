@@ -4,8 +4,8 @@
 //!
 //! On a reserved monitor it is a subsurface of the remote's picture ([`super::surface`]); on each
 //! of home's own monitors, a small layer surface of its own, [`HomeCorner`]: on the overlay
-//! layer, anchored top left, with no keyboard, `home_bar` pixels from the top over the exclusive
-//! zones there (home's bars), or placed by the compositor below them with `home_bar = auto`.
+//! layer, anchored top left, with no keyboard, `local_bar` pixels from the top over the exclusive
+//! zones there (home's bars), or placed by the compositor below them with `local_bar = auto`.
 
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -232,7 +232,7 @@ struct Place {
     top: i32,
 }
 
-/// Where home's corner sits with `home_bar` (see [`crate::corner::Look`]).
+/// Where home's corner sits with `local_bar` (see [`crate::corner::Look`]).
 fn place(home_bar: Option<i32>) -> Place {
     let anchor = Anchor::TOP | Anchor::LEFT;
     match home_bar {

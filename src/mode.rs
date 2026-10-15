@@ -2407,6 +2407,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_config_that_still_names_home_label_or_home_bar_starts_with_a_notice() {
+        for (config, new) in [
+            ("monitor = DP-2\nhome_label = NEAR\n", "local_label"),
+            ("monitor = DP-2\nhome_bar = auto\n", "local_bar"),
+            (
+                "monitor = DP-2\nhome_bar = 5\nlocal_bar = auto\n",
+                "local_bar",
+            ),
+        ] {
+            let text = started_saying(config, Some(true)).await;
+            assert!(text.contains(new), "{config}: {text}");
+            assert!(!text.contains('\n'), "{config}: {text}");
+        }
+        let text = started_saying("monitor = DP-2\nlocal_label = NEAR\n", Some(true)).await;
+        assert!(!text.contains("local_label"), "{text}");
+    }
+
+    #[tokio::test]
     async fn the_corner_tags_are_neutral_by_default() {
         let desk = desk("DP-2");
         let _remote = started(&desk).await;
@@ -2418,13 +2436,13 @@ mod tests {
         let look = Look::default();
         assert_eq!(
             (look.remote_label.as_str(), look.home_label.as_str()),
-            ("REMOTE", "HOME")
+            ("REMOTE", "LOCAL")
         );
     }
 
     #[tokio::test]
     async fn a_mode_names_its_own_corner_labels() {
-        let desk = desk_with("remote_label = FAR\n[office]\nmonitor = DP-2\nhome_label = NEAR\n");
+        let desk = desk_with("remote_label = FAR\n[office]\nmonitor = DP-2\nlocal_label = NEAR\n");
         let _remote = started(&desk).await;
         // The home corner and the reserved monitor's corner each carry their own tag.
         let feeds = desk.feeds.lock().unwrap().clone();
@@ -2442,7 +2460,7 @@ mod tests {
     async fn a_label_the_corner_cannot_draw_fails_clearly_and_changes_nothing() {
         for (label, why) in [
             ("remote_label = Café", "remote_label"),
-            ("home_label = 1234567890123", "12 characters"),
+            ("local_label = 1234567890123", "12 characters"),
         ] {
             let desk = desk_with(&format!("monitor = DP-2\n{label}\n"));
             let remote = connect(&desk);
@@ -2473,14 +2491,14 @@ mod tests {
 
     #[tokio::test]
     async fn home_s_corner_starts_at_the_top_unless_the_mode_sets_it() {
-        let top = desk_with("monitor = DP-2\nhome_bar = 0\n");
+        let top = desk_with("monitor = DP-2\nlocal_bar = 0\n");
         let _remote = started(&top).await;
         let feeds = top.feeds.lock().unwrap().clone();
         assert!(!feeds.is_empty());
         for (_, feed) in feeds {
             assert_eq!(feed.look().home_bar, Some(0));
         }
-        let below = desk_with("monitor = DP-2\nhome_bar = auto\n");
+        let below = desk_with("monitor = DP-2\nlocal_bar = auto\n");
         let _remote = started(&below).await;
         for (_, feed) in below.feeds.lock().unwrap().iter() {
             assert_eq!(feed.look().home_bar, None);
@@ -2493,11 +2511,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_home_bar_that_is_neither_auto_nor_pixels_fails_clearly_and_changes_nothing() {
-        let desk = desk_with("monitor = DP-2\nhome_bar = high\n");
+    async fn a_local_bar_that_is_neither_auto_nor_pixels_fails_clearly_and_changes_nothing() {
+        let desk = desk_with("monitor = DP-2\nlocal_bar = high\n");
         let remote = connect(&desk);
         let error = answer(ask(&desk, true).await).await.unwrap_err();
-        assert!(error.to_string().contains("home_bar"), "{error}");
+        assert!(error.to_string().contains("local_bar"), "{error}");
         assert!(desk.covered.lock().unwrap().is_empty());
         assert!(remote.outbox.queued().is_empty());
         assert!(desk.hypr.changes().is_empty());
