@@ -2,7 +2,7 @@
 //! remote machine takes. Keys before any `[section]` are the default of every mode, and a
 //! `monitor` among them is the one unnamed mode, so a file written before modes had names keeps
 //! working. A `[name]` section is a named mode: its `monitor`, and any of `release`,
-//! `mic_hotkey`, `remote_label`, `home_label`, `remote_bar`, `home_bar` it wants other than the
+//! `mic_hotkey`, `remote_label`, `local_label`, `remote_bar`, `local_bar` it wants other than the
 //! default.
 //! `#` starts a comment.
 
@@ -139,6 +139,33 @@ impl File {
             .collect()
     }
 
+    /// `new` in the mode of section `index`, or `old`, its former name, which still works: the
+    /// section's own setting first, then the defaults. Each place that names `old` adds to
+    /// `said`, and where both names are present `new` is the one used.
+    fn renamed(&self, index: usize, new: &str, old: &str, said: &mut Vec<String>) -> Option<&str> {
+        let mut found = None;
+        let mut places = vec![index];
+        if index != 0 {
+            places.push(0);
+        }
+        for place in places {
+            let section = &self.sections[place];
+            match (section.get(new), section.get(old)) {
+                (Some(_), Some(_)) => {
+                    said.push(format!(
+                        "`{old}` is ignored, `{new}` is used: the line can go"
+                    ));
+                }
+                (None, Some(_)) => {
+                    said.push(format!("`{old}` is now `{new}`: rename the line"));
+                }
+                _ => {}
+            }
+            found = found.or_else(|| section.get(new).or_else(|| section.get(old)));
+        }
+        found
+    }
+
     /// The mode in section `index`: its own settings first, then the defaults.
     fn mode(&self, index: usize) -> io::Result<Mode> {
         let section = &self.sections[index];
@@ -183,19 +210,27 @@ impl File {
         let spec = value("release").unwrap_or(input::DEFAULT_HOTKEY);
         let release =
             Hotkey::parse(spec).map_err(|e| invalid(format!("{path}: `release = {spec}`: {e}")))?;
+        // What the file says that is no longer read, said once at `mode start`.
+        let mut said: Vec<String> = Vec::new();
         // The lid works during every mode now; a file written for the option still starts.
-        let notice = value("closed_lid").map(|_| {
-            format!(
-                "{path}: `closed_lid` is no longer read, the remote laptop can be closed and \
-                 opened during every mode: the line can go"
-            )
-        });
+        if value("closed_lid").is_some() {
+            said.push(
+                "`closed_lid` is no longer read, the remote laptop can be closed and opened \
+                 during every mode: the line can go"
+                    .into(),
+            );
+        }
+        let local_label = self.renamed(index, "local_label", "home_label", &mut said);
+        let local_bar = self.renamed(index, "local_bar", "home_bar", &mut said);
+        let notice = (!said.is_empty()).then(|| format!("{path}: {}", said.join("; ")));
         let mic_hotkey = value("mic_hotkey")
             .filter(|keys| !keys.is_empty())
             .unwrap_or(MIC_HOTKEY)
             .to_string();
         let fallback = Look::default();
-        let label = |key: &str, default: String| match value(key).filter(|v| !v.is_empty()) {
+        let label = |key: &str, found: Option<&str>, default: String| match found
+            .filter(|v| !v.is_empty())
+        {
             None => Ok(default),
             Some(label) => corner::check_label(label)
                 .map(|()| label.to_string())
@@ -214,19 +249,19 @@ impl File {
                 ))
             })?,
         };
-        let home_bar = match value("home_bar") {
+        let home_bar = match local_bar {
             None => fallback.home_bar,
             Some("auto") => None,
             Some(bar) => Some(bar.parse::<u16>().map(i32::from).map_err(|_| {
                 invalid(format!(
-                    "{path}: `home_bar = {bar}`: `auto`, or a height in pixels, 0 or more; \
+                    "{path}: `local_bar = {bar}`: `auto`, or a height in pixels, 0 or more; \
                      nothing was changed"
                 ))
             })?),
         };
         let look = Look {
-            remote_label: label("remote_label", fallback.remote_label)?,
-            home_label: label("home_label", fallback.home_label)?,
+            remote_label: label("remote_label", value("remote_label"), fallback.remote_label)?,
+            home_label: label("local_label", local_label, fallback.home_label)?,
             remote_bar,
             home_bar,
         };
@@ -422,7 +457,7 @@ mod tests {
         let look = mode("monitor = DP-2\n", None).unwrap().look;
         assert_eq!(look, Look::default());
         assert_eq!(look.remote_label, "REMOTE");
-        assert_eq!(look.home_label, "HOME");
+        assert_eq!(look.home_label, "LOCAL");
     }
 
     #[test]
@@ -434,7 +469,7 @@ mod tests {
 
     #[test]
     fn a_mode_names_its_own_corner_labels() {
-        let text = "remote_label = FAR\nhome_label = NEAR\nremote_bar = 30\n\
+        let text = "remote_label = FAR\nlocal_label = NEAR\nremote_bar = 30\n\
                     [office]\nmonitor = DP-1\n\
                     [travel]\nmonitor = DP-2\nremote_label = AWAY\nremote_bar = 0\n";
         let office = mode(text, Some("office")).unwrap().look;
@@ -450,15 +485,15 @@ mod tests {
         );
         assert_eq!(travel.remote_bar, 0);
         // The longest label there is.
-        assert!(mode("monitor = DP-2\nhome_label = ABCDEFGHIJKL\n", None).is_ok());
+        assert!(mode("monitor = DP-2\nlocal_label = ABCDEFGHIJKL\n", None).is_ok());
     }
 
     #[test]
     fn a_label_the_corner_cannot_draw_fails_clearly_and_changes_nothing() {
         for (line, wants) in [
             ("remote_label = Café", "remote_label"),
-            ("home_label = tab\there", "home_label"),
-            ("home_label = ABCDEFGHIJKLM", "12 characters"),
+            ("local_label = tab\there", "local_label"),
+            ("local_label = ABCDEFGHIJKLM", "12 characters"),
             ("remote_label = 日本", "printable ASCII"),
         ] {
             let error = mode(&format!("monitor = DP-2\n{line}\n"), None).unwrap_err();
@@ -488,10 +523,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_bar_26_home_bar_auto_and_home_bar_12_still_place_the_corners_as_before() {
-        let text = "home_bar = auto\nremote_bar = 26\n[office]\nmonitor = DP-1\n\
-                    [travel]\nmonitor = DP-2\nhome_bar = 0\n\
-                    [desk]\nmonitor = DP-3\nhome_bar = 12\n";
+    fn remote_bar_26_local_bar_auto_and_local_bar_12_still_place_the_corners_as_before() {
+        let text = "local_bar = auto\nremote_bar = 26\n[office]\nmonitor = DP-1\n\
+                    [travel]\nmonitor = DP-2\nlocal_bar = 0\n\
+                    [desk]\nmonitor = DP-3\nlocal_bar = 12\n";
         let office = mode(text, Some("office")).unwrap().look;
         assert_eq!((office.remote_bar, office.home_bar), (26, None));
         assert_eq!(mode(text, Some("travel")).unwrap().look.home_bar, Some(0));
@@ -499,12 +534,12 @@ mod tests {
     }
 
     #[test]
-    fn a_home_bar_that_is_neither_auto_nor_pixels_fails_clearly() {
+    fn a_local_bar_that_is_neither_auto_nor_pixels_fails_clearly() {
         for bad in ["-1", "tall", "2.5", "Auto"] {
-            let error = mode(&format!("monitor = DP-2\nhome_bar = {bad}\n"), None)
+            let error = mode(&format!("monitor = DP-2\nlocal_bar = {bad}\n"), None)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("home_bar"), "{bad}: {error}");
+            assert!(error.contains("local_bar"), "{bad}: {error}");
             assert!(error.contains("auto"), "{bad}: {error}");
             assert!(error.contains("nothing was changed"), "{bad}: {error}");
         }
@@ -613,6 +648,95 @@ mod tests {
         let text = "[office]\nmonitor = DP-1\nclosed_lid = on\n[travel]\nmonitor = DP-2\n";
         assert!(mode(text, Some("office")).unwrap().notice.is_some());
         assert!(mode(text, Some("travel")).unwrap().notice.is_none());
+    }
+
+    #[test]
+    fn local_label_and_local_bar_are_read_globally_and_per_section() {
+        let text = "local_label = NEAR\nlocal_bar = auto\n\
+                    [office]\nmonitor = DP-1\n\
+                    [travel]\nmonitor = DP-2\nlocal_label = HERE\nlocal_bar = 12\n";
+        let office = mode(text, Some("office")).unwrap();
+        assert_eq!(office.look.home_label, "NEAR");
+        assert_eq!(office.look.home_bar, None);
+        assert_eq!(office.notice, None);
+        let travel = mode(text, Some("travel")).unwrap();
+        assert_eq!(travel.look.home_label, "HERE");
+        assert_eq!(travel.look.home_bar, Some(12));
+        assert_eq!(travel.notice, None);
+    }
+
+    #[test]
+    fn a_file_that_still_names_home_label_or_home_bar_is_read_with_a_one_line_notice() {
+        let mode_ = mode("monitor = DP-2\nhome_label = NEAR\n", None).unwrap();
+        assert_eq!(mode_.look.home_label, "NEAR");
+        let notice = mode_.notice.expect("a notice");
+        assert!(
+            notice.contains("home_label") && notice.contains("local_label"),
+            "{notice}"
+        );
+        assert!(!notice.contains('\n'), "{notice}");
+        let mode_ = mode("monitor = DP-2\nhome_bar = auto\n", None).unwrap();
+        assert_eq!(mode_.look.home_bar, None);
+        let notice = mode_.notice.expect("a notice");
+        assert!(
+            notice.contains("home_bar") && notice.contains("local_bar"),
+            "{notice}"
+        );
+        // Both old keys: still one line, naming both.
+        let mode_ = mode("monitor = DP-2\nhome_label = A\nhome_bar = 3\n", None).unwrap();
+        let notice = mode_.notice.expect("a notice");
+        assert!(
+            notice.contains("local_label") && notice.contains("local_bar"),
+            "{notice}"
+        );
+        assert!(!notice.contains('\n'), "{notice}");
+        // The old name is read from the defaults and from a section, like the new one.
+        let text = "home_label = NEAR\n[office]\nmonitor = DP-1\n\
+                    [travel]\nmonitor = DP-2\nhome_bar = 7\n";
+        let office = mode(text, Some("office")).unwrap();
+        assert_eq!(office.look.home_label, "NEAR");
+        assert!(office.notice.is_some());
+        let travel = mode(text, Some("travel")).unwrap();
+        assert_eq!(travel.look.home_bar, Some(7));
+        assert_eq!(travel.look.home_label, "NEAR");
+    }
+
+    #[test]
+    fn with_both_the_old_and_the_new_key_the_new_one_wins_and_the_notice_says_so() {
+        let text = "monitor = DP-2\nhome_label = OLD\nlocal_label = NEW\n\
+                    home_bar = 5\nlocal_bar = auto\n";
+        let mode_ = mode(text, None).unwrap();
+        assert_eq!(mode_.look.home_label, "NEW");
+        assert_eq!(mode_.look.home_bar, None);
+        let notice = mode_.notice.expect("a notice");
+        assert!(
+            notice.contains("local_label") && notice.contains("local_bar"),
+            "{notice}"
+        );
+        assert!(notice.contains("ignored"), "{notice}");
+        assert!(!notice.contains('\n'), "{notice}");
+        // The order in the file does not matter.
+        let text = "monitor = DP-2\nlocal_label = NEW\nhome_label = OLD\n";
+        assert_eq!(mode(text, None).unwrap().look.home_label, "NEW");
+    }
+
+    #[test]
+    fn a_section_s_old_key_still_beats_a_default_new_key() {
+        let text = "local_label = DEFAULT\n[office]\nmonitor = DP-1\nhome_label = OWN\n";
+        let office = mode(text, Some("office")).unwrap();
+        assert_eq!(office.look.home_label, "OWN");
+        assert!(office.notice.is_some());
+    }
+
+    #[test]
+    fn a_closed_lid_notice_and_a_renamed_key_notice_share_one_line() {
+        let mode_ = mode("monitor = DP-2\nclosed_lid = on\nhome_label = A\n", None).unwrap();
+        let notice = mode_.notice.expect("a notice");
+        assert!(
+            notice.contains("closed_lid") && notice.contains("local_label"),
+            "{notice}"
+        );
+        assert!(!notice.contains('\n'), "{notice}");
     }
 
     #[test]
