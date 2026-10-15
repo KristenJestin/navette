@@ -90,9 +90,17 @@ cross only when an application reads them, through a virtual folder (below).
     it ends; the folder is emptied again at each start. A file read takes its size there
     while its copy is shown, and the room for it and for the files being fetched beside it is
     checked before it is fetched.
-  - A newer copy does not stop a transfer: the files of an older copy stay while an
-    application holds one of them open, and go once none is. The machine that copied serves
-    the files of its last 8 copies of files, for that. Several transfers can run at once.
+  - A newer copy does not stop a transfer: an older copy stays while an application holds one
+    of its files or folders open, and while its transfer is under way: from the first read of
+    one of its files until it is cancelled, or until every file read is whole and nothing of
+    it was opened for 30 s (a file manager copying a folder opens its files one after the
+    other, with nothing open between two). The machine that copied serves the files of its
+    last 8 copies of files, for that. Several transfers can run at once.
+  - A file closed by its last reader before all its bytes came stops its fetch, and what came
+    of it goes: a file manager that looks at the first bytes of each file of the folder costs
+    a few chunks, not the files. A fetch that fails (the other machine stopped it, or sent
+    less than it said) keeps nothing either. In both cases a later read fetches the file
+    again. A copy whose reads fail says `Paste failed` once, not at each read.
   - It is mounted when a mode starts and unmounted when it stops, when the link ends and when
     `navette` exits; a read in progress then fails. A mount left by a `navette` that died is
     unmounted at the next start.
