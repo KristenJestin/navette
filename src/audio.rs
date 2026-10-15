@@ -608,7 +608,8 @@ impl Latest {
 /// The one level the remote's sink and home's default output share, as one side sees it: what
 /// its own mixer last said, and what the other side holds. A level applied from the other side
 /// is not sent back: neither while the mixer still says the level it had before (it tells the
-/// change a little later), nor once it says the level applied.
+/// change a little later), nor while it says the levels applied before the last one (a held
+/// key sends a level before the mixer said the one before), nor once it says the last one.
 struct Shared {
     latest: Latest,
     /// What the other side was last told, or told us.
@@ -616,6 +617,9 @@ struct Shared {
     /// What the mixer said when the other side's level was applied, until it says something
     /// else.
     stale: Option<Level>,
+    /// The other side's levels applied since the mixer last said the other side's level: what
+    /// it may still say late.
+    in_flight: Vec<Level>,
     /// Home's output leads: its first level is told, for the remote's sink to take. The sink
     /// follows: nothing is told until its mixer says home's level, as whatever it opened at may
     /// be said after home's level was asked for.
@@ -628,6 +632,7 @@ impl Shared {
             latest: Latest::default(),
             peer: None,
             stale: None,
+            in_flight: Vec::new(),
             waiting: false,
         }
     }
@@ -646,11 +651,18 @@ impl Shared {
             self.waiting = self.peer != Some(level);
             return None;
         }
-        if self.stale == Some(level) {
+        if self.peer == Some(level) {
+            // Every level applied has landed.
+            self.stale = None;
+            self.in_flight.clear();
+            return None;
+        }
+        if self.stale == Some(level) || self.in_flight.contains(&level) {
             return None;
         }
         self.stale = None;
-        (self.peer != Some(level)).then_some(level)
+        self.in_flight.clear();
+        Some(level)
     }
 
     fn told(&mut self, level: Level) {
@@ -660,6 +672,7 @@ impl Shared {
     /// The other side's level, about to be applied to the mixer.
     fn applying(&mut self, level: Level) {
         self.stale = self.latest.get().or(self.stale);
+        self.in_flight.push(level);
         self.peer = Some(level);
     }
 }
@@ -1794,6 +1807,44 @@ mod tests {
 
         home.received(volume(session)).unwrap();
         assert_eq!(graph.state().levels, [(fake::OUTPUT.to_owned(), QUIET)]);
+    }
+
+    #[test]
+    fn levels_from_a_held_key_that_home_s_output_says_late_are_not_sent_back() {
+        let graph = FakeGraph::default();
+        graph.state().output = Some(SEVENTY);
+        let (to_remote, mut orders) = mpsc::channel(8);
+        let mut home = Home::new(graph.clone(), to_remote);
+        home.start().unwrap();
+        let Message::Start { session } = orders.try_recv().unwrap() else {
+            panic!("home asked for the sound");
+        };
+        home.tell_level();
+        volumes(&mut orders);
+
+        // A held key on the remote: each level comes before the output said the one before.
+        graph.state().late_echo = true;
+        let held = [HALF, QUIET, Level::UNITY];
+        for level in held {
+            home.received(Message::Volume { session, level }).unwrap();
+            home.tell_level();
+        }
+        for level in held {
+            graph.mixer_sets(fake::OUTPUT, level);
+            home.tell_level();
+        }
+        assert_eq!(volumes(&mut orders), [], "a level in flight came back");
+
+        // Once all have landed, the user going back to one of them is a change.
+        graph.mixer_sets(fake::OUTPUT, QUIET);
+        home.tell_level();
+        assert_eq!(
+            volumes(&mut orders),
+            [Message::Volume {
+                session,
+                level: QUIET
+            }]
+        );
     }
 
     #[test]
