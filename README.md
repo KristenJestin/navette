@@ -102,5 +102,5 @@ cargo test
 
 Apache-2.0. Code reused from gliff (MIT) keeps its MIT notice ([`LICENSES`](LICENSES)).
 The logo and the banner are in [`assets/brand`](assets/brand/README.md); the banner is drawn with
-Peace Sans, Open Sauce Sans and JetBrains Mono, under the SIL Open Font License 1.1
+Figtree and JetBrains Mono, under the SIL Open Font License 1.1
 ([`assets/brand/fonts`](assets/brand/fonts/README.md)).
