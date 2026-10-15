@@ -108,7 +108,10 @@ refuses a request against an offer that a newer copy has replaced.
 - **The journal** follows each copy by its offer number, one line per step and on both
   machines: the offer sent and received with its file count, each paste asked and as what
   type, the files fetched, pasted (with how long it took) or failed with why, the files
-  served, and each request refused with why ("this machine copied again"). It never holds
+  served, and each request refused with why ("this machine copied again"). Each copy made on
+  a machine gets a line there: its offer sent, or why it is not (a newer copy replaced it
+  first), and a file list that names no local file says so. A copy that leaves no line never
+  reached the clipboard Navette watches. It never holds
   what was copied: a paste of text or a picture that fails says only "a paste failed: ...",
   a paste of files names the file it failed on.
 

@@ -453,7 +453,10 @@ impl<C: Compositor> Bridge<C> {
                 None => files::Copied::default(),
             };
             if selection_gen.get() != generation {
-                return; // superseded while we were listing
+                log(format_args!(
+                    "a copy here was replaced before it was sent, so only the newer one is"
+                ));
+                return;
             }
             let serial = kept.serial_of(&copied, generation as u32);
             // Copied again: what the user stopped of it may cross again.
@@ -698,6 +701,9 @@ async fn local_files_from_pipe(mut rx: pipe::Receiver) -> files::Copied {
     }
     let paths = parse_uri_list(&String::from_utf8_lossy(&body));
     if paths.is_empty() {
+        log(format_args!(
+            "the copied file list names no local file, so no file is sent"
+        ));
         return files::Copied::default();
     }
     match tokio::task::spawn_blocking(move || files::list(&paths)).await {
