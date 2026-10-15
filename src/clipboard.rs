@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use gliff_proto::clipboard::{
-    MAX_ITEM, file_list_body, forwardable_mimes, is_file_mime, local_mimes_for_offer,
+    MAX_ITEM, file_list_body, forwardable_mimes, is_file_mime, is_text_mime, local_mimes_for_offer,
     parse_uri_list, resolve_mime, top_level,
 };
 use gliff_proto::{ClipboardFile, ClipboardItem, ClipboardMsg};
@@ -492,7 +492,11 @@ impl<C: Compositor> Bridge<C> {
             }
         };
         let transfers = self.transfers.clone();
-        if is_file_mime(&mime_type) {
+        // The text of a copy of files names the files: an application that pastes by reading
+        // the text gets them like one that reads the list.
+        let of_files = is_file_mime(&mime_type)
+            || (is_text_type(&mime_type) && !self.remote.borrow().files.is_empty());
+        if of_files {
             let (serial, files, received) = {
                 let remote = self.remote.borrow();
                 if remote.files.is_empty() {
@@ -562,7 +566,7 @@ impl<C: Compositor> Bridge<C> {
                                 ),
                             );
                         }
-                        let body = file_list_body(&mime_type, paths).unwrap_or_default();
+                        let body = files_body(&mime_type, paths);
                         // An application that closed its end early is not the paste's failure.
                         if write_body(WriteSink(target), body).await.is_err() {
                             offer_again(&remote, serial, &*compositor);
@@ -597,6 +601,21 @@ impl<C: Compositor> Bridge<C> {
                 });
         }
     }
+}
+
+/// Whether `mime_type` is one of the text types an application reads a text copy as.
+fn is_text_type(mime_type: &str) -> bool {
+    is_text_mime(mime_type) || mime_type.starts_with("text/plain;")
+}
+
+/// What a paste of a copy of files reads as `mime_type`: the file list, or for a text type
+/// the same paths, one per line, with no final newline so that a terminal does not run them.
+fn files_body(mime_type: &str, paths: &[PathBuf]) -> String {
+    if is_text_type(mime_type) {
+        let lines: Vec<_> = paths.iter().map(|p| p.to_string_lossy()).collect();
+        return lines.join("\n");
+    }
+    file_list_body(mime_type, paths).unwrap_or_default()
 }
 
 /// Whether any application may read `mime_type`. An application can put types of its own on
@@ -1978,6 +1997,99 @@ mod tests {
             "{bars:?}"
         );
         assert!(bars.iter().any(Option::is_some), "{bars:?}");
+    }
+
+    /// Home copies the files `names` of `tmp/copied` the way a file manager does: the file
+    /// lists and the text types, all naming home's paths.
+    fn copy_files_with_text(home: &Machine, copied: &std::path::Path, names: &[&str]) {
+        let paths: Vec<_> = names.iter().map(|n| copied.join(n)).collect();
+        let list = uri_list_of(&paths);
+        let text = paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        home.copy(&[
+            (URI_LIST, list.as_bytes()),
+            (TEXT, text.as_bytes()),
+            ("text/plain", text.as_bytes()),
+            ("UTF8_STRING", text.as_bytes()),
+            ("STRING", text.as_bytes()),
+            ("TEXT", text.as_bytes()),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn the_text_of_a_copy_of_files_names_the_receiving_machine_s_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::write(copied.join("a.txt"), b"first").unwrap();
+        std::fs::write(copied.join("b.txt"), b"second").unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                copy_files_with_text(&home, &copied, &["a.txt", "b.txt"]);
+                let offer = remote.offered(1).await;
+                for text in [TEXT, "text/plain", "UTF8_STRING", "STRING", "TEXT"] {
+                    assert!(offer.iter().any(|m| m == text), "{text}: {offer:?}");
+                }
+                // Only the text types are read, as a file manager does when it pastes: they
+                // fetch the files the same way the file list does.
+                let text = String::from_utf8(remote.paste(TEXT).await).unwrap();
+                let here = tmp.path().join("remote");
+                let expected = format!(
+                    "{}\n{}",
+                    here.join("a.txt").display(),
+                    here.join("b.txt").display()
+                );
+                assert_eq!(text, expected);
+                assert_eq!(std::fs::read(here.join("a.txt")).unwrap(), b"first");
+                assert_eq!(std::fs::read(here.join("b.txt")).unwrap(), b"second");
+                // Every text type gives the same paths, from the files already in.
+                for other in ["text/plain", "UTF8_STRING", "STRING", "TEXT"] {
+                    assert_eq!(remote.paste(other).await, expected.as_bytes(), "{other}");
+                }
+                // And the file list names the same files.
+                let list = String::from_utf8(remote.paste(URI_LIST).await).unwrap();
+                assert_eq!(
+                    parse_uri_list(&list),
+                    [here.join("a.txt"), here.join("b.txt")]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_text_of_a_copy_of_files_made_on_the_remote_names_home_s_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::write(copied.join("a.txt"), b"first").unwrap();
+        let list = uri_list_of(&[copied.join("a.txt")]);
+        let text = copied.join("a.txt").display().to_string();
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                remote.copy(&[(URI_LIST, list.as_bytes()), (TEXT, text.as_bytes())]);
+                home.offered(1).await;
+                let pasted = String::from_utf8(home.paste(TEXT).await).unwrap();
+                assert_eq!(pasted, tmp.path().join("home/a.txt").display().to_string());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_text_copy_without_files_is_unchanged_by_the_files_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                home.copy(&[(TEXT, b"/not/a/file/copy")]);
+                remote.offered(1).await;
+                assert_eq!(remote.paste(TEXT).await, b"/not/a/file/copy");
+            })
+            .await;
     }
 
     #[tokio::test]
