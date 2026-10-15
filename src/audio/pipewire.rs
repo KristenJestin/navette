@@ -744,10 +744,19 @@ impl Followed {
             let current = follower.bound.as_ref().map(|b| (b.id, b.card.is_some()));
             let wanted = sink.map(|g| (g.id, card_of(g, &self.cards).is_some()));
             if current != wanted {
+                if !keeps_asked(current.map(|(id, _)| id), wanted.map(|(id, _)| id)) {
+                    follower.asked = None;
+                }
                 follower.bound = sink.and_then(|g| bind_output(registry, g, &self.cards));
             }
         }
     }
+}
+
+/// Whether a level asked while the sink `from` was followed, and not set yet, is still to set
+/// once `to` is: on the first sink followed, or on the same one bound again, never on another.
+fn keeps_asked(from: Option<u32>, to: Option<u32>) -> bool {
+    from.is_none() || from == to
 }
 
 /// The card a sink plays on, with the number of its device on the card
@@ -1947,6 +1956,17 @@ mod tests {
             .iter()
             .find(|p| p.key == key)
             .map(|p| &p.value)
+    }
+
+    #[test]
+    fn a_level_asked_for_one_default_output_is_not_set_on_the_next() {
+        // Asked before any output was bound: for whichever comes first.
+        assert!(keeps_asked(None, Some(51)));
+        // The same sink bound again, its card known now.
+        assert!(keeps_asked(Some(51), Some(51)));
+        // The default moved to another sink, or went away.
+        assert!(!keeps_asked(Some(51), Some(62)));
+        assert!(!keeps_asked(Some(51), None));
     }
 
     #[test]
