@@ -9,9 +9,14 @@
 //!
 //! Like any sink, it applies its volume and mute to what it receives, which is the remote's
 //! mixer acting on it. The sound that goes home is read from its monitor instead, which carries
-//! it as the apps played it. The volume and mute that the sink, and home's playback, hold are
-//! followed by [`Mixer`] and told by the loop, at most every [`LEVEL_EVERY`], so that the
-//! controls one change sets are told together.
+//! it as the apps played it (`monitor.channel-volumes` is false). The volume and mute that the
+//! sink holds are followed by [`Mixer`] and told by the loop, at most every [`LEVEL_EVERY`], so
+//! that the controls one change sets are told together.
+//!
+//! Home's default output is the `default.audio.sink` key, the sink the session manager gives
+//! the apps, followed as it moves. Its volume is read from the node's props, as `wpctl` reads
+//! it, and set on the card's active route when the sink is a card's, as the session manager's
+//! own mixer does, or on the node's props otherwise.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -24,8 +29,10 @@ use std::time::Duration;
 
 use pipewire as pw;
 use pw::metadata::{Metadata, MetadataListener};
+use pw::registry::GlobalObject;
 use pw::spa;
 use pw::types::ObjectType;
+use spa::pod::Value;
 
 use super::codec::{CHANNELS, RATE, SAMPLES_PER_CYCLE};
 use super::jitter::Jitter;
@@ -35,6 +42,8 @@ const CONFIGURED_SINK: &str = "default.configured.audio.sink";
 const CONFIGURED_SOURCE: &str = "default.configured.audio.source";
 /// The source the session manager gives the apps: the configured one, or its own pick.
 const SOURCE_IN_USE: &str = "default.audio.source";
+/// The sink the session manager gives the apps, the same way.
+const SINK_IN_USE: &str = "default.audio.sink";
 /// Long enough for a busy PipeWire, short enough that a hung one does not hang the link.
 const ANSWER: Duration = Duration::from_secs(5);
 const BYTES_PER_FRAME: usize = CHANNELS * size_of::<f32>();
@@ -54,7 +63,7 @@ enum Command {
         reply: Reply<u64>,
     },
     Close(u64),
-    /// The volume and mute of a playback stream.
+    /// The volume and mute of a sink of ours, or of the default output followed.
     SetLevel(u64, Level),
     /// Ends a loop that stopped answering, and with it every stream it holds.
     Quit,
@@ -66,10 +75,8 @@ enum Opening {
         on_sound: OnSound,
         on_level: OnLevel,
     },
-    Playback {
-        jitter: Arc<Mutex<Jitter>>,
-        on_level: OnLevel,
-    },
+    Playback(Arc<Mutex<Jitter>>),
+    Output(OnLevel),
     Source(Arc<Mutex<Jitter>>),
     Mic {
         mic: String,
@@ -215,9 +222,12 @@ impl Graph for PipeWire {
         name: &str,
         description: &str,
         jitter: Arc<Mutex<Jitter>>,
-        on_level: OnLevel,
     ) -> io::Result<Node> {
-        self.open(name, description, Opening::Playback { jitter, on_level })
+        self.open(name, description, Opening::Playback(jitter))
+    }
+
+    fn follow_output(&self, on_level: OnLevel) -> io::Result<Node> {
+        self.open("", "", Opening::Output(on_level))
     }
 
     fn open_source(
@@ -425,12 +435,33 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
 
     let metadata: Rc<RefCell<Option<(Metadata, MetadataListener)>>> = Rc::default();
     let configured: Rc<RefCell<Configured>> = Rc::default();
+    let followed: Rc<RefCell<Followed>> = Rc::default();
+    // Binds each follower to the default output in use, again whenever it changes.
+    let refresh: Rc<dyn Fn()> = Rc::new({
+        let (registry, configured, followed) =
+            (registry.downgrade(), configured.clone(), followed.clone());
+        move || {
+            if let Some(registry) = registry.upgrade() {
+                let output = configured.borrow().output();
+                followed.borrow_mut().refresh(&registry, output.as_deref());
+            }
+        }
+    });
     let _registry_listener = registry
         .add_listener_local()
         .global({
-            let (registry, metadata, configured) =
-                (registry.downgrade(), metadata.clone(), configured.clone());
+            let (registry, metadata, configured, followed, refresh) = (
+                registry.downgrade(),
+                metadata.clone(),
+                configured.clone(),
+                followed.clone(),
+                refresh.clone(),
+            );
             move |global| {
+                if followed.borrow_mut().list(global) {
+                    refresh();
+                    return;
+                }
                 let is_default = global.type_ == ObjectType::Metadata
                     && global.props.and_then(|p| p.get("metadata.name")) == Some("default");
                 let Some(registry) = registry.upgrade().filter(|_| is_default) else {
@@ -439,15 +470,24 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
                 let Ok(bound) = registry.bind::<Metadata, _>(global) else {
                     return;
                 };
-                let configured = configured.clone();
+                let (configured, refresh) = (configured.clone(), refresh.clone());
                 let listener = bound
                     .add_listener_local()
                     .property(move |subject, key, _type, value| {
                         follow(&mut configured.borrow_mut(), subject, key, value);
+                        refresh();
                         0
                     })
                     .register();
                 *metadata.borrow_mut() = Some((bound, listener));
+            }
+        })
+        .global_remove({
+            let (followed, refresh) = (followed.clone(), refresh.clone());
+            move |id| {
+                if followed.borrow_mut().unlist(id) {
+                    refresh();
+                }
             }
         })
         .register();
@@ -481,6 +521,7 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
     let next_id = Cell::new(0u64);
     let playing = streams.clone();
     let mixed = streams.clone();
+    let followed_levels = followed.clone();
     let _commands = commands.attach(mainloop.loop_(), move |command| match command {
         Command::DefaultNode(device, reply) => {
             let value = configured.borrow_mut().of(device).clone();
@@ -525,13 +566,28 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
             reply,
         } => {
             let id = next_id.replace(next_id.get() + 1);
+            let what = match what {
+                Opening::Output(on_level) => {
+                    followed.borrow_mut().followers.insert(
+                        id,
+                        Output {
+                            on_level,
+                            bound: None,
+                            asked: None,
+                        },
+                    );
+                    refresh();
+                    let _ = reply.send(Ok(id));
+                    return;
+                }
+                what => what,
+            };
             let opened = match what {
                 Opening::Sink { on_sound, on_level } => {
                     open_sink(&core, &name, &description, on_sound, on_level)
                 }
-                Opening::Playback { jitter, on_level } => {
-                    open_playback(&core, &name, &description, jitter, on_level)
-                }
+                Opening::Playback(jitter) => open_playback(&core, &name, &description, jitter),
+                Opening::Output(_) => unreachable!("an output is followed, not opened"),
                 Opening::Source(jitter) => open_source(&core, &name, &description, jitter),
                 Opening::Mic { mic, on_sound } => {
                     open_mic(&context, &core, &name, &description, &mic, on_sound)
@@ -545,6 +601,13 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
         }
         Command::Close(id) => {
             streams.borrow_mut().remove(&id);
+            followed.borrow_mut().followers.remove(&id);
+        }
+        Command::SetLevel(id, level) if followed.borrow().followers.contains_key(&id) => {
+            if let Some(output) = followed.borrow_mut().followers.get_mut(&id) {
+                output.asked = Some(level);
+                output.apply();
+            }
         }
         Command::SetLevel(id, level) => {
             if let Some(open) = streams.borrow().get(&id) {
@@ -582,6 +645,13 @@ fn run(commands: pw::channel::Receiver<Command>, ready: &Reply<()>) -> io::Resul
         }
     });
     let _ = levels.update_timer(Some(LEVEL_EVERY), Some(LEVEL_EVERY));
+    let outputs = mainloop.loop_().add_timer(move |_| {
+        for output in followed_levels.borrow_mut().followers.values_mut() {
+            output.apply();
+            output.tell();
+        }
+    });
+    let _ = outputs.update_timer(Some(LEVEL_EVERY), Some(LEVEL_EVERY));
     if !failed.get() {
         mainloop.run();
     }
@@ -594,6 +664,7 @@ struct Configured {
     sink: Option<String>,
     source: Option<String>,
     source_in_use: Option<String>,
+    sink_in_use: Option<String>,
 }
 
 impl Configured {
@@ -602,6 +673,13 @@ impl Configured {
             Device::Sink => &mut self.sink,
             Device::Source => &mut self.source,
         }
+    }
+
+    /// The name of the sink the apps play to: the session manager's pick, which is the
+    /// configured one while it is there.
+    fn output(&self) -> Option<String> {
+        let value = self.sink_in_use.as_ref().or(self.sink.as_ref())?;
+        DefaultNode(value.clone()).name().map(str::to_owned)
     }
 }
 
@@ -622,10 +700,346 @@ fn follow(configured: &mut Configured, subject: u32, key: Option<&str>, value: O
         Some(CONFIGURED_SINK) => configured.sink = value.map(str::to_owned),
         Some(CONFIGURED_SOURCE) => configured.source = value.map(str::to_owned),
         Some(SOURCE_IN_USE) => configured.source_in_use = value.map(str::to_owned),
+        Some(SINK_IN_USE) => configured.sink_in_use = value.map(str::to_owned),
         // Every key of the core cleared.
         None => *configured = Configured::default(),
         _ => {}
     }
+}
+
+/// The sinks and the cards the registry lists, and the followers of the default output: what
+/// [`Graph::follow_output`] needs, on the loop.
+#[derive(Default)]
+struct Followed {
+    sinks: HashMap<u32, GlobalObject<pw::properties::PropertiesBox>>,
+    cards: HashMap<u32, GlobalObject<pw::properties::PropertiesBox>>,
+    followers: HashMap<u64, Output>,
+}
+
+impl Followed {
+    /// Keeps `global` if it is a sink or a card; true when it is.
+    fn list(&mut self, global: &GlobalObject<&spa::utils::dict::DictRef>) -> bool {
+        let class = global.props.and_then(|p| p.get(*pw::keys::MEDIA_CLASS));
+        let list = match (&global.type_, class) {
+            (ObjectType::Node, Some("Audio/Sink")) => &mut self.sinks,
+            (ObjectType::Device, Some("Audio/Device")) => &mut self.cards,
+            _ => return false,
+        };
+        list.insert(global.id, global.to_owned());
+        true
+    }
+
+    fn unlist(&mut self, id: u32) -> bool {
+        self.sinks.remove(&id).is_some() || self.cards.remove(&id).is_some()
+    }
+
+    /// Binds each follower to the sink named `output`, unless it follows it already.
+    fn refresh(&mut self, registry: &pw::registry::RegistryRc, output: Option<&str>) {
+        let sink = output.and_then(|name| {
+            self.sinks
+                .values()
+                .find(|g| g.props.as_ref().and_then(|p| p.get(*pw::keys::NODE_NAME)) == Some(name))
+        });
+        for follower in self.followers.values_mut() {
+            let current = follower.bound.as_ref().map(|b| (b.id, b.card.is_some()));
+            let wanted = sink.map(|g| (g.id, card_of(g, &self.cards).is_some()));
+            if current != wanted {
+                if !keeps_asked(current.map(|(id, _)| id), wanted.map(|(id, _)| id)) {
+                    follower.asked = None;
+                }
+                follower.bound = sink.and_then(|g| bind_output(registry, g, &self.cards));
+            }
+        }
+    }
+}
+
+/// Whether a level asked while the sink `from` was followed, and not set yet, is still to set
+/// once `to` is: on the first sink followed, or on the same one bound again, never on another.
+fn keeps_asked(from: Option<u32>, to: Option<u32>) -> bool {
+    from.is_none() || from == to
+}
+
+/// The card a sink plays on, with the number of its device on the card
+/// (`card.profile.device`), if it is a card's.
+fn card_of<'a>(
+    sink: &GlobalObject<pw::properties::PropertiesBox>,
+    cards: &'a HashMap<u32, GlobalObject<pw::properties::PropertiesBox>>,
+) -> Option<(&'a GlobalObject<pw::properties::PropertiesBox>, i32)> {
+    let props = sink.props.as_ref()?;
+    let card = props.get("device.id")?.parse::<u32>().ok()?;
+    let device = props.get("card.profile.device")?.parse::<i32>().ok()?;
+    Some((cards.get(&card)?, device))
+}
+
+/// One follower of the default output: where its level goes, the sink it follows now, and a
+/// level asked for it that is not set yet.
+struct Output {
+    on_level: OnLevel,
+    bound: Option<Bound>,
+    asked: Option<Level>,
+}
+
+impl Output {
+    /// Sets the level asked, once there is an output to set it on.
+    fn apply(&mut self) {
+        let (Some(level), Some(bound)) = (self.asked, &self.bound) else {
+            return;
+        };
+        if bound.set(level) {
+            self.asked = None;
+            eprintln!(
+                "navette: audio: {} set to {}",
+                bound.name,
+                super::shown(level)
+            );
+        }
+    }
+
+    fn tell(&mut self) {
+        if let Some(level) = self.bound.as_ref().and_then(|b| b.pending.take()) {
+            (self.on_level)(level);
+        }
+    }
+}
+
+/// The default output, bound: its node's props tell its level.
+struct Bound {
+    id: u32,
+    name: String,
+    node: pw::node::Node,
+    _listener: pw::node::NodeListener,
+    /// The card it plays on, if any: its volume is set on the card's route, as the session
+    /// manager's own mixer does, or the card's volume and the node's would no longer agree.
+    card: Option<Card>,
+    /// How many channels its volume has.
+    channels: Rc<Cell<usize>>,
+    /// The level its props last said, until told.
+    pending: Rc<Cell<Option<Level>>>,
+}
+
+struct Card {
+    device: pw::device::Device,
+    _listener: pw::device::DeviceListener,
+    /// The number of the output's device on the card.
+    output: i32,
+    /// The index of the active route of each of the card's devices.
+    routes: Rc<RefCell<HashMap<i32, i32>>>,
+}
+
+impl Bound {
+    /// False while the card has not said its active route yet.
+    fn set(&self, level: Level) -> bool {
+        let channels = self.channels.get();
+        let (value, id) = match &self.card {
+            Some(card) => {
+                let Some(&index) = card.routes.borrow().get(&card.output) else {
+                    return false;
+                };
+                (
+                    route_value((card.output, index), level, channels),
+                    spa::param::ParamType::Route,
+                )
+            }
+            None => (props_value(level, channels), spa::param::ParamType::Props),
+        };
+        let bytes = serialize(&value);
+        let pod = spa::pod::Pod::from_bytes(&bytes).expect("a serialized pod");
+        match &self.card {
+            Some(card) => card.device.set_param(id, 0, pod),
+            None => self.node.set_param(id, 0, pod),
+        }
+        true
+    }
+}
+
+fn bind_output(
+    registry: &pw::registry::RegistryRc,
+    sink: &GlobalObject<pw::properties::PropertiesBox>,
+    cards: &HashMap<u32, GlobalObject<pw::properties::PropertiesBox>>,
+) -> Option<Bound> {
+    let name = sink
+        .props
+        .as_ref()
+        .and_then(|p| p.get(*pw::keys::NODE_NAME))
+        .unwrap_or_default()
+        .to_owned();
+    let node: pw::node::Node = match registry.bind(sink) {
+        Ok(node) => node,
+        Err(e) => {
+            eprintln!("navette: audio: could not follow {name}: {e}");
+            return None;
+        }
+    };
+    let (channels, pending) = (Rc::new(Cell::new(2)), Rc::new(Cell::new(None)));
+    let listener = node
+        .add_listener_local()
+        .param({
+            let (channels, pending) = (channels.clone(), pending.clone());
+            move |_, _, _, _, param| {
+                if let Some((level, n)) = param.and_then(|p| output_level(p.as_bytes())) {
+                    channels.set(n);
+                    pending.set(Some(level));
+                }
+            }
+        })
+        .register();
+    node.subscribe_params(&[spa::param::ParamType::Props]);
+    let card = card_of(sink, cards).and_then(|(card, output)| {
+        let device: pw::device::Device = registry.bind(card).ok()?;
+        let routes: Rc<RefCell<HashMap<i32, i32>>> = Rc::default();
+        let listener = device
+            .add_listener_local()
+            .param({
+                let routes = routes.clone();
+                move |_, _, _, _, param| {
+                    if let Some((device, index)) = param.and_then(|p| active_route(p.as_bytes())) {
+                        routes.borrow_mut().insert(device, index);
+                    }
+                }
+            })
+            .register();
+        device.subscribe_params(&[spa::param::ParamType::Route]);
+        Some(Card {
+            device,
+            _listener: listener,
+            output,
+            routes,
+        })
+    });
+    eprintln!("navette: audio: following the volume of {name}");
+    Some(Bound {
+        id: sink.id,
+        name,
+        node,
+        _listener: listener,
+        card,
+        channels,
+        pending,
+    })
+}
+
+fn serialize(value: &Value) -> Vec<u8> {
+    spa::pod::serialize::PodSerializer::serialize(io::Cursor::new(Vec::new()), value)
+        .expect("a level serializes")
+        .0
+        .into_inner()
+}
+
+fn deserialize(bytes: &[u8]) -> Option<Value> {
+    spa::pod::deserialize::PodDeserializer::deserialize_any_from(bytes)
+        .ok()
+        .map(|(_, value)| value)
+}
+
+fn properties_of(value: &Value) -> &[spa::pod::Property] {
+    match value {
+        Value::Object(object) => &object.properties,
+        _ => &[],
+    }
+}
+
+/// The level an output's props say, and how many channels its volume has; `None` for props
+/// that do not hold the volume of each channel.
+fn output_level(param: &[u8]) -> Option<(Level, usize)> {
+    let value = deserialize(param)?;
+    let (mut volume, mut muted, mut channels) = (1.0, false, None);
+    for property in properties_of(&value) {
+        match (property.key, &property.value) {
+            (spa::sys::SPA_PROP_volume, Value::Float(v)) => volume = *v,
+            (spa::sys::SPA_PROP_mute, Value::Bool(m)) => muted = *m,
+            (
+                spa::sys::SPA_PROP_channelVolumes,
+                Value::ValueArray(spa::pod::ValueArray::Float(v)),
+            ) if !v.is_empty() => {
+                channels = Some(v.clone());
+            }
+            _ => {}
+        }
+    }
+    let channels = channels?;
+    let left = channels[0];
+    let right = channels.get(1).copied().unwrap_or(left);
+    Some((
+        Level {
+            left: volume * left,
+            right: volume * right,
+            muted,
+        },
+        channels.len(),
+    ))
+}
+
+/// The card's device and the index of an active route.
+fn active_route(param: &[u8]) -> Option<(i32, i32)> {
+    let value = deserialize(param)?;
+    let (mut index, mut device) = (None, None);
+    for property in properties_of(&value) {
+        match (property.key, &property.value) {
+            (spa::sys::SPA_PARAM_ROUTE_index, Value::Int(i)) => index = Some(*i),
+            (spa::sys::SPA_PARAM_ROUTE_device, Value::Int(d)) => device = Some(*d),
+            _ => {}
+        }
+    }
+    Some((device?, index?))
+}
+
+/// The gain of each of `channels`: the left and the right, and the louder of the two on the
+/// others; one channel takes the louder.
+fn channel_volumes(level: Level, channels: usize) -> Vec<f32> {
+    let louder = level.left.max(level.right);
+    match channels {
+        0 | 1 => vec![louder],
+        n => [level.left, level.right]
+            .into_iter()
+            .chain(std::iter::repeat_n(louder, n - 2))
+            .collect(),
+    }
+}
+
+fn property(key: u32, value: Value) -> spa::pod::Property {
+    spa::pod::Property {
+        key,
+        flags: spa::pod::PropertyFlags::empty(),
+        value,
+    }
+}
+
+fn props_value(level: Level, channels: usize) -> Value {
+    props_for(spa::param::ParamType::Props, level, channels)
+}
+
+/// The volume and mute as the props of `param`: a node's own, or those a route carries.
+fn props_for(param: spa::param::ParamType, level: Level, channels: usize) -> Value {
+    Value::Object(spa::pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamProps.as_raw(),
+        id: param.as_raw(),
+        properties: vec![
+            property(
+                spa::sys::SPA_PROP_channelVolumes,
+                Value::ValueArray(spa::pod::ValueArray::Float(channel_volumes(
+                    level, channels,
+                ))),
+            ),
+            property(spa::sys::SPA_PROP_mute, Value::Bool(level.muted)),
+        ],
+    })
+}
+
+/// The level on the card's active route `(device, index)`, saved by the card as the user's.
+fn route_value((device, index): (i32, i32), level: Level, channels: usize) -> Value {
+    Value::Object(spa::pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamRoute.as_raw(),
+        id: spa::param::ParamType::Route.as_raw(),
+        properties: vec![
+            property(spa::sys::SPA_PARAM_ROUTE_index, Value::Int(index)),
+            property(spa::sys::SPA_PARAM_ROUTE_device, Value::Int(device)),
+            property(
+                spa::sys::SPA_PARAM_ROUTE_props,
+                props_for(spa::param::ParamType::Route, level, channels),
+            ),
+            property(spa::sys::SPA_PARAM_ROUTE_save, Value::Bool(true)),
+        ],
+    })
 }
 
 /// Runs the loop until the server has answered everything asked so far.
@@ -797,6 +1211,15 @@ fn follow_control(
     }
 }
 
+fn sink_properties(name: &str, description: &str) -> pw::properties::PropertiesBox {
+    let mut props = properties(name, description);
+    props.insert(*pw::keys::MEDIA_CLASS, "Audio/Sink");
+    // The monitor carries the sound before the sink's volume, whatever the machine's own
+    // defaults say: home's volume is the only one heard.
+    props.insert("monitor.channel-volumes", "false");
+    props
+}
+
 /// The remote's sink: a virtual output whose sound is read from its monitor, with the volume
 /// and mute that the sink itself applies told to `on_level`.
 fn open_sink(
@@ -806,8 +1229,7 @@ fn open_sink(
     on_sound: OnSound,
     on_level: OnLevel,
 ) -> io::Result<Open> {
-    let mut props = properties(name, description);
-    props.insert(*pw::keys::MEDIA_CLASS, "Audio/Sink");
+    let props = sink_properties(name, description);
     // Not autoconnected: the session manager links the apps to it, as to any sink.
     let stream = pw::stream::StreamRc::new(core.clone(), name, props).map_err(pw_error)?;
     let pending = Rc::new(Cell::new(None));
@@ -934,13 +1356,12 @@ fn open_playback(
     name: &str,
     description: &str,
     jitter: Arc<Mutex<Jitter>>,
-    on_level: OnLevel,
 ) -> io::Result<Open> {
     let mut props = properties(name, description);
     props.insert(*pw::keys::MEDIA_TYPE, "Audio");
     props.insert(*pw::keys::MEDIA_CATEGORY, "Playback");
-    // The volume is the remote's to say: WirePlumber would put back one it kept from an
-    // earlier run.
+    // At 100 %, home's output volume the only one heard: WirePlumber would put back a
+    // volume it kept from an earlier run.
     props.insert("state.restore-props", "false");
     playing(
         core,
@@ -948,7 +1369,6 @@ fn open_playback(
         props,
         pw::stream::StreamFlags::AUTOCONNECT,
         jitter,
-        Some(on_level),
     )
 }
 
@@ -962,14 +1382,7 @@ fn open_source(
 ) -> io::Result<Open> {
     let mut props = properties(name, description);
     props.insert(*pw::keys::MEDIA_CLASS, "Audio/Source");
-    playing(
-        core,
-        name,
-        props,
-        pw::stream::StreamFlags::empty(),
-        jitter,
-        None,
-    )
+    playing(core, name, props, pw::stream::StreamFlags::empty(), jitter)
 }
 
 /// PipeWire's echo canceller (WebRTC), loaded here: it captures `mic`, named rather than the
@@ -1070,26 +1483,20 @@ fn recording(
     })
 }
 
-/// A stream that plays what `jitter` holds, with its level told to `on_level`, if any.
+/// A stream that plays what `jitter` holds.
 fn playing(
     core: &pw::core::CoreRc,
     name: &str,
     props: pw::properties::PropertiesBox,
     flags: pw::stream::StreamFlags,
     jitter: Arc<Mutex<Jitter>>,
-    on_level: Option<OnLevel>,
 ) -> io::Result<Open> {
     let stream = pw::stream::StreamRc::new(core.clone(), name, props).map_err(pw_error)?;
     let samples = vec![0.0f32; SAMPLES_PER_CYCLE];
     let rate = Arc::new(Rate::default());
-    let pending = Rc::new(Cell::new(None));
     let listener = stream
-        .add_local_listener_with_user_data((jitter, samples, rate.clone(), Mixer::new()))
-        .control_info({
-            let pending = pending.clone();
-            move |_stream, (.., mixer), id, control| follow_control(mixer, &pending, id, control)
-        })
-        .process(|stream, (jitter, samples, rate, _)| {
+        .add_local_listener_with_user_data((jitter, samples, rate.clone()))
+        .process(|stream, (jitter, samples, rate)| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -1129,7 +1536,7 @@ fn playing(
         _listener: Box::new(listener),
         stream,
         rate: Some((rate, Cell::new(1.0))),
-        level: on_level.map(|on_level| (pending, on_level)),
+        level: None,
         _module: None,
         _monitor: None,
         asked: Asked::default(),
@@ -1428,17 +1835,10 @@ mod tests {
     }
 
     #[test]
-    fn the_level_of_a_playback_reaches_its_stream_on_the_loop_that_holds_it() {
+    fn the_level_of_the_default_output_reaches_its_follower_on_the_loop_that_holds_it() {
         let loops = FakeLoops::default();
         let pipewire = loops.pipewire();
-        let node = pipewire
-            .open_playback(
-                "navette-test",
-                "Test",
-                Arc::new(Mutex::new(Jitter::new(1, 4))),
-                Box::new(|_| {}),
-            )
-            .unwrap();
+        let node = pipewire.follow_output(Box::new(|_| {})).unwrap();
         let level = Level {
             left: 0.125,
             right: 0.125,
@@ -1519,5 +1919,199 @@ mod tests {
         follow(&mut configured, 42, Some(CONFIGURED_SINK), None);
         assert_eq!(configured.sink.as_deref(), Some(SPEAKERS));
         assert_eq!(configured.source.as_deref(), Some(MIC));
+    }
+
+    fn pod(value: Value) -> Vec<u8> {
+        spa::pod::serialize::PodSerializer::serialize(io::Cursor::new(Vec::new()), &value)
+            .unwrap()
+            .0
+            .into_inner()
+    }
+
+    fn props(properties: Vec<(u32, Value)>) -> Value {
+        Value::Object(spa::pod::Object {
+            type_: spa::utils::SpaTypes::ObjectParamProps.as_raw(),
+            id: spa::param::ParamType::Props.as_raw(),
+            properties: properties
+                .into_iter()
+                .map(|(key, value)| spa::pod::Property {
+                    key,
+                    flags: spa::pod::PropertyFlags::empty(),
+                    value,
+                })
+                .collect(),
+        })
+    }
+
+    fn floats(values: &[f32]) -> Value {
+        Value::ValueArray(spa::pod::ValueArray::Float(values.to_vec()))
+    }
+
+    fn property(value: &Value, key: u32) -> Option<&Value> {
+        let Value::Object(object) = value else {
+            return None;
+        };
+        object
+            .properties
+            .iter()
+            .find(|p| p.key == key)
+            .map(|p| &p.value)
+    }
+
+    #[test]
+    fn a_level_asked_for_one_default_output_is_not_set_on_the_next() {
+        // Asked before any output was bound: for whichever comes first.
+        assert!(keeps_asked(None, Some(51)));
+        // The same sink bound again, its card known now.
+        assert!(keeps_asked(Some(51), Some(51)));
+        // The default moved to another sink, or went away.
+        assert!(!keeps_asked(Some(51), Some(62)));
+        assert!(!keeps_asked(Some(51), None));
+    }
+
+    #[test]
+    fn the_output_s_level_is_read_from_its_props() {
+        let param = pod(props(vec![
+            (spa::sys::SPA_PROP_volume, Value::Float(1.0)),
+            (spa::sys::SPA_PROP_mute, Value::Bool(true)),
+            (spa::sys::SPA_PROP_channelVolumes, floats(&[0.343, 0.125])),
+        ]));
+        assert_eq!(
+            output_level(&param),
+            Some((
+                Level {
+                    left: 0.343,
+                    right: 0.125,
+                    muted: true
+                },
+                2
+            ))
+        );
+    }
+
+    #[test]
+    fn props_without_the_volume_of_each_channel_say_nothing() {
+        // A card's node also tells props of its own, its latency say, apart from the volume.
+        let param = pod(props(vec![(
+            spa::sys::SPA_PROP_latencyOffsetNsec,
+            Value::Long(0),
+        )]));
+        assert_eq!(output_level(&param), None);
+    }
+
+    #[test]
+    fn a_mono_output_s_level_is_its_one_channel_on_both_sides() {
+        let param = pod(props(vec![(
+            spa::sys::SPA_PROP_channelVolumes,
+            floats(&[0.5]),
+        )]));
+        assert_eq!(
+            output_level(&param),
+            Some((
+                Level {
+                    left: 0.5,
+                    right: 0.5,
+                    muted: false
+                },
+                1
+            ))
+        );
+    }
+
+    #[test]
+    fn a_level_is_spread_over_every_channel_of_the_output() {
+        let level = Level {
+            left: 0.25,
+            right: 0.5,
+            muted: false,
+        };
+        assert_eq!(channel_volumes(level, 2), [0.25, 0.5]);
+        assert_eq!(channel_volumes(level, 1), [0.5]);
+        assert_eq!(channel_volumes(level, 6), [0.25, 0.5, 0.5, 0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn a_card_s_active_route_is_read_with_its_device() {
+        let route = Value::Object(spa::pod::Object {
+            type_: spa::utils::SpaTypes::ObjectParamRoute.as_raw(),
+            id: spa::param::ParamType::Route.as_raw(),
+            properties: [
+                (spa::sys::SPA_PARAM_ROUTE_index, Value::Int(3)),
+                (spa::sys::SPA_PARAM_ROUTE_device, Value::Int(1)),
+            ]
+            .into_iter()
+            .map(|(key, value)| spa::pod::Property {
+                key,
+                flags: spa::pod::PropertyFlags::empty(),
+                value,
+            })
+            .collect(),
+        });
+        assert_eq!(active_route(&pod(route)), Some((1, 3)));
+    }
+
+    const SEVENTY_MUTED: Level = Level {
+        left: 0.343,
+        right: 0.343,
+        muted: true,
+    };
+
+    #[test]
+    fn a_level_for_a_virtual_output_is_set_on_its_props() {
+        let value = props_value(SEVENTY_MUTED, 2);
+        assert_eq!(
+            property(&value, spa::sys::SPA_PROP_channelVolumes),
+            Some(&floats(&[0.343, 0.343]))
+        );
+        assert_eq!(
+            property(&value, spa::sys::SPA_PROP_mute),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn a_level_for_a_card_s_output_is_set_on_its_route_and_saved() {
+        // The way the session manager's own mixer sets it: the card's route, not the node, or
+        // the card's own volume and the node's would no longer agree.
+        let value = route_value((1, 3), SEVENTY_MUTED, 2);
+        assert_eq!(
+            property(&value, spa::sys::SPA_PARAM_ROUTE_index),
+            Some(&Value::Int(3))
+        );
+        assert_eq!(
+            property(&value, spa::sys::SPA_PARAM_ROUTE_device),
+            Some(&Value::Int(1))
+        );
+        assert_eq!(
+            property(&value, spa::sys::SPA_PARAM_ROUTE_save),
+            Some(&Value::Bool(true))
+        );
+        let props = property(&value, spa::sys::SPA_PARAM_ROUTE_props).unwrap();
+        assert_eq!(
+            property(props, spa::sys::SPA_PROP_channelVolumes),
+            Some(&floats(&[0.343, 0.343]))
+        );
+    }
+
+    #[test]
+    fn the_output_followed_is_the_one_in_use() {
+        let mut configured = Configured::default();
+        follow(&mut configured, 0, Some(CONFIGURED_SINK), Some(SPEAKERS));
+        assert_eq!(configured.output(), Some("invented-speakers".to_owned()));
+        // The session manager's own pick, when the configured one is gone, say.
+        follow(
+            &mut configured,
+            0,
+            Some(SINK_IN_USE),
+            Some("{ \"name\": \"invented-headset\" }"),
+        );
+        assert_eq!(configured.output(), Some("invented-headset".to_owned()));
+    }
+
+    #[test]
+    fn the_sink_s_monitor_carries_the_sound_before_its_volume() {
+        let props = sink_properties("navette-home-speakers", "Home speakers");
+        assert_eq!(props.get("monitor.channel-volumes"), Some("false"));
+        assert_eq!(props.get(*pw::keys::MEDIA_CLASS), Some("Audio/Sink"));
     }
 }

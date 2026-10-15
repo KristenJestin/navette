@@ -7,36 +7,47 @@ mixed with home sound. There is no output toggle: both machines are heard at onc
   (`navette-home-speakers`), and makes it the default output: what the apps play goes into it.
   It is Opus-encoded (48 kHz stereo, 10 ms frames, in-band FEC) and sent home over the link.
   The sound is read from the sink's monitor, at the scale the apps played it. The sink itself
-  keeps the volume and mute, which is the remote's mixer acting on it: the volume keys, `wpctl`
-  and the sliders show the real level (see below).
+  holds a volume and mute, which the remote's mixer moves: it stands in for home's output, so
+  the volume keys, `wpctl` and the sliders show the level heard at home (see below).
   When home stops asking, when the link drops or when the agent stops, the previous default
   output is put back, then the sink is removed. If PipeWire restarts on the remote machine
   meanwhile, the agent sees its sink gone within a quarter of a second, opens it again and
   makes it the default again; what it puts back at the end is still the default from before.
 - **At home**, a playback stream, *Remote machine (Navette)* (`navette-remote-sound`), plays it
-  through a small jitter buffer. PipeWire mixes it like any application. Home's own default
-  output is never changed.
+  through a small jitter buffer, at 100 %. PipeWire mixes it like any application. Home's
+  default output is never changed, only its volume, by the remote's volume keys.
 
 ## The volume
 
-The remote's volume and mute act once, at home. The remote's sink does not scale the sound it
-sends: its volume and mute (the gain of each channel, as the remote's mixer sets it) are told
-to home each time they change, and home applies them to *Remote machine (Navette)*, whose
-volume in the home mixer is therefore the remote's real level. Home's own volume still acts on
-everything, as for any application. The volume is told as a linear gain, so a slider at 50 %
-(0.125) reaches home as 0.125; and the first time a session starts, whatever the sink holds is
-told, so home never starts at a level that is not the remote's.
+There is one volume while a mode runs: home's default output's, where the person listens. The
+remote's sound plays at 100 % at home, and home's output volume applies to it like to
+everything else.
 
-It is one level, both ways. Moving *Remote machine (Navette)* in the home mixer moves the
-remote's sink to the same level, so the remote's mixer always shows what is heard. A level
-applied from the other side is not sent back: each side remembers the level the other side
-holds, and what its own mixer said when that level was applied, until its mixer says
-something else. A new home stream is at 100 % until the remote's level comes, and that is not
-taken for the user moving it. WirePlumber is told not to restore a volume it kept for that
-stream. If both machines move the level within the same few milliseconds, each may end at the
-other's; moving it once more sets both.
+The remote's sink stands in for home's output on the remote machine. As a mode starts, home
+tells it its output's level, and the sink takes it: the remote's mixer shows the volume heard.
+The remote's volume keys keep moving the sink, so the remote desktop shows its own volume
+animation, but the sink does not scale the sound it sends (its monitor carries the sound
+before its volume, `monitor.channel-volumes=false`): its new level is told home and set on
+home's default output, mute included. The other way, when home's own keys or its mixer move
+its default output, the level is told to the remote and set on the sink. The default output
+followed is the one the apps play to; if it changes during the mode, the new one is followed.
+When the mode stops, the sink goes away with the remote's own volume as it was, and home's
+output keeps the level it was last set to, which the user chose. The level is told as a
+linear gain, so a slider at 50 % (0.125) is set as 0.125 on the other side.
 
-The sink and the playback set the level in one change of their controls (the overall volume
+A level applied from the other side is not sent back: each side remembers the level the other
+side holds, what its own mixer said when that level was applied, and the levels applied since its
+mixer last said the other side's, which a held volume key sends faster than a mixer may say
+them, until its mixer says something else. Until the sink has said home's level, nothing it says is told, so the level
+the session manager restored it at is never taken for the user moving it. A remote one beta
+older, which tells its sink's level as the session starts, has it set on home's output the
+same way. If both machines move the level within the same few milliseconds, each may end at
+the other's; moving it once more sets both.
+
+Home's output is set as the session manager's own mixer sets it: on the card's active route
+when it is a card's, so that the card keeps it as the user's, or on the node otherwise.
+
+The sink and home's output set the level in one change of their controls (the overall volume
 at unity, the gain of each channel, the mute), and PipeWire's loop tells it at most every
 50 ms, so a level is never told half set. Each side looks for a change 20 times a second while
 the sound plays, so a held volume key is followed within about 100 ms. A level that cannot be
@@ -44,12 +55,15 @@ sent because the link is full is sent as soon as there is room, never dropped.
 
 Each change is logged, so the two journals say where a level stopped: on the remote,
 `navette: audio: the sink is at 40 %, told home` and `navette: audio: home set the sink to
-40 %`; at home, `navette: audio: the remote set its sound to 40 %` and `navette: audio: the
-remote's sound is at 40 %, told the remote`. The percentage is the one `wpctl` shows. Where
-PipeWire takes it, each side also logs `navette: audio: navette-remote-sound set to 40 %` (or
-`navette-home-speakers` on the remote), or `could not set`. A stream that has just opened does
-not have its volume controls yet, and PipeWire drops a level set before then: the level is
-kept and set as soon as the stream has them (`has no volume yet, 40 % kept for when it has`).
+40 %`; at home, `navette: audio: the remote set the volume to 40 %, on home's output` and
+`navette: audio: home's output is at 40 %, told the remote`. The percentage is the one `wpctl`
+shows. Where PipeWire takes it, each side also logs `navette: audio: <sink name> set to 40 %`
+(home's output, or `navette-home-speakers` on the remote), or `could not set`; home logs
+`navette: audio: following the volume of <sink name>` each time it follows a default output.
+A stream that has just opened does not have its volume controls yet, and PipeWire drops a
+level set before then: the level is kept and set as soon as the stream has them (`has no
+volume yet, 40 % kept for when it has`); a card that has not said its active route yet keeps
+home's level the same way.
 A level home receives for a session it does not play is logged as `ignored`.
 
 ## The jitter buffer
@@ -114,7 +128,7 @@ other services:
 | `48` `AudioStart` | home → remote | the session number |
 | `49` `AudioStop` | home → remote | none |
 | `50` `AudioFrame` | remote → home | the session and a sequence number, and `data_len`: the Opus packet follows as the message's payload (4000 bytes at most, or the link ends) |
-| `54` `AudioVolume` | both ways | the session, the linear gain of the left and of the right channel, and whether it is muted: sent when the remote sink's (or home playback's) volume or mute changes, by the side whose mixer moved it |
+| `54` `AudioVolume` | both ways | the session, the linear gain of the left and of the right channel, and whether it is muted: sent when the remote sink's (or home's default output's) volume or mute changes, by the side whose mixer moved it, and by home as a mode starts |
 
 Home numbers each start: a frame of an earlier session, still on its way when home stopped,
 is dropped rather than taken for a late frame of the new one.
@@ -184,18 +198,18 @@ them as concealed or lost.
    Also run `journalctl --user -u navette-agent | grep 'frames dropped'` on the laptop.
    Report the last line, the laptop's lines, and how many crackles were heard.
 
-9. The volume. On the laptop, use the volume keys (or `wpctl set-volume @DEFAULT_SINK@ 40%`)
-   with a video playing: what is heard at home goes down, once (not twice as far), and the
-   laptop's mixer (`wpctl status`, the bar) shows the level you set. At home, `wpctl status`
-   shows *Remote machine (Navette)* at the same level. Mute on the laptop (the mute key): the
-   video falls silent at home and the home stream shows `[MUTED]`; unmute, and it comes back.
-   Home's own volume keys still turn everything down, and the laptop's level does not move.
-   Then the other way: at home, move *Remote machine (Navette)* in the mixer (or
-   `wpctl set-volume <its id> 30%`): the laptop's mixer and bar show 30 %; mute it at home,
-   and the laptop shows muted. If a level does not follow, `journalctl --user -u
-   navette-agent | grep 'navette: audio: \(the sink\|home set\)'` on the laptop and the
-   `navette: audio: \(the remote\|navette-remote-sound\)` lines of `navette serve` say on
-   which side it stopped.
+9. The volume. Note home's volume (say 70 %) and start a mode: the laptop's mixer
+   (`wpctl status`, the bar) shows 70 % on *Home speakers (Navette)*. With a video playing on
+   the laptop and the pointer over a reserved monitor, use the volume keys: the laptop's
+   desktop shows its own volume animation, what is heard at home goes down once, and home's
+   own mixer shows the same level as the laptop's. At home, *Remote machine (Navette)* stays
+   at 100 %. Mute on the laptop (the mute key): home's output is muted; unmute, and it comes
+   back. Then the other way: at home, use home's own volume keys (pointer over a home monitor)
+   or its mixer: the laptop's mixer and bar follow; mute at home, and the laptop shows muted.
+   Stop the mode: home keeps the level last set, the laptop's own output is at its own volume
+   from before. If a level does not follow, `journalctl --user -u navette-agent | grep
+   'navette: audio: \(the sink\|home set\)'` on the laptop and the `navette: audio:` lines of
+   `navette serve` say on which side it stopped.
 
 On loopback, between two private PipeWire instances with a 1024-sample quantum, the gap was
 26 to 41 ms.
