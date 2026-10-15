@@ -453,7 +453,10 @@ impl<C: Compositor> Bridge<C> {
                 None => files::Copied::default(),
             };
             if selection_gen.get() != generation {
-                return; // superseded while we were listing
+                log(format_args!(
+                    "a copy here was replaced before it was sent, so only the newer one is"
+                ));
+                return;
             }
             let serial = kept.serial_of(&copied, generation as u32);
             // Copied again: what the user stopped of it may cross again.
@@ -609,8 +612,8 @@ fn standard(mime_type: &str) -> bool {
 }
 
 /// The application that pasted the peer's offer `serial` stopped waiting before its files were
-/// in: a file manager reads the clipboard when it changes, and gives up after a few seconds
-/// (two for Omarchy's), which a paste over the LAN outlasts. The offer goes on the clipboard
+/// in: a file manager reads the clipboard when it changes, and gives up after a few seconds,
+/// which a paste over the LAN outlasts. The offer goes on the clipboard
 /// again, so the file manager reads it once more and gets the files at once. Only once, and
 /// only while it is still the selection here: a copy made here since is never replaced.
 fn offer_again(remote: &RefCell<RemoteOffer>, serial: u32, compositor: &impl Compositor) {
@@ -698,6 +701,9 @@ async fn local_files_from_pipe(mut rx: pipe::Receiver) -> files::Copied {
     }
     let paths = parse_uri_list(&String::from_utf8_lossy(&body));
     if paths.is_empty() {
+        log(format_args!(
+            "the copied file list names no local file, so no file is sent"
+        ));
         return files::Copied::default();
     }
     match tokio::task::spawn_blocking(move || files::list(&paths)).await {

@@ -79,11 +79,11 @@ refuses a request against an offer that a newer copy has replaced.
   from one link to the next; the machine that fetched that copy answers with the files it
   received, while they are all still in the `Navette` folder. A file changed since, or one
   removed from the folder, is fetched again.
-- **A file manager that stops waiting.** A file manager reads the clipboard as soon as it
-  changes, and gives up when the answer is slow: Omarchy's, flea, waits two seconds for each
-  of the two file-list types, so about four seconds in all, which a large paste over the LAN
-  outlasts (with a mode running, the picture leaves the clipboard a few megabytes a second).
-  It then holds a copy with no file in it, and its paste does nothing. When the files are in and the application
+- **A file manager that stops waiting.** A file manager that reads every new selection at
+  once gives up when the answer is slow: one waits two seconds for each of the two file-list
+  types, so about four seconds in all, which a large paste over the LAN outlasts (with a mode
+  running, the picture leaves the clipboard a few megabytes a second). It then holds a copy
+  with no file in it, and its paste does nothing. When the files are in and the application
   that asked for them had stopped waiting, the copy is put on the clipboard again, once: the
   file manager reads it again and gets them at once. Never over a copy made on this machine
   since.
@@ -108,7 +108,10 @@ refuses a request against an offer that a newer copy has replaced.
 - **The journal** follows each copy by its offer number, one line per step and on both
   machines: the offer sent and received with its file count, each paste asked and as what
   type, the files fetched, pasted (with how long it took) or failed with why, the files
-  served, and each request refused with why ("this machine copied again"). It never holds
+  served, and each request refused with why ("this machine copied again"). Each copy made on
+  a machine gets a line there: its offer sent, or why it is not (a newer copy replaced it
+  first), and a file list that names no local file says so. A copy that leaves no line never
+  reached the clipboard Navette watches. It never holds
   what was copied: a paste of text or a picture that fails says only "a paste failed: ...",
   a paste of files names the file it failed on.
 
