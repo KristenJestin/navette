@@ -23,7 +23,8 @@ background `#14120f`.
 `png/`: the icon at 128, 256, 512 and 1024 pixels (`icon-*.png`), the full icon at 512, the
 favicon at 16 and 32, and `social-preview.png` (1280 by 640). `tools/brand.sh` needs
 `rsvg-convert` (librsvg) and draws the text with the fonts of `fonts/` only, through a fontconfig
-made for the run.
+made for the run. The name in the banner is drawn dot by dot, in rectangles, with the 5 by 8 font
+of the corner (`src/corner.rs`), as the app draws its tags.
 
 `png/social-preview.png` is the social preview of the repository: it is uploaded by hand in the
 repository's settings on GitHub (Settings, General, Social preview), as GitHub offers no other way.
