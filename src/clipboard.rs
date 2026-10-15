@@ -699,7 +699,11 @@ impl<C: Compositor> Bridge<C> {
                 total,
                 content,
             } => self.fetch_read(serial, index, total, content),
-            vfs::Asked::Gone { serial } => {
+            // Its last bytes are in: its fetches end on their own, at the peer's end.
+            vfs::Asked::Gone {
+                unfinished: false, ..
+            } => {}
+            vfs::Asked::Gone { serial, .. } => {
                 if self.progress.stop(Crossing::Read(serial)) {
                     log(format_args!(
                         "offer {serial}: replaced, and no file of it is open: its fetches end"

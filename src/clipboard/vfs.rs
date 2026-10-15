@@ -45,8 +45,9 @@ pub enum Asked {
         content: Arc<Content>,
     },
     /// The copy `serial` went: a newer one replaced it and none of its files is open. Its
-    /// fetches stop.
-    Gone { serial: u32 },
+    /// fetches stop when one of them had not got all its bytes yet: a reader that closed its
+    /// file early wants no more of it.
+    Gone { serial: u32, unfinished: bool },
 }
 
 /// What a name in the folder is.
@@ -110,6 +111,12 @@ impl Content {
         }
         drop(have);
         self.changed.notify_all();
+    }
+
+    /// Whether all its bytes are here, or its fetch is over.
+    fn complete(&self) -> bool {
+        let have = self.have.lock().unwrap();
+        have.got >= self.size || have.end.is_some()
     }
 
     /// Whether the bytes up to `end` are here; `None` while they are still to come.
@@ -274,8 +281,12 @@ impl Folder {
             .get(&serial)
             .is_some_and(|o| !o.current && o.open == 0)
         {
+            let unfinished = tree.offers[&serial]
+                .contents
+                .values()
+                .any(|content| !content.complete());
             tree.remove(serial);
-            let _ = self.asked.send(Asked::Gone { serial });
+            let _ = self.asked.send(Asked::Gone { serial, unfinished });
         }
     }
 
@@ -934,10 +945,64 @@ mod tests {
         assert!(asked.try_recv().is_err());
         folder.release(a);
         assert_eq!(at(&folder, "7").err(), Some(libc::ENOENT));
-        assert!(matches!(asked.try_recv(), Ok(Asked::Gone { serial: 7 })));
+        assert!(matches!(
+            asked.try_recv(),
+            Ok(Asked::Gone {
+                serial: 7,
+                unfinished: false
+            })
+        ));
         // A copy replaced with nothing open goes at once.
         folder.offer(9, &[]);
         assert_eq!(at(&folder, "8").err(), Some(libc::ENOENT));
+    }
+
+    /// A reader of a replaced copy that closes its file: whether its fetch must stop.
+    fn closed_after(written: &[u8]) -> Asked {
+        let tmp = tempfile::tempdir().unwrap();
+        let (folder, mut asked) = folder(tmp.path());
+        folder.offer(7, &[file("a.txt", 4)]);
+        let a = at(&folder, "7/a.txt").unwrap().ino;
+        folder.open(a).unwrap();
+        folder.read(a, 0, 4, |_| {});
+        let Ok(Asked::Fetch { content, .. }) = asked.try_recv() else {
+            panic!("a fetch");
+        };
+        content.write_at(written, 0).unwrap();
+        folder.offer(8, &[]);
+        folder.release(a);
+        asked.try_recv().unwrap()
+    }
+
+    #[test]
+    fn a_replaced_copy_closed_once_its_bytes_are_in_lets_its_fetch_end() {
+        // The peer's end of the transfer is still on its way.
+        let gone = closed_after(b"abcd");
+        assert!(
+            matches!(
+                gone,
+                Asked::Gone {
+                    unfinished: false,
+                    ..
+                }
+            ),
+            "{gone:?}"
+        );
+    }
+
+    #[test]
+    fn a_replaced_copy_closed_in_the_middle_of_a_file_stops_its_fetch() {
+        let gone = closed_after(b"ab");
+        assert!(
+            matches!(
+                gone,
+                Asked::Gone {
+                    unfinished: true,
+                    ..
+                }
+            ),
+            "{gone:?}"
+        );
     }
 
     #[test]
