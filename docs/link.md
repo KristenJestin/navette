@@ -93,9 +93,10 @@ cross only when an application reads them, through a virtual folder (below).
     unmounted at the next start.
   - It needs nothing at build time (no libfuse: the `fuser` crate mounts through
     `fusermount3`), and at run time `/dev/fuse` and `fusermount3` (setuid, from `fuse3`), as
-    the user, with no root and no change to the system. Where it cannot be mounted (no FUSE,
-    or no `$XDG_RUNTIME_DIR`), the journal says so once, and a paste of files fetches them all
-    first, as below.
+    the user, with no root and no change to the system; a setuid helper is what
+    `NoNewPrivileges=` forbids, so the agent's unit does not set it. Where it cannot be
+    mounted (no FUSE, or no `$XDG_RUNTIME_DIR`), the journal says so once, and a paste of
+    files fetches them all first, as below.
 - **Pasted files**, without the virtual folder, go in a private temporary folder, not in the
   Downloads: `navette/clipboard` in `$XDG_RUNTIME_DIR` (per user, mode 0700, cleared at
   logout), else `navette-clipboard-<uid>`
