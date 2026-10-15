@@ -107,7 +107,7 @@ navette mode stop              # it plays on the remote machine again
 ```
 
 Without a mode, nothing of the remote machine plays at home. The agent on the remote machine
-needs nothing more: it follows home.
+needs nothing more: it follows home, and sends no sound outside a mode even if asked.
 
 The default output is the one `wpctl set-default` writes (`default.configured.audio.sink` in
 PipeWire's `default` metadata), so WirePlumber moves the playing apps to the Navette sink and
