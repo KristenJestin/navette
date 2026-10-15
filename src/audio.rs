@@ -739,10 +739,15 @@ impl<G: Graph> Capture<G> {
             self.failures.clone(),
             self.dropped.clone(),
         )?;
+        // What the new sink opened at is not the user's, nor what the old one last said: it
+        // starts as a sink does, waiting for home's level.
+        let peer = self.level.peer;
+        self.level = Shared {
+            peer,
+            ..Shared::following()
+        };
         self.sink.reopen(on_sound, self.level.latest.writer())?;
-        if let Some(level) = self.level.peer {
-            // What the new sink opened at is not the user's.
-            self.level.waiting = true;
+        if let Some(level) = peer {
             self.received_level(self.session, level);
         }
         Ok(())
@@ -1745,6 +1750,22 @@ mod tests {
         graph.restart();
         capture.recover().unwrap();
         assert_eq!(graph.state().levels, [(SINK.to_owned(), SEVENTY)]);
+        capture.tell_level();
+        assert_eq!(volumes(&mut orders), []);
+    }
+
+    #[test]
+    fn the_level_the_sink_reopened_at_after_pipewire_restarts_does_not_move_home() {
+        let graph = FakeGraph::with_default("laptop-speakers");
+        let (mut capture, mut orders, _tmp) = capture_with_room(&graph, QUEUE);
+        graph.restart();
+        // PipeWire says the new sink's levels a little later: the one it opened at, then home's.
+        graph.state().late_echo = true;
+        capture.recover().unwrap();
+        capture.tell_level();
+        graph.mixer_sets(SINK, Level::UNITY);
+        capture.tell_level();
+        graph.mixer_sets(SINK, SEVENTY);
         capture.tell_level();
         assert_eq!(volumes(&mut orders), []);
     }
