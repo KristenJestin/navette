@@ -778,6 +778,10 @@ impl<C: Compositor> Bridge<C> {
                         "offer {serial}: file {index}: got {got} of {size} bytes"
                     ));
                 }
+                // Its reader closed it before its end: the peer is told to stop.
+                Err(_) if content.over() => log(format_args!(
+                    "offer {serial}: file {index} closed before its end, its fetch stopped"
+                )),
                 Err(e) => {
                     content.end(Err(libc::EIO));
                     log(format_args!("offer {serial}: file {index} not read: {e}"));
@@ -1381,6 +1385,12 @@ mod tests {
         /// Whether the last bars shown are none.
         fn no_bar(&self) -> bool {
             self.bars().last().is_some_and(Vec::is_empty)
+        }
+
+        /// How many notifications shown so far have a summary that starts with `start`.
+        fn times_told(&self, start: &str) -> usize {
+            let shown = self.notes.shown();
+            shown.iter().filter(|(s, _)| s.starts_with(start)).count()
         }
 
         /// Waits for a notification whose summary starts with `start`.
@@ -4190,6 +4200,61 @@ mod tests {
                         home.offered(2).await;
                     }
                 }
+            })
+            .await;
+    }
+
+    /// An application opens `path` of `folder`, reads its first `size` bytes, and closes it,
+    /// as a file manager that looks at what a file holds.
+    async fn sniff(folder: Arc<vfs::Folder>, path: std::path::PathBuf, size: u32) -> Vec<u8> {
+        let rel = path.strip_prefix(folder.path()).unwrap();
+        let ino = rel
+            .iter()
+            .fold(1, |ino, name| folder.lookup(ino, name).unwrap().ino);
+        folder.open(ino).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        folder.read(ino, 0, size, move |read| {
+            let _ = tx.send(read);
+        });
+        let read = rx.await.unwrap().unwrap();
+        folder.release(ino);
+        read
+    }
+
+    #[tokio::test]
+    async fn a_file_closed_before_its_bytes_are_in_stops_its_fetch_and_drops_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = bytes_of(4 * CHUNK, 3);
+        LocalSet::new()
+            .run_until(async {
+                let (home, mut remote, mount) = alone_reading(Side::Client, tmp.path());
+                let size = content.len() as u64;
+                let path = offer_a_file(&home, &mut remote, 6, "big.bin", size, 1).await;
+                let folder = mount.folder().await;
+                let sniffed = tokio::task::spawn_local(sniff(folder.clone(), path.clone(), 4096));
+                let (id, _) = next_request(&mut remote).await;
+                send_data(&mut remote, id, 0, &content[..CHUNK], false).await;
+                assert_eq!(within("the sniff", sniffed).await.unwrap(), content[..4096]);
+                // The next chunk finds nobody reading.
+                send_data(
+                    &mut remote,
+                    id,
+                    CHUNK as u64,
+                    &content[CHUNK..2 * CHUNK],
+                    false,
+                )
+                .await;
+                assert_eq!(
+                    next_not_ack(&mut remote).await,
+                    LinkMsg::ClipboardAbort { id },
+                    "the remote is told to stop serving it"
+                );
+                assert_eq!(home.seen.times_told("Paste failed"), 0);
+                // A later read starts it again.
+                let read = tokio::task::spawn_local(read_file(folder, path));
+                let (again, _) = next_request(&mut remote).await;
+                send_rest(&mut remote, again, &content, 0).await;
+                assert!(within("the read", read).await.unwrap().unwrap() == content);
             })
             .await;
     }

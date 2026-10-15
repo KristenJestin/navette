@@ -95,8 +95,14 @@ impl Content {
     }
 
     /// Writes `bytes` at `offset`, the next ones fetched; the readers waiting for them go on.
-    /// Blocks.
+    /// Fails once the fetch is over: its reader closed it, or the user stopped it. Blocks.
     pub fn write_at(&self, bytes: &[u8], offset: u64) -> io::Result<()> {
+        if self.over() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "nobody reads it",
+            ));
+        }
         self.file.write_all_at(bytes, offset)?;
         self.have.lock().unwrap().got = offset + bytes.len() as u64;
         self.changed.notify_all();
@@ -116,6 +122,11 @@ impl Content {
         }
         drop(have);
         self.changed.notify_all();
+    }
+
+    /// Whether its fetch is over, whole or not.
+    pub fn over(&self) -> bool {
+        self.have.lock().unwrap().end.is_some()
     }
 
     /// Whether all its bytes are here, or its fetch is over.
@@ -217,6 +228,8 @@ struct Offer {
     current: bool,
     /// Its files and folders open now.
     open: usize,
+    /// How many times each of its files is open now, by index.
+    opened: HashMap<u32, usize>,
     /// When one of them was last opened or closed.
     touched: Instant,
     /// One of its files was read: its transfer started.
@@ -337,11 +350,12 @@ impl Folder {
             return Err(libc::EIO);
         }
         let node = tree.node(ino)?;
-        let (Kind::File { .. }, Some(serial)) = (&node.kind, node.serial) else {
+        let (&Kind::File { index, .. }, Some(serial)) = (&node.kind, node.serial) else {
             return Err(libc::EISDIR);
         };
         let offer = tree.offers.get_mut(&serial).ok_or(libc::ENOENT)?;
         offer.open += 1;
+        *offer.opened.entry(index).or_default() += 1;
         offer.touched = Instant::now();
         Ok(())
     }
@@ -360,16 +374,38 @@ impl Folder {
         Ok(())
     }
 
-    /// An application closed the file or folder `ino`.
+    /// An application closed the file or folder `ino`. A file closed by its last reader
+    /// before all its bytes came stops its fetch and drops what came: a file manager that
+    /// looks at the first bytes of each file costs a few chunks, not the files. A later read
+    /// fetches it again.
     pub fn release(&self, ino: u64) {
         let mut tree = self.tree.lock().unwrap();
-        let Some(serial) = tree.nodes.get(&ino).and_then(|n| n.serial) else {
+        let Some(node) = tree.nodes.get(&ino) else {
             return;
+        };
+        let Some(serial) = node.serial else { return };
+        let index = match node.kind {
+            Kind::File { index, .. } => Some(index),
+            Kind::Dir(_) => None,
         };
         let now = Instant::now();
         if let Some(offer) = tree.offers.get_mut(&serial) {
             offer.open = offer.open.saturating_sub(1);
             offer.touched = now;
+            if let Some(index) = index
+                && let Some(opened) = offer.opened.get_mut(&index)
+            {
+                *opened -= 1;
+                if *opened == 0 {
+                    offer.opened.remove(&index);
+                    if let Some(content) = offer.contents.get(&index)
+                        && !content.complete()
+                    {
+                        content.end(Err(libc::ECANCELED));
+                        offer.contents.remove(&index);
+                    }
+                }
+            }
         }
         self.prune(&mut tree, serial, now);
     }
@@ -570,6 +606,7 @@ impl Tree {
             inodes: (first..self.next).collect(),
             current: true,
             open: 0,
+            opened: HashMap::new(),
             touched: Instant::now(),
             read: false,
             stopped: false,
