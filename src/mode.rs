@@ -4,7 +4,8 @@
 //! remote for one output per monitor, in home's left-to-right order, and shows each stream on
 //! its surface. `navette mode stop`, or the link dropping, gives the monitors back; so does any
 //! one surface going away. Home monitors are never moved or reconfigured: the changes to the
-//! home desk are the monitors' workspaces, moved whole to another home monitor and back (#48),
+//! home desk are the monitors' workspaces, moved whole to another home monitor and back (#48,
+//! with no slide at the first visit, #118),
 //! a window rule per monitor that opens home windows on that home monitor rather than hidden
 //! under a surface (#2) and, with a mic, the hotkey that switches it, made
 //! through the desk recorder so they are undone on stop, on a dropped link and after a crash,
@@ -2270,6 +2271,77 @@ mod tests {
         drop(remote);
         until(|| desk.covered.lock().unwrap().is_empty()).await;
         until(|| placement(&desk) == before).await;
+    }
+
+    #[tokio::test]
+    async fn the_workspace_a_reserved_monitor_showed_comes_back_without_a_slide_from_home() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let _remote = started(&desk).await;
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(desk.hypr.shown("DP-1"), 11);
+        assert_eq!(desk.hypr.stray_animations(), []);
+        desk.hypr.switch_to("DP-1", 12);
+        desk.hypr.switch_to("DP-1", 11);
+        assert_eq!(desk.hypr.stray_animations(), []);
+    }
+
+    #[tokio::test]
+    async fn a_workspace_visited_at_home_during_the_mode_comes_back_without_a_slide_from_home() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let _remote = started(&desk).await;
+        // Home goes to two of the moved workspaces, which lays their windows out on DP-3.
+        desk.hypr.switch_to("DP-3", 12);
+        desk.hypr.switch_to("DP-3", 13);
+        desk.hypr.switch_to("DP-3", 1);
+        answer(ask(&desk, false).await).await.unwrap();
+        for id in [12, 13, 11] {
+            desk.hypr.switch_to("DP-1", id);
+        }
+        assert_eq!(desk.hypr.stray_animations(), []);
+    }
+
+    #[tokio::test]
+    async fn a_stop_gives_the_animations_back_as_the_user_had_them() {
+        for on in [true, false] {
+            let desk = per_monitor_desk("monitor = DP-1\n");
+            desk.hypr.set_animations(on);
+            let _remote = started(&desk).await;
+            desk.hypr.switch_to("DP-3", 12);
+            answer(ask(&desk, false).await).await.unwrap();
+            assert_eq!(desk.hypr.animations_on(), on);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_workspaces_a_crashed_mode_left_come_back_without_a_slide_at_the_next_start() {
+        let desk = per_monitor_desk("monitor = DP-1\n");
+        let crashed = Home {
+            config_dir: desk._config.path().to_path_buf(),
+            hypr: desk.hypr.clone(),
+            screens: Arc::new(FakeScreens::default()),
+            gpu: Arc::new(HomeGpu::new(None)),
+            desk_record: desk._config.path().join("desk"),
+            mic: None,
+            sound: None,
+            board: Arc::default(),
+            notifier: Arc::new(crate::notify::Fake::default()),
+        };
+        open_desk(
+            &crashed,
+            &["DP-1".to_string()],
+            Some("DP-3".to_string()),
+            "SUPER + CTRL + M",
+        )
+        .await
+        .unwrap()
+        .crash();
+        desk.hypr.switch_to("DP-3", 12);
+        let _remote = started(&desk).await;
+        answer(ask(&desk, false).await).await.unwrap();
+        for id in [12, 13, 11] {
+            desk.hypr.switch_to("DP-1", id);
+        }
+        assert_eq!(desk.hypr.stray_animations(), []);
     }
 
     #[tokio::test]

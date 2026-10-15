@@ -20,7 +20,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::hypr::{Event, HyprError, Hyprland, lua_string, show_workspace, workspace_selector};
+use crate::hypr::{
+    Event, HyprError, Hyprland, lua_string, show_workspace, show_workspace_by, without_animations,
+    workspace_selector,
+};
 
 /// One change to the desk, and how to undo it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +67,9 @@ impl Change {
 
     /// Moves the workspace `id`, named `name`, windows and all, from `monitor` to `home`.
     /// Undoing it moves it back, and when `monitor` showed it (`shown`), shows it there again.
+    /// With animations off, in one chunk, it lays the windows out on `monitor` at once, so that
+    /// the first time the user goes to the workspace nothing slides in from the other monitor
+    /// (#118): a workspace not shown is shown for that, then `monitor` shows what it showed.
     /// The moves do nothing once the workspace is gone (its last window closed), so neither a
     /// reapply nor the undo fails on it, and neither does showing it.
     pub fn move_workspace(id: i64, name: &str, monitor: &str, home: &str, shown: bool) -> Self {
@@ -75,13 +81,24 @@ impl Change {
                 lua_string(monitor)
             )
         };
+        // Hyprland lays a workspace out when it is shown, and the windows of one laid out on
+        // another monitor then slide in from there (#118): each one put back is shown, with
+        // animations off, in the one chunk, and the monitor shows again what it showed.
+        let undo = if shown {
+            format!("{} {}", to(monitor), show_workspace(monitor, id))
+        } else {
+            let m = lua_string(monitor);
+            format!(
+                "local keep = hl.get_monitor({m}) and hl.get_monitor({m}).active_workspace.id \
+                 {} {} if keep then {} end",
+                to(monitor),
+                show_workspace(monitor, id),
+                show_workspace_by(monitor, "keep")
+            )
+        };
         Self {
             apply: to(home),
-            undo: if shown {
-                format!("{} {}", to(monitor), show_workspace(monitor, id))
-            } else {
-                to(monitor)
-            },
+            undo: without_animations(&undo),
         }
     }
 
