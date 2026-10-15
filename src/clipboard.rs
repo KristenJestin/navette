@@ -47,9 +47,7 @@ use gliff_proto::clipboard::{
 };
 use gliff_proto::{ClipboardFile, ClipboardItem, ClipboardMsg};
 use gliff_transport::clipboard::files::{LocalFiles, write_body};
-use gliff_transport::clipboard::progress::{
-    Jobs, Meter, Progress, State, describe_files, describe_mime,
-};
+use gliff_transport::clipboard::progress::{Jobs, Meter, Progress, State, describe_mime};
 use gliff_transport::clipboard::{Event, ReadSource, Side, TransferError, Transfers, WriteSink};
 use hypr_input::{Clipboard, ClipboardEvent, Target};
 use tokio::io::AsyncReadExt;
@@ -539,8 +537,7 @@ impl<C: Compositor> Bridge<C> {
                 return;
             }
             // Validated: gliff's sum of the sizes cannot overflow.
-            let (label, total) = describe_files(&files);
-            let total = total.unwrap_or(0);
+            let total = files::total(&files).unwrap_or(0);
             let paste = Crossing::Paste(self.pastes.get().wrapping_add(1));
             self.pastes.set(self.pastes.get().wrapping_add(1));
             self.remote.borrow_mut().pastes.push(paste);
@@ -569,6 +566,8 @@ impl<C: Compositor> Bridge<C> {
                 progress.end(paste, its_run.get());
                 match result {
                     Ok(paths) => {
+                        // No notification: a file manager fetches the files of a copy as
+                        // soon as it is offered, reading it as a paste does.
                         if fetched {
                             *kept.fetched.borrow_mut() =
                                 Some((serial, (files.clone(), paths.clone())));
@@ -577,14 +576,6 @@ impl<C: Compositor> Bridge<C> {
                                 files.len(),
                                 started.elapsed().as_millis()
                             ));
-                            notifier.show(
-                                "Files pasted",
-                                &format!(
-                                    "{label}, {}, in {}",
-                                    human_bytes(total),
-                                    inbox.dir.display()
-                                ),
-                            );
                         }
                         let body = files_body(&mime_type, paths);
                         // An application that closed its end early is not the paste's failure.
@@ -1714,7 +1705,6 @@ mod tests {
                 );
                 let again = String::from_utf8(remote.paste(URI_LIST).await).unwrap();
                 assert_eq!(parse_uri_list(&again), first);
-                assert_eq!(remote.seen.notes.summaries(), ["Files pasted"]);
             })
             .await;
     }
@@ -2608,7 +2598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_paste_of_files_says_when_they_are_in() {
+    async fn files_fetched_with_no_paste_behind_them_send_no_files_pasted_notification() {
         let tmp = tempfile::tempdir().unwrap();
         let copied = tmp.path().join("report.bin");
         std::fs::write(&copied, b"figures").unwrap();
@@ -2616,12 +2606,35 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let (home, remote) = desk(tmp.path());
-                paste_on_the_remote(&home, &remote, &list).await;
-                let (_, body) = remote.seen.told("Files pasted").await;
-                assert!(body.starts_with("report.bin, 7 B, in "), "{body}");
-                // A second paste of the same copy points at the same files, and says nothing.
+                remote.copy(&[(URI_LIST, list.as_bytes())]);
+                home.offered(1).await;
+                // A file manager reads the copy's files as soon as it is offered, on its own.
+                home.paste(URI_LIST).await;
+                the_bar_went(&home.seen, 7).await;
+                assert_eq!(home.seen.notes.summaries(), Vec::<String>::new());
+            })
+            .await;
+    }
+
+    /// A paste reads the copy as the fetch of a file manager does: nothing tells them apart,
+    /// so a paste says nothing either; the bar shows the files crossing.
+    #[tokio::test]
+    async fn a_paste_that_fetches_files_sends_no_files_pasted_notification_either() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("report.bin");
+        std::fs::write(&copied, b"figures").unwrap();
+        let list = uri_list_of(std::slice::from_ref(&copied));
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                let pasted = paste_on_the_remote(&home, &remote, &list).await;
+                assert_eq!(
+                    parse_uri_list(&pasted),
+                    [tmp.path().join("remote/report.bin")]
+                );
+                the_bar_went(&remote.seen, 7).await;
                 remote.paste(URI_LIST).await;
-                assert_eq!(remote.seen.notes.summaries(), ["Files pasted"]);
+                assert_eq!(remote.seen.notes.summaries(), Vec::<String>::new());
             })
             .await;
     }
@@ -2638,7 +2651,7 @@ mod tests {
                 remote.copy(&[(URI_LIST, list.as_bytes())]);
                 let first = home.offered(1).await;
                 home.paste_and_give_up(URI_LIST);
-                home.seen.told("Files pasted").await;
+                the_bar_went(&home.seen, 7).await;
                 // The clipboard changes again, so a file manager that watches it reads it again,
                 // and this time gets the files at once.
                 assert_eq!(home.offered(2).await, first);
@@ -2665,7 +2678,7 @@ mod tests {
                 home.offered(1).await;
                 home.paste_and_give_up(URI_LIST);
                 home.copy(&[(TEXT, b"a note")]);
-                home.seen.told("Files pasted").await;
+                the_bar_went(&home.seen, 7).await;
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 assert_eq!(home.clipboard.offered.lock().unwrap().len(), 1);
             })
