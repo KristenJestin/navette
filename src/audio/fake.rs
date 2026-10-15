@@ -12,7 +12,7 @@ pub struct State {
     pub default: Option<DefaultNode>,
     pub default_source: Option<DefaultNode>,
     pub sinks: Vec<(String, Arc<Mutex<OnSound>>)>,
-    /// Where the mixer of each sink and playback tells its level.
+    /// Where the mixer of each sink, and of the default output followed, tells its level.
     pub mixers: Vec<(String, Arc<Mutex<OnLevel>>)>,
     /// The levels set on the nodes, in order, by the node's name.
     pub levels: Vec<(String, Level)>,
@@ -20,6 +20,8 @@ pub struct State {
     /// tells it a little later.
     pub late_echo: bool,
     pub playbacks: Vec<(String, Arc<Mutex<Jitter>>)>,
+    /// The default output's level, told as soon as it is followed.
+    pub output: Option<Level>,
     pub sources: Vec<(String, Arc<Mutex<Jitter>>)>,
     /// The echo-cancelled mics open, each with where its sound goes.
     pub mics: Vec<(String, Arc<Mutex<OnSound>>)>,
@@ -52,7 +54,10 @@ impl FakeGraph {
     /// The mixer of the node `name` sets its level, as PipeWire tells the node's owner.
     pub fn mixer_sets(&self, name: &str, level: Level) {
         let on_level = {
-            let state = self.state();
+            let mut state = self.state();
+            if name == OUTPUT {
+                state.output = Some(level);
+            }
             let (_, on_level) = state
                 .mixers
                 .iter()
@@ -75,6 +80,9 @@ impl FakeGraph {
         state.log.push("restart".to_owned());
     }
 }
+
+/// The name the default output's follower goes by in `mixers`, `levels` and `log`.
+pub const OUTPUT: &str = "@default-output";
 
 pub struct FakeNode {
     graph: FakeGraph,
@@ -159,13 +167,9 @@ impl Graph for FakeGraph {
         name: &str,
         _description: &str,
         jitter: Arc<Mutex<Jitter>>,
-        on_level: OnLevel,
     ) -> io::Result<FakeNode> {
         let mut state = self.state();
         state.playbacks.push((name.to_owned(), jitter));
-        state
-            .mixers
-            .push((name.to_owned(), Arc::new(Mutex::new(on_level))));
         state.log.push(format!("playback {name}"));
         Ok(FakeNode {
             graph: self.clone(),
@@ -174,8 +178,27 @@ impl Graph for FakeGraph {
         })
     }
 
+    fn follow_output(&self, mut on_level: OnLevel) -> io::Result<FakeNode> {
+        let mut state = self.state();
+        if let Some(level) = state.output {
+            on_level(level);
+        }
+        state
+            .mixers
+            .push((OUTPUT.to_owned(), Arc::new(Mutex::new(on_level))));
+        state.log.push("output".to_owned());
+        Ok(FakeNode {
+            graph: self.clone(),
+            name: OUTPUT.to_owned(),
+            restarts: state.restarts,
+        })
+    }
+
     fn set_level(&self, node: &FakeNode, level: Level) -> io::Result<()> {
         let mut state = self.state();
+        if node.name == OUTPUT {
+            state.output = Some(level);
+        }
         state.levels.push((node.name.clone(), level));
         state.log.push(format!(
             "level {} {} {} {}",

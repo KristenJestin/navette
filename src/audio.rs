@@ -4,9 +4,11 @@
 //! home asks for the sound; what the apps play into it is Opus-encoded and sent home, and the
 //! previous default comes back when home stops, when the link drops or when the agent ends. At
 //! home, a playback stream that PipeWire mixes like any other application plays it, through a
-//! small jitter buffer. The remote's volume and mute act once, there: the remote's sink sends
-//! its sound at full scale. The sink and the playback share one level: when either machine's
-//! mixer moves its side, the other side is told and follows, and does not tell it back.
+//! small jitter buffer, at 100 %. There is one volume, home's default output's, where the person
+//! listens: the remote's sink sends its sound at full scale, and stands in for home's output on
+//! the remote, so that the remote's own volume keys move it and its desktop shows it. The sink
+//! takes home's level as the mode starts; then when either machine's mixer moves its side, the
+//! other side is told and follows, and does not tell it back.
 //!
 //! PipeWire is reached through [`Graph`]; tests drive a fake one.
 //!
@@ -17,8 +19,8 @@
 //! - `AudioFrame` (remote → home), with the session and a sequence number: one Opus packet
 //!   follows it.
 //! - `AudioVolume` (both ways), with the session, the linear gain of each channel and the
-//!   mute: sent when the sink's (or the playback's) volume or mute changes, applied to the
-//!   playback (or the sink).
+//!   mute: sent when the sink's (or home's default output's) volume or mute changes, applied
+//!   to home's default output (or the sink).
 //!
 //! Home's mic goes the other way ([`mic`]): `MicStart` and `MicStop` (home → remote) open and
 //! close the remote's virtual source, the default mic while a mode runs, and `MicFrame` (home
@@ -60,7 +62,8 @@ const PLAYBACK_DESCRIPTION: &str = "Remote machine (Navette)";
 const JITTER_FLOOR: usize = FRAME_SAMPLES;
 const JITTER_CEILING: usize = 10 * FRAME_SAMPLES;
 
-/// How often the remote checks that its sink is still there: PipeWire may restart under it.
+/// How often the remote checks that its sink is still there (PipeWire may restart under it),
+/// and home that a mode started.
 const CHECK: Duration = Duration::from_millis(250);
 
 /// How often each side looks for a change of its mixer's level while the sound plays: a held
@@ -107,9 +110,10 @@ pub enum Message {
         seq: u32,
         packet: Bytes,
     },
-    /// The level the sink and the playback share, said by the side whose mixer moved it: the
-    /// remote's sink (where it does not act on the sound sent) or home's playback (the only
-    /// place it acts). The other side applies it.
+    /// The level the sink and home's default output share, said by the side whose mixer moved
+    /// it: the remote's sink (where it does not act on the sound sent) or home's output (the
+    /// only place it acts). The other side applies it. A remote that sends it first, before
+    /// home's, is applied the same way.
     Volume {
         session: u32,
         level: Level,
@@ -365,17 +369,22 @@ pub trait Graph: Clone + Send + 'static {
         on_sound: OnSound,
         on_level: OnLevel,
     ) -> io::Result<Self::Node>;
-    /// Sets the volume and mute of a playback stream of ours, as an application's mixer would.
+    /// Sets the volume and mute of a sink of ours, or of the default output followed, as the
+    /// machine's mixer would.
     fn set_level(&self, node: &Self::Node, level: Level) -> io::Result<()>;
-    /// A playback stream, mixed like any application's, that plays what `jitter` holds; its
-    /// volume and mute, as the machine's mixer sets them, are told to `on_level`.
+    /// A playback stream, mixed like any application's, that plays what `jitter` holds, at
+    /// 100 %.
     fn open_playback(
         &self,
         name: &str,
         description: &str,
         jitter: Arc<Mutex<Jitter>>,
-        on_level: OnLevel,
     ) -> io::Result<Self::Node>;
+    /// The machine's default output, whichever sink it is now, followed until the node is
+    /// dropped: its volume and mute, as the machine's mixer sets them, are told to `on_level`,
+    /// once as soon as they are known and again at each change, the default moving to another
+    /// sink included. [`Graph::set_level`] on the node sets them.
+    fn follow_output(&self, on_level: OnLevel) -> io::Result<Self::Node>;
     /// A virtual source, which the machine's apps record from as from a mic: it plays what
     /// `jitter` holds.
     fn open_source(
@@ -596,9 +605,9 @@ impl Latest {
     }
 }
 
-/// The one level the remote's sink and home's playback share, as one side sees it: what its
-/// own mixer last said, and what the other side holds. A level applied from the other side is
-/// not sent back: neither while the mixer still says the level it had before (it tells the
+/// The one level the remote's sink and home's default output share, as one side sees it: what
+/// its own mixer last said, and what the other side holds. A level applied from the other side
+/// is not sent back: neither while the mixer still says the level it had before (it tells the
 /// change a little later), nor once it says the level applied.
 struct Shared {
     latest: Latest,
@@ -607,20 +616,36 @@ struct Shared {
     /// What the mixer said when the other side's level was applied, until it says something
     /// else.
     stale: Option<Level>,
+    /// Home's output leads: its first level is told, for the remote's sink to take. The sink
+    /// follows: nothing is told until its mixer says home's level, as whatever it opened at may
+    /// be said after home's level was asked for.
+    waiting: bool,
 }
 
 impl Shared {
-    fn new(stale: Option<Level>) -> Self {
+    fn leading() -> Self {
         Self {
             latest: Latest::default(),
             peer: None,
-            stale,
+            stale: None,
+            waiting: false,
+        }
+    }
+
+    fn following() -> Self {
+        Self {
+            waiting: true,
+            ..Self::leading()
         }
     }
 
     /// The level to tell the other side: the mixer's, when the user moved it.
     fn due(&mut self) -> Option<Level> {
         let level = self.latest.get()?;
+        if self.waiting {
+            self.waiting = self.peer != Some(level);
+            return None;
+        }
         if self.stale == Some(level) {
             return None;
         }
@@ -658,7 +683,7 @@ struct Capture<G: Graph> {
     /// Frames the link had no room for, and how many of them were told already.
     dropped: Arc<AtomicU64>,
     told: u64,
-    /// The sink's level, shared with home's playback.
+    /// The sink's level, shared with home's default output.
     level: Shared,
 }
 
@@ -679,8 +704,8 @@ impl<G: Graph> Capture<G> {
             failures.clone(),
             dropped.clone(),
         )?;
-        // The remote's mixer leads: its first level is told home.
-        let level = Shared::new(None);
+        // Home's output leads: the sink takes its level before telling any.
+        let level = Shared::following();
         Ok(Self {
             sink: RemoteSink::start(graph, saved, on_sound, level.latest.writer())?,
             home,
@@ -702,7 +727,7 @@ impl<G: Graph> Capture<G> {
         (new > 0).then(|| format!("{new} frames dropped, the link had no room"))
     }
 
-    /// Opens the sink again if PipeWire restarted under it.
+    /// Opens the sink again if PipeWire restarted under it, at home's level.
     fn recover(&mut self) -> io::Result<()> {
         if !self.sink.is_gone() {
             return Ok(());
@@ -714,7 +739,13 @@ impl<G: Graph> Capture<G> {
             self.failures.clone(),
             self.dropped.clone(),
         )?;
-        self.sink.reopen(on_sound, self.level.latest.writer())
+        self.sink.reopen(on_sound, self.level.latest.writer())?;
+        if let Some(level) = self.level.peer {
+            // What the new sink opened at is not the user's.
+            self.level.waiting = true;
+            self.received_level(self.session, level);
+        }
+        Ok(())
     }
 
     /// Tells home the sink's level if it changed since it was last told. Told again at the next
@@ -733,7 +764,7 @@ impl<G: Graph> Capture<G> {
         }
     }
 
-    /// Home's playback moved: the sink follows, for the remote's mixer to show the level heard.
+    /// Home's output moved: the sink follows, for the remote's mixer to show the level heard.
     fn received_level(&mut self, session: u32, level: Level) {
         if session != self.session {
             return;
@@ -867,8 +898,10 @@ pub fn remote<G: Graph>(
 
 struct Playback<G: Graph> {
     _node: G::Node,
+    /// Home's default output, whose level is the remote's sink's.
+    output: G::Node,
     session: u32,
-    /// The playback's level, shared with the remote's sink.
+    /// The output's level, shared with the remote's sink.
     level: Shared,
     jitter: Arc<Mutex<Jitter>>,
     decoder: Decoder,
@@ -925,18 +958,17 @@ impl<G: Graph> Home<G> {
             return Ok(());
         }
         let jitter = Arc::new(Mutex::new(Jitter::new(JITTER_FLOOR, JITTER_CEILING)));
-        // A new stream is at unity until the remote's level comes: not the user moving it.
-        let level = Shared::new(Some(Level::UNITY));
-        let node = self.graph.open_playback(
-            PLAYBACK,
-            PLAYBACK_DESCRIPTION,
-            jitter.clone(),
-            level.latest.writer(),
-        )?;
+        let node = self
+            .graph
+            .open_playback(PLAYBACK, PLAYBACK_DESCRIPTION, jitter.clone())?;
+        // Home's level is told first: the remote's sink takes it as the mode starts.
+        let level = Shared::leading();
+        let output = self.graph.follow_output(level.latest.writer())?;
         self.sessions = self.sessions.wrapping_add(1);
         let session = self.sessions;
         self.playback = Some(Playback {
             _node: node,
+            output,
             session,
             level,
             jitter,
@@ -951,8 +983,8 @@ impl<G: Graph> Home<G> {
         self.order(Message::Stop)
     }
 
-    /// Tells the remote the playback's level if the home mixer moved it; told again at the next
-    /// call when the link has no room.
+    /// Tells the remote the default output's level if the home mixer moved it; told again at
+    /// the next call when the link has no room.
     fn tell_level(&mut self) {
         let Some(playback) = &mut self.playback else {
             return;
@@ -967,7 +999,7 @@ impl<G: Graph> Home<G> {
         if self.remote.try_send(volume).is_ok() {
             playback.level.told(level);
             eprintln!(
-                "navette: audio: the remote's sound is at {}, told the remote",
+                "navette: audio: home's output is at {}, told the remote",
                 shown(level)
             );
         }
@@ -1007,16 +1039,16 @@ impl<G: Graph> Home<G> {
             let Some(playback) = self.playback.as_mut().filter(|p| p.session == session) else {
                 // Not an error, but the one place to see why a level was not heard.
                 eprintln!(
-                    "navette: audio: the remote set its sound to {}, ignored: not the session \
+                    "navette: audio: the remote set the volume to {}, ignored: not the session \
                      home plays",
                     shown(level)
                 );
                 return Ok(());
             };
             playback.level.applying(level);
-            self.graph.set_level(&playback._node, level)?;
+            self.graph.set_level(&playback.output, level)?;
             eprintln!(
-                "navette: audio: the remote set its sound to {}",
+                "navette: audio: the remote set the volume to {}, on home's output",
                 shown(level)
             );
             return Ok(());
@@ -1094,10 +1126,12 @@ pub fn home<G: Graph>(graph: G, wire: Wire, sound: &HomeSound<G>) -> io::Result<
             let mut due = Instant::now() + REPORT_EVERY;
             loop {
                 let wait = due.saturating_duration_since(Instant::now());
+                // A mode started from another thread is seen within `CHECK`: home's level is
+                // the first told, nothing from the remote wakes this loop before.
                 let wait = if lock(&home).playback.is_some() {
                     wait.min(LEVEL_POLL)
                 } else {
-                    wait
+                    wait.min(CHECK)
                 };
                 match wire.from_peer.recv_timeout(wait) {
                     Ok(message) => {
@@ -1469,8 +1503,15 @@ mod tests {
         muted: false,
     };
 
+    /// Home's default output before a mode: 70 % as `wpctl` shows it.
+    const SEVENTY: Level = Level {
+        left: 0.343,
+        right: 0.343,
+        muted: false,
+    };
+
     /// The remote and home of a link in memory, both playing: the remote's sink and home's
-    /// playback are open.
+    /// playback are open, and the sink has taken home's level, `SEVENTY`.
     async fn playing() -> (
         FakeGraph,
         FakeGraph,
@@ -1478,18 +1519,47 @@ mod tests {
         tokio::task::JoinHandle<io::Error>,
     ) {
         let home_graph = FakeGraph::with_default("home-speakers");
+        home_graph.state().output = Some(SEVENTY);
         let remote_graph = FakeGraph::with_default("laptop-speakers");
         let (tmp, saved) = saved();
         let (home_peer, remote_peer, link) = linked().await;
         remote(remote_graph.clone(), saved, remote_peer, None).unwrap();
         mode_started(&home_graph, home_peer).await;
-        until(&remote_graph, |s| !s.sinks.is_empty()).await;
+        until(&remote_graph, |s| !s.levels.is_empty()).await;
         until(&home_graph, |s| !s.playbacks.is_empty()).await;
         (home_graph, remote_graph, tmp, link)
     }
 
     #[tokio::test]
-    async fn the_remote_volume_and_mute_reach_the_home_stream_once() {
+    async fn a_mode_start_sets_the_remote_sink_to_home_s_level() {
+        let (home_graph, remote_graph, _tmp, _link) = playing().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(remote_graph.state().levels, [(SINK.to_owned(), SEVENTY)]);
+        assert_eq!(home_graph.state().levels, [], "home's level came back");
+    }
+
+    #[tokio::test]
+    async fn the_level_the_remote_sink_opened_at_does_not_move_home() {
+        let home_graph = FakeGraph::with_default("home-speakers");
+        home_graph.state().output = Some(SEVENTY);
+        let remote_graph = FakeGraph::with_default("laptop-speakers");
+        let (_tmp, saved) = saved();
+        let (home_peer, remote_peer, _link) = linked().await;
+        remote(remote_graph.clone(), saved, remote_peer, None).unwrap();
+        // The remote's session manager restores the sink at the level it last had.
+        remote_graph.state().late_echo = true;
+        mode_started(&home_graph, home_peer).await;
+        until(&remote_graph, |s| !s.sinks.is_empty()).await;
+        remote_graph.mixer_sets(SINK, QUIET);
+        until(&remote_graph, |s| !s.levels.is_empty()).await;
+        remote_graph.mixer_sets(SINK, SEVENTY);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(home_graph.state().levels, []);
+        assert_eq!(home_graph.state().output, Some(SEVENTY));
+    }
+
+    #[tokio::test]
+    async fn a_remote_level_sets_home_s_default_output() {
         let (home_graph, remote_graph, _tmp, _link) = playing().await;
 
         remote_graph.mixer_sets(SINK, QUIET);
@@ -1497,18 +1567,40 @@ mod tests {
         remote_graph.mixer_sets(SINK, QUIET);
         until(&home_graph, |s| !s.levels.is_empty()).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(home_graph.state().levels, [(PLAYBACK.to_owned(), QUIET)]);
-
-        let muted = Level {
-            muted: true,
-            ..QUIET
-        };
-        remote_graph.mixer_sets(SINK, muted);
-        until(&home_graph, |s| s.levels.len() == 2).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             home_graph.state().levels,
-            [(PLAYBACK.to_owned(), QUIET), (PLAYBACK.to_owned(), muted)]
+            [(fake::OUTPUT.to_owned(), QUIET)]
+        );
+        assert_eq!(home_graph.state().output, Some(QUIET));
+    }
+
+    #[tokio::test]
+    async fn a_remote_mute_mutes_home_s_default_output() {
+        let (home_graph, remote_graph, _tmp, _link) = playing().await;
+        let muted = Level {
+            muted: true,
+            ..SEVENTY
+        };
+        remote_graph.mixer_sets(SINK, muted);
+        until(&home_graph, |s| !s.levels.is_empty()).await;
+        assert_eq!(home_graph.state().output, Some(muted));
+    }
+
+    #[tokio::test]
+    async fn the_remote_sound_plays_at_100_percent_at_home() {
+        let (home_graph, remote_graph, _tmp, _link) = playing().await;
+        remote_graph.mixer_sets(SINK, QUIET);
+        until(&home_graph, |s| !s.levels.is_empty()).await;
+        home_graph.mixer_sets(fake::OUTPUT, HALF);
+        until(&remote_graph, |s| s.levels.len() == 2).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            home_graph
+                .state()
+                .levels
+                .iter()
+                .all(|(node, _)| node != PLAYBACK),
+            "the playback's volume was set"
         );
     }
 
@@ -1540,6 +1632,7 @@ mod tests {
         assert!((0.45..0.55).contains(&peak), "peak {peak}");
     }
 
+    /// The remote's side of session 7, which has taken home's level, `SEVENTY`.
     fn capture_with_room(
         graph: &FakeGraph,
         room: usize,
@@ -1550,7 +1643,11 @@ mod tests {
     ) {
         let (tmp, saved) = saved();
         let (to_home, orders) = mpsc::channel(room);
-        let capture = Capture::start(graph.clone(), saved, to_home, 7).unwrap();
+        let mut capture = Capture::start(graph.clone(), saved, to_home, 7).unwrap();
+        capture.received_level(7, SEVENTY);
+        // As the remote's loop does after each message.
+        capture.tell_level();
+        graph.state().levels.clear();
         (capture, orders, tmp)
     }
 
@@ -1559,16 +1656,28 @@ mod tests {
     }
 
     #[test]
+    fn the_sink_tells_nothing_before_home_s_level() {
+        let graph = FakeGraph::with_default("laptop-speakers");
+        let (tmp, saved) = saved();
+        let (to_home, mut orders) = mpsc::channel(QUEUE);
+        let mut capture = Capture::start(graph.clone(), saved, to_home, 7).unwrap();
+        graph.mixer_sets(SINK, QUIET);
+        capture.tell_level();
+        assert_eq!(volumes(&mut orders), []);
+
+        capture.received_level(7, SEVENTY);
+        capture.tell_level();
+        assert_eq!(volumes(&mut orders), [], "home's level came back");
+        drop((capture, tmp));
+    }
+
+    #[test]
     fn a_level_is_told_when_it_changes_and_not_when_it_is_repeated() {
         let graph = FakeGraph::with_default("laptop-speakers");
         let (mut capture, mut orders, _tmp) = capture_with_room(&graph, QUEUE);
 
         capture.tell_level();
-        assert_eq!(
-            volumes(&mut orders),
-            [],
-            "nothing to tell before the mixer spoke"
-        );
+        assert_eq!(volumes(&mut orders), [], "nothing moved");
 
         graph.mixer_sets(SINK, QUIET);
         capture.tell_level();
@@ -1584,13 +1693,13 @@ mod tests {
         );
 
         // Back to what it was before: that is a change too.
-        graph.mixer_sets(SINK, Level::UNITY);
+        graph.mixer_sets(SINK, SEVENTY);
         capture.tell_level();
         assert_eq!(
             volumes(&mut orders),
             [Message::Volume {
                 session: 7,
-                level: Level::UNITY
+                level: SEVENTY
             }]
         );
     }
@@ -1630,39 +1739,18 @@ mod tests {
     }
 
     #[test]
-    fn a_new_session_tells_its_level_again() {
-        let graph = FakeGraph::with_default("laptop-speakers");
-        let (mut first, mut orders, _tmp) = capture_with_room(&graph, QUEUE);
-        graph.mixer_sets(SINK, QUIET);
-        first.tell_level();
-        assert_eq!(volumes(&mut orders).len(), 1);
-        drop(first);
-
-        let (mut second, mut orders, _tmp) = capture_with_room(&graph, QUEUE);
-        graph.mixer_sets(SINK, QUIET);
-        second.tell_level();
-        assert_eq!(
-            volumes(&mut orders),
-            [Message::Volume {
-                session: 7,
-                level: QUIET
-            }]
-        );
-    }
-
-    #[test]
-    fn the_sink_that_came_back_after_pipewire_restarts_tells_its_level() {
+    fn the_sink_that_came_back_after_pipewire_restarts_takes_home_s_level_again() {
         let graph = FakeGraph::with_default("laptop-speakers");
         let (mut capture, mut orders, _tmp) = capture_with_room(&graph, QUEUE);
         graph.restart();
         capture.recover().unwrap();
-        graph.mixer_sets(SINK, QUIET);
+        assert_eq!(graph.state().levels, [(SINK.to_owned(), SEVENTY)]);
         capture.tell_level();
-        assert_eq!(volumes(&mut orders).len(), 1);
+        assert_eq!(volumes(&mut orders), []);
     }
 
     #[test]
-    fn a_level_applies_to_the_playback_of_its_own_session_only() {
+    fn a_level_applies_to_home_s_output_for_its_own_session_only() {
         let graph = FakeGraph::default();
         let (to_remote, mut orders) = mpsc::channel(8);
         let mut home = Home::new(graph.clone(), to_remote);
@@ -1684,7 +1772,28 @@ mod tests {
         assert!(graph.state().levels.is_empty());
 
         home.received(volume(session)).unwrap();
-        assert_eq!(graph.state().levels, [(PLAYBACK.to_owned(), QUIET)]);
+        assert_eq!(graph.state().levels, [(fake::OUTPUT.to_owned(), QUIET)]);
+    }
+
+    #[test]
+    fn an_older_remote_that_tells_its_level_first_sets_home_s_output() {
+        let graph = FakeGraph::default();
+        let (to_remote, mut orders) = mpsc::channel(8);
+        let mut home = Home::new(graph.clone(), to_remote);
+        home.start().unwrap();
+        let Message::Start { session } = orders.try_recv().unwrap() else {
+            panic!("home asked for the sound");
+        };
+        // An older remote tells its sink's level as soon as the session starts, for the
+        // playback; home has not said its own yet.
+        home.received(Message::Volume {
+            session,
+            level: QUIET,
+        })
+        .unwrap();
+        home.tell_level();
+        assert_eq!(graph.state().output, Some(QUIET));
+        assert_eq!(volumes(&mut orders), [], "the remote's level came back");
     }
 
     const HALF: Level = Level {
@@ -1694,21 +1803,23 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn the_home_stream_moved_at_home_moves_the_remote_sink() {
+    async fn home_s_output_moved_at_home_moves_the_remote_sink() {
         let (home_graph, remote_graph, _tmp, _link) = playing().await;
-        remote_graph.mixer_sets(SINK, QUIET);
-        until(&home_graph, |s| !s.levels.is_empty()).await;
 
-        // The home mixer moves the remote's stream.
-        home_graph.mixer_sets(PLAYBACK, HALF);
-        until(&remote_graph, |s| !s.levels.is_empty()).await;
-        assert_eq!(remote_graph.state().levels, [(SINK.to_owned(), HALF)]);
+        // Home's own keys, or its mixer, move its default output.
+        home_graph.mixer_sets(fake::OUTPUT, HALF);
+        until(&remote_graph, |s| s.levels.len() == 2).await;
+        assert_eq!(remote_graph.state().levels[1], (SINK.to_owned(), HALF));
+    }
 
+    #[tokio::test]
+    async fn home_s_mute_mutes_the_remote_sink() {
+        let (home_graph, remote_graph, _tmp, _link) = playing().await;
         let muted = Level {
             muted: true,
-            ..HALF
+            ..SEVENTY
         };
-        home_graph.mixer_sets(PLAYBACK, muted);
+        home_graph.mixer_sets(fake::OUTPUT, muted);
         until(&remote_graph, |s| s.levels.len() == 2).await;
         assert_eq!(remote_graph.state().levels[1], (SINK.to_owned(), muted));
     }
@@ -1722,25 +1833,21 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             remote_graph.state().levels,
-            [],
+            [(SINK.to_owned(), SEVENTY)],
             "the remote's own level came back"
         );
 
-        home_graph.mixer_sets(PLAYBACK, HALF);
-        until(&remote_graph, |s| !s.levels.is_empty()).await;
+        home_graph.mixer_sets(fake::OUTPUT, HALF);
+        until(&remote_graph, |s| s.levels.len() == 2).await;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(home_graph.state().levels, [(PLAYBACK.to_owned(), QUIET)]);
-        assert_eq!(remote_graph.state().levels, [(SINK.to_owned(), HALF)]);
-    }
-
-    #[tokio::test]
-    async fn the_home_stream_s_first_level_does_not_move_the_remote() {
-        let (home_graph, remote_graph, _tmp, _link) = playing().await;
-
-        // A new stream is at unity: that is not the user moving it.
-        home_graph.mixer_sets(PLAYBACK, Level::UNITY);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(remote_graph.state().levels, []);
+        assert_eq!(
+            home_graph.state().levels,
+            [(fake::OUTPUT.to_owned(), QUIET)]
+        );
+        assert_eq!(
+            remote_graph.state().levels,
+            [(SINK.to_owned(), SEVENTY), (SINK.to_owned(), HALF)]
+        );
     }
 
     #[test]
@@ -1804,7 +1911,7 @@ mod tests {
         };
         home.remote.try_send(Message::Stop).unwrap();
 
-        graph.mixer_sets(PLAYBACK, HALF);
+        graph.mixer_sets(fake::OUTPUT, HALF);
         home.tell_level();
         assert_eq!(volumes(&mut orders), [Message::Stop]);
         home.tell_level();
