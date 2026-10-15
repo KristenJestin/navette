@@ -112,9 +112,13 @@ refuses a request against an offer that a newer copy has replaced.
   of a paste already written is removed, nothing is left behind, and the copy whose paste was
   stopped serves no more files (copy again to paste it). The bar loses a paste served from
   here when its last byte goes, when a file is not the size the copy said, or when the other
-  machine asks for no next file within 30 s. The machine that pasted says
-  how it ended in a desktop notification: `Files pasted` with their folder, `Paste failed`
-  with why (no room, the other machine stopped it…), or `Paste cancelled`.
+  machine asks for no next file within 30 s. The machine that pasted says in a desktop
+  notification when a paste did not end well: `Paste failed` with why (no room, the other
+  machine stopped it…), or `Paste cancelled`. Files that arrive say nothing: a file manager
+  reads the files of a copy as soon as it is offered, before any paste, and a read of the
+  clipboard does not say why it is made (the same types, at any time, the first read being
+  that fetch and not the paste), so a notification could not tell a paste from it. The bar
+  shows them crossing.
 - **When the link drops**, every paste and transfer in flight ends at once, and what it had
   written is removed; the files already pasted stay.
 - **When a newer copy replaces the one being pasted**, the paste of the older one stops, and

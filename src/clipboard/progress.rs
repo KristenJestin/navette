@@ -1,7 +1,7 @@
 //! What the user sees of the files crossing, both ways: one bar for all of them, at home in
-//! the corner, and a notification when a paste ends; and how they stop them all, by a click on
-//! the bar. The pasting side counts the bytes it writes, the copying side the bytes it serves:
-//! home shows both, whichever machine pasted.
+//! the corner, and a notification when a paste fails or is stopped; and how they stop them all,
+//! by a click on the bar. The pasting side counts the bytes it writes, the copying side the
+//! bytes it serves: home shows both, whichever machine pasted.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -40,7 +40,7 @@ impl Bar {
 pub struct Shown {
     /// The bar of every file crossing, both ways; none once they are all done.
     pub bar: Arc<dyn Fn(Option<Bar>) + Send + Sync>,
-    /// A paste's end, or its failure, on the machine that pasted; what a copy left out, on the
+    /// A paste's failure or cancel, on the machine that pasted; what a copy left out, on the
     /// machine that copied.
     pub notifier: Arc<dyn Notifier>,
     /// Each change stops every file crossing.
