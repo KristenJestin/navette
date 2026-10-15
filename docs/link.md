@@ -62,23 +62,28 @@ refuses a request against an offer that a newer copy has replaced.
   (`text/plain` and its charsets, `UTF8_STRING`, `STRING`, `TEXT`), `text/html`, `image/*`
   and the file lists. The types an application keeps for its own instances (a token, a
   process id) stay on their machine, where they mean something.
-- **Pasted files** go in a `Navette` folder of the download directory (`$XDG_DOWNLOAD_DIR`, as
-  `user-dirs.dirs` names it, else `~/Downloads`), made if missing, and stay there. A paste
-  first fills a hidden 0700 folder in it (`.navette-incoming-<pid>-<n>`), then moves each
-  pasted file or folder in under its own name, or `name (1).ext`, `name (2).ext`… when one is
-  already there: nothing is ever overwritten, and a name from the other machine never
-  reaches out of the folder. They move in all together or not at all. On a filesystem that
-  cannot rename without replacing, a file is linked in then unlinked, a folder replaces an
-  empty one made for it. The application that pasted gets their paths once they are all
-  complete. A second paste of the same copy points at the same files.
-- **The same copy offered again** points at the same files too. An application that reads
-  every new selection fetches a copy of files as soon as it arrives, so each reconnect (the
-  lid closed and opened, a network blip), which offers each machine's copy again, would fetch
-  it again as `name (1)`. The machine that copied offers files unchanged since its last copy
-  of files (the same files, sizes and modification times) under the same offer number, kept
-  from one link to the next; the machine that fetched that copy answers with the files it
-  received, while they are all still in the `Navette` folder. A file changed since, or one
-  removed from the folder, is fetched again.
+- **Pasted files** go in a private temporary folder, not in the Downloads: `navette/clipboard`
+  in `$XDG_RUNTIME_DIR` (per user, mode 0700, cleared at logout), else `navette-clipboard-<uid>`
+  in the temporary directory, mode 0700 as well, and refused if it is a link or belongs to
+  another user. A file manager reads every new copy at once, so files come in with no paste;
+  here they pile up nowhere the user keeps things, and a paste copies them from there to where
+  the user pastes. Only the files of the copy being offered are kept: a newer copy removes the
+  older one's, and the folder is emptied when the link ends (the mode stops, the lid closes) or
+  `navette` starts. That folder may live in memory (`$XDG_RUNTIME_DIR` is a tmpfs): a very large
+  copy takes that much memory until it is replaced or the link ends. A paste first fills a
+  hidden 0700 folder in it (`.navette-incoming-<pid>-<n>`), then moves each pasted file or
+  folder in under its own name, or `name (1).ext`, `name (2).ext`… when one is already there:
+  nothing is ever overwritten, and a name from the other machine never reaches out of the
+  folder. They move in all together or not at all. On a filesystem that cannot rename without
+  replacing, a file is linked in then unlinked, a folder replaces an empty one made for it. The
+  application that pasted gets their paths once they are all complete (the text types of the
+  copy name the same paths). A second paste of the same copy points at the same files.
+- **The same copy offered again** points at the same files too. The machine that copied offers
+  files unchanged since its last copy of files (the same files, sizes and modification times)
+  under the same offer number; the machine that fetched that copy answers with the files it
+  received, while they are all still in the folder, and keeps them. A file changed since is
+  fetched again. A new link starts with an empty folder, so a copy offered again on it is
+  fetched again.
 - **A file manager that stops waiting.** A file manager that reads every new selection at
   once gives up when the answer is slow: one waits two seconds for each of the two file-list
   types, so about four seconds in all, which a large paste over the LAN outlasts (with a mode

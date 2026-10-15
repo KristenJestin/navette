@@ -118,9 +118,11 @@ pub enum Selected {
 
 /// What a machine's bridges keep from one link to the next. A reconnect (the lid closed and
 /// opened, a network blip) offers each machine's copy again, and an application that reads
-/// every new selection would fetch its files again, next to the ones it already has: so the
-/// machine that copied offers an unchanged copy of files under the serial it had, and the
-/// machine that fetched it answers with the files it already has.
+/// every new selection would fetch its files again: so the machine that copied offers an
+/// unchanged copy of files under the serial it had, and the machine that fetched it answers
+/// with the files it already has, while they are in the receiving folder. That folder is
+/// emptied when a link ends, so across links only the serial is kept; within one, this is what
+/// keeps a copy offered again from being fetched twice.
 #[derive(Clone)]
 pub struct Kept {
     /// The serials of this machine's offers. From a random start, so that a restart does not
@@ -217,7 +219,7 @@ pub struct Bridge<C: Compositor> {
     transfers: Transfers,
     jobs: Jobs,
     compositor: OffThread<C>,
-    /// Where the files of a peer's offer go when pasted; none without a home folder.
+    /// Where the files of a peer's offer go when pasted: a temporary folder.
     inbox: Option<Inbox>,
     local: Rc<RefCell<LocalOffer>>,
     remote: Rc<RefCell<RemoteOffer>>,
@@ -308,6 +310,13 @@ impl<C: Compositor> Bridge<C> {
             ));
         }
         let received = self.kept.received(serial, &files);
+        // Only the files of the current offer are kept: a paste of it in progress copies from
+        // them until it is replaced. The same copy offered again points at the same files.
+        if received.is_none()
+            && let Some(inbox) = &self.inbox
+        {
+            inbox.empty();
+        }
         if received.is_some() {
             log(format_args!(
                 "offer {serial}: the copy fetched before, its files are here already"
@@ -510,7 +519,7 @@ impl<C: Compositor> Bridge<C> {
             };
             log(format_args!("offer {serial}: pasted as {mime_type}"));
             let Some(inbox) = self.inbox.clone() else {
-                log(format_args!("no folder for pasted files: $HOME is not set"));
+                log(format_args!("no folder for pasted files"));
                 return;
             };
             if let Err(e) = files::validate(&files) {
@@ -750,6 +759,10 @@ pub async fn run<C: Compositor>(
 ) -> bool {
     // Every task the bridge and gliff's engine spawn lands in this set, and dies with it.
     let tasks = LocalSet::new();
+    // The received files go with the link, however it ends: the mode stops, the link drops, or
+    // this future is dropped. Only a compositor that went away leaves them, since the link and
+    // the offer they belong to are still up.
+    let mut leaving = Emptying(inbox.clone());
     tasks
         .run_until(async {
             let bridge = Bridge::new(
@@ -776,12 +789,26 @@ pub async fn run<C: Compositor>(
                     },
                     event = events.recv() => match event {
                         Some(event) => bridge.on_compositor_event(event),
-                        None => return false,
+                        None => {
+                            leaving.0 = None;
+                            return false;
+                        }
                     },
                 }
             }
         })
         .await
+}
+
+/// Empties the folder of the files received over a link when dropped.
+struct Emptying(Option<Inbox>);
+
+impl Drop for Emptying {
+    fn drop(&mut self) {
+        if let Some(inbox) = &self.0 {
+            inbox.empty();
+        }
+    }
 }
 
 /// Only what the user must know: a paste of text or a picture that failed. It names no
@@ -838,6 +865,8 @@ where
     S: Fn(UnboundedSender<Selected>) -> io::Result<C> + Clone + Send + 'static,
 {
     let inbox = Inbox::of_this_user();
+    // Left behind by a process that died before it emptied its folder.
+    inbox.empty();
     let mut warned = false;
     loop {
         let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
@@ -859,7 +888,7 @@ where
                     &mut wire,
                     compositor,
                     events,
-                    inbox.clone(),
+                    Some(inbox.clone()),
                     kept.clone(),
                     shown.clone(),
                 )
@@ -1270,6 +1299,99 @@ mod tests {
         file_crosses(false).await;
     }
 
+    /// Home copies `name` of `copied` (made with `content`); the remote pastes it. The paths it
+    /// read.
+    async fn copy_and_paste(
+        home: &Machine,
+        remote: &Machine,
+        copied: &std::path::Path,
+        name: &str,
+        content: &[u8],
+        offers: usize,
+    ) -> Vec<std::path::PathBuf> {
+        std::fs::write(copied.join(name), content).unwrap();
+        let list = uri_list_of(&[copied.join(name)]);
+        home.copy(&[(URI_LIST, list.as_bytes())]);
+        remote.offered(offers).await;
+        parse_uri_list(&String::from_utf8(remote.paste(URI_LIST).await).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_newer_copy_removes_the_files_of_the_one_it_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        let folder = tmp.path().join("remote");
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                let first = copy_and_paste(&home, &remote, &copied, "first.bin", b"one", 1).await;
+                assert_eq!(first, [folder.join("first.bin")]);
+                assert!(first[0].exists());
+
+                // Copied again, not pasted yet: the old files are already gone.
+                let list = uri_list_of(&[copied.join("second.bin")]);
+                std::fs::write(copied.join("second.bin"), b"two").unwrap();
+                home.copy(&[(URI_LIST, list.as_bytes())]);
+                remote.offered(2).await;
+                assert!(tree(&folder).is_empty(), "{:?}", tree(&folder));
+
+                let pasted = String::from_utf8(remote.paste(URI_LIST).await).unwrap();
+                assert_eq!(parse_uri_list(&pasted), [folder.join("second.bin")]);
+                assert_eq!(
+                    tree(&folder),
+                    [("second.bin".into(), Some(b"two".to_vec()))]
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_same_copy_offered_again_keeps_its_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        let folder = tmp.path().join("remote");
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                let first = copy_and_paste(&home, &remote, &copied, "report.bin", b"data", 1).await;
+                // The same files copied again: the same offer, and no second fetch.
+                let list = uri_list_of(&[copied.join("report.bin")]);
+                home.copy(&[(URI_LIST, list.as_bytes())]);
+                remote.offered(2).await;
+                assert_eq!(
+                    tree(&folder),
+                    [("report.bin".into(), Some(b"data".to_vec()))]
+                );
+                let again = String::from_utf8(remote.paste(URI_LIST).await).unwrap();
+                assert_eq!(parse_uri_list(&again), first);
+                assert_eq!(remote.seen.notes.summaries(), ["Files pasted"]);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_files_of_the_current_copy_stay_until_it_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        let folder = tmp.path().join("remote");
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                let first = copy_and_paste(&home, &remote, &copied, "report.bin", b"data", 1).await;
+                // Pasted twice, one after the other: the application copies from there when it
+                // likes.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let again = String::from_utf8(remote.paste(URI_LIST).await).unwrap();
+                assert_eq!(parse_uri_list(&again), first);
+                assert_eq!(std::fs::read(&first[0]).unwrap(), b"data");
+                assert_eq!(tree(&folder).len(), 1);
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn an_application_s_private_types_stay_on_its_machine() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1366,7 +1488,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reconnect_with_the_same_copy_fetches_nothing_new() {
+    async fn the_end_of_the_link_empties_the_receiving_folder() {
         let tmp = tempfile::tempdir().unwrap();
         let copied = tmp.path().join("copied");
         std::fs::create_dir(&copied).unwrap();
@@ -1380,27 +1502,32 @@ mod tests {
                 remote.connected().await;
                 remote.copy(&[(URI_LIST, list.as_bytes())]);
                 home.offered(1).await;
-                let pasted = String::from_utf8(home.paste(URI_LIST).await).unwrap();
-
-                let again = after_a_reconnect(&home, &remote, cable, plug, &list).await;
-                assert_eq!(again, pasted);
+                home.paste(URI_LIST).await;
                 assert_eq!(
                     tree(&folder),
                     [("report.bin".into(), Some(b"figures".to_vec()))]
                 );
-                assert_eq!(home.seen.notes.summaries(), ["Files pasted"]);
+
+                // The mode stops, or the lid closes: the files are not kept for the next link.
+                drop(cable);
+                within("the folder emptied", async {
+                    while !tree(&folder).is_empty() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await;
+                assert!(folder.is_dir());
             })
             .await;
     }
 
     #[tokio::test]
-    async fn a_reconnect_with_the_files_changed_since_fetches_them_again() {
+    async fn a_reconnect_fetches_the_copy_again_into_the_emptied_folder() {
         let tmp = tempfile::tempdir().unwrap();
         let copied = tmp.path().join("copied");
         std::fs::create_dir(&copied).unwrap();
-        let report = copied.join("report.bin");
-        std::fs::write(&report, b"figures").unwrap();
-        let list = uri_list_of(std::slice::from_ref(&report));
+        std::fs::write(copied.join("report.bin"), b"figures").unwrap();
+        let list = uri_list_of(&[copied.join("report.bin")]);
         let folder = tmp.path().join("home");
         LocalSet::new()
             .run_until(async {
@@ -1411,20 +1538,11 @@ mod tests {
                 home.offered(1).await;
                 home.paste(URI_LIST).await;
 
-                // Edited while the link was down: the same name and size, a later time.
-                std::fs::write(&report, b"FIGURES").unwrap();
-                let later = std::time::SystemTime::now() + Duration::from_secs(60);
-                std::fs::File::options()
-                    .write(true)
-                    .open(&report)
-                    .unwrap()
-                    .set_modified(later)
-                    .unwrap();
                 let again = after_a_reconnect(&home, &remote, cable, plug, &list).await;
-                assert_eq!(parse_uri_list(&again), [folder.join("report (1).bin")]);
+                assert_eq!(parse_uri_list(&again), [folder.join("report.bin")]);
                 assert_eq!(
-                    std::fs::read(folder.join("report (1).bin")).unwrap(),
-                    b"FIGURES"
+                    tree(&folder),
+                    [("report.bin".into(), Some(b"figures".to_vec()))]
                 );
             })
             .await;
@@ -1840,14 +1958,15 @@ mod tests {
         std::fs::create_dir(&copied).unwrap();
         std::fs::write(copied.join("report.bin"), b"new").unwrap();
         let folder = tmp.path().join("remote");
-        std::fs::create_dir(&folder).unwrap();
-        std::fs::write(folder.join("report.bin"), b"mine").unwrap();
         let list = uri_list_of(&[copied.join("report.bin")]);
         LocalSet::new()
             .run_until(async {
                 let (home, remote) = desk(tmp.path());
                 home.copy(&[(URI_LIST, list.as_bytes())]);
                 remote.offered(1).await;
+                // A new offer empties the folder, so the name is taken after it.
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join("report.bin"), b"mine").unwrap();
                 let pasted = String::from_utf8(remote.paste(URI_LIST).await).unwrap();
                 assert_eq!(parse_uri_list(&pasted), [folder.join("report (1).bin")]);
                 assert_eq!(std::fs::read(folder.join("report.bin")).unwrap(), b"mine");
