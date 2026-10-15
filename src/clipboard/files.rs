@@ -1,7 +1,6 @@
 //! Files on the clipboard. On the copying side, what a copy offers: the files the user copied,
 //! directories walked, links and special files left out and named, read again only at paste
-//! time. On the pasting side, where the peer's files go: a `Navette` folder in the download
-//! directory, filled through a hidden folder of its own so a cancelled or failed paste leaves
+//! time. On the pasting side, where the peer's files go: a private temporary folder, filled through a hidden folder of its own so a cancelled or failed paste leaves
 //! no half-written file, and never outside it or over a file already there, whatever names the
 //! peer sends.
 //!
@@ -12,7 +11,7 @@
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -130,7 +129,10 @@ pub fn open_copied(path: &Path) -> io::Result<tokio::fs::File> {
     Ok(tokio::fs::File::from_std(file))
 }
 
-/// Where pasted files go: the `Navette` folder of the download directory.
+/// Where pasted files go: a private temporary folder, not the user's Downloads. An application
+/// that reads the file list of every new copy (a file manager) makes the files come in with no
+/// paste, so they must not pile up where the user keeps things; a paste copies from here to
+/// where the user pastes.
 #[derive(Clone, Debug)]
 pub struct Inbox {
     pub dir: PathBuf,
@@ -146,24 +148,61 @@ impl Inbox {
         }
     }
 
-    /// The machine's own: `Navette` in `$XDG_DOWNLOAD_DIR` (from the environment or
-    /// `user-dirs.dirs`), else in `~/Downloads`. None without a home folder.
-    pub fn of_this_user() -> Option<Self> {
-        let home = PathBuf::from(std::env::var_os("HOME").filter(|h| !h.is_empty())?);
-        let config = std::env::var_os("XDG_CONFIG_HOME")
-            .filter(|c| !c.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"));
-        let downloads = match std::env::var_os("XDG_DOWNLOAD_DIR").filter(|d| !d.is_empty()) {
-            Some(dir) => PathBuf::from(dir),
-            None => download_dir(&home, &config),
+    /// The machine's own: `navette/clipboard` in `$XDG_RUNTIME_DIR` (per user, 0700, cleared at
+    /// logout), else a folder of the user's in the temporary directory.
+    pub fn of_this_user() -> Self {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from);
+        Self::new(folder_in(runtime.as_deref(), &std::env::temp_dir(), euid()))
+    }
+
+    /// Makes the folder, the user's alone, or says why it cannot be trusted: the temporary
+    /// directory is shared, so another user may have made the name first, or put a link there.
+    fn prepare(&self) -> io::Result<()> {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.dir)?;
+        let meta = std::fs::symlink_metadata(&self.dir)?;
+        if !meta.is_dir() || meta.uid() != euid() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is not a folder of this user", self.dir.display()),
+            ));
+        }
+        if meta.mode() & 0o077 != 0 {
+            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    /// Removes everything in the folder; the folder itself stays. Links are removed, never
+    /// followed.
+    pub fn empty(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
         };
-        Some(Self::new(downloads.join("Navette")))
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let removed = match entry.file_type() {
+                Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
+                _ => std::fs::remove_file(&path),
+            };
+            if let Err(e) = removed
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                eprintln!(
+                    "navette: clipboard: {} was not removed: {e}",
+                    path.display()
+                );
+            }
+        }
     }
 
     /// Room for `bytes` more, or why not.
     pub fn check_room(&self, bytes: u64) -> io::Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
+        self.prepare()?;
         let free = (self.free)(&self.dir)?;
         if free < bytes {
             return Err(io::Error::new(
@@ -175,22 +214,18 @@ impl Inbox {
     }
 }
 
-/// The download directory `user-dirs.dirs` names, else `~/Downloads`.
-fn download_dir(home: &Path, config: &Path) -> PathBuf {
-    let named = std::fs::read_to_string(config.join("user-dirs.dirs"))
-        .ok()
-        .and_then(|dirs| {
-            dirs.lines().find_map(|line| {
-                let value = line.trim().strip_prefix("XDG_DOWNLOAD_DIR=")?;
-                let value = value.trim_matches('"');
-                let path = match value.strip_prefix("$HOME") {
-                    Some(rest) => home.join(rest.trim_start_matches('/')),
-                    None => PathBuf::from(value),
-                };
-                path.is_absolute().then_some(path)
-            })
-        });
-    named.unwrap_or_else(|| home.join("Downloads"))
+/// The folder under `runtime` (`$XDG_RUNTIME_DIR`) when it is an absolute path, else one named
+/// for the user in `temp`.
+fn folder_in(runtime: Option<&Path>, temp: &Path, uid: u32) -> PathBuf {
+    match runtime {
+        Some(runtime) if runtime.is_absolute() => runtime.join("navette").join("clipboard"),
+        _ => temp.join(format!("navette-clipboard-{uid}")),
+    }
+}
+
+fn euid() -> u32 {
+    // SAFETY: no arguments, no failure.
+    unsafe { libc::geteuid() }
 }
 
 fn free_space(dir: &Path) -> io::Result<u64> {
@@ -212,7 +247,7 @@ pub struct Staging {
 
 impl Staging {
     pub fn create_in(inbox: &Inbox) -> io::Result<Self> {
-        std::fs::create_dir_all(&inbox.dir)?;
+        inbox.prepare()?;
         sweep_stale(&inbox.dir);
         // Pasted files can be private: the folder is the user's alone while it fills.
         let mut builder = std::fs::DirBuilder::new();
@@ -399,7 +434,7 @@ fn invalid(e: impl ToString) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
     use super::*;
 
@@ -594,20 +629,6 @@ mod tests {
     }
 
     #[test]
-    fn the_download_folder_is_the_one_user_dirs_names() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (home, config) = (tmp.path().join("home"), tmp.path().join("config"));
-        assert_eq!(download_dir(&home, &config), home.join("Downloads"));
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(
-            config.join("user-dirs.dirs"),
-            "# written by xdg-user-dirs-update\nXDG_DOWNLOAD_DIR=\"$HOME/Téléchargements\"\n",
-        )
-        .unwrap();
-        assert_eq!(download_dir(&home, &config), home.join("Téléchargements"));
-    }
-
-    #[test]
     fn too_little_room_is_said_before_anything_is_written() {
         let tmp = tempfile::tempdir().unwrap();
         let inbox = Inbox {
@@ -618,5 +639,68 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
         assert!(error.to_string().contains("2.0 GiB needed"), "{error}");
         inbox.check_room(1 << 10).unwrap();
+    }
+
+    #[test]
+    fn the_receiving_folder_is_under_the_runtime_directory() {
+        let folder = folder_in(Some(Path::new("/run/user/1000")), Path::new("/tmp"), 1000);
+        assert_eq!(folder, Path::new("/run/user/1000/navette/clipboard"));
+    }
+
+    #[test]
+    fn without_a_runtime_directory_the_receiving_folder_is_the_users_in_the_temp_one() {
+        let folder = folder_in(None, Path::new("/tmp"), 1000);
+        assert_eq!(folder, Path::new("/tmp/navette-clipboard-1000"));
+        // A relative runtime directory is no place to trust either.
+        assert_eq!(
+            folder_in(Some(Path::new("run")), Path::new("/tmp"), 1000),
+            folder
+        );
+    }
+
+    #[test]
+    fn the_receiving_folder_is_made_private_to_the_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("navette").join("clipboard");
+        let inbox = Inbox::new(dir.clone());
+        inbox.check_room(1).unwrap();
+        for made in [&dir, &dir.parent().unwrap().to_path_buf()] {
+            assert_eq!(made.metadata().unwrap().mode() & 0o777, 0o700, "{made:?}");
+        }
+        // One left open by an older run is closed again.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        inbox.check_room(1).unwrap();
+        assert_eq!(dir.metadata().unwrap().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn a_receiving_folder_that_is_a_link_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let dir = tmp.path().join("clipboard");
+        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+        let inbox = Inbox::new(dir);
+        assert!(inbox.check_room(1).is_err());
+        assert!(Staging::create_in(&inbox).is_err());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn emptying_the_receiving_folder_removes_what_it_holds_and_keeps_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = Inbox::new(tmp.path().join("clipboard"));
+        inbox.check_room(1).unwrap();
+        std::fs::write(inbox.dir.join("report.bin"), b"figures").unwrap();
+        std::fs::create_dir_all(inbox.dir.join("album/2026")).unwrap();
+        std::fs::write(inbox.dir.join("album/2026/photo.bin"), b"pixels").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"mine").unwrap();
+        std::os::unix::fs::symlink(&outside, inbox.dir.join("link")).unwrap();
+        inbox.empty();
+        assert_eq!(std::fs::read_dir(&inbox.dir).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"mine");
+        // Nothing to empty is no failure.
+        Inbox::new(tmp.path().join("never-made")).empty();
     }
 }
