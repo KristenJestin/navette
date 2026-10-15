@@ -122,7 +122,10 @@ While the mode runs:
   there too instead of under a surface. These changes are undone when the mode stops, when the
   link drops, when `navette serve` stops, and at the next start after a crash: each workspace
   goes back to its monitor, and each reserved monitor shows the workspace it showed, even with
-  workspace rules that bind workspaces to monitors. A workspace whose windows were all closed
+  workspace rules that bind workspaces to monitors. The workspaces come back with Hyprland's
+  animations off for that one moment (they are on again as they were), so that the first time
+  you go to one of them nothing slides in from the other monitor's place. A workspace whose
+  windows were all closed
   meanwhile is not made again, except the one a monitor showed, which it shows again, empty.
   After a config reload they are made again. The mode also ends if any one surface goes away
   (its monitor unplugged, Hyprland restarted at home) or home cannot decode a picture.

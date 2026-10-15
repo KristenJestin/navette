@@ -468,6 +468,11 @@ pub fn workspace_selector(id: i64, name: &str) -> String {
 /// names repeat (#93): the workspace is renamed to a name of its own for the call, then given
 /// its name back. A name it does not find does nothing (all measured on Hyprland 0.56.2).
 pub fn show_workspace(monitor: &str, id: i64) -> String {
+    show_workspace_by(monitor, &id.to_string())
+}
+
+/// [`show_workspace`] for a workspace id that is a Lua expression, such as a local variable.
+pub fn show_workspace_by(monitor: &str, id: &str) -> String {
     let unique = lua_string("navette:show");
     format!(
         "local m = hl.get_monitor({}) local w = hl.get_workspace({id}) if m and w then \
@@ -476,6 +481,21 @@ pub fn show_workspace(monitor: &str, id: i64) -> String {
          m:set_workspace({{ workspace = {unique} }}) \
          hl.dispatch(hl.dsp.workspace.rename({{ workspace = w, name = name }})) end",
         lua_string(monitor)
+    )
+}
+
+/// Runs `body`, a runtime chunk, with Hyprland's animations off, and gives them back as the user
+/// had them, whatever `body` does. A workspace put back on a monitor is not laid out again until
+/// it is shown, and its windows then slide in from where they were laid out before, the
+/// other monitor's place; with animations off, one chunk puts them where they belong at once
+/// (measured on Hyprland 0.56.2: turning animations off around the move alone changes nothing).
+pub fn without_animations(body: &str) -> String {
+    format!(
+        "local anim = hl.get_config(\"animations.enabled\") \
+         hl.config({{ animations = {{ enabled = false }} }}) \
+         local ok, err = pcall(function() {body} end) \
+         hl.config({{ animations = {{ enabled = anim }} }}) \
+         if not ok then error(err) end"
     )
 }
 
@@ -625,6 +645,15 @@ pub mod fake {
         shown: Vec<(String, i64)>,
         /// The user's workspace rules: workspace id, the monitor it is bound to.
         bound: Vec<(i64, String)>,
+        /// `animations:enabled` is off (it is on by default).
+        animations_off: bool,
+        /// Where the windows of a workspace were last laid out, for those laid out elsewhere
+        /// than on the monitor it was born on: Hyprland lays a workspace out when it is shown
+        /// or moved while shown, and a hidden one is left as it was (measured on 0.56.2).
+        laid_out: Vec<(i64, String)>,
+        /// Each time a workspace was shown on a monitor other than the one its windows were
+        /// laid out on, with animations on: its windows slide in from the other place.
+        strays: Vec<(i64, String, String)>,
     }
 
     impl State {
@@ -646,6 +675,21 @@ pub mod fake {
             }
         }
 
+        /// `id` is shown on `monitor`: its windows are laid out there, and slide in from where
+        /// they were laid out before when animations are on.
+        fn lay_out(&mut self, id: i64, monitor: &str) {
+            match self.laid_out.iter_mut().find(|(i, _)| *i == id) {
+                Some((_, was)) if was != monitor => {
+                    if !self.animations_off {
+                        self.strays.push((id, was.clone(), monitor.to_string()));
+                    }
+                    *was = monitor.to_string();
+                }
+                Some(_) => {}
+                None => self.laid_out.push((id, monitor.to_string())),
+            }
+        }
+
         /// Moves a workspace and its windows to `to`. A shown workspace is shown where it goes,
         /// and where it was gets a new one: Hyprland does so when its monitor has the focus.
         fn move_workspace(&mut self, id: i64, name: String, from: String, to: &str) {
@@ -658,11 +702,88 @@ pub mod fake {
             self.workspaces.retain(|(i, _, _)| *i != id);
             self.workspaces.push((id, name, to.to_string()));
             if self.shown(&from) == id && from != to {
+                // Laid out where it goes, with no one to see it slide.
+                self.laid_out.retain(|(i, _)| *i != id);
+                self.laid_out.push((id, to.to_string()));
                 let new = 1000 + self.workspaces.len() as i64;
                 self.shown.retain(|(m, _)| *m != from && *m != to);
                 self.shown.push((from, new));
                 self.shown.push((to.to_string(), id));
             }
+        }
+
+        /// A Lua chunk that moves a workspace and/or shows one on a monitor, as Hyprland runs
+        /// it: statement after statement.
+        ///
+        /// - `hl.dispatch(hl.dsp.workspace.move(...))`, bare or behind
+        ///   `if hl.get_workspace(...) then`, which skips a workspace not there.
+        /// - `local keep = hl.get_monitor("X")...`: what X shows now, for `keep` below.
+        /// - `local m = hl.get_monitor("X") local w = hl.get_workspace(ID) if m and w then ...
+        ///   m:set_workspace(...) ... end`: X shows workspace ID (or `keep`), when there, without
+        ///   the focus. One on another monitor is not moved: shown there all the same, and still
+        ///   listed on its own (measured on Hyprland 0.56.2).
+        /// - `enabled = false` / `enabled = anim` around them: animations off, then back to
+        ///   what they were.
+        fn workspace_chunk(&mut self, lua: &str) -> String {
+            let saved = self.animations_off;
+            if lua.contains("animations = { enabled = false }") {
+                self.animations_off = true;
+            }
+            let keep = lua
+                .split_once("local keep = hl.get_monitor(")
+                .and_then(|(_, rest)| rest.split('"').nth(1))
+                .map(|monitor| self.shown(monitor));
+            let done = (|| {
+                if let Some(at) = lua.find("hl.dispatch(hl.dsp.workspace.move(") {
+                    let guarded = lua[..at].contains("if hl.get_workspace(");
+                    let moved = &lua[at..];
+                    let (Some(name), Some(to)) =
+                        (quoted(moved, "workspace"), quoted(moved, "monitor"))
+                    else {
+                        return Err("error: hl.workspace.move: expected a table");
+                    };
+                    // As Hyprland reads a selector: a number is an id (a negative one
+                    // relative, so never found here), `name:` the first workspace with that
+                    // name.
+                    let all = self.all_workspaces();
+                    let found = match name.strip_prefix("name:") {
+                        Some(name) => all.into_iter().find(|(_, n, _)| n == name),
+                        None => name
+                            .parse::<i64>()
+                            .ok()
+                            .filter(|id| *id > 0)
+                            .and_then(|id| all.into_iter().find(|(i, _, _)| *i == id)),
+                    };
+                    match found {
+                        Some((id, name, from)) => self.move_workspace(id, name, from, &to),
+                        None if !guarded => return Err("warning: =[C]:-1: Workspace not found"),
+                        None => {}
+                    }
+                }
+                for shown in lua.split("local m = hl.get_monitor(").skip(1) {
+                    let id = shown
+                        .split_once("hl.get_workspace(")
+                        .and_then(|(_, rest)| rest.split_once(')'))
+                        .map(|(id, _)| id);
+                    let (Some(monitor), Some(id)) = (shown.split('"').nth(1), id) else {
+                        return Err("error: set_workspace: expected a table");
+                    };
+                    let Some(id) = (if id == "keep" { keep } else { id.parse().ok() }) else {
+                        continue;
+                    };
+                    let there = self.all_workspaces().iter().any(|(i, _, _)| *i == id);
+                    if there && self.monitors.iter().any(|m| m.name == monitor) {
+                        self.shown.retain(|(m, _)| m != monitor);
+                        self.shown.push((monitor.to_string(), id));
+                        self.lay_out(id, monitor);
+                    }
+                }
+                Ok(())
+            })();
+            if lua.contains("enabled = anim") {
+                self.animations_off = saved;
+            }
+            done.map_or_else(str::to_string, |()| "ok".into())
         }
 
         fn name_of(&self, id: i64) -> String {
@@ -765,6 +886,29 @@ pub mod fake {
             let mut state = self.state.lock().unwrap();
             state.shown.retain(|(m, _)| m != monitor);
             state.shown.push((monitor.into(), id));
+        }
+
+        /// The user goes to workspace `id` on `monitor`: Hyprland lays its windows out there.
+        pub fn switch_to(&self, monitor: &str, id: i64) {
+            let mut state = self.state.lock().unwrap();
+            state.shown.retain(|(m, _)| m != monitor);
+            state.shown.push((monitor.into(), id));
+            state.lay_out(id, monitor);
+        }
+
+        /// The workspaces whose windows slid in from another monitor's place when shown:
+        /// workspace, where they were laid out, where they were shown.
+        pub fn stray_animations(&self) -> Vec<(i64, String, String)> {
+            self.state.lock().unwrap().strays.clone()
+        }
+
+        /// `animations:enabled`, as set now.
+        pub fn animations_on(&self) -> bool {
+            !self.state.lock().unwrap().animations_off
+        }
+
+        pub fn set_animations(&self, on: bool) {
+            self.state.lock().unwrap().animations_off = !on;
         }
 
         pub fn shown(&self, monitor: &str) -> i64 {
@@ -1039,61 +1183,13 @@ pub mod fake {
                 window.workspace = Some(shown);
                 return Ok("ok".into());
             }
-            // Bare, or behind `if hl.get_workspace(...) then`, which skips a workspace not there.
+            // A workspace move and/or showing, maybe with animations off around them and the
+            // workspace a monitor showed shown again after.
             if let Some(lua) = command.strip_prefix("eval ")
-                && let Some(at) = lua.find("hl.dispatch(hl.dsp.workspace.move(")
+                && (lua.contains("hl.dispatch(hl.dsp.workspace.move(")
+                    || lua.contains("local m = hl.get_monitor("))
             {
-                let guarded = lua.starts_with("if hl.get_workspace(");
-                let lua = &lua[at..];
-                let (Some(name), Some(to)) = (quoted(lua, "workspace"), quoted(lua, "monitor"))
-                else {
-                    return Ok("error: hl.workspace.move: expected a table".into());
-                };
-                // As Hyprland reads a selector: a number is an id (a negative one relative, so
-                // never found here), `name:` the first workspace with that name.
-                let all = state.all_workspaces();
-                let found = match name.strip_prefix("name:") {
-                    Some(name) => all.into_iter().find(|(_, n, _)| n == name),
-                    None => name
-                        .parse::<i64>()
-                        .ok()
-                        .filter(|id| *id > 0)
-                        .and_then(|id| all.into_iter().find(|(i, _, _)| *i == id)),
-                };
-                match found {
-                    Some((id, name, from)) => state.move_workspace(id, name, from, &to),
-                    None if !guarded => {
-                        return Ok("warning: =[C]:-1: Workspace not found".into());
-                    }
-                    None => {}
-                }
-                // The rest of the chunk, if any, runs next.
-                if !lua.contains("local m = hl.get_monitor(") {
-                    return Ok("ok".into());
-                }
-            }
-            // `local m = hl.get_monitor("X") local w = hl.get_workspace(ID) if m and w then ...
-            // m:set_workspace(...) ... end`, maybe after a move: the monitor shows workspace ID,
-            // when there, without the focus. One on another monitor is not moved: shown there all
-            // the same, and still listed on its own (measured on Hyprland 0.56.2).
-            if let Some(lua) = command.strip_prefix("eval ")
-                && let Some(at) = lua.find("local m = hl.get_monitor(")
-            {
-                let lua = &lua[at..];
-                let id = lua
-                    .split_once("hl.get_workspace(")
-                    .and_then(|(_, rest)| rest.split_once(')'))
-                    .and_then(|(id, _)| id.parse::<i64>().ok());
-                let (Some(monitor), Some(id)) = (lua.split('"').nth(1).map(str::to_string), id)
-                else {
-                    return Ok("error: set_workspace: expected a table".into());
-                };
-                let there = state.all_workspaces().iter().any(|(i, _, _)| *i == id);
-                if there && state.monitors.iter().any(|m| m.name == monitor) {
-                    state.shown.retain(|(m, _)| *m != monitor);
-                    state.shown.push((monitor, id));
-                }
-                return Ok("ok".into());
+                return Ok(state.workspace_chunk(lua));
             }
             if let Some(lua) = command.strip_prefix("eval hl.config({ cursor = { invisible = ") {
                 state.cursor_invisible = lua.starts_with("true");
