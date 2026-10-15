@@ -253,6 +253,8 @@ pub struct Bridge<C: Compositor> {
     folder: Option<Arc<vfs::Folder>>,
     /// The reads of each copy read through the folder.
     reads: Rc<RefCell<std::collections::HashMap<u32, Reads>>>,
+    /// The files fetched now for the folder, of every copy: room is kept for all of them.
+    fetching: Rc<RefCell<Vec<Arc<vfs::Content>>>>,
 }
 
 /// The reads of one copy of the peer's through the virtual folder.
@@ -290,6 +292,7 @@ impl<C: Compositor> Bridge<C> {
             serving: Cell::new(None),
             folder: None,
             reads: Rc::default(),
+            fetching: Rc::default(),
         }
     }
 
@@ -720,14 +723,19 @@ impl<C: Compositor> Bridge<C> {
     /// that read it: one transfer per copy, whose bar counts the bytes of all its files.
     fn fetch_read(&self, serial: u32, index: u32, total: u64, content: Arc<vfs::Content>) {
         let size = content.size;
+        let coming: u64 = self.fetching.borrow().iter().map(|c| c.left()).sum();
         if let Some(inbox) = &self.inbox
-            && let Err(e) = inbox.check_room(size)
+            && let Err(e) = inbox.check_room(size.saturating_add(coming))
         {
             log(format_args!("offer {serial}: file {index} not read: {e}"));
             self.notifier.show("Paste failed", &e.to_string());
             content.end(Err(libc::ENOSPC));
+            if let Some(folder) = &self.folder {
+                folder.forget(serial, index, &content);
+            }
             return;
         }
+        self.fetching.borrow_mut().push(content.clone());
         let (first, done) = {
             let mut reads = self.reads.borrow_mut();
             let reads = reads.entry(serial).or_default();
@@ -747,14 +755,18 @@ impl<C: Compositor> Bridge<C> {
             self.notifier.clone(),
             self.reads.clone(),
         );
+        let (folder, fetching) = (self.folder.clone(), self.fetching.clone());
         let task = tokio::task::spawn_local(async move {
             // Ends the read and the transfer however the fetch ends, stopped included.
             let _ending = ReadEnding {
                 content: content.clone(),
                 serial,
+                index,
                 run,
                 progress,
                 reads,
+                folder,
+                fetching,
             };
             let sink = meter.wrap(ContentSink {
                 content: content.clone(),
@@ -794,19 +806,32 @@ impl<C: Compositor> Bridge<C> {
 }
 
 /// Ends a read of the virtual folder when its fetch ends or is dropped: its readers get what
-/// came, or fail; the transfer of its copy ends with its last fetch.
+/// came, or fail, and a file not fetched whole is fetched again at its next read; the transfer
+/// of its copy ends with its last fetch.
 struct ReadEnding {
     content: Arc<vfs::Content>,
     serial: u32,
+    index: u32,
     run: u64,
     progress: progress::Progress,
     reads: Rc<RefCell<std::collections::HashMap<u32, Reads>>>,
+    folder: Option<Arc<vfs::Folder>>,
+    fetching: Rc<RefCell<Vec<Arc<vfs::Content>>>>,
 }
 
 impl Drop for ReadEnding {
     fn drop(&mut self) {
         // A fetch dropped before its end: stopped by the user, its copy gone, or the mode.
         self.content.end(Err(libc::ECANCELED));
+        let content = &self.content;
+        self.fetching
+            .borrow_mut()
+            .retain(|c| !Arc::ptr_eq(c, content));
+        if !content.whole()
+            && let Some(folder) = &self.folder
+        {
+            folder.forget(self.serial, self.index, content);
+        }
         let mut all = self.reads.borrow_mut();
         let Some(reads) = all.get_mut(&self.serial) else {
             return;
@@ -4255,6 +4280,78 @@ mod tests {
                 let (again, _) = next_request(&mut remote).await;
                 send_rest(&mut remote, again, &content, 0).await;
                 assert!(within("the read", read).await.unwrap().unwrap() == content);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_keeps_nothing_and_a_later_read_fetches_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = bytes_of(2 * CHUNK, 8);
+        LocalSet::new()
+            .run_until(async {
+                let (home, mut remote, mount) = alone_reading(Side::Client, tmp.path());
+                let size = content.len() as u64;
+                let path = offer_a_file(&home, &mut remote, 6, "a.bin", size, 1).await;
+                let folder = mount.folder().await;
+                let ino = folder.lookup(1, "6".as_ref()).unwrap().ino;
+                let ino = folder.lookup(ino, "a.bin".as_ref()).unwrap().ino;
+                folder.open(ino).unwrap();
+                // A read of the second chunk waits for it.
+                let (tx, waiting) = tokio::sync::oneshot::channel();
+                folder.read(ino, CHUNK as u64, 4096, move |read| {
+                    let _ = tx.send(read);
+                });
+                let (id, _) = next_request(&mut remote).await;
+                send_data(&mut remote, id, 0, &content[..CHUNK], false).await;
+                // The remote stops in the middle of it.
+                remote
+                    .write_msg(&LinkMsg::ClipboardAbort { id })
+                    .await
+                    .unwrap();
+                assert_eq!(within("the read", waiting).await.unwrap(), Err(libc::EIO));
+                let read = tokio::task::spawn_local(read_file(folder.clone(), path));
+                let (again, _) = next_request(&mut remote).await;
+                send_rest(&mut remote, again, &content, 0).await;
+                assert!(within("the read again", read).await.unwrap().unwrap() == content);
+                folder.release(ino);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_read_needs_room_for_the_fetches_under_way_as_well() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = |path: &str| ClipboardFile {
+            path: path.into(),
+            size: 2 * CHUNK as u64,
+            dir: false,
+        };
+        LocalSet::new()
+            .run_until(async {
+                let (end, peer) = tokio::io::duplex(64 * 1024);
+                let (inbox, mount) = reading(tmp.path());
+                // Room for one of the two files, and a half.
+                let inbox = Inbox {
+                    free: |_| Ok(3 * CHUNK as u64),
+                    ..inbox
+                };
+                let (home, mut remote) = (machine(Side::Client, end, inbox), Framed::new(peer));
+                let offer = LinkMsg::ClipboardOffer {
+                    serial: 6,
+                    mime_types: Vec::new(),
+                    files: vec![file("a.bin"), file("b.bin")],
+                };
+                remote.write_msg(&offer).await.unwrap();
+                home.offered(1).await;
+                let pasted = home.paste(URI_LIST).await;
+                let paths = parse_uri_list(&String::from_utf8(pasted).unwrap());
+                let folder = mount.folder().await;
+                let _a = tokio::task::spawn_local(read_file(folder.clone(), paths[0].clone()));
+                next_request(&mut remote).await;
+                let b = read_file(folder, paths[1].clone()).await;
+                assert_eq!(b, Err(libc::ENOSPC));
+                home.seen.told("Paste failed").await;
             })
             .await;
     }

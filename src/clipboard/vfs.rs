@@ -129,6 +129,16 @@ impl Content {
         self.have.lock().unwrap().end.is_some()
     }
 
+    /// Whether its fetch ended with all its bytes.
+    pub fn whole(&self) -> bool {
+        self.have.lock().unwrap().end == Some(Ok(()))
+    }
+
+    /// The bytes still to come.
+    pub fn left(&self) -> u64 {
+        self.size.saturating_sub(self.have.lock().unwrap().got)
+    }
+
     /// Whether all its bytes are here, or its fetch is over.
     fn complete(&self) -> bool {
         let have = self.have.lock().unwrap();
@@ -479,6 +489,20 @@ impl Folder {
             content.end(Err(libc::EIO));
         }
         Ok(content)
+    }
+
+    /// The fetch of `content`, file `index` of the copy `serial`, ended without all its bytes:
+    /// what came of it goes, and the next read fetches it again.
+    pub fn forget(&self, serial: u32, index: u32, content: &Arc<Content>) {
+        let mut tree = self.tree.lock().unwrap();
+        if let Some(offer) = tree.offers.get_mut(&serial)
+            && offer
+                .contents
+                .get(&index)
+                .is_some_and(|c| Arc::ptr_eq(c, content))
+        {
+            offer.contents.remove(&index);
+        }
     }
 
     /// The user stopped the reads of the copy `serial`: those waiting fail, and the next ones.
