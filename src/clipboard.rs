@@ -266,6 +266,8 @@ struct Reads {
     done: Meter,
     /// The copy went from the folder: these reads go with their last fetch.
     gone: bool,
+    /// The user was told a read of it failed: once is enough, the next ones fail alike.
+    told: bool,
 }
 
 impl<C: Compositor> Bridge<C> {
@@ -762,7 +764,7 @@ impl<C: Compositor> Bridge<C> {
         let (folder, fetching) = (self.folder.clone(), self.fetching.clone());
         let task = tokio::task::spawn_local(async move {
             // Ends the read and the transfer however the fetch ends, stopped included.
-            let _ending = ReadEnding {
+            let ending = ReadEnding {
                 content: content.clone(),
                 serial,
                 index,
@@ -801,12 +803,23 @@ impl<C: Compositor> Bridge<C> {
                 Err(e) => {
                     content.end(Err(libc::EIO));
                     log(format_args!("offer {serial}: file {index} not read: {e}"));
-                    notifier.show("Paste failed", &why(&e));
+                    let told = told_once(&ending.reads, serial);
+                    if !told {
+                        notifier.show("Paste failed", &why(&e));
+                    }
                 }
             }
         });
         tasks.borrow_mut().push(task.abort_handle());
     }
+}
+
+/// Whether the user was told already that a read of the copy `serial` failed; they are now.
+fn told_once(reads: &RefCell<std::collections::HashMap<u32, Reads>>, serial: u32) -> bool {
+    let mut reads = reads.borrow_mut();
+    reads
+        .get_mut(&serial)
+        .is_some_and(|r| std::mem::replace(&mut r.told, true))
 }
 
 /// Ends a read of the virtual folder when its fetch ends or is dropped: its readers get what
@@ -4451,6 +4464,29 @@ mod tests {
                 bridge.reads.borrow_mut().insert(6, Reads::default());
                 bridge.on_asked(vfs::Asked::Gone { serial: 6 });
                 assert!(bridge.reads.borrow().is_empty());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn once_the_peer_stops_serving_a_copy_its_later_reads_say_so_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (remote, mut home, mount) = alone_reading(Side::Server, tmp.path());
+                let path = offer_a_file(&remote, &mut home, 6, "a.bin", 2 * CHUNK as u64, 1).await;
+                let folder = mount.folder().await;
+                // Home's user cancelled its serving: each request is refused from now on.
+                for _ in 0..3 {
+                    let read = tokio::task::spawn_local(read_file(folder.clone(), path.clone()));
+                    let (id, _) = next_request(&mut home).await;
+                    home.write_msg(&LinkMsg::ClipboardAbort { id })
+                        .await
+                        .unwrap();
+                    assert_eq!(within("the read", read).await.unwrap(), Err(libc::EIO));
+                }
+                remote.seen.told("Paste failed").await;
+                assert_eq!(remote.seen.times_told("Paste failed"), 1);
             })
             .await;
     }
