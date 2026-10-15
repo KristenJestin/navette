@@ -1,7 +1,9 @@
 //! The clipboard bridge: copy on one machine, paste on the other, both ways, text and files.
 //! One bridge runs per link, on each side, however many monitors a mode will give the remote
 //! machine: during the trial two sessions to the same machine replaced each other's offers on
-//! its one clipboard, and every paste failed with "the peer aborted the transfer".
+//! its one clipboard, and every paste failed with "the peer aborted the transfer". It bridges
+//! only while a mode runs: between two modes, a copy stays on its machine, and the peer's
+//! requests are refused, on both sides, whatever the other side asks.
 //!
 //! The transfer engine is gliff's (`gliff-transport`): lazy (nothing moves until an
 //! application pastes), typed, chunked, files included. The compositor side is
@@ -258,6 +260,15 @@ impl<C: Compositor> Bridge<C> {
             notifier: shown.notifier.clone(),
             pastes: Cell::new(0),
             serving: Cell::new(None),
+        }
+    }
+
+    /// The peer's copy goes with the mode: no application here pastes it after. A copy made
+    /// here since stays.
+    fn withdraw(&self) {
+        let mut remote = self.remote.borrow_mut();
+        if std::mem::take(&mut remote.selected) {
+            self.compositor.get().offer(Vec::new());
         }
     }
 
@@ -744,10 +755,11 @@ async fn local_files_from_pipe(mut rx: pipe::Receiver) -> files::Copied {
     }
 }
 
-/// Runs one link's bridge until the link's clipboard channel closes (`true`) or the compositor
-/// side does (`false`). Takes the wire by reference so a new compositor connection can pick
-/// the same link up again; `kept` is the machine's. Whatever the bridge started (pastes and
-/// transfers, their half-written files) ends with it, even when this future is dropped.
+/// Serves one link's clipboard until the link's clipboard channel closes (`true`) or the
+/// compositor side does (`false`): a bridge for each mode, and nothing crossing between two.
+/// Takes the wire by reference so a new compositor connection can pick the same link up again;
+/// `kept` is the machine's. Whatever a bridge started (pastes and transfers, their half-written
+/// files) ends with it, even when this future is dropped.
 pub async fn run<C: Compositor>(
     side: Side,
     wire: &mut Wire,
@@ -757,9 +769,91 @@ pub async fn run<C: Compositor>(
     kept: Kept,
     shown: Shown,
 ) -> bool {
+    // Dropping the compositor may block: never on the link's thread.
+    let compositor = OffThread(Some(compositor));
+    loop {
+        if let Some(ended) = quiet(wire, &mut events).await {
+            return matches!(ended, Ended::Link);
+        }
+        log(format_args!("a mode runs: copies cross"));
+        let ended = bridge(
+            side,
+            wire,
+            compositor.get().clone(),
+            &mut events,
+            inbox.clone(),
+            kept.clone(),
+            shown.clone(),
+        )
+        .await;
+        match ended {
+            Ended::Mode => log(format_args!("no mode runs: copies stay on their machine")),
+            ended => return matches!(ended, Ended::Link),
+        }
+    }
+}
+
+/// What ended a link's bridge.
+enum Ended {
+    Link,
+    Compositor,
+    Mode,
+}
+
+/// Until the display says a mode runs (`on`), or that none does.
+async fn mode_is(mode: &mut tokio::sync::watch::Receiver<bool>, on: bool) {
+    while crate::link::in_mode(mode) != on {
+        if mode.changed().await.is_err() && on {
+            // No display: no mode will start on this link.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Outside a mode: a copy here stays here, a copy the peer offers anyway is not put on the
+/// clipboard, and its requests are refused. A copy made now is not offered when the mode
+/// starts: only the next one is. `None` once a mode runs.
+async fn quiet(wire: &mut Wire, events: &mut UnboundedReceiver<Selected>) -> Option<Ended> {
+    loop {
+        tokio::select! {
+            biased;
+            () = mode_is(&mut wire.mode, true) => return None,
+            clip = wire.from_peer.recv() => match clip {
+                Some((ClipboardMsg::Request { id, serial, .. }, _)) => {
+                    log(format_args!("offer {serial}: a request refused, no mode runs"));
+                    let _ = wire.to_peer.send((ClipboardMsg::Abort { id }, Bytes::new())).await;
+                }
+                Some((ClipboardMsg::Offer { serial, .. }, _)) => {
+                    log(format_args!("offer {serial} not taken, no mode runs"));
+                }
+                Some(_) => {}
+                None => return Some(Ended::Link),
+            },
+            event = events.recv() => match event {
+                Some(Selected::Selection { .. }) => {
+                    log(format_args!("a copy here stays here, no mode runs"));
+                }
+                // Nothing of the peer's is on the clipboard: the paste reads nothing.
+                Some(Selected::Paste { .. }) => {}
+                None => return Some(Ended::Compositor),
+            },
+        }
+    }
+}
+
+/// A mode's bridge, until the mode stops, the link ends or the compositor goes.
+async fn bridge<C: Compositor>(
+    side: Side,
+    wire: &mut Wire,
+    compositor: Arc<C>,
+    events: &mut UnboundedReceiver<Selected>,
+    inbox: Option<Inbox>,
+    kept: Kept,
+    shown: Shown,
+) -> Ended {
     // Every task the bridge and gliff's engine spawn lands in this set, and dies with it.
     let tasks = LocalSet::new();
-    // The received files go with the link, however it ends: the mode stops, the link drops, or
+    // The received files go with the mode, however it ends: the mode stops, the link drops, or
     // this future is dropped. Only a compositor that went away leaves them, since the link and
     // the offer they belong to are still up.
     let mut leaving = Emptying(inbox.clone());
@@ -779,19 +873,25 @@ pub async fn run<C: Compositor>(
             let mut cancel_open = true;
             loop {
                 tokio::select! {
+                    // A stop is seen before what the peer sent after it.
+                    biased;
+                    () = mode_is(&mut wire.mode, false) => {
+                        bridge.withdraw();
+                        return Ended::Mode;
+                    }
                     changed = cancel.changed(), if cancel_open => match changed {
                         Ok(()) => bridge.cancel(),
                         Err(_) => cancel_open = false,
                     },
                     clip = wire.from_peer.recv() => match clip {
                         Some((msg, payload)) => bridge.on_peer_msg(msg, payload),
-                        None => return true,
+                        None => return Ended::Link,
                     },
                     event = events.recv() => match event {
                         Some(event) => bridge.on_compositor_event(event),
                         None => {
                             leaving.0 = None;
-                            return false;
+                            return Ended::Compositor;
                         }
                     },
                 }
@@ -940,6 +1040,7 @@ mod tests {
 
     use gliff_proto::ClipboardMsg;
     use gliff_proto::clipboard::CHUNK;
+    use gliff_transport::Framed;
     use gliff_transport::clipboard::outbound_channel;
     use tokio::net::unix::pipe;
     use tokio::sync::mpsc;
@@ -1070,6 +1171,12 @@ mod tests {
         }
     }
 
+    /// Whether a mode runs on each new link, and what the display of the link up now says.
+    type ModeSaid = (
+        Cell<bool>,
+        RefCell<Option<tokio::sync::watch::Sender<bool>>>,
+    );
+
     /// One machine of a test desk: its clipboard and the way to act on it.
     struct Machine {
         clipboard: Arc<Fake>,
@@ -1080,6 +1187,9 @@ mod tests {
         display: tokio::sync::Mutex<mpsc::UnboundedReceiver<crate::display::wire::Peer>>,
         /// Its end of the link: aborting it drops the link.
         link: tokio::task::JoinHandle<()>,
+        /// Whether a mode runs, as its display says it on each link: from the link's start
+        /// unless the test says otherwise, so that what crosses during a mode is tested alone.
+        mode: Rc<ModeSaid>,
     }
 
     impl Machine {
@@ -1125,6 +1235,14 @@ mod tests {
             });
         }
 
+        /// A mode starts on its link (`true`) or stops.
+        fn mode(&self, on: bool) {
+            self.mode.0.set(on);
+            if let Some(mode) = &*self.mode.1.borrow() {
+                mode.send_replace(on);
+            }
+        }
+
         /// Its link is up, once more.
         async fn connected(&self) {
             within("the link", self.display.lock().await.recv()).await;
@@ -1145,11 +1263,44 @@ mod tests {
     /// Home and the remote machine, each with its bridge, over an in-memory link. Spawns on
     /// the current `LocalSet`.
     /// Each machine's receiving folder is `home` or `remote` in `folders`.
+    /// A mode runs on it from the start.
     fn desk(folders: &std::path::Path) -> (Machine, Machine) {
         let (home_end, remote_end) = tokio::io::duplex(64 * 1024);
         let home = machine(Side::Client, home_end, Inbox::new(folders.join("home")));
         let remote = machine(Side::Server, remote_end, Inbox::new(folders.join("remote")));
         (home, remote)
+    }
+
+    /// The same, with the link up and no mode.
+    fn quiet_desk(folders: &std::path::Path) -> (Machine, Machine) {
+        let (home, remote) = desk(folders);
+        home.mode(false);
+        remote.mode(false);
+        (home, remote)
+    }
+
+    /// A machine and the raw end of its link, where a test plays the peer; no mode runs.
+    fn alone(side: Side, folder: &std::path::Path) -> (Machine, Framed<tokio::io::DuplexStream>) {
+        let (end, peer) = tokio::io::duplex(64 * 1024);
+        let machine = machine(side, end, Inbox::new(folder.into()));
+        machine.mode(false);
+        (machine, Framed::new(peer))
+    }
+
+    /// The next clipboard message the machine sent the peer.
+    async fn next_clip(peer: &mut Framed<tokio::io::DuplexStream>) -> LinkMsg {
+        within("a clipboard message", async {
+            loop {
+                let msg = peer.read_msg::<LinkMsg>().await.unwrap();
+                if let LinkMsg::ClipboardData { data_len, .. } = &msg {
+                    peer.read_payload(*data_len).await.unwrap();
+                }
+                if msg.clone().into_clipboard().is_some() {
+                    return msg;
+                }
+            }
+        })
+        .await
     }
 
     fn machine(side: Side, stream: tokio::io::DuplexStream, inbox: Inbox) -> Machine {
@@ -1177,9 +1328,14 @@ mod tests {
         let (displays, display) = mpsc::unbounded_channel();
         let seen = Seen::new();
         let kept = Kept::default();
+        let mode = Rc::new((Cell::new(true), RefCell::new(None)));
         let (bridge, shown, its_events) = (clipboard.clone(), seen.shown(), events.clone());
+        let its_mode = mode.clone();
         let service: Service = Rc::new(move |mut wire: Wire| {
-            let _ = displays.send(wire.display.take().unwrap());
+            let peer = wire.display.take().unwrap();
+            peer.mode.send_replace(its_mode.0.get());
+            *its_mode.1.borrow_mut() = Some(peer.mode.clone());
+            let _ = displays.send(peer);
             let selected = first.borrow_mut().take().unwrap_or_else(|| {
                 let (to_bridge, selected) = mpsc::unbounded_channel();
                 *its_events.borrow_mut() = to_bridge;
@@ -1198,6 +1354,7 @@ mod tests {
             seen,
             display: tokio::sync::Mutex::new(display),
             link: link(service),
+            mode,
         }
     }
 
@@ -1254,6 +1411,197 @@ mod tests {
                 home.copy(&[(TEXT, b"second")]);
                 remote.offered(2).await;
                 assert_eq!(remote.paste(TEXT).await, b"second");
+            })
+            .await;
+    }
+
+    const HTML: &str = "text/html";
+
+    /// Long enough for a copy to be offered, were it offered: a newer copy made before
+    /// replaces it unsent.
+    async fn settled() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// A copy made with no mode sends nothing: the first clipboard message the peer gets is
+    /// the offer of the copy made once the mode started.
+    async fn a_copy_with_no_mode_sends_nothing(side: Side) {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (machine, mut peer) = alone(side, tmp.path());
+                machine.copy(&[(HTML, b"<p>salaries</p>")]);
+                settled().await;
+                machine.mode(true);
+                machine.copy(&[(TEXT, b"meeting at ten")]);
+                let LinkMsg::ClipboardOffer { mime_types, .. } = next_clip(&mut peer).await else {
+                    panic!("an offer first");
+                };
+                assert!(
+                    mime_types.iter().any(|m| m == TEXT) && !mime_types.iter().any(|m| m == HTML),
+                    "{mime_types:?}"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn with_the_link_up_and_no_mode_a_copy_at_home_sends_nothing() {
+        a_copy_with_no_mode_sends_nothing(Side::Client).await;
+    }
+
+    #[tokio::test]
+    async fn with_the_link_up_and_no_mode_a_copy_on_the_remote_sends_nothing() {
+        a_copy_with_no_mode_sends_nothing(Side::Server).await;
+    }
+
+    #[tokio::test]
+    async fn after_mode_start_a_copy_crosses() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = quiet_desk(tmp.path());
+                home.connected().await;
+                home.mode(true);
+                remote.mode(true);
+                home.copy(&[(TEXT, b"meeting at ten")]);
+                remote.offered(1).await;
+                assert_eq!(remote.paste(TEXT).await, b"meeting at ten");
+                remote.copy(&[(TEXT, b"room 4")]);
+                home.offered(1).await;
+                assert_eq!(home.paste(TEXT).await, b"room 4");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_copy_made_before_mode_start_does_not_cross_at_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = quiet_desk(tmp.path());
+                home.connected().await;
+                home.copy(&[(HTML, b"<p>salaries</p>")]);
+                settled().await;
+                home.mode(true);
+                remote.mode(true);
+                home.copy(&[(TEXT, b"meeting at ten")]);
+                let offer = remote.offered(1).await;
+                assert!(!offer.iter().any(|mime| mime == HTML), "{offer:?}");
+                assert_eq!(remote.paste(TEXT).await, b"meeting at ten");
+                assert_eq!(remote.clipboard.offered.lock().unwrap().len(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn after_mode_stop_a_copy_no_longer_crosses() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                home.copy(&[(TEXT, b"meeting at ten")]);
+                remote.offered(1).await;
+                home.mode(false);
+                remote.mode(false);
+                // What the remote held of home's copy goes with the mode.
+                assert_eq!(remote.offered(2).await, Vec::<String>::new());
+                home.copy(&[(HTML, b"<p>salaries</p>")]);
+                settled().await;
+                home.mode(true);
+                remote.mode(true);
+                home.copy(&[(TEXT, b"room 4")]);
+                let offer = remote.offered(3).await;
+                assert!(!offer.iter().any(|mime| mime == HTML), "{offer:?}");
+                assert_eq!(remote.paste(TEXT).await, b"room 4");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_mode_s_stop_takes_the_peer_s_copy_off_the_clipboard() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                remote.copy(&[(TEXT, b"meeting at ten")]);
+                home.offered(1).await;
+                home.mode(false);
+                assert_eq!(home.offered(2).await, Vec::<String>::new());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_mode_s_stop_leaves_a_copy_made_here_since_on_the_clipboard() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (home, mut peer) = alone(Side::Client, tmp.path());
+                home.mode(true);
+                peer.write_msg(&LinkMsg::ClipboardOffer {
+                    serial: 7,
+                    mime_types: vec![TEXT.into()],
+                    files: Vec::new(),
+                })
+                .await
+                .unwrap();
+                home.offered(1).await;
+                home.copy(&[(TEXT, b"mine")]);
+                let LinkMsg::ClipboardOffer { serial, .. } = next_clip(&mut peer).await else {
+                    panic!("the offer of the copy");
+                };
+                home.mode(false);
+                // Refused, the request shows the stop handled.
+                peer.write_msg(&LinkMsg::ClipboardRequest {
+                    id: 1,
+                    serial,
+                    item: ClipboardItem::Mime(TEXT.into()),
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    next_clip(&mut peer).await,
+                    LinkMsg::ClipboardAbort { id: 1 }
+                );
+                assert_eq!(home.clipboard.offered.lock().unwrap().len(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn outside_a_mode_the_remote_refuses_what_home_asks_and_offers() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (remote, mut home) = alone(Side::Server, tmp.path());
+                remote.mode(true);
+                remote.copy(&[(TEXT, b"meeting at ten")]);
+                let LinkMsg::ClipboardOffer { serial, .. } = next_clip(&mut home).await else {
+                    panic!("an offer first");
+                };
+                remote.mode(false);
+                // A home that asks anyway: its offer is not put on the clipboard, and its
+                // request is refused, in that order.
+                home.write_msg(&LinkMsg::ClipboardOffer {
+                    serial: 9,
+                    mime_types: vec![TEXT.into()],
+                    files: Vec::new(),
+                })
+                .await
+                .unwrap();
+                home.write_msg(&LinkMsg::ClipboardRequest {
+                    id: 1,
+                    serial,
+                    item: ClipboardItem::Mime(TEXT.into()),
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    next_clip(&mut home).await,
+                    LinkMsg::ClipboardAbort { id: 1 }
+                );
+                assert!(remote.clipboard.offered.lock().unwrap().is_empty());
             })
             .await;
     }
@@ -1510,6 +1858,37 @@ mod tests {
 
                 // The mode stops, or the lid closes: the files are not kept for the next link.
                 drop(cable);
+                within("the folder emptied", async {
+                    while !tree(&folder).is_empty() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await;
+                assert!(folder.is_dir());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_mode_s_stop_empties_the_receiving_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("copied");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::write(copied.join("report.bin"), b"figures").unwrap();
+        let list = uri_list_of(&[copied.join("report.bin")]);
+        let folder = tmp.path().join("home");
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                remote.copy(&[(URI_LIST, list.as_bytes())]);
+                home.offered(1).await;
+                home.paste(URI_LIST).await;
+                assert_eq!(
+                    tree(&folder),
+                    [("report.bin".into(), Some(b"figures".to_vec()))]
+                );
+
+                home.mode(false);
                 within("the folder emptied", async {
                     while !tree(&folder).is_empty() {
                         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2346,16 +2725,19 @@ mod tests {
     async fn a_large_paste_under_way(folder: &std::path::Path) -> LargePaste {
         let (peer, from_peer) = mpsc::channel(16);
         let (to_peer, mut sent) = outbound_channel();
+        let (mode, in_mode) = tokio::sync::watch::channel(true);
         let mut wire = Wire {
             from_peer,
             to_peer,
             display: None,
             audio: None,
+            mode: in_mode,
         };
         let (events, selected) = mpsc::unbounded_channel();
         let (seen, clipboard) = (Seen::new(), Arc::new(Fake::default()));
         let (shown, bridge, inbox) = (seen.shown(), clipboard.clone(), folder.to_path_buf());
         tokio::task::spawn_local(async move {
+            let _mode = mode;
             let inbox = Some(Inbox::new(inbox));
             let kept = Kept::default();
             super::run(
@@ -2858,11 +3240,13 @@ mod tests {
             .run_until(async {
                 let (_from_peer, inbound) = mpsc::channel(1);
                 let (to_peer, mut sent) = outbound_channel();
+                let (_mode, in_mode) = tokio::sync::watch::channel(true);
                 let mut wire = Wire {
                     from_peer: inbound,
                     to_peer,
                     display: None,
                     audio: None,
+                    mode: in_mode,
                 };
                 let kept = Kept::default();
                 let clipboard = Arc::new(Fake::default());
