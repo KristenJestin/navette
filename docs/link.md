@@ -31,13 +31,23 @@ identity, remove its `identity.*` files and pair both machines again.
 
 ## The clipboard
 
-Once the link is up, `navette serve` and `navette agent` each run one clipboard bridge for it,
-whatever the modes will later be: copy on one machine, paste on the other, text and files,
+While a mode runs, `navette serve` and `navette agent` each run one clipboard bridge on the
+link, whatever the monitors given: copy on one machine, paste on the other, text and files,
 both ways. It rides the link after the hello, in gliff's framing; the transfer is gliff's
 engine, which is lazy (nothing moves until an application pastes), typed, chunked, and
 refuses a request against an offer that a newer copy has replaced.
 
-- **One bridge per link, never per monitor.** Two bridges on one machine's clipboard replace
+- **Nothing crosses outside a mode.** The link stays up between two modes, so that a start is
+  quick, but each machine's display says on it whether a mode runs: home once the remote
+  answered its start, the remote while it runs home's mode. Until then and after the stop,
+  each machine keeps its copies to itself, does not put the other's offer on its clipboard,
+  and refuses its requests, whatever the other machine asks. A copy made before `mode start`
+  is not offered when the mode starts: the next one is. At the stop, the other machine's copy
+  leaves the clipboard (a copy made here since stays), and the received files go. The
+  remote's sound and home's mic are not sent either, and the input goes only to a mode's
+  outputs.
+
+- **One bridge at a time on a link, never per monitor.** Two bridges on one machine's clipboard replace
   each other's offers, and every paste then fails with "the peer aborted the transfer"; the
   link has exactly one. When a new connection from the remote has said hello, home ends the
   older one, and its bridge, before it starts the new one's; a connection whose hello fails
@@ -68,8 +78,8 @@ refuses a request against an offer that a newer copy has replaced.
   another user. A file manager reads every new copy at once, so files come in with no paste;
   here they pile up nowhere the user keeps things, and a paste copies them from there to where
   the user pastes. Only the files of the copy being offered are kept: a newer copy removes the
-  older one's, and the folder is emptied when the link ends (the mode stops, the lid closes) or
-  `navette` starts. That folder may live in memory (`$XDG_RUNTIME_DIR` is a tmpfs): a very large
+  older one's, and the folder is emptied when the mode stops, when the link ends (the lid
+  closes) or when `navette` starts. That folder may live in memory (`$XDG_RUNTIME_DIR` is a tmpfs): a very large
   copy takes that much memory until it is replaced or the link ends. A paste first fills a
   hidden 0700 folder in it (`.navette-incoming-<pid>-<n>`), then moves each pasted file or
   folder in under its own name, or `name (1).ext`, `name (2).ext`… when one is already there:

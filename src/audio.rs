@@ -139,7 +139,7 @@ pub enum Message {
 pub const QUEUE: usize = 64;
 
 impl Message {
-    fn is_frame(&self) -> bool {
+    pub fn is_frame(&self) -> bool {
         matches!(self, Message::Frame { .. } | Message::MicFrame { .. })
     }
 }
@@ -1184,8 +1184,8 @@ mod tests {
 
     pub(super) const WAIT: Duration = Duration::from_secs(10);
 
-    /// The audio wires of the two ends of a link in memory, and home's end of the link, to
-    /// drop it.
+    /// The audio wires of the two ends of a link in memory, a mode running on it, and home's
+    /// end of the link, to drop it.
     pub(super) async fn linked() -> (Wire, Wire, tokio::task::JoinHandle<io::Error>) {
         let (home_stream, remote_stream) = tokio::io::duplex(64 * 1024);
         let heartbeat = link::Heartbeat::default();
@@ -1193,8 +1193,13 @@ mod tests {
             let (taken, wire) = tokio::sync::oneshot::channel();
             let link = tokio::spawn(link::run(stream, heartbeat, move |mut wire: link::Wire| {
                 let _ = taken.send(wire.audio.take().unwrap());
-                // The clipboard's queues stay open, unused.
-                async move { std::future::pending::<()>().await }
+                let display = wire.display.take().unwrap();
+                display.mode.send_replace(true);
+                // The clipboard's queues stay open, unused, and the display says a mode runs.
+                async move {
+                    let _keep = (wire, display);
+                    std::future::pending::<()>().await
+                }
             }));
             (link, wire)
         };

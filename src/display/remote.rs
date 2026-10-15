@@ -303,6 +303,10 @@ pub async fn serve_peer(
     let mut home = Home::default();
     let mut input_open = true;
     loop {
+        // The clipboard and the sound cross only while home's mode runs here.
+        let running = active.is_some();
+        peer.mode
+            .send_if_modified(|mode| std::mem::replace(mode, running) != running);
         let retry_at = active.as_ref().and_then(Active::retry_at);
         let had_mode = active.is_some();
         tokio::select! {
@@ -980,6 +984,8 @@ mod tests {
         logind: Arc<FakeLogind>,
         record: std::path::PathBuf,
         notices: Arc<crate::notify::Fake>,
+        /// What the clipboard and the sound read: whether a mode runs.
+        mode: tokio::sync::watch::Receiver<bool>,
         _dir: tempfile::TempDir,
         task: tokio::task::JoinHandle<()>,
     }
@@ -1003,11 +1009,13 @@ mod tests {
         let (events, mut events_rx) = mpsc::unbounded_channel();
         let outbox = Outbox::default();
         let wire = input::Wire::default();
+        let (mode, in_mode) = tokio::sync::watch::channel(false);
         let peer = Peer {
             outbox: outbox.clone(),
             inbox: inbox_rx,
             pointer: tokio::sync::watch::channel(Default::default()).1,
             input: wire.clone(),
+            mode,
         };
         let logind = Arc::new(FakeLogind::default());
         let dir = tempfile::tempdir().unwrap();
@@ -1041,6 +1049,7 @@ mod tests {
             logind,
             record,
             notices,
+            mode: in_mode,
             _dir: dir,
             task,
         }
@@ -1310,6 +1319,25 @@ mod tests {
                 closed_lid: Some(true),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn with_the_link_up_and_no_mode_the_agent_lets_nothing_cross() {
+        let agent = agent();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!*agent.mode.borrow());
+    }
+
+    #[tokio::test]
+    async fn after_mode_start_the_agent_lets_the_link_carry_and_after_mode_stop_no_longer() {
+        let agent = agent();
+        agent.inbox.try_send(start()).unwrap();
+        until(|| *agent.mode.borrow()).await;
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        until(|| !*agent.mode.borrow()).await;
     }
 
     #[tokio::test]

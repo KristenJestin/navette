@@ -1,7 +1,8 @@
 //! The link once paired: the remote's agent dials home and keeps a connection, home serves it.
 //! Over it, a hello (the link's version), then gliff's framing carrying a heartbeat each way
 //! and the connection's services (the clipboard bridge, the display), over the same
-//! authenticated stream.
+//! authenticated stream. The link stays up between two modes, so that a start is quick, but
+//! carries nothing of the user's then: no copy, no sound, no mic, no input.
 //!
 //! The agent reconnects with an exponential backoff whenever the link drops; home keeps the
 //! newest connection of its one paired remote and drops the older one, which a laptop that
@@ -68,6 +69,9 @@ pub struct Wire {
     pub display: Option<Peer>,
     /// The sound's own queues, for whoever takes them.
     pub audio: Option<audio::Wire>,
+    /// Whether a mode runs, as the display says it: the link stays up between modes so that a
+    /// start is quick, but nothing of the user's crosses outside one.
+    pub mode: watch::Receiver<bool>,
 }
 
 /// How often each side shows it is alive, and how long a silence ends the link.
@@ -170,11 +174,14 @@ where
     let (display_tx, display_rx) = mpsc::channel(DISPLAY_INBOUND);
     let (pointer_tx, pointer) = watch::channel(Vec::new());
     let input = input::Wire::default();
+    let (mode, in_mode) = watch::channel(false);
+    let sound_mode = mode.subscribe();
     let display = Peer {
         outbox: outbox.clone(),
         inbox: display_rx,
         pointer,
         input: input.clone(),
+        mode,
     };
     let (sound, sound_end) = audio::wire();
     let service = async {
@@ -183,6 +190,7 @@ where
             to_peer,
             display: Some(display),
             audio: Some(sound),
+            mode: in_mode,
         })
         .await;
         std::future::pending::<Infallible>().await
@@ -192,7 +200,7 @@ where
             Framed::new(writer),
             heartbeat.interval,
             outbound_rx,
-            sound_end.from_audio,
+            (sound_end.from_audio, sound_mode),
             &outbox,
             &input.to_peer,
         ) => result,
@@ -227,7 +235,7 @@ async fn send<W: AsyncWrite + Unpin>(
     mut writer: Framed<W>,
     interval: Duration,
     mut outbound: mpsc::Receiver<Clip>,
-    mut sound: mpsc::Receiver<audio::Message>,
+    (mut sound, mode): (mpsc::Receiver<audio::Message>, watch::Receiver<bool>),
     display: &Outbox,
     input: &input::Queue,
 ) -> io::Result<Infallible> {
@@ -248,6 +256,9 @@ async fn send<W: AsyncWrite + Unpin>(
                     .map_err(io_error)?
             }
             msg = sound.recv(), if sound_open => match msg {
+                // What the remote plays, or the home mic hears, never crosses outside a mode,
+                // whatever the other side asked.
+                Some(msg) if msg.is_frame() && !in_mode(&mode) => {}
                 Some(msg) => {
                     let packet = match &msg {
                         audio::Message::Frame { packet, .. }
@@ -289,6 +300,11 @@ async fn send<W: AsyncWrite + Unpin>(
             },
         }
     }
+}
+
+/// Whether the display says a mode runs; with no display, none does.
+pub fn in_mode(mode: &watch::Receiver<bool>) -> bool {
+    *mode.borrow() && mode.has_changed().is_ok()
 }
 
 /// The output a message names; one past the most a mode streams ends the link.
@@ -846,6 +862,83 @@ pub(crate) mod tests {
             .await
             .expect("the link must give up on an oversized packet");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// The next sound or display message the link sent.
+    async fn next_sound_or_order(peer: &mut Framed<tokio::io::DuplexStream>) -> LinkMsg {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match peer.read_msg::<LinkMsg>().await.unwrap() {
+                    msg @ (LinkMsg::AudioFrame { data_len, .. }
+                    | LinkMsg::MicFrame { data_len, .. }) => {
+                        peer.read_payload(data_len).await.unwrap();
+                        return msg;
+                    }
+                    msg @ LinkMsg::Display(_) => return msg,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("a message in time")
+    }
+
+    #[tokio::test]
+    async fn with_the_link_up_and_no_mode_no_sound_crosses_either_way() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut peer = Framed::new(b);
+        let (taken, ends) = tokio::sync::oneshot::channel();
+        let service = |mut wire: Wire| async move {
+            let _ = taken.send((wire.audio.take().unwrap(), wire.display.take().unwrap()));
+            std::future::pending::<()>().await
+        };
+        tokio::spawn(run(a, fast(), service));
+        let (sound, display) = ends.await.unwrap();
+        let packet = Bytes::from_static(&[1, 2, 3]);
+        let frames = |seq| {
+            // The remote's sound, and home's mic.
+            for frame in [
+                audio::Message::Frame {
+                    session: 1,
+                    seq,
+                    packet: packet.clone(),
+                },
+                audio::Message::MicFrame {
+                    session: 1,
+                    seq,
+                    packet: packet.clone(),
+                },
+            ] {
+                sound.to_peer.try_send(frame).unwrap();
+            }
+        };
+        // The sound goes before an order: the order read, the frames before it were taken.
+        let order = || {
+            display
+                .outbox
+                .send(DisplayMsg::Display(Display::Stop), Vec::new())
+        };
+        let stop = LinkMsg::Display(Display::Stop);
+
+        frames(0);
+        order();
+        assert_eq!(next_sound_or_order(&mut peer).await, stop);
+
+        display.mode.send_replace(true);
+        frames(1);
+        assert!(matches!(
+            next_sound_or_order(&mut peer).await,
+            LinkMsg::AudioFrame { seq: 1, .. }
+        ));
+        assert!(matches!(
+            next_sound_or_order(&mut peer).await,
+            LinkMsg::MicFrame { seq: 1, .. }
+        ));
+
+        display.mode.send_replace(false);
+        frames(2);
+        order();
+        assert_eq!(next_sound_or_order(&mut peer).await, stop);
     }
 
     #[tokio::test]

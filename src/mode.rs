@@ -352,6 +352,13 @@ pub async fn serve(
     // Each start has its own, said to the remote and back: see `Display::Start`.
     let mut generation: u32 = 0;
     loop {
+        // The link carries the user's clipboard and sound once the remote started the mode,
+        // and no longer once home stops it.
+        if let Some(peer) = &peer {
+            let running = active.as_ref().is_some_and(|a| a.starting.is_none());
+            peer.mode
+                .send_if_modified(|mode| std::mem::replace(mode, running) != running);
+        }
         let deadline = active
             .as_ref()
             .and_then(|a| a.starting.as_ref().map(|(_, at)| *at));
@@ -1415,6 +1422,8 @@ mod tests {
         to_home: mpsc::Sender<Incoming>,
         pointer: watch::Sender<Vec<Pointer>>,
         input: input::Wire,
+        /// What home's clipboard and sound read: whether a mode runs.
+        mode: watch::Receiver<bool>,
     }
 
     fn connect(desk: &Desk) -> Remote {
@@ -1422,12 +1431,14 @@ mod tests {
         let (to_home, inbox) = mpsc::channel(64);
         let (pointer, pointer_rx) = watch::channel(Vec::new());
         let input = input::Wire::default();
+        let (mode, in_mode) = watch::channel(false);
         desk.peers
             .send(Peer {
                 outbox: outbox.clone(),
                 inbox,
                 pointer: pointer_rx,
                 input: input.clone(),
+                mode,
             })
             .unwrap();
         Remote {
@@ -1435,6 +1446,7 @@ mod tests {
             to_home,
             pointer,
             input,
+            mode: in_mode,
         }
     }
 
@@ -1726,6 +1738,38 @@ mod tests {
 
     fn sound_log(desk: &Desk) -> Vec<&'static str> {
         desk.sound.log.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn with_the_link_up_and_no_mode_home_lets_nothing_cross() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!*remote.mode.borrow());
+    }
+
+    #[tokio::test]
+    async fn after_mode_start_home_lets_the_link_carry_and_after_mode_stop_no_longer() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        // Asked, not started: the remote may not carry yet, and home waits for it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!*remote.mode.borrow());
+        remote
+            .to_home
+            .try_send(Incoming::Display(Display::Started {
+                generation: None,
+                output: "NAVETTE-1".into(),
+                others: None,
+                closed_lid: Some(true),
+            }))
+            .unwrap();
+        answer(pending).await.unwrap();
+        until(|| *remote.mode.borrow()).await;
+        answer(ask(&desk, false).await).await.unwrap();
+        until(|| !*remote.mode.borrow()).await;
     }
 
     #[tokio::test]
@@ -2739,6 +2783,7 @@ mod tests {
             to_home,
             pointer,
             input,
+            ..
         } = connect(&desk);
         let _kept = (pointer, input);
         // The link goes: its queue closes, and so does its inbox with the last sender.

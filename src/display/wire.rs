@@ -168,6 +168,9 @@ pub struct Peer {
     /// Remote to home, each output's at its id (none yet: the default); it ends with the inbox.
     pub pointer: watch::Receiver<Vec<Pointer>>,
     pub input: crate::input::Wire,
+    /// Whether a mode runs on this link, which this machine's display says: nothing else
+    /// crosses outside one (see [`Wire::mode`](crate::link::Wire::mode)).
+    pub mode: watch::Sender<bool>,
 }
 
 /// A message queued, with the output it is for and its payloads.
