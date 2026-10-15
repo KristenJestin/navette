@@ -722,6 +722,10 @@ impl<C: Compositor> Bridge<C> {
     /// Fetches file `index` of the peer's copy `serial` into `content`, for the applications
     /// that read it: one transfer per copy, whose bar counts the bytes of all its files.
     fn fetch_read(&self, serial: u32, index: u32, total: u64, content: Arc<vfs::Content>) {
+        // Asked before a cancel the bridge saw first: the copy's reads are stopped.
+        if content.over() {
+            return;
+        }
         let size = content.size;
         let coming: u64 = self.fetching.borrow().iter().map(|c| c.left()).sum();
         if let Some(inbox) = &self.inbox
@@ -4379,6 +4383,74 @@ mod tests {
                 send_rest(&mut remote, id, &content, 0).await;
                 assert!(within("the read", read).await.unwrap().unwrap() == content);
                 assert!(tmp.path().join("cache").is_dir());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_read_asked_just_before_a_cancel_starts_no_new_transfer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = bytes_of(2 * CHUNK, 1);
+        LocalSet::new()
+            .run_until(async {
+                let (home, mut remote, mount) = alone_reading(Side::Client, tmp.path());
+                let photos = offer_a_folder(&home, &mut remote, 6, 2, first.len() as u64).await;
+                let folder = mount.folder().await;
+                let read_a =
+                    tokio::task::spawn_local(read_file(folder.clone(), photos.join("0.bin")));
+                let (a, _) = next_request(&mut remote).await;
+                send_data(&mut remote, a, 0, &first[..CHUNK], false).await;
+                within("the bar", async {
+                    while home.seen.no_bar() || home.seen.bars().is_empty() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await;
+                // The next file is read, and the bar clicked, before the bridge sees either.
+                let b = photos.join("1.bin");
+                let rel = b.strip_prefix(folder.path()).unwrap();
+                let ino = rel
+                    .iter()
+                    .fold(1, |ino, name| folder.lookup(ino, name).unwrap().ino);
+                let (tx, read_b) = tokio::sync::oneshot::channel();
+                folder.read(ino, 0, 4096, move |read| {
+                    let _ = tx.send(read);
+                });
+                home.seen.click(Crossing::Read(6).id());
+                assert_eq!(
+                    next_not_ack(&mut remote).await,
+                    LinkMsg::ClipboardAbort { id: a }
+                );
+                assert_eq!(
+                    within("the first read", read_a).await.unwrap(),
+                    Err(libc::ECANCELED)
+                );
+                assert_eq!(
+                    within("the second read", read_b).await.unwrap(),
+                    Err(libc::ECANCELED)
+                );
+                nothing_more(&mut remote).await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_copy_gone_from_the_folder_leaves_no_reads_behind() {
+        LocalSet::new()
+            .run_until(async {
+                let (out, _sent) = outbound_channel();
+                let bridge = Bridge::new(
+                    Transfers::new(out, Side::Client),
+                    Jobs::new(|_, _| {}),
+                    Arc::new(Fake::default()),
+                    None,
+                    Kept::default(),
+                    &quiet(),
+                );
+                // Its last file read whole, its fetch over.
+                bridge.reads.borrow_mut().insert(6, Reads::default());
+                bridge.on_asked(vfs::Asked::Gone { serial: 6 });
+                assert!(bridge.reads.borrow().is_empty());
             })
             .await;
     }
