@@ -4,10 +4,10 @@
 //! - **On each reserved monitor**, over the remote's picture: a warm orange gradient, a
 //!   `REMOTE` tag and the mic button. It is drawn at home and never sent: the remote never
 //!   captures it, and a click on it stays home.
-//! - **On each of home's own monitors**: the same corner, red with a `HOME` tag, wherever the
+//! - **On each of home's own monitors**: the same corner, red with a `LOCAL` tag, wherever the
 //!   mic is.
-//! - **The tags and how far down the corners start** are the mode's to set (`remote_label`, `home_label`,
-//!   `remote_bar`, `home_bar`): see [`Look`].
+//! - **The tags and how far down the corners start** are the mode's to set (`remote_label`, `local_label`,
+//!   `remote_bar`, `local_bar`): see [`Look`].
 //! - **The mic button** is a mic and a round check: on the side that has the mic, the check draws
 //!   in and the button turns green; on the other, it wipes out. A click switches the mic, as the
 //!   hotkey and `navette mic toggle` do; hovering it shows the hotkey.
@@ -207,7 +207,7 @@ impl Default for Look {
     fn default() -> Self {
         Self {
             remote_label: "REMOTE".into(),
-            home_label: "HOME".into(),
+            home_label: "LOCAL".into(),
             remote_bar: 0,
             home_bar: Some(0),
         }
@@ -1028,7 +1028,7 @@ mod tests {
                 "{mic:?}: {:?}",
                 (r, g, b, a)
             );
-            assert_eq!(home.tag().unwrap().1, "HOME", "{mic:?}");
+            assert_eq!(home.tag().unwrap().1, "LOCAL", "{mic:?}");
             assert!(
                 drawn.width >= 150 && drawn.height >= 80,
                 "{mic:?}: the whole gradient"

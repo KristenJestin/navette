@@ -41,7 +41,7 @@ stops the start with a message that names them, and nothing is changed.
 
 A `[name]` section in `mode.conf` defines a mode of its own. The keys before the first section
 are the default of every mode: `release`, `mic_hotkey` and the corner's
-`remote_label`, `home_label`, `remote_bar` and `home_bar` (a section may set its own), and a `monitor` among them is the one unnamed mode, so a file with no sections keeps
+`remote_label`, `local_label`, `remote_bar` and `local_bar` (a section may set its own), and a `monitor` among them is the one unnamed mode, so a file with no sections keeps
 working, and `navette mode start` with no name starts it.
 
 ```
@@ -161,8 +161,8 @@ While a mode runs, every home monitor shows, at its top left, what it is and whe
   is back over the picture. A drag that passes over the button goes on to the remote machine.
   Anywhere else the pointer goes to the remote machine as before.
 - **On each of home's own monitors**, at the same place, over whatever home shows there (a bar
-  included), unless [`home_bar`](#the-corners-tags-and-offset) moves it down or below the space
-  home's bars reserve: a red glow, a `HOME` tag and the mic button, wherever the mic is. As on the
+  included), unless [`local_bar`](#the-corners-tags-and-offset) moves it down or below the space
+  home's bars reserve: a red glow, a `LOCAL` tag and the mic button, wherever the mic is. As on the
   reserved monitors, only the button tells where the mic is.
 - **The mic button** shows a mic and a round check. On the side that has the mic the check
   draws in and the button turns green; on the other it wipes out (350 ms). A click switches the
@@ -187,9 +187,9 @@ Four keys of `mode.conf`, global or per `[name]` section like `release`:
 
 ```
 remote_label = REMOTE   # the tag on the reserved monitors
-home_label = HOME       # the tag on home's own monitors
+local_label = LOCAL     # the tag on home's own monitors
 remote_bar = 0          # logical pixels from the top, over what the remote shows there
-home_bar = 0            # logical pixels from the top, over home's bars, or auto: below them
+local_bar = 0           # logical pixels from the top, over home's bars, or auto: below them
 ```
 
 A label is printable ASCII (what the corner's font draws), 12 characters at most; anything else
@@ -200,10 +200,14 @@ corners at the very top-left, drawn over whatever is there.
 pixels: the height of the remote's bar, say, to keep its left end in sight. Anything but a
 number, 0 or more, stops the start with a message, and nothing is changed.
 
-`home_bar` places the corner on home's own monitors. A number puts it that many logical pixels
+`local_bar` places the corner on home's own monitors. A number puts it that many logical pixels
 from the top of the monitor, ignoring the space home's bars reserve there. With `auto` the
 compositor puts it below that space. Anything else stops the start with a message, and nothing
 is changed.
+
+`local_label` and `local_bar` were `home_label` and `home_bar`: a `mode.conf` that still names
+the old ones is read as before, and `navette mode start` says the new name on one line. A file
+with both an old key and its new one uses the new one, and says so.
 
 ## The remote's workspaces
 
