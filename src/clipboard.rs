@@ -725,7 +725,7 @@ impl<C: Compositor> Bridge<C> {
         let size = content.size;
         let coming: u64 = self.fetching.borrow().iter().map(|c| c.left()).sum();
         if let Some(inbox) = &self.inbox
-            && let Err(e) = inbox.check_room(size.saturating_add(coming))
+            && let Err(e) = inbox.check_cache_room(size.saturating_add(coming))
         {
             log(format_args!("offer {serial}: file {index} not read: {e}"));
             self.notifier.show("Paste failed", &e.to_string());
@@ -1184,10 +1184,11 @@ async fn mount(inbox: Option<&Inbox>) -> Option<(Mounted, UnboundedReceiver<vfs:
     let inbox = inbox?.clone();
     let mounter = inbox.mount.clone()?;
     let (asked, rx) = tokio::sync::mpsc::unbounded_channel();
-    let folder = vfs::Folder::new(mounter.path().to_owned(), inbox.dir.clone(), asked);
+    let folder = vfs::Folder::new(mounter.path().to_owned(), inbox.cache.clone(), asked);
     let mounting = folder.clone();
     let mounted = tokio::task::spawn_blocking(move || {
         inbox.prepare()?;
+        inbox.prepare_cache()?;
         mounter.mount(mounting)
     })
     .await
@@ -1277,6 +1278,7 @@ where
     let inbox = Inbox::of_this_user();
     // Left behind by a process that died before it emptied its folder, or unmounted its own.
     inbox.empty();
+    inbox.empty_cache();
     if let Some(mount) = inbox.mount.clone() {
         let _ = tokio::task::spawn_blocking(move || mount.clean()).await;
     }
@@ -2696,9 +2698,8 @@ mod tests {
                 let (home_end, remote_end) = tokio::io::duplex(64 * 1024);
                 let home = machine(Side::Client, home_end, Inbox::new(tmp.path().join("home")));
                 let full = Inbox {
-                    dir: folder.clone(),
                     free: |_| Ok(1024),
-                    mount: None,
+                    ..Inbox::new(folder.clone())
                 };
                 let remote = machine(Side::Server, remote_end, full);
                 home.copy(&[(URI_LIST, list.as_bytes())]);
@@ -4352,6 +4353,32 @@ mod tests {
                 let b = read_file(folder, paths[1].clone()).await;
                 assert_eq!(b, Err(libc::ENOSPC));
                 home.seen.told("Paste failed").await;
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_file_read_is_kept_in_the_cache_folder_not_the_runtime_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = bytes_of(CHUNK, 2);
+        LocalSet::new()
+            .run_until(async {
+                let (end, peer) = tokio::io::duplex(64 * 1024);
+                let (inbox, mount) = reading(tmp.path());
+                // The runtime folder has no room for it; the cache folder on disk has.
+                let inbox = Inbox {
+                    cache: tmp.path().join("cache"),
+                    free: |dir| Ok(if dir.ends_with("cache") { 1 << 40 } else { 0 }),
+                    ..inbox
+                };
+                let (home, mut remote) = (machine(Side::Client, end, inbox), Framed::new(peer));
+                let size = content.len() as u64;
+                let path = offer_a_file(&home, &mut remote, 6, "a.bin", size, 1).await;
+                let read = tokio::task::spawn_local(read_file(mount.folder().await, path));
+                let (id, _) = next_request(&mut remote).await;
+                send_rest(&mut remote, id, &content, 0).await;
+                assert!(within("the read", read).await.unwrap().unwrap() == content);
+                assert!(tmp.path().join("cache").is_dir());
             })
             .await;
     }

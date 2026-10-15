@@ -79,12 +79,17 @@ cross only when an application reads them, through a virtual folder (below).
   once, `<offer number>/<name>`, folders as their tree: nothing crosses, so a file manager
   that reads every new copy to set its Paste button moves no byte, and never waits. A file's
   bytes are fetched from the other machine only when an application reads it: the first read
-  fetches it whole, in order, into a cache file of the receiving folder (removed from its
-  folder at once, so it goes with the copy), and each read waits for its part. Reading the
+  fetches it whole, in order, into a cache file, and each read waits for its part. Reading the
   same file again fetches nothing. The folder is read-only and the user's alone; a read waits
-  on a thread of its own, never on the link's. The cache lives where the receiving folder
-  does, in memory when it is `$XDG_RUNTIME_DIR`: a file read takes its size there until its
-  copy goes, and its room is checked before it is fetched.
+  on a thread of its own, never on the link's.
+  - The bytes read go to disk, not memory: `navette/clipboard` in `$XDG_CACHE_HOME` (else
+    `~/.cache`), a folder made private to the user (mode 0700; a link put in its place is
+    refused), since a runtime folder is a tmpfs of a few GB that a large file would fill.
+    Each cache file is removed from the folder as soon as it is made, so nothing there has a
+    name and nothing stays: its bytes go when their copy goes, or when `navette` ends, however
+    it ends; the folder is emptied again at each start. A file read takes its size there
+    while its copy is shown, and the room for it and for the files being fetched beside it is
+    checked before it is fetched.
   - A newer copy does not stop a transfer: the files of an older copy stay while an
     application holds one of them open, and go once none is. The machine that copied serves
     the files of its last 8 copies of files, for that. Several transfers can run at once.
