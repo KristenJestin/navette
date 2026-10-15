@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+<rect width="1280" height="640" fill="#14120f"/>
+<g transform="translate(286 32) scale(0.95)"><g transform="translate(20.8 20.8) scale(0.7921)"><path d="M54 40 L 120 76 L 54 112" stroke-width="22" stroke-linecap="round" stroke-linejoin="round" fill="none" stroke="#56baef"/><path d="M146 88 L 80 124 L 146 160" stroke-width="22" stroke-linecap="round" stroke-linejoin="round" fill="none" stroke="#ece5d8"/><circle cx="26" cy="76" r="16" fill="#56baef"/><circle cx="174" cy="124" r="16" fill="#ece5d8"/></g></g>
+<text x="460" y="146" font-family="Peace Sans" font-size="104" fill="#ece5d8">Navette</text>
+<text x="640" y="236" text-anchor="middle" font-family="Open Sauce Sans" font-size="25" fill="#a39b8c">The work-from-home mode: drive the work laptop from the home desk, unplugging nothing.</text>
+<rect x="96" y="290" width="1088" height="400" rx="18" fill="#1c1915" stroke="#2e2a24" stroke-width="2"/>
+<line x1="97" y1="334" x2="1183" y2="334" stroke="#2e2a24" stroke-width="2"/>
+<circle cx="124" cy="312" r="6" fill="#3a352d"/><circle cx="146" cy="312" r="6" fill="#3a352d"/><circle cx="168" cy="312" r="6" fill="#3a352d"/>
+<text x="640" y="318" text-anchor="middle" font-family="JetBrains Mono" font-size="15" fill="#7d7567">the home desk, starting a mode</text>
+<text x="128" y="376" font-family="Open Sauce Sans" font-weight="500" font-size="15" fill="#7d7567">YOU</text>
+<rect x="128" y="388" width="636" height="44" rx="12" fill="#2a261f"/>
+<text x="146" y="417" font-family="JetBrains Mono" font-size="18" fill="#7d7567">$</text><text x="168" y="417" font-family="JetBrains Mono" font-size="18" fill="#ece5d8">navette mode start office</text>
+<text x="128" y="466" font-family="Open Sauce Sans" font-weight="500" font-size="15" fill="#7d7567">NAVETTE</text>
+<g font-family="JetBrains Mono" font-size="17" xml:space="preserve">
+<text x="128" y="500"><tspan fill="#56baef">link</tspan><tspan fill="#ece5d8">    the laptop dialed home, paired</tspan></text>
+<text x="760" y="500" text-anchor="end" fill="#56baef">up</text>
+<text x="128" y="532"><tspan fill="#56baef">display</tspan><tspan fill="#ece5d8"> DP-2, DP-3 → the laptop</tspan></text>
+<text x="760" y="532" text-anchor="end" fill="#56baef">streaming</text>
+<text x="128" y="564"><tspan fill="#56baef">mic</tspan><tspan fill="#ece5d8">     home mic → the laptop</tspan></text>
+<text x="760" y="564" text-anchor="end" fill="#56baef">switched</text>
+</g>
+<text x="128" y="608" font-family="Open Sauce Sans" font-size="19" fill="#a39b8c">The pointer crosses to the laptop, the keyboard follows.</text>
+<rect x="808" y="362" width="344" height="300" rx="14" fill="#14120f" stroke="#2e2a24" stroke-width="2"/>
+<text x="836" y="398" font-family="Open Sauce Sans" font-weight="600" font-size="14" letter-spacing="1.5" fill="#56baef">MODE</text>
+<text x="836" y="440" font-family="Peace Sans" font-size="32" fill="#ece5d8">office</text>
+<g>
+<rect x="836" y="466" width="88" height="54" rx="5" fill="#1c1915" stroke="#3a352d" stroke-width="2"/>
+<rect x="934" y="466" width="88" height="54" rx="5" fill="#173c4f" stroke="#56baef" stroke-width="2"/>
+<rect x="1032" y="466" width="88" height="54" rx="5" fill="#173c4f" stroke="#56baef" stroke-width="2"/>
+<rect x="873" y="520" width="14" height="8" fill="#3a352d"/><rect x="971" y="520" width="14" height="8" fill="#3a352d"/><rect x="1069" y="520" width="14" height="8" fill="#3a352d"/>
+<path d="M906 494 L 954 494" stroke="#ece5d8" stroke-width="2" stroke-dasharray="4 4" fill="none"/>
+<path d="M950 488 L 958 494 L 950 500" stroke="#ece5d8" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<g font-family="Open Sauce Sans" font-size="14" text-anchor="middle">
+<text x="880" y="548" fill="#7d7567">home</text>
+<text x="1027" y="548" fill="#a39b8c">the laptop</text>
+</g>
+<line x1="836" y1="568" x2="1124" y2="568" stroke="#2e2a24" stroke-width="2"/>
+<g font-family="Open Sauce Sans" font-size="17">
+<text x="836" y="604" fill="#7d7567">mic</text>
+<rect x="958" y="584" width="104" height="30" rx="15" fill="#173c4f"/>
+<text x="1010" y="605" text-anchor="middle" fill="#56baef">the laptop</text>
+</g>
+</svg>
