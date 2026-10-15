@@ -21,7 +21,9 @@ ExecStart=%h/.local/bin/navette agent
 Restart=on-failure
 RestartSec=10
 # No `NoNewPrivileges=`: the clipboard's virtual folder is mounted by `fusermount3`, which is
-# setuid; with it, the mount fails and a paste of files fetches them all first.
+# setuid; with it, the mount fails and a paste of files fetches them all first. The line was a
+# thin layer for a user service anyway: the agent can already reach the user's own service
+# manager over D-Bus, and so start a process without it.
 
 [Install]
 WantedBy=default.target
