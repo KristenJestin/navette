@@ -702,7 +702,7 @@ impl<C: Compositor> Bridge<C> {
             vfs::Asked::Gone { serial } => {
                 if self.progress.stop(Crossing::Read(serial)) {
                     log(format_args!(
-                        "offer {serial}: replaced and closed, its reads stopped"
+                        "offer {serial}: replaced, and no file of it is open: its fetches end"
                     ));
                 }
                 self.reads.borrow_mut().remove(&serial);
