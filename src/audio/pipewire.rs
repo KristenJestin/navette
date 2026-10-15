@@ -759,16 +759,32 @@ fn keeps_asked(from: Option<u32>, to: Option<u32>) -> bool {
     from.is_none() || from == to
 }
 
-/// The card a sink plays on, with the number of its device on the card
-/// (`card.profile.device`), if it is a card's.
+/// The card a sink plays on, if it is a card's. The number of its device on the card is not
+/// among the registry's props: [`card_device`] reads it from the node's own info.
 fn card_of<'a>(
     sink: &GlobalObject<pw::properties::PropertiesBox>,
     cards: &'a HashMap<u32, GlobalObject<pw::properties::PropertiesBox>>,
-) -> Option<(&'a GlobalObject<pw::properties::PropertiesBox>, i32)> {
-    let props = sink.props.as_ref()?;
-    let card = props.get("device.id")?.parse::<u32>().ok()?;
-    let device = props.get("card.profile.device")?.parse::<i32>().ok()?;
-    Some((cards.get(&card)?, device))
+) -> Option<&'a GlobalObject<pw::properties::PropertiesBox>> {
+    let card = sink.props.as_ref()?.get("device.id")?.parse::<u32>().ok()?;
+    cards.get(&card)
+}
+
+/// The number of a sink's device on its card (`card.profile.device`), from the node's info.
+fn card_device(props: Option<&spa::utils::dict::DictRef>) -> Option<i32> {
+    props?.get("card.profile.device")?.parse().ok()
+}
+
+/// What is known of a sink's device on its card once an info with `props` came: the first
+/// info is whole and says it, or says there is none; the later ones hold only what changed,
+/// without the device, and would make a card's output look like a virtual one.
+fn learned(
+    known: Option<Option<i32>>,
+    props: Option<&spa::utils::dict::DictRef>,
+) -> Option<Option<i32>> {
+    match (known, props) {
+        (None, Some(_)) => Some(card_device(props)),
+        _ => known,
+    }
 }
 
 /// One follower of the default output: where its level goes, the sink it follows now, and a
@@ -820,8 +836,9 @@ struct Bound {
 struct Card {
     device: pw::device::Device,
     _listener: pw::device::DeviceListener,
-    /// The number of the output's device on the card.
-    output: i32,
+    /// The number of the output's device on the card, once the node's info said it: `None`
+    /// until then, `Some(None)` when it has none, and its volume is then set on its props.
+    output: Rc<Cell<Option<Option<i32>>>>,
     /// The index of the active route of each of the card's devices.
     routes: Rc<RefCell<HashMap<i32, i32>>>,
 }
@@ -830,13 +847,20 @@ impl Bound {
     /// False while the card has not said its active route yet.
     fn set(&self, level: Level) -> bool {
         let channels = self.channels.get();
-        let (value, id) = match &self.card {
-            Some(card) => {
-                let Some(&index) = card.routes.borrow().get(&card.output) else {
+        let card = match &self.card {
+            Some(card) => match card.output.get() {
+                None => return false,
+                Some(output) => output.map(|output| (card, output)),
+            },
+            None => None,
+        };
+        let (value, id) = match card {
+            Some((card, output)) => {
+                let Some(&index) = card.routes.borrow().get(&output) else {
                     return false;
                 };
                 (
-                    route_value((card.output, index), level, channels),
+                    route_value((output, index), level, channels),
                     spa::param::ParamType::Route,
                 )
             }
@@ -844,8 +868,8 @@ impl Bound {
         };
         let bytes = serialize(&value);
         let pod = spa::pod::Pod::from_bytes(&bytes).expect("a serialized pod");
-        match &self.card {
-            Some(card) => card.device.set_param(id, 0, pod),
+        match card {
+            Some((card, _)) => card.device.set_param(id, 0, pod),
             None => self.node.set_param(id, 0, pod),
         }
         true
@@ -871,8 +895,13 @@ fn bind_output(
         }
     };
     let (channels, pending) = (Rc::new(Cell::new(2)), Rc::new(Cell::new(None)));
+    let output: Rc<Cell<Option<Option<i32>>>> = Rc::default();
     let listener = node
         .add_listener_local()
+        .info({
+            let output = output.clone();
+            move |info| output.set(learned(output.get(), info.props()))
+        })
         .param({
             let (channels, pending) = (channels.clone(), pending.clone());
             move |_, _, _, _, param| {
@@ -884,7 +913,7 @@ fn bind_output(
         })
         .register();
     node.subscribe_params(&[spa::param::ParamType::Props]);
-    let card = card_of(sink, cards).and_then(|(card, output)| {
+    let card = card_of(sink, cards).and_then(|card| {
         let device: pw::device::Device = registry.bind(card).ok()?;
         let routes: Rc<RefCell<HashMap<i32, i32>>> = Rc::default();
         let listener = device
@@ -2028,6 +2057,72 @@ mod tests {
         assert_eq!(channel_volumes(level, 2), [0.25, 0.5]);
         assert_eq!(channel_volumes(level, 1), [0.5]);
         assert_eq!(channel_volumes(level, 6), [0.25, 0.5, 0.5, 0.5, 0.5, 0.5]);
+    }
+
+    fn global(
+        id: u32,
+        type_: ObjectType,
+        props: pw::properties::PropertiesBox,
+    ) -> GlobalObject<pw::properties::PropertiesBox> {
+        GlobalObject {
+            id,
+            permissions: pw::permissions::PermissionFlags::empty(),
+            type_,
+            version: 3,
+            props: Some(props),
+        }
+    }
+
+    #[test]
+    fn a_sink_s_card_is_found_from_the_props_the_registry_gives() {
+        // What the registry says of a USB headset's sink: its card, not its device on it.
+        let sink = global(
+            34,
+            ObjectType::Node,
+            pw::properties::properties! {
+                "node.name" => "alsa_output.usb-Example_Headset-00.analog-stereo",
+                "media.class" => "Audio/Sink",
+                "device.id" => "49",
+            },
+        );
+        let cards = HashMap::from([(
+            49,
+            global(
+                49,
+                ObjectType::Device,
+                pw::properties::properties! { "media.class" => "Audio/Device" },
+            ),
+        )]);
+        assert!(card_of(&sink, &cards).is_some(), "the sink's card");
+    }
+
+    #[test]
+    fn a_sink_s_device_on_its_card_is_read_from_its_node_info() {
+        let info = pw::properties::properties! {
+            "node.name" => "alsa_output.usb-Example_Headset-00.analog-stereo",
+            "device.id" => "49",
+            "card.profile.device" => "3",
+        };
+        assert_eq!(card_device(Some(info.dict())), Some(3));
+        let virtual_sink = pw::properties::properties! { "node.name" => "a-virtual-sink" };
+        assert_eq!(card_device(Some(virtual_sink.dict())), None);
+    }
+
+    #[test]
+    fn a_later_node_info_does_not_forget_the_device_the_first_one_said() {
+        let first = pw::properties::properties! {
+            "node.name" => "alsa_output.usb-Example_Headset-00.analog-stereo",
+            "card.profile.device" => "3",
+        };
+        let later = pw::properties::properties! { "node.driver" => "true" };
+        let known = learned(None, Some(first.dict()));
+        assert_eq!(known, Some(Some(3)));
+        assert_eq!(learned(known, Some(later.dict())), Some(Some(3)));
+        assert_eq!(
+            learned(None, None),
+            None,
+            "an info without props says nothing yet"
+        );
     }
 
     #[test]
