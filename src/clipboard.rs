@@ -612,8 +612,8 @@ fn standard(mime_type: &str) -> bool {
 }
 
 /// The application that pasted the peer's offer `serial` stopped waiting before its files were
-/// in: a file manager reads the clipboard when it changes, and gives up after a few seconds
-/// (two for Omarchy's), which a paste over the LAN outlasts. The offer goes on the clipboard
+/// in: a file manager reads the clipboard when it changes, and gives up after a few seconds,
+/// which a paste over the LAN outlasts. The offer goes on the clipboard
 /// again, so the file manager reads it once more and gets the files at once. Only once, and
 /// only while it is still the selection here: a copy made here since is never replaced.
 fn offer_again(remote: &RefCell<RemoteOffer>, serial: u32, compositor: &impl Compositor) {
