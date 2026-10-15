@@ -4163,4 +4163,99 @@ mod tests {
             })
             .await;
     }
+    /// What the hand check of the virtual folder measures, between two paired instances over
+    /// a loopback link, the remote reading through a real FUSE mount in a temporary folder:
+    /// the copy and the read of its file list move nothing, then a read fetches the file whole,
+    /// a copy of text in the middle stopping nothing. 2 GB under `target/` by default;
+    /// `NAVETTE_BENCH_BYTES` sets another size. Needs FUSE and `fusermount3`.
+    #[tokio::test]
+    #[ignore = "a measure, a minute long, 2 GB on disk, and a real FUSE mount"]
+    async fn a_large_file_read_through_a_real_mount_between_two_paired_instances() {
+        use std::io::Write;
+        let bytes: u64 = std::env::var("NAVETTE_BENCH_BYTES")
+            .ok()
+            .and_then(|b| b.parse().ok())
+            .unwrap_or(2_000_000_000);
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        let tmp = tempfile::tempdir_in(target).unwrap();
+        let copied = tmp.path().join("large.bin");
+        {
+            let mut file = std::io::BufWriter::new(std::fs::File::create(&copied).unwrap());
+            let block: Vec<u8> = (0..8u32 << 20).map(|i| (i % 251) as u8).collect();
+            let mut left = bytes;
+            while left > 0 {
+                let n = left.min(block.len() as u64) as usize;
+                file.write_all(&block[..n]).unwrap();
+                left -= n as u64;
+            }
+        }
+        let desk = link::tests::paired_desk().await;
+        LocalSet::new()
+            .run_until(async {
+                let (events, _log) = mpsc::unbounded_channel();
+                let acceptor = link::home_acceptor(&desk.home, None).await.unwrap();
+                let home = machine_on(Side::Client, Inbox::new(tmp.path().join("home")), {
+                    let events = events.clone();
+                    |service| {
+                        let attach = move |wire| service(wire);
+                        tokio::task::spawn_local(link::serve(
+                            acceptor,
+                            Heartbeat::default(),
+                            events,
+                            attach,
+                        ))
+                    }
+                });
+                let mount = tmp.path().join("files");
+                let inbox = Inbox {
+                    mount: Some(Arc::new(vfs::Fuse::at(mount.clone()))),
+                    ..Inbox::new(tmp.path().join("r"))
+                };
+                let dialer = link::remote_dialer(&desk.remote).unwrap();
+                let remote = machine_on(Side::Server, inbox, |service| {
+                    tokio::task::spawn_local(link::agent(
+                        dialer,
+                        Heartbeat::default(),
+                        link::Backoff::default(),
+                        events,
+                        move |wire| service(wire),
+                    ))
+                });
+                remote.connected().await;
+                let list = uri_list_of(std::slice::from_ref(&copied));
+                home.copy(&[(URI_LIST, list.as_bytes())]);
+                remote.offered(1).await;
+                let asked = std::time::Instant::now();
+                let pasted = remote.paste(URI_LIST).await;
+                let answered = asked.elapsed();
+                let paths = parse_uri_list(&String::from_utf8(pasted).unwrap());
+                assert!(paths[0].starts_with(&mount), "{paths:?}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let served_before = home.seen.bars().iter().flatten().count();
+                let path = paths[0].clone();
+                let read = tokio::task::spawn_blocking(move || {
+                    let started = std::time::Instant::now();
+                    let mut file = std::fs::File::open(path)?;
+                    let got = std::io::copy(&mut file, &mut std::io::sink())?;
+                    io::Result::Ok((got, started.elapsed()))
+                });
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                home.copy(&[(TEXT, b"meeting at ten")]);
+                remote.offered(2).await;
+                let in_the_middle = !read.is_finished();
+                let (got, elapsed) = read.await.unwrap().unwrap();
+                assert_eq!(got, bytes);
+                assert_eq!(served_before, 0, "nothing served before the read");
+                let rate = bytes as f64 / elapsed.as_secs_f64() / 1e6;
+                eprintln!(
+                    "list answered in {} ms, nothing served before the read; {bytes} bytes \
+                     read through the mount in {:.1} s: {rate:.0} MB/s ({:.0} Mbit/s); a copy \
+                     of text in the middle of it: {in_the_middle}",
+                    answered.as_millis(),
+                    elapsed.as_secs_f64(),
+                    rate * 8.0,
+                );
+            })
+            .await;
+    }
 }
