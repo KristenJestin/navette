@@ -625,13 +625,13 @@ impl Session {
         let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
         self.ctl
             .reconfigure(want.0 as u64 * want.1 as u64, streams, MAX_FPS);
-        let settings = EncoderSettings {
-            width: want.0,
-            height: want.1,
-            bitrate: self.ctl.stream_bitrate(),
-            framerate: self.fps_cmd,
-            vbv_ms: self.ctl.vbv_ms(self.fps_cmd),
-        };
+        let settings = encoder_settings(
+            self.video.is_gpu(),
+            want,
+            self.ctl.stream_bitrate(),
+            self.fps_cmd,
+            self.ctl.vbv_ms(self.fps_cmd),
+        );
         match VideoEncoder::new(&self.video, &settings, chroma == ChromaMode::Dual420) {
             Ok(encoder) => {
                 self.encoder = encoder;
@@ -678,10 +678,11 @@ impl Session {
             self.ctl.stream_bitrate()
         };
         let vbv = self.ctl.vbv_ms(self.fps_cmd);
+        let framerate = encoder_framerate(self.video.is_gpu(), self.refining, self.fps_cmd);
         self.settings.bitrate = bitrate;
-        self.settings.framerate = self.fps_cmd;
+        self.settings.framerate = framerate;
         self.settings.vbv_ms = vbv;
-        self.encoder.set_rate(bitrate, self.fps_cmd, vbv);
+        self.encoder.set_rate(bitrate, framerate, vbv);
     }
 
     /// Encodes `frame` and queues it; returns the coded byte count. `app_limited` marks a send
@@ -745,6 +746,45 @@ impl Session {
     }
 }
 
+/// Ceiling on the GPU encoder's quantiser. Without one, a frame that changes the whole picture
+/// (a page change, a scroll) comes out very coarse and the old page ghosts under the new one;
+/// measured on a stand-in encoder, such a frame was 23 dB at 9 kB, and 37 dB at about 82 kB
+/// with this ceiling. The CPU encoder has no such setting.
+const GPU_MAX_QP: u8 = 36;
+
+fn max_qp(gpu: bool) -> Option<u8> {
+    gpu.then_some(GPU_MAX_QP)
+}
+
+/// The frame rate the encoder is told. A refinement pass comes every `REFINE_EVERY`, but told
+/// the commanded rate each pass would get a 30th of the budget instead of a fifth; told its
+/// real pace, still text sharpens within half a second. The CPU encoder is left alone: a frame
+/// rate change rebuilds it with a keyframe.
+fn encoder_framerate(gpu: bool, refining: bool, fps_cmd: u32) -> u32 {
+    if gpu && refining {
+        (1000 / REFINE_EVERY.as_millis() as u32).max(1)
+    } else {
+        fps_cmd
+    }
+}
+
+fn encoder_settings(
+    gpu: bool,
+    size: (u32, u32),
+    bitrate: u32,
+    framerate: u32,
+    vbv_ms: u32,
+) -> EncoderSettings {
+    EncoderSettings {
+        width: size.0,
+        height: size.1,
+        bitrate,
+        framerate,
+        vbv_ms,
+        max_qp: max_qp(gpu),
+    }
+}
+
 /// Vulkan compute and VA-API on the GPU, or OpenH264 on the CPU.
 enum VideoTier {
     Gpu(Arc<Gpu>),
@@ -752,6 +792,10 @@ enum VideoTier {
 }
 
 impl VideoTier {
+    fn is_gpu(&self) -> bool {
+        matches!(self, Self::Gpu(_))
+    }
+
     fn open(mode: VideoMode, render_node: &std::path::Path) -> Self {
         if mode == VideoMode::Cpu {
             return Self::Cpu;
@@ -810,13 +854,13 @@ impl VideoStart {
         let stream = EncoderSettings::fit_extent(output.0, output.1, encoder_max);
         let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
         let ctl = RateController::new(stream.0 as u64 * stream.1 as u64, streams, MAX_FPS, None);
-        let settings = EncoderSettings {
-            width: stream.0,
-            height: stream.1,
-            bitrate: ctl.stream_bitrate(),
-            framerate: fps,
-            vbv_ms: ctl.vbv_ms(fps),
-        };
+        let settings = encoder_settings(
+            video.is_gpu(),
+            stream,
+            ctl.stream_bitrate(),
+            fps,
+            ctl.vbv_ms(fps),
+        );
         let encoder = VideoEncoder::new(&video, &settings, chroma == ChromaMode::Dual420)?;
         Ok(Self {
             video,
@@ -1101,6 +1145,46 @@ mod tests {
             desk.session.settings.bitrate,
             desk.session.ctl.stream_bitrate()
         );
+    }
+
+    #[test]
+    fn the_gpu_encoder_is_given_a_quantiser_ceiling_of_36() {
+        let settings = encoder_settings(true, (1280, 720), 3_000_000, 30, 100);
+        assert_eq!(settings.max_qp, Some(36));
+    }
+
+    #[test]
+    fn the_cpu_encoder_is_given_no_quantiser_ceiling() {
+        let settings = encoder_settings(false, (1280, 720), 3_000_000, 30, 100);
+        assert_eq!(settings.max_qp, None);
+    }
+
+    #[test]
+    fn during_refinement_the_gpu_encoder_is_told_the_passes_pace() {
+        assert_eq!(encoder_framerate(true, true, 30), 5);
+        assert_eq!(encoder_framerate(true, true, 60), 5);
+    }
+
+    #[test]
+    fn when_the_picture_moves_the_gpu_encoder_is_told_the_command_rate_again() {
+        assert_eq!(encoder_framerate(true, false, 30), 30);
+    }
+
+    #[test]
+    fn the_cpu_encoder_keeps_the_command_rate_during_refinement() {
+        assert_eq!(encoder_framerate(false, true, 30), 30);
+        assert_eq!(encoder_framerate(false, false, 30), 30);
+    }
+
+    /// The CPU session reaches the same decision through its settings, whatever the pass.
+    #[test]
+    fn a_cpu_session_keeps_the_command_rate_while_it_refines() {
+        let mut desk = Desk::new(1280, 720);
+        desk.acks = false;
+        desk.show(text_page(1280, 720, 1));
+        desk.frames(2);
+        assert!(desk.session.refining);
+        assert_eq!(desk.session.settings.framerate, desk.session.fps_cmd);
     }
 
     /// A session on the CPU tier, stepped by hand: no clock to wait for, every frame acked at
