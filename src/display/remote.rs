@@ -29,6 +29,7 @@ use tokio::sync::oneshot;
 use super::output;
 use super::stream::{self, Source};
 use crate::display::wire::{Display, Incoming, MAX_OUTPUTS, Msg, Outbox, OutputCopy, Peer};
+use crate::events::{Driven, Events, Phase};
 use crate::hypr::{self, Hypr};
 use crate::input::{self, Inject, Injectors};
 use crate::lid::{self, Logind};
@@ -122,6 +123,8 @@ pub struct Ports {
     pub lid_poll: Duration,
     /// Says, once each, that home started driving the outputs and stopped.
     pub notifier: Arc<dyn Notifier>,
+    /// Where the agent stands, for `events.sock`: the outputs home drives.
+    pub events: Arc<Events>,
 }
 
 /// Puts the laptop's screen back if a record says the agent disabled it.
@@ -302,11 +305,13 @@ pub async fn serve_peer(
     let mut active: Option<Active> = None;
     let mut home = Home::default();
     let mut input_open = true;
+    let mut told = None;
     loop {
         // The clipboard and the sound cross only while home's mode runs here.
         let running = active.is_some();
         peer.mode
             .send_if_modified(|mode| std::mem::replace(mode, running) != running);
+        tell(ports, active.as_ref(), &mut told);
         let retry_at = active.as_ref().and_then(Active::retry_at);
         let had_mode = active.is_some();
         tokio::select! {
@@ -474,6 +479,29 @@ pub async fn serve_peer(
         }
     }
     stop(&mut active, ports).await;
+    tell(ports, None, &mut told);
+}
+
+/// Tells the events which outputs home drives, when they changed since they were last told:
+/// how many, and whether they are still being made.
+fn tell(ports: &Ports, active: Option<&Active>, told: &mut Option<Option<(usize, bool)>>) {
+    let now = active.map(|a| (a.copies.len(), a.starting));
+    if *told == Some(now) {
+        return;
+    }
+    *told = Some(now);
+    ports.events.update(|p| {
+        p.mode = active.map(|a| Driven {
+            phase: if a.starting {
+                Phase::Starting
+            } else {
+                Phase::Running
+            },
+            // Home does not say the mode's name.
+            name: None,
+            monitors: (0..a.copies.len()).map(output::name).collect(),
+        })
+    });
 }
 
 /// Starts the lid's watch; what keeps it from working is said here and at home.
@@ -708,6 +736,7 @@ mod tests {
     use gliff_proto::{ChromaMode, Codec, ServerMsg};
 
     use super::*;
+    use crate::events::Parts;
     use crate::hypr::fake::{FakeHypr, FakeMonitor};
     use crate::lid::fake::FakeLogind;
 
@@ -986,6 +1015,8 @@ mod tests {
         notices: Arc<crate::notify::Fake>,
         /// What the clipboard and the sound read: whether a mode runs.
         mode: tokio::sync::watch::Receiver<bool>,
+        /// What a reader of `events.sock` reads.
+        said: Mutex<mpsc::Receiver<Arc<str>>>,
         _dir: tempfile::TempDir,
         task: tokio::task::JoinHandle<()>,
     }
@@ -1021,6 +1052,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let record = dir.path().join("navette").join("lid");
         let notices = Arc::new(crate::notify::Fake::default());
+        // The link is up while the peer is served.
+        let state = Events::new(Parts {
+            link: crate::events::Link::Linked,
+            ..Parts::remote()
+        });
+        let said = Mutex::new(state.subscribe());
         let ports = Ports {
             hypr: hypr.clone(),
             streams: streams.clone(),
@@ -1033,6 +1070,7 @@ mod tests {
             lid_record: Some(record.clone()),
             lid_poll: poll,
             notifier: notices.clone(),
+            events: state,
         };
         let task = tokio::spawn(async move {
             serve_peer(peer, &ports, &mut events_rx).await;
@@ -1050,6 +1088,7 @@ mod tests {
             record,
             notices,
             mode: in_mode,
+            said,
             _dir: dir,
             task,
         }
@@ -1613,6 +1652,7 @@ mod tests {
             lid_record: record.map(std::path::Path::to_path_buf),
             lid_poll: LID_POLL,
             notifier: Arc::new(crate::notify::Fake::default()),
+            events: Events::new(Parts::remote()),
         }
     }
 
@@ -2367,5 +2407,78 @@ mod tests {
         until(|| agent.injected(3).is_some()).await;
         assert_eq!(agent.injected(2).unwrap().2, [area(1920)]);
         assert_eq!(agent.injected(3).unwrap().2, []);
+    }
+
+    /// The lines said since the last look, until one says `last`, as (state, monitors).
+    async fn said_until(agent: &Agent, last: &str) -> Vec<(String, serde_json::Value)> {
+        let mut said = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let line = agent.said.lock().unwrap().try_recv();
+                match line {
+                    Ok(line) => {
+                        let line: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let state = line["state"].as_str().unwrap().to_string();
+                        let done = state == last;
+                        said.push((state, line["monitors"].clone()));
+                        if done {
+                            return;
+                        }
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("never said {last}: said {said:?}"));
+        said
+    }
+
+    fn line(state: &str, monitors: &[&str]) -> (String, serde_json::Value) {
+        (state.to_string(), serde_json::json!(monitors))
+    }
+
+    #[tokio::test]
+    async fn the_agent_says_starting_while_it_makes_its_outputs_then_mode_with_their_names() {
+        let agent = agent();
+        assert_eq!(said_until(&agent, "linked").await, [line("linked", &[])]);
+        two(&agent).await;
+        assert_eq!(
+            said_until(&agent, "mode").await,
+            [
+                line("starting", &["NAVETTE-1", "NAVETTE-2"]),
+                line("mode", &["NAVETTE-1", "NAVETTE-2"])
+            ]
+        );
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        assert_eq!(said_until(&agent, "linked").await, [line("linked", &[])]);
+    }
+
+    #[tokio::test]
+    async fn a_start_the_agent_cannot_make_says_starting_then_linked() {
+        let agent = agent();
+        *agent.streams.refuse.lock().unwrap() = true;
+        agent.inbox.try_send(start()).unwrap();
+        assert_eq!(said_until(&agent, "linked").await, [line("linked", &[])]);
+        assert_eq!(
+            said_until(&agent, "linked").await,
+            [line("starting", &["NAVETTE-1"]), line("linked", &[])]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_ends_the_mode_said() {
+        let agent = agent();
+        agent.inbox.try_send(start()).unwrap();
+        said_until(&agent, "mode").await;
+        drop(agent.inbox);
+        agent.task.await.unwrap();
+        let left = agent.said.lock().unwrap().try_recv().unwrap();
+        let left: serde_json::Value = serde_json::from_str(&left).unwrap();
+        assert_eq!(left["state"], "linked");
+        assert_eq!(left["monitors"], serde_json::json!([]));
     }
 }

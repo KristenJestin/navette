@@ -214,7 +214,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 acceptor.local_addr()?
             );
             let (events, log) = mpsc::unbounded_channel();
-            tokio::spawn(print_events(log));
+            tokio::spawn(print_events(log, |_| {}));
             let control = mode::listen(&mode::control_path()?)?;
             let mic_control = mic::control_path()?;
             let mic_control = mode::listen(&mic_control)?;
@@ -331,8 +331,21 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let _one_agent = AgentLock::take(&single::agent_lock_path()?)?;
             let dialer = link::remote_dialer(&store)?;
             let home_network = network::HomeNetwork::new(ProcNet, store.clone())?;
+            // Only after the lock: the socket of a running agent is never taken from it.
+            let state = events::Events::new(events::Parts::remote());
+            match events::path().and_then(|path| events::listen(&path)) {
+                Ok(stream) => {
+                    let refused = Arc::new(events::Commands::Remote);
+                    tokio::spawn(events::serve(stream, state.clone(), refused));
+                }
+                // The link matters more than a bar.
+                Err(e) => eprintln!("navette: no events.sock, a bar cannot follow the agent: {e}"),
+            }
             let (events, log) = mpsc::unbounded_channel();
-            tokio::spawn(print_events(log));
+            let followed = state.clone();
+            tokio::spawn(print_events(log, move |event| {
+                followed.update(|p| p.link = events::link_after(p.link, event));
+            }));
             let (peers, peers_rx) = mpsc::unbounded_channel();
             let (hypr_events, hypr_events_rx) = mpsc::unbounded_channel();
             hypr::watch_events(hypr_events);
@@ -344,6 +357,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 lid_record: lid::record_path(),
                 lid_poll: lid::POLL,
                 notifier: Arc::new(notify::NotifySend::new(notify::Command)),
+                events: state,
             };
             let mut display = tokio::spawn(remote::serve(peers_rx, ports, hypr_events_rx));
             let graph = PipeWire::default();
@@ -468,9 +482,11 @@ async fn stopped() -> std::io::Result<()> {
     }
 }
 
-/// The link's events, on stderr (the journal, under systemd). They name no key or certificate.
-async fn print_events(mut events: mpsc::UnboundedReceiver<Event>) {
+/// The link's events, on stderr (the journal, under systemd), each handed to `then` too. They
+/// name no key or certificate.
+async fn print_events(mut events: mpsc::UnboundedReceiver<Event>, then: impl Fn(&Event)) {
     while let Some(event) = events.recv().await {
+        then(&event);
         match event {
             Event::Connected => eprintln!("navette: link up"),
             Event::Disconnected(e) => eprintln!("navette: link down: {e}"),

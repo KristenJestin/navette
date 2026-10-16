@@ -2055,4 +2055,40 @@ pub(crate) mod tests {
             "frames between clipboard messages: {gaps:?}"
         );
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn on_the_remote_the_events_say_away_then_dialing_then_linked() {
+        use crate::events::{Events, Parts, link_after};
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let tables = FakeTables::behind(OTHER_ROUTER);
+        let (_, agent, mut events) = gated_agent(&store, tables.clone());
+        let state = Events::new(Parts::remote());
+        let mut said = state.subscribe();
+        let followed = state.clone();
+        let follow = tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                followed.update(|p| p.link = link_after(p.link, &event));
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        tables.move_behind(HOME_ROUTER);
+        let states = tokio::time::timeout(RECHECK + A_FEW_SECONDS, async {
+            let mut states = Vec::new();
+            loop {
+                let line = said.recv().await.unwrap();
+                let line: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let state = line["state"].as_str().unwrap().to_string();
+                let linked = state == "linked";
+                states.push(state);
+                if linked {
+                    return states;
+                }
+            }
+        })
+        .await
+        .expect("linked in time");
+        agent.abort();
+        follow.abort();
+        assert_eq!(states, ["dialing", "away", "dialing", "linked"]);
+    }
 }

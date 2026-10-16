@@ -246,6 +246,8 @@ async fn main() -> io::Result<()> {
         lid_record: navette::lid::record_path(),
         lid_poll: navette::lid::POLL,
         notifier: Arc::new(navette::notify::NotifySend::new(navette::notify::Command)),
+        // No socket here: nothing reads it.
+        events: navette::events::Events::new(navette::events::Parts::remote()),
     };
     tokio::spawn(remote::serve(peers_rx, ports, hypr_events_rx));
     // The display only: no clipboard bridge here.

@@ -263,6 +263,17 @@ pub async fn follow_mic(events: Arc<Events>, mut mic: watch::Receiver<mic::Statu
     }
 }
 
+/// The remote machine's link after one of the agent's events.
+pub fn link_after(link: Link, event: &crate::link::Event) -> Link {
+    use crate::link::Event;
+    match event {
+        Event::Away => Link::Away,
+        Event::Back | Event::Disconnected(_) => Link::Dialing,
+        Event::Connected => Link::Linked,
+        Event::Failed(_) | Event::Retrying(_) => link,
+    }
+}
+
 /// What the commands on the socket reach.
 pub enum Commands {
     /// `serve`'s orders, as `control.sock` hands them, and its mic, as `mic.sock` does.
@@ -832,5 +843,27 @@ mod tests {
         let line: serde_json::Value = serde_json::from_str(&reader.next().await).unwrap();
         assert_eq!(line["mic"], "failed");
         reader.quiet().await;
+    }
+
+    #[test]
+    fn the_agent_s_events_move_its_link() {
+        use crate::link::Event;
+        let error = || io::Error::other("invented");
+        let after = |link, event| link_after(link, &event);
+        assert_eq!(after(Link::Dialing, Event::Away), Link::Away);
+        assert_eq!(after(Link::Away, Event::Back), Link::Dialing);
+        assert_eq!(after(Link::Dialing, Event::Connected), Link::Linked);
+        assert_eq!(
+            after(Link::Linked, Event::Disconnected(error())),
+            Link::Dialing
+        );
+        // A dial that failed, and the wait before the next, change nothing.
+        assert_eq!(after(Link::Dialing, Event::Failed(error())), Link::Dialing);
+        assert_eq!(
+            after(Link::Dialing, Event::Retrying(Duration::from_secs(1))),
+            Link::Dialing
+        );
+        // What the agent could not save of its first link: it is linked all the same.
+        assert_eq!(after(Link::Linked, Event::Failed(error())), Link::Linked);
     }
 }
