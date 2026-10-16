@@ -196,7 +196,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             })?;
             // Home's router, as this machine sees it now, on home's network: the agent dials
             // home only behind it.
-            let gateway = network::gateways(&ProcNet).first().copied();
+            let gateway = network::routers(&ProcNet, home.ip()).first().copied();
             pair::remote(&store, home, gateway, &pin, Timeouts::default()).await?;
             // A running agent read the previous pairing when it started: restart it.
             println!(

@@ -200,17 +200,25 @@ default gateway there.
 
 At pairing, the remote machine records that router's hardware address in `paired.conf`
 (`gateway = 02:00:00:00:00:01`). Before each dial, the agent reads its routing and ARP tables
-(`/proc/net/route`, `/proc/net/arp`), which sends nothing, and dials only when one of its
-default gateways has that address: a corporate VPN's default route goes through a tunnel, not
-a router, and does not hide the one below it. Otherwise it does not dial, says once in its
-journal `not on the desk's network`, and looks again every 10 s; back on the desk's network,
-it links within that.
+(`/proc/net/route`, `/proc/net/arp`), which sends nothing, and follows the way to the desk,
+not the default route: the interface whose directly connected subnet holds the desk's address
+(the narrowest one), then the routers of the routes through that interface (the default
+route's, or under a full-tunnel VPN the one its server's host route goes through), as the ARP
+table knows them there. It dials only when one of them has the recorded address. So a
+tethered phone or an LTE dock with a preferred default route is not taken for the desk's
+router, and a corporate VPN, whether it adds a tunnel beside the LAN's default route or
+replaces it, does not hide the router below it. No connected subnet holding the desk's address
+is away, whatever else the laptop sees. Otherwise it does not dial, says once in its journal
+`not on the desk's network`, and looks again every 10 s; back on the desk's network, it links
+within that.
 
 - **A pairing made before this check** has no `gateway`: the agent dials as before, and learns
   the router at its next link, then keeps it. That is safe: the link only comes up with the
   paired desk, authenticated, so the laptop was on the desk's network when it learned.
 - **No router known yet** (pairing, or that first link, came before any traffic through the
   router, so the ARP table did not have it): the same, the next link learns it.
+- **A desk paired on an IPv6 address**: the check reads only IPv4 routes, so no router is
+  recorded and the agent dials as it did before.
 - **A new router at the desk** has another hardware address: the agent never dials again,
   and its journal says so, until `navette pair` is run again on both machines and the agent
   restarted (`systemctl --user restart navette-agent`), since a running agent read the
