@@ -341,10 +341,17 @@ fn the_install_script_refuses_to_run_as_root() {
 #[test]
 fn the_install_script_names_a_file_missing_next_to_it_and_installs_nothing() {
     let machine = Machine::new();
-    let alone = machine.home.join("alone");
-    fs::create_dir(&alone).unwrap();
-    fs::copy(machine.archive.join("install.sh"), alone.join("install.sh")).unwrap();
-    let output = machine.install_from(&alone);
+    let half = machine.home.join("half");
+    fs::create_dir(&half).unwrap();
+    for name in [
+        "install.sh",
+        "navette",
+        "navette.svg",
+        "navette-agent.service",
+    ] {
+        fs::copy(machine.archive.join(name), half.join(name)).unwrap();
+    }
+    let output = machine.install_from(&half);
     assert!(!output.status.success());
     assert!(
         said(&output).contains("navette.service"),
