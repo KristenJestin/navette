@@ -372,6 +372,51 @@ fn status(active: Option<&Active>, peer: Option<&Peer>) -> String {
     format!("{mode}; the remote machine is {link}")
 }
 
+/// How long the desk waits after a link comes up before it says the remote machine is here. A user
+/// whose own setup starts the mode as the laptop links starts it within this moment, and would
+/// otherwise see a notification offering what has just happened.
+const ARRIVAL_DELAY: Duration = Duration::from_secs(3);
+
+/// Says that the remote machine is here, with a button that starts the default mode. With no
+/// mode to start (no `mode.conf`), there is nothing to offer.
+fn announce(home: &Home, pressed: &UnboundedSender<()>) {
+    let Ok(mode) = Mode::read(&home.config_dir, None) else {
+        return;
+    };
+    let pressed = pressed.clone();
+    home.notifier.offer(
+        &format!("{} is here", mode.look.remote_label),
+        "Start",
+        Box::new(move || {
+            let _ = pressed.send(());
+        }),
+    );
+}
+
+/// `navette mode start`, whoever asks: the answer goes to `reply` once the remote has answered.
+async fn begin(
+    home: &Home,
+    peer: Option<&Peer>,
+    name: Option<&str>,
+    reply: oneshot::Sender<io::Result<String>>,
+    generation: &mut u32,
+    active: &mut Option<Active>,
+) {
+    *generation = generation.wrapping_add(1);
+    match start(home, peer, name, *generation, active).await {
+        Ok(()) => {
+            if let Some(a) = active {
+                let wait = start_timeout(a.monitors.len());
+                let at = tokio::time::Instant::now() + wait;
+                a.starting = Some((reply, at));
+            }
+        }
+        Err(e) => {
+            let _ = reply.send(Err(e));
+        }
+    }
+}
+
 /// Serves the orders and the links, until both channels close.
 pub async fn serve(
     home: Home,
@@ -383,6 +428,11 @@ pub async fn serve(
     let mut active: Option<Active> = None;
     // Each start has its own, said to the remote and back: see `Display::Start`.
     let mut generation: u32 = 0;
+    // When the desk says the remote machine is here: set by a link coming up, and gone once said,
+    // or once the link drops or a mode is asked for.
+    let mut here_at: Option<tokio::time::Instant> = None;
+    // The offer's button, pressed.
+    let (pressed_tx, mut pressed) = tokio::sync::mpsc::unbounded_channel::<()>();
     loop {
         // The link carries the user's clipboard and sound once the remote started the mode,
         // and no longer once home stops it.
@@ -402,12 +452,14 @@ pub async fn serve(
                 Some(new) => {
                     link_lost(&mut active, "the link was replaced").await;
                     peer = Some(new);
+                    here_at = Some(tokio::time::Instant::now() + ARRIVAL_DELAY);
                 }
                 None => break,
             },
             heard = next(&mut peer) => match heard {
                 Heard::Gone => {
                     peer = None;
+                    here_at = None;
                     link_lost(&mut active, "the link to the remote machine dropped").await;
                 }
                 // The answer of a mode that is no longer the running one (a switch, a stop).
@@ -504,21 +556,9 @@ pub async fn serve(
             },
             order = orders.recv() => match order {
                 Some(Order::Start(name, reply)) => {
-                    generation = generation.wrapping_add(1);
-                    let started =
-                        start(&home, peer.as_ref(), name.as_deref(), generation, &mut active);
-                    match started.await {
-                        Ok(()) => {
-                            if let Some(a) = &mut active {
-                                let wait = start_timeout(a.monitors.len());
-                                let at = tokio::time::Instant::now() + wait;
-                                a.starting = Some((reply, at));
-                            }
-                        }
-                        Err(e) => {
-                            let _ = reply.send(Err(e));
-                        }
-                    }
+                    here_at = None;
+                    begin(&home, peer.as_ref(), name.as_deref(), reply, &mut generation, &mut active)
+                        .await;
                 }
                 Some(Order::Stop(reply)) => {
                     let given = active.as_ref().map(Active::given_back);
@@ -598,6 +638,25 @@ pub async fn serve(
                     if let Err(e) = blocking(move || mic.follow(remote)).await {
                         eprintln!("navette: mic: it did not follow the keyboard: {e}");
                     }
+                }
+            }
+            _ = sleep_until(here_at) => {
+                here_at = None;
+                if active.is_none() {
+                    announce(&home, &pressed_tx);
+                }
+            }
+            Some(()) = pressed.recv() => {
+                // The user started it by other means since: nothing to start.
+                if active.is_none() {
+                    let (reply, answer) = oneshot::channel();
+                    begin(&home, peer.as_ref(), None, reply, &mut generation, &mut active).await;
+                    let notifier = home.notifier.clone();
+                    tokio::spawn(async move {
+                        if let Ok(Err(e)) = answer.await {
+                            notifier.show("The mode could not start", &e.to_string());
+                        }
+                    });
                 }
             }
             _ = sleep_until(deadline) => {
@@ -1904,6 +1963,189 @@ mod tests {
 
     fn sound_log(desk: &Desk) -> Vec<&'static str> {
         desk.sound.log.lock().unwrap().clone()
+    }
+
+    fn offers(desk: &Desk) -> Vec<(String, String)> {
+        desk.notices.offers()
+    }
+
+    /// Waits for the desk to have said what it says once a link has settled, and a little more.
+    async fn settle() {
+        tokio::time::sleep(ARRIVAL_DELAY * 2).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_with_no_mode_offers_to_start_it() {
+        let desk = desk("DP-2");
+        let _remote = connect(&desk);
+        settle().await;
+        assert_eq!(offers(&desk), [("REMOTE is here".into(), "Start".into())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_offer_names_the_remote_as_the_config_does() {
+        let desk = desk_with("remote_label = FAR\n[office]\nmonitor = DP-2\n");
+        let _remote = connect(&desk);
+        settle().await;
+        assert_eq!(offers(&desk), [("FAR is here".into(), "Start".into())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_offered_before_the_moment_is_over() {
+        let desk = desk("DP-2");
+        let _remote = connect(&desk);
+        tokio::time::sleep(ARRIVAL_DELAY / 2).await;
+        assert!(offers(&desk).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_offered_with_no_mode_to_start() {
+        let desk = desk_with("");
+        let _remote = connect(&desk);
+        settle().await;
+        assert!(offers(&desk).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_offer_is_not_made_again_while_the_link_stays_up() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        settle().await;
+        desk.notices.press(0);
+        until(|| !starts(&remote).is_empty()).await;
+        remote
+            .to_home
+            .try_send(Incoming::Display(Display::Started {
+                generation: None,
+                output: "NAVETTE-1".into(),
+                others: None,
+                closed_lid: Some(true),
+            }))
+            .unwrap();
+        // The mode runs, then stops, and the link is still the same one.
+        let stopping = ask(&desk, false).await;
+        answer_text(stopping).await;
+        settle().await;
+        assert_eq!(offers(&desk).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_link_after_a_drop_offers_again() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        settle().await;
+        assert_eq!(offers(&desk).len(), 1);
+        drop(remote);
+        settle().await;
+        let _again = connect(&desk);
+        settle().await;
+        assert_eq!(offers(&desk).len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_that_drops_within_the_moment_offers_nothing() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        tokio::time::sleep(ARRIVAL_DELAY / 2).await;
+        drop(remote);
+        settle().await;
+        assert!(offers(&desk).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_action_starts_the_default_mode() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        settle().await;
+        desk.notices.press(0);
+        until(|| !starts(&remote).is_empty()).await;
+        assert_eq!(*desk.covered.lock().unwrap(), ["DP-2"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_action_pressed_with_a_mode_running_starts_nothing_more() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        settle().await;
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        remote
+            .to_home
+            .try_send(Incoming::Display(Display::Started {
+                generation: None,
+                output: "NAVETTE-1".into(),
+                others: None,
+                closed_lid: Some(true),
+            }))
+            .unwrap();
+        answer(pending).await.unwrap();
+        desk.notices.press(0);
+        settle().await;
+        assert_eq!(starts(&remote).len(), 1);
+        assert!(
+            desk.notices
+                .summaries()
+                .iter()
+                .all(|s| !s.contains("could not")),
+            "{:?}",
+            desk.notices.summaries()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_action_that_cannot_start_the_mode_says_why() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        settle().await;
+        drop(remote);
+        settle().await;
+        desk.notices.press(0);
+        until(|| !desk.notices.shown().is_empty()).await;
+        let (summary, body) = desk.notices.shown().remove(0);
+        assert_eq!(summary, "The mode could not start");
+        assert!(body.contains("not connected"), "{body}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mode_started_within_the_moment_of_the_link_is_not_offered() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        remote
+            .to_home
+            .try_send(Incoming::Display(Display::Started {
+                generation: None,
+                output: "NAVETTE-1".into(),
+                others: None,
+                closed_lid: Some(true),
+            }))
+            .unwrap();
+        answer(pending).await.unwrap();
+        settle().await;
+        assert!(offers(&desk).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_mode_started_and_stopped_within_the_moment_is_not_offered_either() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        let pending = ask(&desk, true).await;
+        until(|| !starts(&remote).is_empty()).await;
+        remote
+            .to_home
+            .try_send(Incoming::Display(Display::Started {
+                generation: None,
+                output: "NAVETTE-1".into(),
+                others: None,
+                closed_lid: Some(true),
+            }))
+            .unwrap();
+        answer(pending).await.unwrap();
+        let stopping = ask(&desk, false).await;
+        answer_text(stopping).await;
+        settle().await;
+        assert!(offers(&desk).is_empty());
     }
 
     #[tokio::test]
