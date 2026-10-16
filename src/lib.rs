@@ -18,6 +18,7 @@ pub mod mode;
 pub mod network;
 pub mod notify;
 pub mod pair;
+pub mod runner;
 pub mod single;
 pub mod store;
 pub mod transport;

@@ -417,3 +417,83 @@ fn the_remote_says_dialing_once_the_desk_goes() {
     drop(serve);
     watched_until(&remote, "dialing");
 }
+
+#[test]
+fn run_without_a_pairing_exits_with_the_refusal_status_and_says_to_pair() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (status, output) = Navette::start(tmp.path(), &["run", "--audio"]).finish_with_status();
+    assert_eq!(
+        status.code(),
+        Some(i32::from(navette::runner::REFUSED)),
+        "{output}"
+    );
+    assert!(
+        output.contains("navette: not paired; run navette pair first"),
+        "{output}"
+    );
+}
+
+#[test]
+fn run_with_a_broken_role_names_the_key_and_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("paired.conf"), "role = boss\n").unwrap();
+    let (status, output) = Navette::start(tmp.path(), &["run"]).finish_with_status();
+    assert_eq!(
+        status.code(),
+        Some(i32::from(navette::runner::REFUSED)),
+        "{output}"
+    );
+    assert!(output.contains("role"), "{output}");
+    assert!(output.contains("paired.conf"), "{output}");
+}
+
+/// Pairs the two config dirs, then starts `navette run` on both machines (no `--audio` at home:
+/// it would reach the real PipeWire) and waits until both report the link up.
+fn run_link(home: &Path, remote: &Path, remote_args: &[&str]) -> (Navette, Navette) {
+    let home_pair = Navette::start(home, &["pair", "--listen", "127.0.0.1:0"]);
+    let pin = home_pair.wait_for("PIN:");
+    let pin = pin.rsplit(' ').next().unwrap().to_owned();
+    let hint = home_pair.wait_for("navette pair ");
+    let address = hint.split('`').nth(1).unwrap().rsplit(' ').next().unwrap();
+    let mut remote_pair = Navette::start(remote, &["pair", address]);
+    remote_pair.type_line(&pin);
+    remote_pair.finish();
+    home_pair.finish();
+
+    let serve = Navette::start(home, &["run"]);
+    serve.wait_for("waiting for the paired remote machine");
+    let agent = Navette::start(remote, &[&["run"], remote_args].concat());
+    serve.wait_for("link up");
+    agent.wait_for("link up");
+    (serve, agent)
+}
+
+#[test]
+fn run_starts_serve_at_home_and_the_agent_on_the_remote_machine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (_serve, _agent) = run_link(&home, &remote, &[]);
+}
+
+#[test]
+fn run_on_the_remote_machine_says_once_that_audio_is_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (_serve, agent) = run_link(&home, &remote, &["--audio"]);
+    let output = agent.output();
+    assert_eq!(output.matches("--audio is ignored").count(), 1, "{output}");
+}
+
+#[test]
+fn run_ends_on_sigterm_like_the_command_it_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (serve, agent) = run_link(&home, &remote, &[]);
+    for machine in [agent, serve] {
+        let pid = machine.child.id().to_string();
+        let sent = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+        assert!(sent.success());
+        let (status, output) = machine.finish_with_status();
+        assert_eq!(status.code(), Some(0), "{output}");
+    }
+}
