@@ -71,11 +71,18 @@ fn work(mut run: impl Run, messages: &mpsc::Receiver<(String, String)>) {
     let mut shown: Option<u32> = None;
     let mut told = false;
     for (summary, body) in messages {
-        let mut args: Vec<String> = ["--print-id", "--app-name", "Navette", "--expire-time"]
-            .into_iter()
-            .chain([EXPIRE])
-            .map(str::to_owned)
-            .collect();
+        let mut args: Vec<String> = [
+            "--print-id",
+            "--app-name",
+            "Navette",
+            "--icon",
+            "navette",
+            "--expire-time",
+        ]
+        .into_iter()
+        .chain([EXPIRE])
+        .map(str::to_owned)
+        .collect();
         if let Some(id) = shown {
             args.extend(["--replace-id".to_owned(), id.to_string()]);
         }
@@ -176,6 +183,11 @@ mod tests {
         let args = next(&seen);
         assert!(args.contains(&"--print-id".to_owned()), "{args:?}");
         assert!(!args.contains(&"--replace-id".to_owned()), "{args:?}");
+        // The icon by its name in the icon theme, where the install puts `navette.svg`.
+        assert!(
+            args.windows(2).any(|pair| pair == ["--icon", "navette"]),
+            "{args:?}"
+        );
         // The text comes last, after `--`: a summary never reads as an option.
         assert_eq!(args[args.len() - 2..], ["--", "Mic → remote"]);
     }
