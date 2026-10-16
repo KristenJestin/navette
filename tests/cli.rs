@@ -217,7 +217,8 @@ fn nothing_listens_on_the_remote_machine() {
     }
     assert_eq!(
         established, 1,
-        "the agent holds exactly its link to home: {seen:#?} of {sockets:?}"
+        "the agent holds exactly its link to home: {seen:#?} of {sockets:?}\n{}",
+        agent.output()
     );
 }
 

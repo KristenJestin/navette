@@ -52,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [remote, cli]
+        suite: [remote, cli, full]
     steps:
       - uses: actions/checkout@v4
       - run: tools/install-build-libraries.sh
@@ -76,6 +76,8 @@ jobs:
           fi
           if [ "${{ matrix.suite }}" = remote ]; then
             args=(--lib -- display::remote::tests --test-threads=32)
+          elif [ "${{ matrix.suite }}" = full ]; then
+            args=(-j 4)
           else
             args=(--test cli -- --test-threads=16)
           fi
