@@ -268,6 +268,9 @@ struct Reads {
     gone: bool,
     /// The user was told a read of it failed: once is enough, the next ones fail alike.
     told: bool,
+    /// The peer stopped serving it: an application that tries again is refused alike, so
+    /// its tries are not logged as fetches.
+    aborted: bool,
 }
 
 impl<C: Compositor> Bridge<C> {
@@ -464,9 +467,11 @@ impl<C: Compositor> Bridge<C> {
                 }
                 let Some((done, stopped, run)) = self.progress.serving(serial, total) else {
                     // The user stopped this copy's paste: its next files are not served.
-                    log(format_args!(
-                        "offer {serial}: file {index} refused, its paste was stopped"
-                    ));
+                    if self.progress.first_refusal(serial) {
+                        log(format_args!(
+                            "offer {serial}: file {index} refused, its paste was stopped"
+                        ));
+                    }
                     self.transfers.refuse(id);
                     return;
                 };
@@ -742,14 +747,14 @@ impl<C: Compositor> Bridge<C> {
             return;
         }
         self.fetching.borrow_mut().push(content.clone());
-        let (first, done) = {
+        let (first, done, aborted) = {
             let mut reads = self.reads.borrow_mut();
             let reads = reads.entry(serial).or_default();
             reads.running += 1;
-            (reads.running == 1, reads.done.clone())
+            (reads.running == 1, reads.done.clone(), reads.aborted)
         };
         let (meter, tasks, run) = self.progress.reading(serial, total, done);
-        if first {
+        if first && !aborted {
             log(format_args!(
                 "offer {serial}: an application reads its files, fetching them as read ({})",
                 human_bytes(total)
@@ -802,7 +807,12 @@ impl<C: Compositor> Bridge<C> {
                 )),
                 Err(e) => {
                     content.end(Err(libc::EIO));
-                    log(format_args!("offer {serial}: file {index} not read: {e}"));
+                    // A copy the peer stopped serving refuses each try alike: said once.
+                    let again =
+                        matches!(e, TransferError::Aborted) && set_aborted(&ending.reads, serial);
+                    if !again {
+                        log(format_args!("offer {serial}: file {index} not read: {e}"));
+                    }
                     let told = told_once(&ending.reads, serial);
                     if !told {
                         notifier.show("Paste failed", &why(&e));
@@ -812,6 +822,14 @@ impl<C: Compositor> Bridge<C> {
         });
         tasks.borrow_mut().push(task.abort_handle());
     }
+}
+
+/// Notes that the peer stopped serving the copy `serial`; whether it had already.
+fn set_aborted(reads: &RefCell<std::collections::HashMap<u32, Reads>>, serial: u32) -> bool {
+    reads
+        .borrow_mut()
+        .get_mut(&serial)
+        .is_some_and(|r| std::mem::replace(&mut r.aborted, true))
 }
 
 /// Whether the user was told already that a read of the copy `serial` failed; they are now.
@@ -1248,7 +1266,15 @@ fn report(_job: u32, progress: Progress) {
 }
 
 fn log(message: std::fmt::Arguments) {
+    #[cfg(test)]
+    LOGGED.with(|lines| lines.borrow_mut().push(message.to_string()));
     eprintln!("navette: clipboard: {message}");
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What a test thread logged, for the tests that say what the journal must (not) tell.
+    static LOGGED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The Wayland clipboard of the machine, through `ext-data-control`.
@@ -4487,6 +4513,78 @@ mod tests {
                 }
                 remote.seen.told("Paste failed").await;
                 assert_eq!(remote.seen.times_told("Paste failed"), 1);
+            })
+            .await;
+    }
+
+    /// How many lines logged on this thread contain `part`.
+    fn logged(part: &str) -> usize {
+        LOGGED.with(|lines| lines.borrow().iter().filter(|l| l.contains(part)).count())
+    }
+
+    #[tokio::test]
+    async fn the_reads_of_a_copy_the_peer_stopped_serving_log_no_fetch_and_one_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        LocalSet::new()
+            .run_until(async {
+                let (remote, mut home, mount) = alone_reading(Side::Server, tmp.path());
+                let path = offer_a_file(&remote, &mut home, 6, "a.bin", 2 * CHUNK as u64, 1).await;
+                let folder = mount.folder().await;
+                // The first read starts before the cancel, and is stopped by it; the file
+                // manager then tries again, three times.
+                for _ in 0..4 {
+                    let read = tokio::task::spawn_local(read_file(folder.clone(), path.clone()));
+                    let (id, _) = next_request(&mut home).await;
+                    home.write_msg(&LinkMsg::ClipboardAbort { id })
+                        .await
+                        .unwrap();
+                    assert_eq!(within("the read", read).await.unwrap(), Err(libc::EIO));
+                }
+                assert_eq!(logged("offer 6: an application reads its files"), 1);
+                assert_eq!(logged("offer 6: file 0 not read"), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_requests_for_a_copy_the_user_stopped_serving_are_refused_and_said_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("big.bin");
+        std::fs::write(&copied, vec![9; 16 * CHUNK]).unwrap();
+        let list = uri_list_of(std::slice::from_ref(&copied));
+        LocalSet::new()
+            .run_until(async {
+                let (out, mut sent) = outbound_channel();
+                let clipboard = Arc::new(Fake::default());
+                let bridge = Bridge::new(
+                    Transfers::new(out, Side::Client),
+                    Jobs::new(|_, _| {}),
+                    clipboard.clone(),
+                    None,
+                    Kept::default(),
+                    &quiet(),
+                );
+                let mime_types = clipboard.select(&[(URI_LIST, list.as_bytes())]);
+                bridge.on_compositor_event(Selected::Selection { mime_types });
+                let ClipboardMsg::Offer { serial, .. } =
+                    next_sent(&mut sent, |m| matches!(m, ClipboardMsg::Offer { .. })).await
+                else {
+                    unreachable!()
+                };
+                let request = |id| ClipboardMsg::Request {
+                    id,
+                    serial,
+                    item: ClipboardItem::File(0),
+                };
+                bridge.on_peer_msg(request(2), Bytes::new());
+                next_sent(&mut sent, |m| matches!(m, ClipboardMsg::Data { .. })).await;
+                // The user stops it while it crosses; the peer asks again, three times.
+                bridge.cancel(Crossing::Serve(serial).id());
+                for id in [4, 6, 8] {
+                    bridge.on_peer_msg(request(id), Bytes::new());
+                    next_sent(&mut sent, |m| *m == ClipboardMsg::Abort { id }).await;
+                }
+                assert_eq!(logged("file 0 refused, its paste was stopped"), 1);
             })
             .await;
     }

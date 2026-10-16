@@ -40,7 +40,7 @@ stops the start with a message that names them, and nothing is changed.
 ## Named modes
 
 A `[name]` section in `mode.conf` defines a mode of its own. The keys before the first section
-are the default of every mode: `release`, `mic_hotkey` and the corner's
+are the default of every mode: `release`, `mic` ([following the keyboard](mic.md#following-the-keyboard)), `mic_hotkey` and the corner's
 `remote_label`, `local_label`, `remote_bar` and `local_bar` (a section may set its own), and a `monitor` among them is the one unnamed mode, so a file with no sections keeps
 working, and `navette mode start` with no name starts it.
 
@@ -141,7 +141,7 @@ While the mode runs:
 - **The remote's sound**, with `navette serve --audio`, plays at home while the mode runs, and
   on the remote machine's own output again once it stops ([the sound](audio.md)).
 - **The home mic**, with `navette serve --audio`, goes to the remote machine while the mode runs,
-  and the hotkey switches it either way ([the mic](mic.md)).
+  and the hotkey switches it either way, or it follows the keyboard ([the mic](mic.md)).
 - **A notification** says when the mode is up and when it stops, once each, on both machines:
   at home `DP-2, DP-3 show the remote machine`, then `DP-2, DP-3 are back home`; on the remote
   machine `2 screens driven from home (NAVETTE-1, NAVETTE-2)`, then `2 screens driven from home

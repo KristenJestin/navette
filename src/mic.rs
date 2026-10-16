@@ -1,8 +1,9 @@
 //! Where the home mic goes. It serves one machine at a time: the remote machine while a mode
 //! runs, from the moment it starts, and home again when it stops; in between, `navette mic
-//! toggle|remote|home` (the hotkey, the bar) switches it either way. Switching only starts or
-//! stops sending: the remote's source stays its default mic for the whole mode, silent while
-//! the mic is home, so a call there keeps its device.
+//! toggle|remote|home` (the hotkey, the bar) switches it either way, and with `mic = follow`
+//! it goes to the side that has the keyboard. Switching only starts or stops sending: the
+//! remote's source stays its default mic for the whole mode, silent while the mic is home, so a
+//! call there keeps its device.
 //!
 //! `navette serve` holds the mic, so `navette mic` reaches it over a Unix socket beside the
 //! mode's, in `$XDG_RUNTIME_DIR/navette`. `navette mic watch` prints where it goes at each
@@ -167,9 +168,10 @@ impl<G: Graph + Sync> Mic<G> {
         lock(&self.shared.state).link = Some(link);
     }
 
-    /// A mode started: the remote's source becomes its default mic, and the mic goes there.
-    /// When it cannot, the mode runs without it, and the mic says why until the mode stops.
-    pub fn start(&self) -> io::Result<()> {
+    /// A mode started: the remote's source becomes its default mic, and the mic goes there, or
+    /// stays home unless `remote`. When it cannot, the mode runs without it, and the mic says
+    /// why until the mode stops.
+    pub fn start(&self, remote: bool) -> io::Result<()> {
         let shared = &self.shared;
         let _lifecycle = lock(&shared.lifecycle);
         let started = {
@@ -181,7 +183,7 @@ impl<G: Graph + Sync> Mic<G> {
             let link = state.link.clone().filter(|link| !link.is_closed());
             link.map(|link| (link, state.sessions))
         };
-        let (running, result) = match self.open(started) {
+        let (running, result) = match self.open(started, remote) {
             Ok(running) => (running, Ok(())),
             Err(e) => {
                 let running = Running {
@@ -200,7 +202,11 @@ impl<G: Graph + Sync> Mic<G> {
 
     /// Tells the remote and opens the mic, the state's lock not held: the link may make it
     /// wait.
-    fn open(&self, link: Option<(mpsc::Sender<Message>, u32)>) -> io::Result<Running<G>> {
+    fn open(
+        &self,
+        link: Option<(mpsc::Sender<Message>, u32)>,
+        remote: bool,
+    ) -> io::Result<Running<G>> {
         let shared = &self.shared;
         let (link, session) =
             link.ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "the link is down"))?;
@@ -210,6 +216,7 @@ impl<G: Graph + Sync> Mic<G> {
             shared.saved.clone(),
             link.clone(),
             session,
+            remote,
         );
         let mic = match started {
             Ok(mic) => mic,
@@ -528,8 +535,18 @@ pub async fn watch(path: &Path, mut each: impl FnMut(Status) -> io::Result<()>) 
 }
 
 impl<G: Graph + Sync> crate::mode::Mic for Mic<G> {
-    fn start(&self) -> io::Result<()> {
-        Mic::start(self)
+    fn start(&self, remote: bool) -> io::Result<()> {
+        Mic::start(self, remote)
+    }
+
+    fn follow(&self, remote: bool) -> io::Result<()> {
+        let to = if remote { Status::Remote } else { Status::Home };
+        // Each switch shows in the corners and makes a gap in a call: none for nothing.
+        if Shared::<G>::place(*self.shared.status.borrow()) == to {
+            return Ok(());
+        }
+        let order = if remote { Order::Remote } else { Order::Home };
+        Routing::order(self, order).map(drop)
     }
 
     fn stop(&self) {
@@ -615,7 +632,7 @@ mod tests {
     async fn a_mode_start_sends_the_mic_to_the_remote() {
         let (graph, mic, mut remote, _tmp) = mic();
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         assert_eq!(mic.order(Order::Status).unwrap(), Status::Remote);
         assert_eq!(orders(&mut remote), [Message::MicStart { session: 1 }]);
         assert_eq!(graph.state().mics.len(), 1);
@@ -626,7 +643,7 @@ mod tests {
     async fn toggling_switches_the_mic_both_ways() {
         let (graph, mic, mut remote, _tmp) = mic();
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         assert_eq!(orders(&mut remote), [Message::MicStart { session: 1 }]);
         assert_eq!(home_default(&graph), AWAY);
         assert_eq!(mic.order(Order::Toggle).unwrap(), Status::Home);
@@ -644,7 +661,7 @@ mod tests {
     async fn home_and_remote_send_the_mic_one_way_whatever_the_state() {
         let (graph, mic, mut remote, _tmp) = mic();
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         assert_eq!(mic.order(Order::Home).unwrap(), Status::Home);
         assert_eq!(mic.order(Order::Home).unwrap(), Status::Home);
         assert!(!sends(&graph, &mut remote));
@@ -657,7 +674,7 @@ mod tests {
     async fn a_mode_stop_brings_the_mic_home_and_closes_the_echo_canceller() {
         let (graph, mic, mut remote, _tmp) = mic();
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         let stopped = mic.clone();
         blocking(move || stopped.stop()).await;
         assert_eq!(mic.order(Order::Status).unwrap(), Status::Off);
@@ -699,7 +716,7 @@ mod tests {
         for _ in 0..2 {
             let cycled = mic.clone();
             blocking(move || {
-                cycled.start().unwrap();
+                cycled.start(true).unwrap();
                 cycled.stop();
             })
             .await;
@@ -720,7 +737,7 @@ mod tests {
         let (graph, mic, mut remote, _tmp) = mic();
         graph.state().refuse_mics = true;
         let started = mic.clone();
-        assert!(blocking(move || started.start()).await.is_err());
+        assert!(blocking(move || started.start(true)).await.is_err());
         // The mode runs without it, and says why.
         assert_eq!(mic.order(Order::Status).unwrap(), Status::Failed);
         let error = mic.order(Order::Toggle).unwrap_err().to_string();
@@ -743,7 +760,7 @@ mod tests {
         let (_graph, mic, _remote, notes, _tmp) = noted();
         // The mode starts: the mic goes to the remote machine.
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         assert_eq!(notes.summaries(), ["Mic → remote"]);
         mic.order(Order::Toggle).unwrap();
         mic.order(Order::Toggle).unwrap();
@@ -759,10 +776,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mode_starting_with_the_keyboard_home_keeps_the_mic_home_saying_nothing() {
+        let (graph, mic, mut remote, notes, _tmp) = noted();
+        let started = mic.clone();
+        blocking(move || started.start(false)).await.unwrap();
+        assert_eq!(mic.order(Order::Status).unwrap(), Status::Home);
+        assert_eq!(home_default(&graph), "desk-mic");
+        // The remote's source is there all the same, for the mic to go to it.
+        assert_eq!(orders(&mut remote), [Message::MicStart { session: 1 }]);
+        assert!(!sends(&graph, &mut remote));
+        assert!(notes.summaries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn following_the_keyboard_switches_as_the_hotkey_does_and_never_for_nothing() {
+        let (graph, mic, mut remote, notes, _tmp) = noted();
+        let started = mic.clone();
+        blocking(move || started.start(false)).await.unwrap();
+        let follows = mic.clone();
+        blocking(move || crate::mode::Mic::follow(&*follows, true))
+            .await
+            .unwrap();
+        assert_eq!(mic.order(Order::Status).unwrap(), Status::Remote);
+        assert!(sends(&graph, &mut remote));
+        let follows = mic.clone();
+        blocking(move || crate::mode::Mic::follow(&*follows, true))
+            .await
+            .unwrap();
+        let follows = mic.clone();
+        blocking(move || crate::mode::Mic::follow(&*follows, false))
+            .await
+            .unwrap();
+        assert_eq!(mic.order(Order::Status).unwrap(), Status::Home);
+        assert_eq!(notes.summaries(), ["Mic → remote", "Mic → home"]);
+    }
+
+    #[tokio::test]
+    async fn following_the_keyboard_with_a_failed_mic_says_it_was_not_switched() {
+        let (graph, mic, _remote, notes, _tmp) = noted();
+        graph.state().refuse_mics = true;
+        let started = mic.clone();
+        assert!(blocking(move || started.start(true)).await.is_err());
+        let follows = mic.clone();
+        assert!(
+            blocking(move || crate::mode::Mic::follow(&*follows, true))
+                .await
+                .is_err()
+        );
+        assert_eq!(notes.summaries(), ["Mic failed", "Mic not switched"]);
+    }
+
+    #[tokio::test]
     async fn stopping_the_mode_with_the_mic_remote_shows_it_came_home() {
         let (_graph, mic, _remote, notes, _tmp) = noted();
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         let stopped = mic.clone();
         blocking(move || stopped.stop()).await;
         assert_eq!(notes.summaries(), ["Mic → remote", "Mic → home"]);
@@ -772,7 +840,7 @@ mod tests {
     async fn an_order_that_changes_nothing_shows_nothing() {
         let (_graph, mic, _remote, notes, _tmp) = noted();
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         mic.order(Order::Remote).unwrap();
         mic.order(Order::Status).unwrap();
         assert_eq!(notes.summaries(), ["Mic → remote"]);
@@ -782,7 +850,7 @@ mod tests {
     async fn a_switch_that_fails_says_it_failed() {
         let (graph, mic, _remote, notes, _tmp) = noted();
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         mic.order(Order::Home).unwrap();
         // Going back to the remote needs PipeWire: it refuses.
         graph.state().refuse_defaults = true;
@@ -798,7 +866,7 @@ mod tests {
         let (graph, mic, _remote, notes, _tmp) = noted();
         graph.state().refuse_mics = true;
         let started = mic.clone();
-        assert!(blocking(move || started.start()).await.is_err());
+        assert!(blocking(move || started.start(true)).await.is_err());
         let shown = notes.shown();
         assert_eq!(shown.len(), 1, "{shown:?}");
         assert_eq!(shown[0].0, "Mic failed");
@@ -826,7 +894,7 @@ mod tests {
     async fn a_pipewire_restart_that_the_mic_survives_shows_nothing_more() {
         let (graph, mic, _remote, notes, _tmp) = noted();
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         graph.restart();
         tokio::time::sleep(CHECK * 4).await;
         assert_eq!(notes.summaries(), ["Mic → remote"]);
@@ -845,7 +913,7 @@ mod tests {
     async fn a_home_pipewire_restart_opens_the_mic_again() {
         let (graph, mic, mut remote, _tmp) = mic();
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         graph.restart();
         tokio::time::timeout(Duration::from_secs(5), async {
             while graph.state().mics.is_empty() || graph.state().sources.is_empty() {
@@ -863,7 +931,7 @@ mod tests {
     async fn a_mic_that_cannot_open_again_says_so_until_it_can() {
         let (graph, mic, _remote, _tmp) = mic();
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         graph.state().refuse_mics = true;
         graph.restart();
         until_status(&mic, Status::Failed).await;
@@ -900,7 +968,7 @@ mod tests {
     async fn a_stop_waits_out_a_stalled_link_and_its_order_is_not_lost() {
         let (_graph, mic, mut remote, _tmp) = mic();
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         stall(&remote, &mic);
         let stopped = mic.clone();
         let stop = tokio::task::spawn_blocking(move || stopped.stop());
@@ -920,7 +988,7 @@ mod tests {
         let (_graph, mic, remote, _tmp) = mic();
         stall(&remote, &mic);
         let started = mic.clone();
-        let start = tokio::task::spawn_blocking(move || started.start());
+        let start = tokio::task::spawn_blocking(move || started.start(true));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(answers(&mic, Order::Status).await.unwrap(), Status::Off);
         assert!(answers(&mic, Order::Toggle).await.is_err());
@@ -935,7 +1003,7 @@ mod tests {
         let notes = Arc::new(Fake::default());
         let mic = Arc::new(Mic::new(FakeGraph::default(), saved, String::new(), notes));
         let started = mic.clone();
-        let error = blocking(move || started.start()).await.unwrap_err();
+        let error = blocking(move || started.start(true)).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
         assert_eq!(mic.order(Order::Status).unwrap(), Status::Failed);
     }
@@ -946,7 +1014,7 @@ mod tests {
         let (link, mut new) = mpsc::channel(crate::audio::QUEUE);
         mic.attach(link);
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         assert!(orders(&mut old).is_empty());
         assert_eq!(orders(&mut new), [Message::MicStart { session: 1 }]);
     }
@@ -990,7 +1058,7 @@ mod tests {
         assert!(error.to_string().contains("no mode is running"), "{error}");
 
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         assert_eq!(ask(&path, Order::Status).await.unwrap(), Status::Remote);
         assert_eq!(ask(&path, Order::Toggle).await.unwrap(), Status::Home);
         assert_eq!(ask(&path, Order::Remote).await.unwrap(), Status::Remote);
@@ -1017,7 +1085,7 @@ mod tests {
         };
         assert_eq!(next(&mut hears).await, Status::Off);
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         assert_eq!(next(&mut hears).await, Status::Remote);
         mic.order(Order::Toggle).unwrap();
         assert_eq!(next(&mut hears).await, Status::Home);
@@ -1068,7 +1136,7 @@ mod tests {
 
         let (_graph, mic, _remote, _tmp) = mic();
         let started = mic.clone();
-        blocking(move || started.start()).await.unwrap();
+        blocking(move || started.start(true)).await.unwrap();
         let listener = crate::mode::listen(&path).unwrap();
         tokio::spawn(serve(listener, mic));
         // Within one retry.

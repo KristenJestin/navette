@@ -32,6 +32,18 @@ pub enum Keyboard {
     Home,
     /// A surface took it again, the pointer having come back after a release.
     Remote,
+    /// The pointer came over a reserved monitor, the keyboard with it: the corner says nothing,
+    /// the mic may follow.
+    Came,
+    /// The pointer left for a home monitor, the keyboard with it.
+    Left,
+}
+
+impl Keyboard {
+    /// Whether the keyboard is the remote's now.
+    pub fn remote(self) -> bool {
+        matches!(self, Keyboard::Remote | Keyboard::Came)
+    }
 }
 
 /// Where the surface says the keyboard went.
