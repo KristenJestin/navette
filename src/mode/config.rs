@@ -2,8 +2,8 @@
 //! remote machine takes. Keys before any `[section]` are the default of every mode, and a
 //! `monitor` among them is the one unnamed mode, so a file written before modes had names keeps
 //! working. A `[name]` section is a named mode: its `monitor`, and any of `release`, `mic`,
-//! `mic_hotkey`, `remote_label`, `local_label`, `remote_bar`, `local_bar` it wants other than the
-//! default.
+//! `mic_hotkey`, `remote_label`, `local_label`, `remote_bar`, `local_bar`, `local_above` it wants
+//! other than the default.
 //! `#` starts a comment.
 
 use std::io;
@@ -22,6 +22,9 @@ const MIC_HOTKEY: &str = "SUPER + CTRL + M";
 pub const NAME_LONGEST: usize = 32;
 /// A monitor named by its description rather than its output name.
 const BY_DESCRIPTION: &str = "desc:";
+/// The layer namespaces drawn above the remote's picture unless the config names others: the
+/// selection overlays of slurp and hyprpicker, tools the user starts on purpose.
+const LOCAL_ABOVE: &str = "selection, hyprpicker";
 
 /// One mode, as the config says it.
 #[derive(Debug)]
@@ -36,6 +39,8 @@ pub struct Mode {
     pub mic_hotkey: String,
     /// `mic = follow`: the mic goes to the side that has the keyboard.
     pub mic_follows: bool,
+    /// The layer namespaces of home's own tools drawn above the remote's picture.
+    pub local_above: Vec<String>,
     pub look: Look,
 }
 
@@ -238,6 +243,15 @@ impl File {
                 )));
             }
         };
+        let local_above = match value("local_above").unwrap_or(LOCAL_ABOVE) {
+            "none" => Vec::new(),
+            list => list
+                .split(',')
+                .map(str::trim)
+                .filter(|namespace| !namespace.is_empty())
+                .map(str::to_string)
+                .collect(),
+        };
         let fallback = Look::default();
         let label = |key: &str, found: Option<&str>, default: String| match found
             .filter(|v| !v.is_empty())
@@ -283,6 +297,7 @@ impl File {
             notice,
             mic_hotkey,
             mic_follows,
+            local_above,
             look,
         })
     }
@@ -789,6 +804,35 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("`mic = always`"), "{text}");
         assert!(text.contains("`fixed` or `follow`"), "{text}");
+    }
+
+    #[test]
+    fn local_above_defaults_to_the_selection_overlays_of_slurp_and_hyprpicker() {
+        let mode = mode("monitor = DP-2\n", None).unwrap();
+        assert_eq!(mode.local_above, ["selection", "hyprpicker"]);
+    }
+
+    #[test]
+    fn local_above_is_a_list_read_globally_and_per_section() {
+        let text = "local_above = selection, invented-picker\n\
+                    [office]\nmonitor = DP-1\n\
+                    [call]\nmonitor = DP-2\nlocal_above = invented-shot\n";
+        assert_eq!(
+            mode(text, Some("office")).unwrap().local_above,
+            ["selection", "invented-picker"]
+        );
+        assert_eq!(
+            mode(text, Some("call")).unwrap().local_above,
+            ["invented-shot"]
+        );
+    }
+
+    #[test]
+    fn local_above_none_lists_nothing() {
+        let none = mode("monitor = DP-2\nlocal_above = none\n", None).unwrap();
+        assert!(none.local_above.is_empty());
+        let empty = mode("monitor = DP-2\nlocal_above =\n", None).unwrap();
+        assert!(empty.local_above.is_empty());
     }
 
     #[test]

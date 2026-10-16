@@ -41,7 +41,8 @@ stops the start with a message that names them, and nothing is changed.
 
 A `[name]` section in `mode.conf` defines a mode of its own. The keys before the first section
 are the default of every mode: `release`, `mic` ([following the keyboard](mic.md#following-the-keyboard)), `mic_hotkey` and the corner's
-`remote_label`, `local_label`, `remote_bar` and `local_bar` (a section may set its own), and a `monitor` among them is the one unnamed mode, so a file with no sections keeps
+`remote_label`, `local_label`, `remote_bar` and `local_bar`, and
+[`local_above`](#homes-overlays) (a section may set its own), and a `monitor` among them is the one unnamed mode, so a file with no sections keeps
 working, and `navette mode start` with no name starts it.
 
 ```
@@ -115,7 +116,8 @@ While the mode runs:
   remote machine cannot start one more, the mode does not start and `mode start` says which
   output could not stream.
 - **At home**, the changes to the desk are the reserved monitors' workspaces, a window rule
-  per reserved monitor and, with `navette serve --audio`, the mic's hotkey. Before the surfaces
+  per reserved monitor, the layer rules that keep the remote's picture
+  [above home's overlays](#homes-overlays) and, with `navette serve --audio`, the mic's hotkey. Before the surfaces
   open, every workspace with windows on a reserved monitor moves whole to the leftmost home
   monitor kept home: each stays a workspace of its own, out of sight, and that monitor still
   shows what it showed. Windows that would open on any workspace of a reserved monitor open
@@ -212,6 +214,32 @@ is changed.
 `local_label` and `local_bar` were `home_label` and `home_bar`: a `mode.conf` that still names
 the old ones is read as before, and `navette mode start` says the new name on one line. A file
 with both an old key and its new one uses the new one, and says so.
+
+## Home's overlays
+
+While a mode runs, the remote's picture on a reserved monitor is drawn above home's own
+overlays: a volume OSD, a notification, a shell's full-screen layer restarted during the mode
+no longer cover it. The tools you start on purpose to act on the screen, a screenshot's
+selection or a colour picker, are still drawn above it. One key of `mode.conf`, global or per
+`[name]` section like `release`, names their layer namespaces:
+
+```
+local_above = selection, hyprpicker   # the default; local_above = none for none
+```
+
+The default is the selection overlays of slurp (namespace `selection`) and hyprpicker
+(`hyprpicker`). `none`, or the key left empty, lists none. `hyprctl layers` shows a tool's
+namespace while it is open.
+
+Both are runtime layer rules, set before the surfaces open: the picture's surface (namespace
+`navette`) gets `order = -1000` and each listed namespace `order = -2000`. Hyprland sorts a
+monitor's overlay layers by `order`, highest first, whenever one of them maps, and draws the last
+on top. After a config reload, which drops runtime rules, the rules are set again and each
+surface makes Hyprland sort its monitor again, at once and without a blank frame. The rules are
+disabled when the mode stops, and at the next start after a crash.
+
+Not covered: a home overlay that closes still fades out above the picture for a moment, as
+Hyprland draws every closing layer last, whatever its `order`.
 
 ## The remote's workspaces
 
