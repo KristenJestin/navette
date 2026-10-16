@@ -103,9 +103,10 @@ impl Store {
             match key.trim() {
                 "role" => {
                     role = match value {
-                        "home" => Ok(Role::Home),
+                        // `home` is what 0.1 wrote, before the desk was called the desk.
+                        "desk" | "home" => Ok(Role::Home),
                         "remote" => Ok(Role::Remote),
-                        _ => Err(format!("has `role = {value}`, which is not home or remote")),
+                        _ => Err(format!("has `role = {value}`, which is not desk or remote")),
                     }
                 }
                 "peer" => peer = Fingerprint::from_hex(value),
@@ -131,7 +132,7 @@ impl Store {
     /// Records a pairing, replacing any previous one.
     pub fn save_pairing(&self, pairing: &Pairing) -> io::Result<()> {
         let role = match pairing.role {
-            Role::Home => "home",
+            Role::Home => "desk",
             Role::Remote => "remote",
         };
         let mut text = format!(
