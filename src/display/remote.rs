@@ -685,7 +685,7 @@ fn start_blocking(
         .start(source, caps, outbox, feedback_rx, ended_tx)?;
     let input = ports.injectors.start(&name, keymap).map_err(|e| {
         eprintln!(
-            "navette: home's input cannot be injected on {name}, the picture goes on \
+            "navette: the desk's input cannot be injected on {name}, the picture goes on \
                  without it: {e}"
         );
         e.to_string()

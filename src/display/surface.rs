@@ -449,7 +449,7 @@ fn run(
     let mut event_loop: EventLoop<'static, State> = EventLoop::try_new()?;
     if inhibit.is_none() {
         eprintln!(
-            "navette: the compositor cannot inhibit its shortcuts: they stay home over the \
+            "navette: the compositor cannot inhibit its shortcuts: they stay at the desk over the \
              remote monitor"
         );
     }

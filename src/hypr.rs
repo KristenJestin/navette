@@ -287,7 +287,7 @@ pub fn focus_last_window(hypr: &dyn Hypr, covered: &[String]) -> io::Result<Opti
     Ok(Some(address.to_string()))
 }
 
-/// Sends to the `home` monitor every desk window that is on a workspace of a `covered` monitor,
+/// Sends to the `home` monitor (the desk's) every desk window that is on a workspace of a `covered` monitor,
 /// where the cover would hide it; says what it moved (`window <address>`, `workspace <name>`).
 ///
 /// A workspace the covered monitor does not show goes to the desk whole, and so does the one it shows

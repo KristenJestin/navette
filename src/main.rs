@@ -240,7 +240,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             );
             Ok(())
         }
-        Command::Pair { .. } => unreachable!("clap requires --listen or the home address"),
+        Command::Pair { .. } => unreachable!("clap requires --listen or the desk address"),
         Command::Serve { listen, audio } => {
             let acceptor = link::home_acceptor(&store, listen).await?;
             eprintln!(

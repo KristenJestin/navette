@@ -547,7 +547,7 @@ impl Thread {
                                 decoder = self.decoder(config, false);
                             } else {
                                 let why = format!(
-                                    "home cannot decode {output} any more, {} decoder(s) lost, \
+                                    "the desk cannot decode {output} any more, {} decoder(s) lost, \
                                      the CPU's last: {e}",
                                     stats.lost
                                 );
