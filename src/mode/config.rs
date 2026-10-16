@@ -943,7 +943,8 @@ mod tests {
         ];
         let found = |specs: &[&str]| {
             let specs: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
-            resolve(&specs, &monitors).map(|m| m.into_iter().map(|m| m.name).collect::<Vec<_>>())
+            resolve(&specs, &monitors, &Names::default())
+                .map(|m| m.into_iter().map(|m| m.name).collect::<Vec<_>>())
         };
         assert_eq!(found(&["DP-2"]).unwrap(), ["DP-2"]);
         assert_eq!(found(&["desc:Dell Inc. DELL U2723QE"]).unwrap(), ["DP-1"]);
@@ -957,27 +958,100 @@ mod tests {
             monitor("DP-2", "Dell Inc. DELL U2723QE 7XYZ456"),
         ];
         let specs = |s: &str| vec![s.to_string()];
-        let none = resolve(&specs("desc:Iiyama"), &monitors).unwrap_err();
+        let none = resolve(&specs("desc:Iiyama"), &monitors, &Names::default()).unwrap_err();
         assert_eq!(none.kind(), io::ErrorKind::NotFound);
         let none = none.to_string();
         assert!(
             none.contains("desc:Iiyama") && none.contains("DP-1, DP-2"),
             "{none}"
         );
-        let two = resolve(&specs("desc:Dell Inc."), &monitors).unwrap_err();
+        let two = resolve(&specs("desc:Dell Inc."), &monitors, &Names::default()).unwrap_err();
         let two = two.to_string();
         assert!(two.contains("DP-1") && two.contains("DP-2"), "{two}");
         assert!(two.contains("more of the description"), "{two}");
         // Told apart by the serial.
-        let one = resolve(&specs("desc:Dell Inc. DELL U2723QE 7XYZ456"), &monitors).unwrap();
+        let one = resolve(
+            &specs("desc:Dell Inc. DELL U2723QE 7XYZ456"),
+            &monitors,
+            &Names::default(),
+        )
+        .unwrap();
         assert_eq!(one[0].name, "DP-2");
+    }
+
+    #[test]
+    fn a_monitor_that_is_not_there_is_missing_on_the_desk_by_its_label() {
+        let monitors = [monitor("DP-1", "Dell Inc. DELL U2723QE 7XYZ123")];
+        let specs = ["DP-3".to_string()];
+        let default = resolve(&specs, &monitors, &Names::default()).unwrap_err();
+        assert!(
+            default
+                .to_string()
+                .contains("no monitor DP-3 on the desk ("),
+            "{default}"
+        );
+        let labelled = resolve(&specs, &monitors, &Names::new(Some("NEAR"), None)).unwrap_err();
+        assert!(
+            labelled.to_string().contains("no monitor DP-3 on NEAR ("),
+            "{labelled}"
+        );
+    }
+
+    #[test]
+    fn a_mode_names_the_machines_by_its_labels_else_desk_and_remote() {
+        let none = mode("monitor = DP-2\n", None).unwrap();
+        assert_eq!(none.names, Names::default());
+        let text = "remote_label = FAR\nlocal_label = NEAR\n\
+                    [office]\nmonitor = DP-1\n\
+                    [travel]\nmonitor = DP-2\nremote_label = AWAY\n\
+                    [bare]\nmonitor = DP-3\nlocal_label =\n";
+        let office = mode(text, Some("office")).unwrap();
+        assert_eq!(office.names, Names::new(Some("NEAR"), Some("FAR")));
+        let travel = mode(text, Some("travel")).unwrap();
+        assert_eq!(travel.names, Names::new(Some("NEAR"), Some("AWAY")));
+        // An empty label is none: the corner says LOCAL, the sentences say the desk.
+        let bare = mode(text, Some("bare")).unwrap();
+        assert_eq!(bare.names.desk, "desk");
+    }
+
+    #[test]
+    fn the_old_home_label_still_names_the_desk_in_the_sentences() {
+        let mode_ = mode("monitor = DP-2\nhome_label = NEAR\n", None).unwrap();
+        assert_eq!(mode_.names.desk, "NEAR");
+    }
+
+    #[test]
+    fn a_label_that_is_the_default_tag_still_counts_as_set() {
+        // `LOCAL` is what the corner says with no label; set by hand, it is the user's word.
+        let mode_ = mode(
+            "monitor = DP-2\nlocal_label = LOCAL\nremote_label = REMOTE\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(mode_.names, Names::new(Some("LOCAL"), Some("REMOTE")));
+    }
+
+    #[test]
+    fn the_desk_label_the_link_carries_is_the_one_before_any_section() {
+        let dir = written("local_label = NEAR\n[office]\nmonitor = DP-1\nlocal_label = HERE\n");
+        assert_eq!(desk_label(dir.path()), Some("NEAR".to_string()));
+        let dir = written("home_label = OLD\n[office]\nmonitor = DP-1\n");
+        assert_eq!(desk_label(dir.path()), Some("OLD".to_string()));
+        let dir = written("[office]\nmonitor = DP-1\nlocal_label = HERE\n");
+        assert_eq!(desk_label(dir.path()), None);
+        assert_eq!(desk_label(tempfile::tempdir().unwrap().path()), None);
+        // A label the corner could not draw is not sent either: the mode would not start.
+        let dir = written("local_label = Café\n");
+        assert_eq!(desk_label(dir.path()), None);
     }
 
     #[test]
     fn a_monitor_named_twice_by_name_and_description_is_refused() {
         let monitors = [monitor("DP-1", "Dell Inc. DELL U2723QE 7XYZ123")];
         let specs = ["DP-1".to_string(), "desc:Dell".to_string()];
-        let error = resolve(&specs, &monitors).unwrap_err().to_string();
+        let error = resolve(&specs, &monitors, &Names::default())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("DP-1 twice"), "{error}");
     }
 
@@ -985,7 +1059,7 @@ mod tests {
     fn a_disabled_monitor_is_not_there() {
         let mut off = monitor("DP-1", "Dell Inc. DELL U2723QE 7XYZ123");
         off.disabled = true;
-        let error = resolve(&["DP-1".to_string()], &[off]).unwrap_err();
+        let error = resolve(&["DP-1".to_string()], &[off], &Names::default()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
