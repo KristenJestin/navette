@@ -2049,7 +2049,8 @@ mod tests {
             agent.hypr.monitor("eDP-1").unwrap(),
             FakeMonitor::new("eDP-1", 1920, 1200, 0)
         );
-        assert!(!agent.record.exists());
+        // The record goes after the rule is applied, not with it.
+        until(|| !agent.record.exists()).await;
     }
 
     #[tokio::test]
