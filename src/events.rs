@@ -1228,4 +1228,22 @@ mod tests {
             assert_eq!(said.next_line().await.unwrap().unwrap(), "ok started");
         }
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_that_takes_no_line_within_the_write_delay_is_let_go() {
+        // Room for a few bytes, never read.
+        let (mut write, _unread) = tokio::io::duplex(8);
+        let (line_tx, mut lines) = mpsc::channel::<Arc<str>>(QUEUE);
+        let (_answer_tx, mut answers) = mpsc::channel(1);
+        line_tx.try_send(Parts::desk().line().into()).unwrap();
+        let begun = tokio::time::Instant::now();
+        tokio::time::timeout(WRITE * 2, write_out(&mut write, &mut lines, &mut answers))
+            .await
+            .expect("let go");
+        assert!(
+            begun.elapsed() >= WRITE,
+            "let go after {:?}",
+            begun.elapsed()
+        );
+    }
 }
