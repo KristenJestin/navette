@@ -3,7 +3,19 @@
 //! from its parts, and serve it on `$XDG_RUNTIME_DIR/navette/events.sock` (`docs/events.md`,
 //! the contract other programs read).
 
-use crate::mic;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
+use tokio::net::unix::OwnedReadHalf;
+use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::oneshot;
+
+use crate::mic::{self, Routing};
+use crate::mode;
 
 /// The contract's version, said on every line: it changes only when a field or a value changes
 /// meaning or goes away, never for a new one (`docs/events.md`).
@@ -171,9 +183,200 @@ impl Parts {
     }
 }
 
+/// How many lines a reader may have waiting: one that falls further behind is let go, so a
+/// stalled bar never holds up `serve` or `agent`. It connects again and starts from the state.
+pub const QUEUE: usize = 32;
+/// How long a reader has to take a line, after which it is let go too.
+const WRITE: Duration = Duration::from_secs(5);
+/// The longest command line: `start` and a mode's name.
+const COMMAND_LONGEST: u64 = 64;
+
+/// The state, the one place it is kept: each change to its parts makes a line, sent to every
+/// reader, unless the line is the one already said.
+pub struct Events {
+    inner: Mutex<Inner>,
+}
+
+struct Inner {
+    parts: Parts,
+    line: Arc<str>,
+    readers: Vec<mpsc::Sender<Arc<str>>>,
+}
+
+impl Events {
+    pub fn new(parts: Parts) -> Arc<Self> {
+        let line = parts.line().into();
+        Arc::new(Self {
+            inner: Mutex::new(Inner {
+                parts,
+                line,
+                readers: Vec::new(),
+            }),
+        })
+    }
+
+    pub fn parts(&self) -> Parts {
+        self.inner.lock().unwrap().parts.clone()
+    }
+
+    /// Changes the parts; a new line goes to every reader, and a reader whose queue is full is
+    /// let go. Never waits on a reader.
+    pub fn update(&self, change: impl FnOnce(&mut Parts)) {
+        let mut inner = self.inner.lock().unwrap();
+        change(&mut inner.parts);
+        let line: Arc<str> = inner.parts.line().into();
+        if line == inner.line {
+            return;
+        }
+        inner.line = line.clone();
+        inner
+            .readers
+            .retain(|reader| reader.try_send(line.clone()).is_ok());
+    }
+
+    /// The current line first, then one per change.
+    pub fn subscribe(&self) -> mpsc::Receiver<Arc<str>> {
+        let (reader, lines) = mpsc::channel(QUEUE);
+        let mut inner = self.inner.lock().unwrap();
+        // Under the lock: no change slips between the state and the next line.
+        let _ = reader.try_send(inner.line.clone());
+        inner.readers.push(reader);
+        lines
+    }
+
+    /// The readers still there.
+    #[cfg(test)]
+    fn readers(&self) -> usize {
+        let inner = self.inner.lock().unwrap();
+        inner.readers.iter().filter(|r| !r.is_closed()).count()
+    }
+}
+
+/// What the commands on the socket reach.
+pub enum Commands {
+    /// `serve`'s orders, as `control.sock` hands them, and its mic, as `mic.sock` does.
+    Desk {
+        orders: UnboundedSender<mode::Order>,
+        mic: Arc<dyn Routing>,
+    },
+    /// The remote machine drives nothing: every command is refused.
+    Remote,
+}
+
+/// The refusal of every command on the remote machine.
+pub const REMOTE_REFUSES: &str = "error the remote does not drive the mode";
+
+/// `$XDG_RUNTIME_DIR/navette/events.sock`, the same on both machines.
+pub fn path() -> io::Result<PathBuf> {
+    Ok(mode::control_path()?.with_file_name("events.sock"))
+}
+
+/// Listens on `path`, 0600 in a 0700 directory, in place of a socket a crash left there.
+pub fn listen(path: &Path) -> io::Result<UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+    let listener = mode::listen(path).map_err(|e| match e.kind() {
+        io::ErrorKind::AddrInUse => io::Error::new(
+            e.kind(),
+            format!(
+                "{} is taken: another `navette serve` or `navette agent` runs here",
+                path.display()
+            ),
+        ),
+        _ => e,
+    })?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+/// Serves each reader: the state, a line per change, and an answer to each command.
+pub async fn serve(listener: UnixListener, events: Arc<Events>, commands: Arc<Commands>) {
+    while let Ok((stream, _)) = listener.accept().await {
+        let (read, mut write) = stream.into_split();
+        let mut lines = events.subscribe();
+        let (answers_tx, mut answers) = mpsc::channel(1);
+        let commands = commands.clone();
+        tokio::spawn(async move {
+            // Commands are read and carried out on their own, one after the other, so the
+            // state goes on meanwhile; anything that ends the reading ends the reader, a close
+            // included, rather than at the next change, which may be hours away.
+            let commanded = tokio::spawn(command(read, commands, answers_tx));
+            loop {
+                let text = tokio::select! {
+                    line = lines.recv() => match line {
+                        Some(line) => line.to_string(),
+                        // Let go for falling behind.
+                        None => break,
+                    },
+                    answer = answers.recv() => match answer {
+                        Some(answer) => answer,
+                        None => break,
+                    },
+                };
+                let text = format!("{text}\n");
+                let written = write.write_all(text.as_bytes());
+                if !matches!(tokio::time::timeout(WRITE, written).await, Ok(Ok(()))) {
+                    break;
+                }
+            }
+            commanded.abort();
+        });
+    }
+}
+
+/// Reads a reader's commands, and hands each one's answer to its writer.
+async fn command(read: OwnedReadHalf, commands: Arc<Commands>, answers: mpsc::Sender<String>) {
+    let mut read = BufReader::new(read);
+    loop {
+        let mut line = String::new();
+        match (&mut read).take(COMMAND_LONGEST).read_line(&mut line).await {
+            Ok(_) if line.ends_with('\n') => {}
+            // The end, an endless line, or no text.
+            _ => return,
+        }
+        let answer = answer(&commands, line.trim()).await;
+        if answers.send(answer).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// One command's answer, by the very handlers of `control.sock` and `mic.sock`.
+async fn answer(commands: &Commands, line: &str) -> String {
+    let Commands::Desk { orders, mic } = commands else {
+        return REMOTE_REFUSES.to_string();
+    };
+    let unknown = || format!("error unknown command: {line}");
+    if let Some(word) = line.strip_prefix("mic ") {
+        // `home` is the word of `navette mic` before the desk was called the desk.
+        let order = match word.trim() {
+            "toggle" => mic::Order::Toggle,
+            "remote" => mic::Order::Remote,
+            "desk" | "home" => mic::Order::Home,
+            _ => return unknown(),
+        };
+        return mic::answer(mic.clone(), order).await;
+    }
+    if line == "status" {
+        return unknown();
+    }
+    let (reply, answer) = oneshot::channel();
+    match mode::order_of(line, reply) {
+        Some(order) => mode::answered(orders, order, answer)
+            .await
+            .unwrap_or_else(|| "error navette is stopping".to_string()),
+        None => unknown(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+    use tokio::net::unix::OwnedWriteHalf;
+    use tokio::sync::mpsc::UnboundedReceiver;
+
     use super::*;
+    use crate::mic::NoSound;
 
     fn office() -> Driven {
         Driven {
@@ -305,5 +508,298 @@ mod tests {
             serde_json::json!([{"name": null, "monitors": ["desc:Invented Display 27"]}])
         );
         assert_eq!(line["mic"], "off");
+    }
+
+    fn linked_desk() -> Parts {
+        desk_in(Link::Linked, None)
+    }
+
+    /// `events.sock` served from `events` in a temporary directory.
+    fn served(events: Arc<Events>, commands: Commands) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("navette").join("events.sock");
+        let listener = listen(&path).unwrap();
+        tokio::spawn(serve(listener, events, Arc::new(commands)));
+        (dir, path)
+    }
+
+    struct Reader {
+        lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+        write: OwnedWriteHalf,
+    }
+
+    impl Reader {
+        async fn connect(path: &Path) -> Self {
+            let (read, write) = UnixStream::connect(path).await.unwrap().into_split();
+            Self {
+                lines: BufReader::new(read).lines(),
+                write,
+            }
+        }
+
+        async fn next(&mut self) -> String {
+            tokio::time::timeout(Duration::from_secs(5), self.lines.next_line())
+                .await
+                .expect("a line in time")
+                .unwrap()
+                .expect("the stream goes on")
+        }
+
+        async fn state(&mut self) -> String {
+            let line: serde_json::Value = serde_json::from_str(&self.next().await).unwrap();
+            line["state"].as_str().unwrap().to_string()
+        }
+
+        async fn say(&mut self, command: &str) {
+            self.write
+                .write_all(format!("{command}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        /// Nothing more within a moment.
+        async fn quiet(&mut self) {
+            let next = tokio::time::timeout(Duration::from_millis(200), self.lines.next_line());
+            assert!(next.await.is_err(), "a line without a change");
+        }
+    }
+
+    fn remote_commands() -> Commands {
+        Commands::Remote
+    }
+
+    /// A desk whose `serve` answers each order with what it was, and plays no sound.
+    fn desk_commands() -> (Commands, UnboundedReceiver<String>) {
+        let (orders, mut taken) = mpsc::unbounded_channel();
+        let (said, heard) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(order) = taken.recv().await {
+                let (what, reply) = match order {
+                    mode::Order::Start(name, reply) => (format!("start {name:?}"), reply),
+                    mode::Order::Stop(reply) => ("stop".to_string(), reply),
+                    mode::Order::Status(reply) => ("status".to_string(), reply),
+                };
+                let _ = said.send(what.clone());
+                let _ = reply.send(Ok(format!("did {what}")));
+            }
+        });
+        let mic: Arc<dyn Routing> = Arc::new(NoSound::default());
+        (Commands::Desk { orders, mic }, heard)
+    }
+
+    #[tokio::test]
+    async fn the_first_line_is_the_current_state_on_each_side() {
+        let desk = Events::new(linked_desk());
+        let (_dir, path) = served(desk.clone(), desk_commands().0);
+        let mut reader = Reader::connect(&path).await;
+        assert_eq!(reader.next().await, linked_desk().line());
+
+        let away = Parts {
+            link: Link::Away,
+            ..Parts::remote()
+        };
+        let remote = Events::new(away.clone());
+        let (_dir, path) = served(remote, remote_commands());
+        let mut reader = Reader::connect(&path).await;
+        assert_eq!(reader.next().await, away.line());
+    }
+
+    #[tokio::test]
+    async fn each_change_gives_one_line_and_no_line_comes_without_one() {
+        let events = Events::new(Parts::desk());
+        let (_dir, path) = served(events.clone(), desk_commands().0);
+        let mut reader = Reader::connect(&path).await;
+        assert_eq!(reader.state().await, "waiting");
+        events.update(|p| p.link = Link::Linked);
+        assert_eq!(reader.state().await, "linked");
+        // Said again as it is: nothing new.
+        events.update(|p| p.link = Link::Linked);
+        events.update(|_| {});
+        reader.quiet().await;
+        events.update(|p| p.mic = Some(mic::Status::Remote));
+        let line: serde_json::Value = serde_json::from_str(&reader.next().await).unwrap();
+        assert_eq!(line["mic"], "remote");
+    }
+
+    #[tokio::test]
+    async fn two_readers_get_the_same_lines() {
+        let events = Events::new(Parts::desk());
+        let (_dir, path) = served(events.clone(), desk_commands().0);
+        let mut first = Reader::connect(&path).await;
+        let mut second = Reader::connect(&path).await;
+        assert_eq!(first.state().await, "waiting");
+        assert_eq!(second.state().await, "waiting");
+        events.update(|p| p.link = Link::Linked);
+        events.update(|p| p.link = Link::Waiting);
+        for reader in [&mut first, &mut second] {
+            assert_eq!(reader.state().await, "linked");
+            assert_eq!(reader.state().await, "waiting");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_command_answers_and_the_stream_goes_on() {
+        let events = Events::new(linked_desk());
+        let (commands, mut heard) = desk_commands();
+        let (_dir, path) = served(events.clone(), commands);
+        let mut reader = Reader::connect(&path).await;
+        assert_eq!(reader.state().await, "linked");
+
+        reader.say("start office").await;
+        assert_eq!(reader.next().await, r#"ok did start Some("office")"#);
+        reader.say("start").await;
+        assert_eq!(reader.next().await, "ok did start None");
+        reader.say("stop").await;
+        assert_eq!(reader.next().await, "ok did stop");
+        // The mic answers as `mic.sock` does: here, home plays no sound.
+        reader.say("mic toggle").await;
+        let answer = reader.next().await;
+        assert!(
+            answer.starts_with("error ") && answer.contains("--audio"),
+            "{answer}"
+        );
+        for word in ["remote", "desk", "home"] {
+            reader.say(&format!("mic {word}")).await;
+            assert!(reader.next().await.starts_with("error "));
+        }
+        assert_eq!(
+            std::iter::from_fn(|| heard.try_recv().ok()).collect::<Vec<_>>(),
+            [r#"start Some("office")"#, "start None", "stop"]
+        );
+
+        events.update(|p| p.link = Link::Waiting);
+        assert_eq!(reader.state().await, "waiting");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_command_is_answered_and_the_stream_goes_on() {
+        let events = Events::new(linked_desk());
+        let (commands, mut heard) = desk_commands();
+        let (_dir, path) = served(events.clone(), commands);
+        let mut reader = Reader::connect(&path).await;
+        reader.next().await;
+        // `status` is `control.sock`'s: the stream's first line says it.
+        for command in ["status", "mic status", "start bad/name", "jump"] {
+            reader.say(command).await;
+            let answer = reader.next().await;
+            assert!(answer.starts_with("error unknown command"), "{answer}");
+        }
+        assert!(heard.try_recv().is_err());
+        events.update(|p| p.link = Link::Waiting);
+        assert_eq!(reader.state().await, "waiting");
+    }
+
+    #[tokio::test]
+    async fn a_command_on_the_remote_is_refused() {
+        let events = Events::new(Parts::remote());
+        let (_dir, path) = served(events.clone(), remote_commands());
+        let mut reader = Reader::connect(&path).await;
+        assert_eq!(reader.state().await, "dialing");
+        for command in [
+            "start",
+            "start office",
+            "stop",
+            "mic toggle",
+            "mic desk",
+            "jump",
+        ] {
+            reader.say(command).await;
+            assert_eq!(reader.next().await, REMOTE_REFUSES);
+        }
+        events.update(|p| p.link = Link::Linked);
+        assert_eq!(reader.state().await, "linked");
+    }
+
+    #[tokio::test]
+    async fn an_endless_command_line_ends_that_reader_only() {
+        let events = Events::new(linked_desk());
+        let (_dir, path) = served(events.clone(), desk_commands().0);
+        let mut endless = Reader::connect(&path).await;
+        let mut other = Reader::connect(&path).await;
+        endless.next().await;
+        other.next().await;
+        endless.say(&"x".repeat(1000)).await;
+        let ended = tokio::time::timeout(Duration::from_secs(5), endless.lines.next_line()).await;
+        assert!(matches!(ended, Ok(Ok(None)) | Ok(Err(_))), "{ended:?}");
+        events.update(|p| p.link = Link::Waiting);
+        assert_eq!(other.state().await, "waiting");
+    }
+
+    #[tokio::test]
+    async fn a_reader_closing_mid_stream_is_let_go() {
+        let events = Events::new(Parts::desk());
+        let (_dir, path) = served(events.clone(), desk_commands().0);
+        let mut gone = Reader::connect(&path).await;
+        let mut staying = Reader::connect(&path).await;
+        gone.next().await;
+        staying.next().await;
+        assert_eq!(events.readers(), 2);
+        drop(gone);
+        // Noticed without waiting for a change, which may be hours away.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.readers() > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the reader let go");
+        events.update(|p| p.link = Link::Linked);
+        assert_eq!(staying.state().await, "linked");
+    }
+
+    #[test]
+    fn a_reader_that_falls_behind_is_let_go_without_holding_anyone_up() {
+        let events = Events::new(Parts::desk());
+        let mut stalled = events.subscribe();
+        let mut reading = events.subscribe();
+        assert!(reading.try_recv().is_ok());
+        for i in 0..QUEUE * 2 {
+            // Never waits: a stalled reader holds up neither `serve` nor the other readers.
+            events.update(|p| p.peer = Some(format!("PEER-{i}")));
+            assert!(reading.try_recv().is_ok());
+        }
+        // What it had queued, the first line included, then the end: it connects again.
+        let kept = std::iter::from_fn(|| stalled.try_recv().ok()).count();
+        assert_eq!(kept, QUEUE);
+        assert!(matches!(
+            stalled.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert_eq!(events.readers(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_socket_left_by_a_crash_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("navette").join("events.sock");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+        let events = Events::new(linked_desk());
+        tokio::spawn(serve(
+            listen(&path).unwrap(),
+            events,
+            Arc::new(Commands::Remote),
+        ));
+        let mut reader = Reader::connect(&path).await;
+        assert_eq!(reader.state().await, "linked");
+    }
+
+    #[tokio::test]
+    async fn a_second_one_running_is_not_replaced() {
+        let events = Events::new(linked_desk());
+        let (_dir, path) = served(events, Commands::Remote);
+        let error = listen(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(error.to_string().contains("events.sock"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_socket_is_the_user_s_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = served(Events::new(Parts::desk()), Commands::Remote);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
     }
 }
