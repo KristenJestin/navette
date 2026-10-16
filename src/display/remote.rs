@@ -834,6 +834,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((source.output.clone(), feedback));
+            std::thread::sleep(Duration::from_millis(100)); // TEMPORARY (#140)
             outbox.send(Msg::Video(ServerMsg::Ping { t: 1 }), Vec::new());
             Ok(Box::new(FakeStream {
                 hypr: self.hypr.clone(),

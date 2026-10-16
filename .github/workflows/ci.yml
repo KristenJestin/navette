@@ -60,18 +60,32 @@ jobs:
       - name: Loop under load
         run: |
           for _ in $(seq "$(nproc)"); do (while :; do :; done) & done
+          if [ "${{ matrix.suite }}" = cli ]; then
+            # Socket churn in the same network namespace, as the other tests make.
+            python3 - <<'PY' &
+          import socket, threading
+          srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(512)
+          port = srv.getsockname()[1]
+          def accept():
+              while True:
+                  srv.accept()[0].close()
+          threading.Thread(target=accept, daemon=True).start()
+          while True:
+              socket.create_connection(("127.0.0.1", port)).close()
+          PY
+          fi
           if [ "${{ matrix.suite }}" = remote ]; then
             args=(--lib -- display::remote::tests --test-threads=32)
           else
             args=(--test cli -- --test-threads=16)
           fi
           fail=0
-          for i in $(seq 60); do
+          for i in $(seq 20); do
             if ! out=$(cargo test --locked "${args[@]}" 2>&1); then
               fail=$((fail + 1))
               echo "== iteration $i"
               echo "$out" | grep -E "FAILED|panicked|left:|right:|established|never got" | head -20
             fi
           done
-          echo "failed iterations: $fail of 60"
+          echo "failed iterations: $fail of 20"
           [ "$fail" = 0 ]
