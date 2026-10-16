@@ -197,7 +197,9 @@ fn nothing_listens_on_the_remote_machine() {
             )
         })
         .collect();
-    let mut established = 0;
+    // A table read in several `read()`s can repeat a row while sockets come and go on the
+    // machine, so a socket is counted once by its inode.
+    let mut established = std::collections::HashSet::new();
     for table in ["tcp", "tcp6", "udp", "udp6"] {
         let text = fs::read_to_string(format!("/proc/{pid}/net/{table}")).unwrap_or_default();
         for line in text.lines().skip(1) {
@@ -209,11 +211,15 @@ fn nothing_listens_on_the_remote_machine() {
             assert!(table.starts_with("tcp"), "the agent holds a UDP socket");
             assert_ne!(state, "0A", "the agent listens on a TCP socket");
             if state == "01" {
-                established += 1;
+                established.insert(inode.to_owned());
             }
         }
     }
-    assert_eq!(established, 1, "the agent holds exactly its link to home");
+    assert_eq!(
+        established.len(),
+        1,
+        "the agent holds exactly its link to home"
+    );
 }
 
 #[test]

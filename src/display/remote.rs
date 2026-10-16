@@ -1856,6 +1856,9 @@ mod tests {
     async fn home_s_acks_go_to_the_stream_of_their_output() {
         let agent = agent();
         two(&agent).await;
+        // A stream is counted when its start runs, before the agent holds it: an ack that
+        // comes in between is dropped for good. `Started` is said once every output runs.
+        until(|| started(&agent.outbox)).await;
         for output in [1, 7] {
             agent
                 .inbox
@@ -2113,7 +2116,8 @@ mod tests {
             agent.hypr.monitor("eDP-1").unwrap(),
             FakeMonitor::new("eDP-1", 1920, 1200, 0)
         );
-        assert!(!agent.record.exists());
+        // The record goes after the rule is applied, not with it.
+        until(|| !agent.record.exists()).await;
     }
 
     #[tokio::test]

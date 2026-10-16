@@ -392,13 +392,15 @@ mod tests {
         // The next agent: no session asked for yet.
         let (wire, _link) = super::super::wire();
         remote(graph.clone(), saved.clone(), wire, None).unwrap();
+        // The repair puts each default back, then clears what it saved: waiting for the
+        // defaults alone leaves the clearing to race the asserts.
         until(&graph, |s| {
             s.default == Some(DefaultNode::named("laptop-speakers"))
                 && s.default_source == Some(DefaultNode::named("laptop-mic"))
+                && saved.load(Device::Sink).unwrap().is_none()
+                && saved.load(Device::Source).unwrap().is_none()
         })
         .await;
-        assert_eq!(saved.load(Device::Sink).unwrap(), None);
-        assert_eq!(saved.load(Device::Source).unwrap(), None);
     }
 
     #[test]
