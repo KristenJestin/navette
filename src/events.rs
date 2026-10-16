@@ -326,26 +326,39 @@ pub async fn serve(listener: UnixListener, events: Arc<Events>, commands: Arc<Co
             // state goes on meanwhile; anything that ends the reading ends the reader, a close
             // included, rather than at the next change, which may be hours away.
             let commanded = tokio::spawn(command(read, commands, answers_tx));
-            loop {
-                let text = tokio::select! {
-                    line = lines.recv() => match line {
-                        Some(line) => line.to_string(),
-                        // Let go for falling behind.
-                        None => break,
-                    },
-                    answer = answers.recv() => match answer {
-                        Some(answer) => answer,
-                        None => break,
-                    },
-                };
-                let text = format!("{text}\n");
-                let written = write.write_all(text.as_bytes());
-                if !matches!(tokio::time::timeout(WRITE, written).await, Ok(Ok(()))) {
-                    break;
-                }
-            }
+            write_out(&mut write, &mut lines, &mut answers).await;
             commanded.abort();
         });
+    }
+}
+
+/// Writes a reader's state lines and answers as they come, until it is let go: for falling
+/// behind, for taking no line within [`WRITE`], or once its commands are read to the end.
+async fn write_out<W: tokio::io::AsyncWrite + Unpin>(
+    write: &mut W,
+    lines: &mut mpsc::Receiver<Arc<str>>,
+    answers: &mut mpsc::Receiver<String>,
+) {
+    loop {
+        let text = tokio::select! {
+            // A state queued before an answer goes first: a `start` is answered after its
+            // `starting` line, as the contract says.
+            biased;
+            line = lines.recv() => match line {
+                Some(line) => line.to_string(),
+                // Let go for falling behind.
+                None => return,
+            },
+            answer = answers.recv() => match answer {
+                Some(answer) => answer,
+                None => return,
+            },
+        };
+        let text = format!("{text}\n");
+        let written = write.write_all(text.as_bytes());
+        if !matches!(tokio::time::timeout(WRITE, written).await, Ok(Ok(()))) {
+            return;
+        }
     }
 }
 
@@ -1189,5 +1202,30 @@ mod tests {
             .unwrap();
         assert_eq!(heard(&mut hears).await, linked_desk().line());
         assert!(hears.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_state_line_queued_before_an_answer_is_written_first() {
+        // Many times over: an unordered choice would pass some of them.
+        for _ in 0..64 {
+            let (mut write, read) = tokio::io::duplex(4096);
+            let (line_tx, mut lines) = mpsc::channel::<Arc<str>>(QUEUE);
+            let (answer_tx, mut answers) = mpsc::channel(1);
+            line_tx
+                .try_send(Arc::from("{\"state\":\"starting\"}"))
+                .unwrap();
+            answer_tx.try_send("ok started".to_string()).unwrap();
+            // The hub keeps its end; the reader's commands are read to the end.
+            drop(answer_tx);
+            write_out(&mut write, &mut lines, &mut answers).await;
+            drop(line_tx);
+            drop(write);
+            let mut said = BufReader::new(read).lines();
+            assert_eq!(
+                said.next_line().await.unwrap().unwrap(),
+                "{\"state\":\"starting\"}"
+            );
+            assert_eq!(said.next_line().await.unwrap().unwrap(), "ok started");
+        }
     }
 }
