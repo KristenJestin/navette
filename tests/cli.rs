@@ -407,3 +407,13 @@ fn each_machine_says_where_it_stands_on_its_events_socket() {
         "error the remote does not drive the mode"
     );
 }
+
+#[test]
+fn the_remote_says_dialing_once_the_desk_goes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (serve, _agent, _) = paired_link(&home, &remote);
+    watched_until(&remote, "linked");
+    drop(serve);
+    watched_until(&remote, "dialing");
+}
