@@ -2067,7 +2067,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_no_label_the_desk_says_none_and_the_remote_says_the_desk() {
+    async fn with_no_label_the_desk_says_none() {
         let desk = desk("DP-2");
         let remote = connect(&desk);
         // The orders are taken after the link: once this is answered, the link was served.
