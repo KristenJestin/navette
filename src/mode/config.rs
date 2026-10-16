@@ -3,7 +3,8 @@
 //! `monitor` among them is the one unnamed mode, so a file written before modes had names keeps
 //! working. A `[name]` section is a named mode: its `monitor`, and any of `release`, `mic`,
 //! `mic_hotkey`, `remote_label`, `local_label`, `remote_bar`, `local_bar`, `local_above` it wants
-//! other than the default.
+//! other than the default. `here_notice` is about the link, so only the keys before any section
+//! set it.
 //! `#` starts a comment.
 
 use std::io;
@@ -39,6 +40,9 @@ pub struct Mode {
     pub mic_hotkey: String,
     /// `mic = follow`: the mic goes to the side that has the keyboard.
     pub mic_follows: bool,
+    /// `here_notice = off` turns off the notification that the remote machine is here. It is
+    /// about the link, not about a mode: only the keys before any section set it.
+    pub here_notice: bool,
     /// The layer namespaces of home's own tools drawn above the remote's picture.
     pub local_above: Vec<String>,
     pub look: Look,
@@ -243,6 +247,15 @@ impl File {
                 )));
             }
         };
+        let here_notice = match self.sections[0].get("here_notice").unwrap_or_default() {
+            "" | "on" => true,
+            "off" => false,
+            other => {
+                return Err(invalid(format!(
+                    "{path}: `here_notice = {other}`: `on` or `off`; nothing was changed"
+                )));
+            }
+        };
         let local_above = match value("local_above").unwrap_or(LOCAL_ABOVE) {
             "none" => Vec::new(),
             list => list
@@ -297,6 +310,7 @@ impl File {
             notice,
             mic_hotkey,
             mic_follows,
+            here_notice,
             local_above,
             look,
         })
@@ -804,6 +818,46 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("`mic = always`"), "{text}");
         assert!(text.contains("`fixed` or `follow`"), "{text}");
+    }
+
+    #[test]
+    fn here_notice_is_on_by_default() {
+        assert!(mode("monitor = DP-2\n", None).unwrap().here_notice);
+        assert!(
+            mode("monitor = DP-2\nhere_notice =\n", None)
+                .unwrap()
+                .here_notice
+        );
+        assert!(
+            mode("monitor = DP-2\nhere_notice = on\n", None)
+                .unwrap()
+                .here_notice
+        );
+    }
+
+    #[test]
+    fn here_notice_off_is_read() {
+        assert!(
+            !mode("monitor = DP-2\nhere_notice = off\n", None)
+                .unwrap()
+                .here_notice
+        );
+    }
+
+    #[test]
+    fn here_notice_is_read_globally_only() {
+        let text = "[office]\nmonitor = DP-2\nhere_notice = off\n";
+        assert!(mode(text, Some("office")).unwrap().here_notice);
+        let text = "here_notice = off\n[office]\nmonitor = DP-2\nhere_notice = on\n";
+        assert!(!mode(text, Some("office")).unwrap().here_notice);
+    }
+
+    #[test]
+    fn an_unknown_here_notice_value_is_refused_naming_the_key() {
+        let error = mode("monitor = DP-2\nhere_notice = sometimes\n", None).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("`here_notice = sometimes`"), "{text}");
+        assert!(text.contains("`on` or `off`"), "{text}");
     }
 
     #[test]

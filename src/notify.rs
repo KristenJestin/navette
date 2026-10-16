@@ -7,26 +7,48 @@
 
 use std::io;
 use std::process::Stdio;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 
 /// How long a notification stays up, in milliseconds.
 const EXPIRE: &str = "3000";
+
+/// How long an offer stays up, in milliseconds: long enough to reach for the mouse, which the
+/// other messages, that only tell, are not.
+const OFFER_EXPIRE: &str = "15000";
+
+/// The name of an offer's button, which `notify-send` prints when it is pressed.
+const ACTION: &str = "start";
+
+/// The name libnotify gives to a click on the notification itself, which `notify-send` prints
+/// like a button's: the click on the body does what the button does.
+const BODY_CLICK: &str = "default";
 
 /// Shows short messages to the user.
 pub trait Notifier: Send + Sync {
     /// Shows `summary` (and `body` under it, unless empty), in place of the previous message
     /// of this notifier, so that they do not pile up. It never waits for the desktop.
     fn show(&self, summary: &str, body: &str);
+
+    /// Shows `summary` with one button called `action`; `chosen` runs if the user presses it,
+    /// and never if they dismiss the message or the desktop has no service. It never waits for
+    /// the user, and does not replace or get replaced by the messages of [`Notifier::show`].
+    /// A notifier with no button only says `summary`.
+    fn offer(&self, summary: &str, action: &str, chosen: Box<dyn FnOnce() + Send>) {
+        let _ = (action, chosen);
+        self.show(summary, "");
+    }
 }
 
-/// Runs `notify-send` (the port behind which tests put a fake).
-pub trait Run: Send + 'static {
+/// Runs `notify-send` (the port behind which tests put a fake). A clone is what an offer runs,
+/// for it waits on the user: the one of the other messages must stay free.
+pub trait Run: Clone + Send + Sync + 'static {
     /// Runs it with `args` and returns what it printed.
     fn run(&mut self, args: &[String]) -> io::Result<String>;
 }
 
 /// The `notify-send` of this machine.
+#[derive(Clone)]
 pub struct Command;
 
 impl Run for Command {
@@ -43,26 +65,70 @@ impl Run for Command {
     }
 }
 
+/// A `notify-send` run on its own thread, as an offer's.
+type Spare = Arc<dyn Fn(&[String]) -> io::Result<String> + Send + Sync>;
+
 /// Notifications shown with `notify-send`.
 pub struct NotifySend {
     queue: mpsc::Sender<(String, String)>,
+    /// What an offer runs `notify-send` with, on a thread of its own.
+    spare: Spare,
 }
 
 impl NotifySend {
     /// The thread ends with the notifier.
     pub fn new(run: impl Run) -> Self {
         let (queue, messages) = mpsc::channel();
+        let spare = run.clone();
         thread::Builder::new()
             .name("navette-notify".into())
             .spawn(move || work(run, &messages))
             .expect("a thread for the notifications");
-        Self { queue }
+        Self {
+            queue,
+            spare: Arc::new(move |args| spare.clone().run(args)),
+        }
     }
 }
 
 impl Notifier for NotifySend {
     fn show(&self, summary: &str, body: &str) {
         let _ = self.queue.send((summary.to_owned(), body.to_owned()));
+    }
+
+    fn offer(&self, summary: &str, action: &str, chosen: Box<dyn FnOnce() + Send>) {
+        let args: Vec<String> = [
+            "--app-name",
+            "Navette",
+            "--icon",
+            "navette",
+            "--expire-time",
+            OFFER_EXPIRE,
+            "--wait",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain([
+            format!("--action={ACTION}={action}"),
+            format!("--action={BODY_CLICK}={action}"),
+            "--".into(),
+            summary.into(),
+        ])
+        .collect();
+        let spare = self.spare.clone();
+        // One thread per offer: it waits on the user, and the queue of the other messages must
+        // not wait with it.
+        let spawned =
+            thread::Builder::new()
+                .name("navette-offer".into())
+                .spawn(move || match spare(&args) {
+                    Ok(printed) if matches!(printed.trim(), ACTION | BODY_CLICK) => chosen(),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("navette: notifications: `notify-send` failed: {e}"),
+                });
+        if let Err(e) = spawned {
+            eprintln!("navette: notifications: no thread for an offer: {e}");
+        }
     }
 }
 
@@ -106,11 +172,16 @@ fn work(mut run: impl Run, messages: &mpsc::Receiver<(String, String)>) {
     }
 }
 
+/// An offer the fake heard: its summary, its action, and what pressing the action runs.
+#[cfg(test)]
+type Offer = (String, String, Option<Box<dyn FnOnce() + Send>>);
+
 /// A notifier in memory, for the tests: it records what was shown.
 #[cfg(test)]
 #[derive(Default)]
 pub struct Fake {
     shown: std::sync::Mutex<Vec<(String, String)>>,
+    offered: std::sync::Mutex<Vec<Offer>>,
 }
 
 #[cfg(test)]
@@ -125,6 +196,21 @@ impl Fake {
     pub fn shown(&self) -> Vec<(String, String)> {
         self.shown.lock().unwrap().clone()
     }
+
+    /// Every offer made so far, in order, as `(summary, action)`.
+    pub fn offers(&self) -> Vec<(String, String)> {
+        let offered = self.offered.lock().unwrap();
+        offered
+            .iter()
+            .map(|(summary, action, _)| (summary.clone(), action.clone()))
+            .collect()
+    }
+
+    /// The user presses the button of the `n`-th offer (counted from 0).
+    pub fn press(&self, n: usize) {
+        let chosen = self.offered.lock().unwrap()[n].2.take();
+        chosen.expect("an offer not pressed yet")();
+    }
 }
 
 #[cfg(test)]
@@ -135,6 +221,13 @@ impl Notifier for Fake {
             .unwrap()
             .push((summary.to_owned(), body.to_owned()));
     }
+
+    fn offer(&self, summary: &str, action: &str, chosen: Box<dyn FnOnce() + Send>) {
+        self.offered
+            .lock()
+            .unwrap()
+            .push((summary.to_owned(), action.to_owned(), Some(chosen)));
+    }
 }
 
 #[cfg(test)]
@@ -144,10 +237,13 @@ mod tests {
 
     /// A `notify-send` that numbers its notifications from 7 and tells the test what it was
     /// run with. With `refuse`, it fails as one with no service does.
+    #[derive(Clone)]
     struct FakeRun {
         calls: mpsc::Sender<Vec<String>>,
         next: u32,
         refuse: bool,
+        /// What a `notify-send --wait` prints once the user is done with the message.
+        printed: String,
     }
 
     impl Run for FakeRun {
@@ -155,6 +251,9 @@ mod tests {
             self.calls.send(args.to_vec()).unwrap();
             if self.refuse {
                 return Err(io::Error::other("no notification service"));
+            }
+            if args.iter().any(|a| a == "--wait") {
+                return Ok(self.printed.clone());
             }
             self.next += 1;
             Ok(format!("{}\n", self.next + 6))
@@ -167,6 +266,7 @@ mod tests {
             calls,
             next: 0,
             refuse,
+            printed: String::new(),
         };
         (NotifySend::new(run), seen)
     }
@@ -233,5 +333,84 @@ mod tests {
             let args = next(&seen);
             assert!(!args.contains(&"--replace-id".to_owned()), "{args:?}");
         }
+    }
+
+    /// A notifier whose `notify-send --wait` prints `printed` (or fails, with `refuse`).
+    fn offering(printed: &str, refuse: bool) -> (NotifySend, mpsc::Receiver<Vec<String>>) {
+        let (calls, seen) = mpsc::channel();
+        let run = FakeRun {
+            calls,
+            next: 0,
+            refuse,
+            printed: printed.to_owned(),
+        };
+        (NotifySend::new(run), seen)
+    }
+
+    /// An offer, and whether its button was heard of within a moment.
+    fn pressed_after_offer(notifier: &NotifySend) -> bool {
+        let (pressed, heard) = mpsc::channel();
+        notifier.offer(
+            "REMOTE is here",
+            "Start",
+            Box::new(move || pressed.send(()).unwrap()),
+        );
+        heard.recv_timeout(Duration::from_millis(500)).is_ok()
+    }
+
+    #[test]
+    fn an_offer_is_a_notify_send_that_waits_for_its_action() {
+        let (notifier, seen) = offering("start\n", false);
+        assert!(pressed_after_offer(&notifier));
+        let args = next(&seen);
+        assert!(
+            args.contains(&"--action=start=Start".to_owned()),
+            "{args:?}"
+        );
+        assert!(args.contains(&"--wait".to_owned()), "{args:?}");
+        assert_eq!(args[args.len() - 2..], ["--", "REMOTE is here"]);
+    }
+
+    #[test]
+    fn a_dismissed_offer_does_nothing() {
+        let (notifier, seen) = offering("", false);
+        assert!(!pressed_after_offer(&notifier));
+        next(&seen);
+    }
+
+    #[test]
+    fn an_offer_with_no_notification_service_does_nothing() {
+        let (notifier, seen) = offering("start\n", true);
+        assert!(!pressed_after_offer(&notifier));
+        next(&seen);
+    }
+
+    #[test]
+    fn a_click_on_the_notification_starts_the_mode_like_its_button() {
+        let (notifier, seen) = offering("default\n", false);
+        assert!(pressed_after_offer(&notifier));
+        next(&seen);
+    }
+
+    #[test]
+    fn an_offer_carries_the_button_and_the_click_on_the_body() {
+        let (notifier, seen) = offering("", false);
+        pressed_after_offer(&notifier);
+        let args = next(&seen);
+        assert!(
+            args.contains(&"--action=start=Start".to_owned()),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(&"--action=default=Start".to_owned()),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn an_action_other_than_the_offered_ones_does_nothing() {
+        let (notifier, seen) = offering("other\n", false);
+        assert!(!pressed_after_offer(&notifier));
+        next(&seen);
     }
 }
