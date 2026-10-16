@@ -300,6 +300,8 @@ struct Active {
     starting: Option<(oneshot::Sender<io::Result<String>>, tokio::time::Instant)>,
     /// What the config says that is no longer read, said with `mode start`'s answer.
     notice: Option<String>,
+    /// What the sentences call the machines: the labels of the mode.
+    names: Names,
     /// Says the mode stopped, once it said it started: last, once the rest is gone.
     told: Option<Told>,
     /// Told that the mode is stopping, while it gives the monitors back.
@@ -341,10 +343,10 @@ impl Active {
         switch_error(self.switched.as_deref(), &self.title(), e)
     }
 
-    /// `DP-2 is back home`, once the monitors are given back.
+    /// `DP-2 is back on the desk` (or on the desk's label), once the monitors are given back.
     fn given_back(&self) -> String {
         let verb = if self.monitors.len() > 1 { "are" } else { "is" };
-        format!("{} {verb} back home", self.label())
+        format!("{} {verb} back on {}", self.label(), self.names.the_desk())
     }
 }
 
@@ -595,7 +597,7 @@ pub async fn serve(
                     }
                 }
                 Heard::Msg(Incoming::NoInput(reason)) => eprintln!(
-                    "navette: the remote machine shows its picture but cannot take home's \
+                    "navette: the remote machine shows its picture but cannot take the desk's \
                      keyboard and pointer: {reason}"
                 ),
                 Heard::Msg(Incoming::NoLid(reason)) => eprintln!(
@@ -660,7 +662,7 @@ pub async fn serve(
                         blocking(move || desk.lock().unwrap().handle(&event).map_err(desk_error))
                             .await;
                     if let Err(e) = handled {
-                        eprintln!("navette: the home desk could not be restored after a reload: {e}");
+                        eprintln!("navette: the desk could not be restored after a reload: {e}");
                     }
                     // The layer rules are back, but in effect only once each monitor is sorted
                     // again: until then, an overlay of home's that maps lands above the picture.
@@ -675,19 +677,23 @@ pub async fn serve(
                 }
             }
             Some(said) = said(&mut active) => match said {
-                Said::Keyboard(Keyboard::Remote) => home.board.say("Keyboard → remote"),
+                Said::Keyboard(Keyboard::Remote) => {
+                    let names = active.as_ref().map(|a| a.names.clone()).unwrap_or_default();
+                    home.board.say(&format!("Keyboard → {}", names.remote));
+                }
                 Said::Keyboard(Keyboard::Home) => {
-                    home.board.say("Keyboard → home");
+                    let names = active.as_ref().map(|a| a.names.clone()).unwrap_or_default();
+                    home.board.say(&format!("Keyboard → {}", names.desk));
                     if let Some(a) = &active {
                         let (hypr, given) = (home.hypr.clone(), a.monitors.clone());
                         let focus = move || hypr::focus_last_window(&*hypr, &given);
                         match blocking(focus).await {
                             Ok(Some(window)) => {
-                                tracing::info!(window, "the keyboard went to a home window")
+                                tracing::info!(window, "the keyboard went to a window of the desk")
                             }
-                            Ok(None) => tracing::info!("no home window shown to take the keyboard"),
+                            Ok(None) => tracing::info!("no window of the desk shown to take the keyboard"),
                             Err(e) => eprintln!(
-                                "navette: the keyboard came home but no window took it: {e}"
+                                "navette: the keyboard came back to the desk but no window took it: {e}"
                             ),
                         }
                     }
@@ -993,7 +999,7 @@ async fn launch(
         // a mode. The mic is kept when it failed, so that the stop clears what it says.
         let sound = sound.map(|sound| {
             if let Err(e) = sound.start() {
-                eprintln!("navette: audio: the remote's sound could not come home: {e}");
+                eprintln!("navette: audio: the remote's sound could not come to the desk: {e}");
             }
             SoundPlayed(sound)
         });
@@ -1001,7 +1007,7 @@ async fn launch(
             let remote = pointed.is_none_or(|(hypr, given)| pointer_over(&*hypr, &given));
             if let Err(e) = mic.start(remote, labels) {
                 eprintln!(
-                    "navette: mic: it stays home, it could not go to the remote machine: {e}"
+                    "navette: mic: it stays at the desk, it could not go to the remote machine: {e}"
                 );
             }
             MicSent(mic)
@@ -1041,6 +1047,7 @@ async fn launch(
         keyboard: None,
         starting: None,
         notice: mode.notice,
+        names: mode.names,
         told: None,
         events: home.events.clone(),
     });
@@ -1195,10 +1202,10 @@ async fn send_home(home: &Home, sending: (Vec<String>, Option<String>, Arc<Mutex
         blocking(move || hypr::send_home(&*hypr, &given, &to, &mut seen.lock().unwrap())).await;
     match sent {
         Ok(sent) if !sent.is_empty() => {
-            tracing::info!(?sent, "home windows taken from under the cover")
+            tracing::info!(?sent, "windows of the desk taken from under the cover")
         }
         Ok(_) => {}
-        Err(e) => eprintln!("navette: a home window may be left under the cover: {e}"),
+        Err(e) => eprintln!("navette: a window of the desk may be left under the cover: {e}"),
     }
 }
 
@@ -1237,7 +1244,7 @@ async fn link_lost(active: &mut Option<Active>, why: &str) {
     match undone {
         Ok(()) => text.push_str("; nothing was changed"),
         Err(e) => text.push_str(&format!(
-            "; the home desk could not be given back ({e}): it is restored at the next start"
+            "; the desk could not be given back ({e}): it is restored at the next start"
         )),
     }
     let e = io::Error::new(io::ErrorKind::ConnectionAborted, text);
