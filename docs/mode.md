@@ -99,13 +99,14 @@ monitors are back. The two commands reach `navette serve` over a Unix socket in
 `$XDG_RUNTIME_DIR/navette`, private to the user.
 
 When the remote machine links and no mode runs, `navette serve` shows a desktop notification,
-`REMOTE is here` (the `remote_label` of `mode.conf`), with a `Start` button that starts the
-default mode, as `navette mode start` does. Dismissing it does nothing more. It comes a few
-seconds after the link, so that a mode started by your own setup as the laptop links is not
-offered what has just happened; it is not shown again while the link stays up, and shows again
-after the link drops and comes back. With no `mode.conf`, there is nothing to start and nothing
-is shown. It needs `notify-send` with `--action` (libnotify 0.7.10 or later); without it, one
-line in the log says so and nothing else happens.
+`REMOTE is here` (the `remote_label` of `mode.conf`), with a `Start` button, or a click on
+the notification itself, that starts the default mode, as `navette mode start` does.
+Dismissing it does nothing more. It comes a few seconds after the link, so that a mode started
+by your own setup as the laptop links is not offered what has just happened; it is not shown
+again while the link stays up, and shows again after the link drops and comes back. With no
+`mode.conf`, there is nothing to start and nothing is shown. It needs `notify-send` with
+`--action` (libnotify 0.7.10 or later); without it, one line in the log says so and nothing
+else happens.
 
 While the mode runs:
 

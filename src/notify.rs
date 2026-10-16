@@ -17,8 +17,12 @@ const EXPIRE: &str = "3000";
 /// other messages, that only tell, are not.
 const OFFER_EXPIRE: &str = "15000";
 
-/// The name of an offer's one action, which `notify-send` prints when it is pressed.
+/// The name of an offer's button, which `notify-send` prints when it is pressed.
 const ACTION: &str = "start";
+
+/// The name libnotify gives to a click on the notification itself, which `notify-send` prints
+/// like a button's: the click on the body does what the button does.
+const BODY_CLICK: &str = "default";
 
 /// Shows short messages to the user.
 pub trait Notifier: Send + Sync {
@@ -106,6 +110,7 @@ impl Notifier for NotifySend {
         .map(str::to_owned)
         .chain([
             format!("--action={ACTION}={action}"),
+            format!("--action={BODY_CLICK}={action}"),
             "--".into(),
             summary.into(),
         ])
@@ -117,7 +122,7 @@ impl Notifier for NotifySend {
             thread::Builder::new()
                 .name("navette-offer".into())
                 .spawn(move || match spare(&args) {
-                    Ok(printed) if printed.trim() == ACTION => chosen(),
+                    Ok(printed) if matches!(printed.trim(), ACTION | BODY_CLICK) => chosen(),
                     Ok(_) => {}
                     Err(e) => eprintln!("navette: notifications: `notify-send` failed: {e}"),
                 });
@@ -381,8 +386,30 @@ mod tests {
     }
 
     #[test]
-    fn an_action_other_than_the_offered_one_does_nothing() {
+    fn a_click_on_the_notification_starts_the_mode_like_its_button() {
         let (notifier, seen) = offering("default\n", false);
+        assert!(pressed_after_offer(&notifier));
+        next(&seen);
+    }
+
+    #[test]
+    fn an_offer_carries_the_button_and_the_click_on_the_body() {
+        let (notifier, seen) = offering("", false);
+        pressed_after_offer(&notifier);
+        let args = next(&seen);
+        assert!(
+            args.contains(&"--action=start=Start".to_owned()),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(&"--action=default=Start".to_owned()),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn an_action_other_than_the_offered_ones_does_nothing() {
+        let (notifier, seen) = offering("other\n", false);
         assert!(!pressed_after_offer(&notifier));
         next(&seen);
     }
