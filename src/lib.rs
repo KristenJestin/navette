@@ -14,6 +14,7 @@ pub mod lid;
 pub mod link;
 pub mod mic;
 pub mod mode;
+pub mod network;
 pub mod notify;
 pub mod pair;
 pub mod single;

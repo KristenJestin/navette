@@ -30,6 +30,7 @@ use crate::audio::{self, codec::MAX_PACKET};
 use crate::display::wire::{Cursor, Incoming, MAX_CURSOR, MAX_OUTPUTS, Outbox, Peer, Pointer};
 use crate::frame::{read_frame, write_frame};
 use crate::input;
+use crate::network::{HomeNetwork, RECHECK, Tables};
 use crate::store::{Role, Store};
 use crate::transport::{Accept, Dial, TlsAcceptor, TlsDialer};
 use crate::wire::{Clip, LinkMsg, checked, output_id};
@@ -135,6 +136,10 @@ pub enum Event {
     /// A connection home refused, or one the agent could not open.
     Failed(io::Error),
     Retrying(Duration),
+    /// The agent is not on home's network: it does not dial.
+    Away,
+    /// The agent is back on home's network: it dials again.
+    Back,
 }
 
 /// Both sides say hello first; a peer of another version is refused.
@@ -537,23 +542,43 @@ async fn audio_received<R: AsyncRead + Unpin>(
 }
 
 /// `navette agent`: dials home, keeps the link up, and dials again whenever it drops. `attach`
-/// starts the connection's service each time the link is up. Never returns.
-pub async fn agent<D, F, Fut>(
+/// starts the connection's service each time the link is up. Away from home's network, it does
+/// not dial, and looks again every `RECHECK`. Never returns.
+pub async fn agent<D, T, F, Fut>(
     dialer: D,
+    mut network: HomeNetwork<T>,
     heartbeat: Heartbeat,
     mut backoff: Backoff,
     events: UnboundedSender<Event>,
     attach: F,
 ) where
     D: Dial,
+    T: Tables,
     F: Fn(Wire) -> Fut,
     Fut: Future<Output = ()>,
 {
+    // Said once per change, not at each check.
+    let mut away = false;
     loop {
+        if !network.at_home() {
+            if !away {
+                away = true;
+                let _ = events.send(Event::Away);
+            }
+            tokio::time::sleep(RECHECK).await;
+            continue;
+        }
+        if away {
+            away = false;
+            let _ = events.send(Event::Back);
+        }
         match dialer.dial().await {
             Ok(mut stream) => match hello(&mut stream, heartbeat).await {
                 Ok(()) => {
                     backoff.reset();
+                    if let Err(e) = network.linked() {
+                        let _ = events.send(Event::Failed(e));
+                    }
                     let _ = events.send(Event::Connected);
                     let ended = run(stream, heartbeat, &attach).await;
                     let _ = events.send(Event::Disconnected(ended));
@@ -674,7 +699,7 @@ fn paired_as(store: &Store, role: Role) -> io::Result<crate::store::Pairing> {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use gliff_proto::{ClientMsg, ClipboardFile};
     use tokio::sync::mpsc;
@@ -682,6 +707,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::display::wire::{Display, Msg as DisplayMsg};
     use crate::identity::Identity;
+    use crate::network::tests::{FakeTables, HOME_ROUTER, OTHER_ROUTER, mac, paired_remote};
     use crate::pair::{self, Pin, Timeouts};
     use crate::transport::bind_lan;
 
@@ -693,6 +719,11 @@ pub(crate) mod tests {
     }
 
     async fn nothing(_: Wire) {}
+
+    /// The gate of a pairing that does not know home's router: it dials wherever it is.
+    pub(crate) fn anywhere(store: &Store) -> HomeNetwork<FakeTables> {
+        HomeNetwork::new(FakeTables::default(), store.clone()).unwrap()
+    }
 
     fn quick_backoff() -> Backoff {
         Backoff::new(Duration::from_millis(10), Duration::from_millis(100))
@@ -732,7 +763,7 @@ pub(crate) mod tests {
         let pin = Pin::random();
         let (home, remote) = tokio::join!(
             pair::home(&desk.home, listener, &pin, Timeouts::default()),
-            pair::remote(&desk.remote, address, &pin, Timeouts::default()),
+            pair::remote(&desk.remote, address, None, &pin, Timeouts::default()),
         );
         home.unwrap();
         remote.unwrap();
@@ -1202,6 +1233,7 @@ pub(crate) mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_agent_redials_within_the_cap_after_a_long_outage() {
+        let tmp = tempfile::tempdir().unwrap();
         let home_is_back = Arc::new(AtomicBool::new(false));
         let (events_tx, mut events) = mpsc::unbounded_channel();
         let backoff = Backoff::default();
@@ -1209,6 +1241,7 @@ pub(crate) mod tests {
             Outage {
                 home_is_back: home_is_back.clone(),
             },
+            anywhere(&Store::new(tmp.path())),
             Heartbeat::default(),
             backoff,
             events_tx,
@@ -1235,6 +1268,140 @@ pub(crate) mod tests {
         assert!(waited <= A_FEW_SECONDS, "dialled again after {waited:?}");
     }
 
+    /// A dialer that answers like home does, and counts its dials.
+    #[derive(Clone, Default)]
+    struct Counted {
+        dials: Arc<AtomicUsize>,
+    }
+
+    impl Dial for Counted {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn dial(&self) -> io::Result<Self::Stream> {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            let (agent_side, mut home_side) = tokio::io::duplex(1024);
+            tokio::spawn(async move {
+                let _ = hello(&mut home_side, Heartbeat::default()).await;
+                std::future::pending::<()>().await;
+            });
+            Ok(agent_side)
+        }
+    }
+
+    /// An agent paired with home's router as `gateway`, on `tables`.
+    fn gated_agent(
+        store: &Store,
+        tables: FakeTables,
+    ) -> (
+        Counted,
+        tokio::task::JoinHandle<()>,
+        mpsc::UnboundedReceiver<Event>,
+    ) {
+        let dialer = Counted::default();
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let agent = tokio::spawn(agent(
+            dialer.clone(),
+            HomeNetwork::new(tables, store.clone()).unwrap(),
+            Heartbeat::default(),
+            Backoff::default(),
+            events_tx,
+            nothing,
+        ));
+        (dialer, agent, events)
+    }
+
+    fn drained(events: &mut mpsc::UnboundedReceiver<Event>) -> Vec<Event> {
+        std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
+
+    /// Away from home for ten minutes: no dial, and one line said, not one per check.
+    async fn never_dialed_and_said_once(tables: FakeTables) {
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let (dialer, agent, mut events) = gated_agent(&store, tables);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        agent.abort();
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 0);
+        let said = drained(&mut events);
+        assert!(matches!(said.as_slice(), [Event::Away]), "said {said:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_agent_dials_behind_home_s_router() {
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let (_, agent, mut events) = gated_agent(&store, FakeTables::behind(HOME_ROUTER));
+        let first = tokio::time::timeout(A_FEW_SECONDS, events.recv()).await;
+        agent.abort();
+        assert!(matches!(first, Ok(Some(Event::Connected))), "{first:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn behind_another_router_the_agent_never_dials_and_says_so_once() {
+        never_dialed_and_said_once(FakeTables::behind(OTHER_ROUTER)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_no_router_the_agent_never_dials_and_says_so_once() {
+        never_dialed_and_said_once(FakeTables::default()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_no_arp_entry_for_the_router_the_agent_never_dials_and_says_so_once() {
+        let tables = FakeTables::behind(HOME_ROUTER);
+        tables.set(
+            &tables.route().unwrap(),
+            "IP address       HW type     Flags       HW address            Mask     Device\n",
+        );
+        never_dialed_and_said_once(tables).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn back_on_home_s_network_the_agent_dials_again() {
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let tables = FakeTables::behind(OTHER_ROUTER);
+        let (_, agent, mut events) = gated_agent(&store, tables.clone());
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        tables.move_behind(HOME_ROUTER);
+        let back = tokio::time::Instant::now();
+        let said = tokio::time::timeout(RECHECK + A_FEW_SECONDS, async {
+            let mut said = Vec::new();
+            loop {
+                let event = events.recv().await.expect("the agent is alive");
+                let connected = matches!(event, Event::Connected);
+                said.push(event);
+                if connected {
+                    return said;
+                }
+            }
+        })
+        .await
+        .expect("the agent dials home again");
+        agent.abort();
+        assert!(
+            back.elapsed() <= RECHECK,
+            "linked after {:?}",
+            back.elapsed()
+        );
+        assert!(
+            matches!(
+                said.as_slice(),
+                [Event::Away, Event::Back, Event::Connected]
+            ),
+            "said {said:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_old_pairing_learns_home_s_router_at_its_first_link() {
+        let (_tmp, store) = paired_remote(None);
+        let (_, agent, mut events) = gated_agent(&store, FakeTables::behind(HOME_ROUTER));
+        until_connected(&mut events).await;
+        agent.abort();
+        assert_eq!(
+            store.pairing().unwrap().unwrap().gateway,
+            Some(mac(HOME_ROUTER))
+        );
+    }
+
     #[tokio::test]
     async fn after_pairing_the_remote_connects_on_its_own() {
         let desk = paired_desk().await;
@@ -1246,6 +1413,7 @@ pub(crate) mod tests {
                 let home = tokio::task::spawn_local(serve(acceptor, fast(), home_tx, nothing));
                 let remote = tokio::task::spawn_local(agent(
                     remote_dialer(&desk.remote).unwrap(),
+                    anywhere(&desk.remote),
                     fast(),
                     quick_backoff(),
                     remote_tx,
@@ -1267,6 +1435,7 @@ pub(crate) mod tests {
                 let (remote_tx, mut remote_events) = mpsc::unbounded_channel();
                 let remote = tokio::task::spawn_local(agent(
                     remote_dialer(&desk.remote).unwrap(),
+                    anywhere(&desk.remote),
                     fast(),
                     quick_backoff(),
                     remote_tx,
@@ -1324,6 +1493,7 @@ pub(crate) mod tests {
                 let home = tokio::task::spawn_local(serve(acceptor, fast(), home_tx, nothing));
                 let remote = tokio::task::spawn_local(agent(
                     remote_dialer(&desk.remote).unwrap(),
+                    anywhere(&desk.remote),
                     fast(),
                     quick_backoff(),
                     remote_tx,
