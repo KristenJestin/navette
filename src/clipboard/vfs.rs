@@ -28,6 +28,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gliff_proto::ClipboardFile;
 use gliff_proto::clipboard::safe_relative_path;
+
+use super::progress::Headline;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// The folder's own inode.
@@ -49,6 +51,8 @@ pub enum Asked {
         serial: u32,
         index: u32,
         total: u64,
+        /// What names the copy in its bar.
+        headline: Option<Headline>,
         content: Arc<Content>,
     },
     /// The copy `serial` went: a newer one replaced it, and its transfer is over.
@@ -483,6 +487,7 @@ impl Folder {
             serial,
             index,
             total,
+            headline: crate::clipboard::files::headline(&offer.files),
             content: content.clone(),
         };
         if self.asked.send(asked).is_err() {
@@ -1026,6 +1031,7 @@ mod tests {
             index: 1,
             total: 10,
             content,
+            ..
         }) = asked.try_recv()
         else {
             panic!("file 1 of copy 7 asked");

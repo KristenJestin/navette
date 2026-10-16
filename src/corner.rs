@@ -14,8 +14,8 @@
 //! - **Messages** (`Mic → remote`, `Keyboard → home`, …) show under the button for two seconds,
 //!   in place of desktop notifications.
 //! - **Files crossing** the clipboard, either way, show as one bar per transfer under the tag,
-//!   as wide as the tag row (more only when the text needs it) and stacked tightly, filled
-//!   by the part done and saying what is left; a click on a bar stops its transfer, the others going on.
+//!   as wide as the tag row (more only when the text needs it, at most 20 characters) and
+//!   stacked tightly, filled by the part done and saying the copy's name and what is left; a click on a bar stops its transfer, the others going on.
 //!
 //! [`Board`] carries the mic's place and the messages to every corner open; [`Corner`] is one
 //! corner, drawn in software into ARGB pixels. Its text uses a 5×8 bitmap font of its own, so
@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use crate::clipboard::files::human_bytes;
-use crate::clipboard::progress::{Bar, Cancel};
+use crate::clipboard::progress::{Bar, Cancel, Headline};
 use crate::mic::Status;
 use crate::notify::Notifier;
 
@@ -410,6 +410,8 @@ const LONGEST: usize = 64;
 const BAR_ROW: f64 = 16.0;
 /// The air between two bars, and between the tag row and the first bar.
 const BAR_GAP: f64 = 2.0;
+/// The longest text of a bar of files crossing, in characters: its name is cut to fit.
+const BAR_CHARS: usize = 20;
 
 /// One corner: what it shows, and how it is drawn.
 pub struct Corner {
@@ -572,7 +574,7 @@ impl Corner {
                     height: BAR_ROW,
                 };
                 y += BAR_ROW;
-                (rect, *bar)
+                (rect, bar.clone())
             })
             .collect()
     }
@@ -641,6 +643,10 @@ impl Corner {
             id: 0,
             done: 0,
             total: u64::MAX,
+            headline: Some(Headline {
+                name: "M".repeat(BAR_CHARS),
+                more: 0,
+            }),
         };
         widest.update(Update::Files(vec![bar; BARS_SHOWN]), now);
         widest.update(Update::Say("M".repeat(LONGEST)), now);
@@ -719,10 +725,30 @@ impl Corner {
 
 /// What a bar of files crossing says.
 ///
-/// Only what is left and the cancel mark: the fill says how far it is, and the text stays short
-/// enough for the bar to be no wider than the tag row.
+/// The copy's name (and how many more it holds), what is left and the cancel mark: the fill says
+/// how far it is. The name is cut with `…` so that the whole stays within [`BAR_CHARS`]; what is
+/// left and the mark never are.
 fn bar_text(bar: &Bar) -> String {
-    format!("{} x", human_bytes(bar.left()))
+    let tail = format!("{} x", human_bytes(bar.left()));
+    let Some(Headline { name, more }) = &bar.headline else {
+        return tail;
+    };
+    let more = if *more > 0 {
+        format!(" +{more}")
+    } else {
+        String::new()
+    };
+    let room = BAR_CHARS.saturating_sub(tail.chars().count() + 1 + more.chars().count());
+    if room == 0 {
+        return tail;
+    }
+    let name = if name.chars().count() > room {
+        let cut: String = name.chars().take(room - 1).collect();
+        format!("{cut}…")
+    } else {
+        name.clone()
+    };
+    format!("{name}{more} {tail}")
 }
 
 /// Draws in logical pixels on a canvas of physical ones.
@@ -1027,6 +1053,7 @@ const FONT: &[(char, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clipboard::progress::Headline;
 
     fn corner(side: Side, mic: Status, now: Instant) -> Corner {
         let look = Look::default();
@@ -1234,8 +1261,9 @@ mod tests {
             id: 1,
             done: 1 << 30,
             total: 3 << 30,
+            headline: None,
         };
-        pro.update(Update::Files(vec![files]), now);
+        pro.update(Update::Files(vec![files.clone()]), now);
         assert_eq!(bar_text(&files), "2.0 GiB x");
         let (bar, _) = pro.bars()[0];
         let (width, height) = pro.size(now);
@@ -1263,17 +1291,30 @@ mod tests {
         let (bare_width, bare_height) = bare.size(now);
         // Two pastes of a 2 GiB file, then a third: the bound is the corner without bars for
         // the width, and for the height too up to two transfers, one more row after.
-        let transfer = |id, done_gib: u64| Bar {
+        let transfer = |id, done_gib: u64, name: &str, more| Bar {
             id,
             done: done_gib << 30,
             total: 2 << 30,
+            headline: Some(Headline {
+                name: name.into(),
+                more,
+            }),
         };
-        let all = [transfer(1, 1), transfer(2, 0), transfer(3, 2)];
+        let all = [
+            transfer(1, 1, "big-backup-of-the-year.tar", 0),
+            transfer(2, 0, "photos", 3),
+            transfer(3, 2, "a.txt", 0),
+        ];
+        // No wider than the longest bar there is, plus the corner's padding on both sides.
+        let longest = 2.0 * PAD + text_width(&"M".repeat(BAR_CHARS)) + 2.0 * 6.0;
         for count in 1..=BARS_SHOWN {
             let mut pro = bare_clone(now);
             pro.update(Update::Files(all[..count].to_vec()), now);
             let (width, height) = pro.size(now);
-            assert_eq!(width, bare_width, "{count} transfers: as wide as without");
+            assert!(
+                width <= bare_width.max(longest.ceil() as u32),
+                "{count} transfers: {width} wider than the {BAR_CHARS}-character bar"
+            );
             let bound = if count <= 2 {
                 bare_height
             } else {
@@ -1311,12 +1352,62 @@ mod tests {
             id,
             done: 1,
             total: 3,
+            headline: None,
         };
         pro.update(Update::Files((1..=3).map(bar).collect()), now);
         let button = pro.button().unwrap();
         for (rect, _) in pro.bars() {
             assert!(rect.y >= button.y + button.height, "under the button");
         }
+    }
+
+    fn named(name: &str, more: usize, left_gib: u64) -> Bar {
+        Bar {
+            id: 1,
+            done: 0,
+            total: left_gib << 30,
+            headline: Some(Headline {
+                name: name.into(),
+                more,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_bar_names_its_copy_and_keeps_the_size_and_the_cross_whole() {
+        // Fits: the name, then what is left, then the cross.
+        assert_eq!(bar_text(&named("notes.txt", 0, 2)), "notes.txt 2.0 GiB x");
+        assert_eq!(bar_text(&named("photos", 3, 2)), "photos +3 2.0 GiB x");
+        // Cut with `…`, within twenty characters; the size and the cross stay.
+        let long = bar_text(&named("holiday-videos-2026.mkv", 0, 2));
+        assert_eq!(long, "holiday-v… 2.0 GiB x");
+        let with_more = bar_text(&named("holiday-videos-2026", 12, 2));
+        assert_eq!(with_more, "holid… +12 2.0 GiB x");
+        for text in [&long, &with_more] {
+            assert!(text.chars().count() <= BAR_CHARS, "{text}");
+            assert!(text.ends_with("2.0 GiB x"));
+        }
+        // A bar without a known name says what round one said.
+        let mut unnamed = named("x", 0, 2);
+        unnamed.headline = None;
+        assert_eq!(bar_text(&unnamed), "2.0 GiB x");
+    }
+
+    #[test]
+    fn all_bars_share_the_width_of_the_longest_text() {
+        let now = Instant::now();
+        let mut pro = bare_clone(now);
+        let short = named("a", 0, 1);
+        let long = Bar {
+            id: 2,
+            ..named("holiday-videos-2026.mkv", 0, 1)
+        };
+        pro.update(Update::Files(vec![short, long.clone()]), now);
+        let rects = pro.bars();
+        assert_eq!(rects[0].0.width, rects[1].0.width);
+        let wanted = text_width(&bar_text(&long)) + 2.0 * 6.0;
+        assert_eq!(rects[0].0.width, wanted.max(pro.row_width()));
+        assert!(rects[0].0.width > pro.row_width(), "wider than the tag row");
     }
 
     fn bare_clone(now: Instant) -> Corner {
@@ -1338,6 +1429,7 @@ mod tests {
             id,
             done: 0,
             total: 10,
+            headline: None,
         };
         pro.update(Update::Files(vec![bar(5), bar(9)]), now);
         let (second, button) = (pro.bars()[1].0, pro.button().unwrap());
@@ -1368,6 +1460,7 @@ mod tests {
             id: 1,
             done: 1,
             total: 2,
+            headline: None,
         }];
         board.files(files.clone());
         let heard = listening(&board);

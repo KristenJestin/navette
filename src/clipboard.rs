@@ -439,7 +439,7 @@ impl<C: Compositor> Bridge<C> {
                 });
             }
             ClipboardItem::File(index) => {
-                let (path, size, total, skipped) = {
+                let (path, size, total, skipped, headline) = {
                     let mut local = self.local.borrow_mut();
                     let copied = match older {
                         false => &local.files,
@@ -453,19 +453,21 @@ impl<C: Compositor> Bridge<C> {
                         return;
                     };
                     let size = copied.entries[index as usize].size;
+                    let headline = files::headline(&copied.entries);
                     // Listed and validated: the sum is counted.
                     let total = files::total(&copied.entries).unwrap_or(u64::MAX);
                     let skipped = match older {
                         false => std::mem::take(&mut local.skipped),
                         true => Vec::new(),
                     };
-                    (path, size, total, skipped)
+                    (path, size, total, skipped, headline)
                 };
                 if !skipped.is_empty() {
                     self.notifier
                         .show("Not sent: links and special files", &skipped.join(", "));
                 }
-                let Some((done, stopped, run)) = self.progress.serving(serial, total) else {
+                let Some((done, stopped, run)) = self.progress.serving(serial, headline, total)
+                else {
                     // The user stopped this copy's paste: its next files are not served.
                     if self.progress.first_refusal(serial) {
                         log(format_args!(
@@ -628,6 +630,7 @@ impl<C: Compositor> Bridge<C> {
             }
             // Validated: gliff's sum of the sizes cannot overflow.
             let total = files::total(&files).unwrap_or(0);
+            let headline = files::headline(&files);
             let paste = Crossing::Paste(self.pastes.get().wrapping_add(1));
             self.pastes.set(self.pastes.get().wrapping_add(1));
             self.remote.borrow_mut().pastes.push(paste);
@@ -681,10 +684,13 @@ impl<C: Compositor> Bridge<C> {
                     }
                 }
             });
-            run.set(
-                self.progress
-                    .start(paste, total, done, Stop::Task(task.abort_handle())),
-            );
+            run.set(self.progress.start(
+                paste,
+                headline,
+                total,
+                done,
+                Stop::Task(task.abort_handle()),
+            ));
         } else {
             let serial = self.remote.borrow().serial;
             log(format_args!("offer {serial}: pasted as {mime_type}"));
@@ -712,8 +718,9 @@ impl<C: Compositor> Bridge<C> {
                 serial,
                 index,
                 total,
+                headline,
                 content,
-            } => self.fetch_read(serial, index, total, content),
+            } => self.fetch_read(serial, index, headline, total, content),
             // Its transfer is over: a fetch still running has its bytes, and ends on its own
             // at the peer's end.
             vfs::Asked::Gone { serial } => {
@@ -728,7 +735,14 @@ impl<C: Compositor> Bridge<C> {
 
     /// Fetches file `index` of the peer's copy `serial` into `content`, for the applications
     /// that read it: one transfer per copy, whose bar counts the bytes of all its files.
-    fn fetch_read(&self, serial: u32, index: u32, total: u64, content: Arc<vfs::Content>) {
+    fn fetch_read(
+        &self,
+        serial: u32,
+        index: u32,
+        headline: Option<progress::Headline>,
+        total: u64,
+        content: Arc<vfs::Content>,
+    ) {
         // Asked before a cancel the bridge saw first: the copy's reads are stopped.
         if content.over() {
             return;
@@ -753,7 +767,7 @@ impl<C: Compositor> Bridge<C> {
             reads.running += 1;
             (reads.running == 1, reads.done.clone(), reads.aborted)
         };
-        let (meter, tasks, run) = self.progress.reading(serial, total, done);
+        let (meter, tasks, run) = self.progress.reading(serial, headline, total, done);
         if first && !aborted {
             log(format_args!(
                 "offer {serial}: an application reads its files, fetching them as read ({})",
@@ -2980,6 +2994,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_bar_names_the_copy_on_the_machine_that_serves_and_on_the_one_that_pastes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("trip");
+        std::fs::create_dir(&copied).unwrap();
+        std::fs::write(copied.join("a.bin"), vec![3; 1 << 20]).unwrap();
+        let notes = tmp.path().join("notes.txt");
+        std::fs::write(&notes, b"figures").unwrap();
+        let list = uri_list_of(&[copied, notes]);
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                paste_on_the_remote(&home, &remote, &list).await;
+                the_bar_went(&home.seen, (1 << 20) + 7).await;
+                the_bar_went(&remote.seen, (1 << 20) + 7).await;
+                // Home serves it, the remote writes it: each knows the list of the copy.
+                let trip = Some(progress::Headline {
+                    name: "trip".into(),
+                    more: 1,
+                });
+                for seen in [&home.seen, &remote.seen] {
+                    let bars = seen.bars();
+                    let shown: Vec<_> = bars.iter().flatten().collect();
+                    assert!(shown.iter().all(|bar| bar.headline == trip), "{bars:?}");
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn files_fetched_with_no_paste_behind_them_send_no_files_pasted_notification() {
         let tmp = tempfile::tempdir().unwrap();
         let copied = tmp.path().join("report.bin");
@@ -4619,13 +4662,18 @@ mod tests {
                 let (b, _) = next_request(&mut remote).await;
                 send_data(&mut remote, b, 0, &second[..CHUNK], false).await;
                 let id = Crossing::Read(6).id();
+                // The name comes from the peer's offer: its first file, one more beside it.
                 let three_of_four = Bar {
                     id,
                     done: 3 * CHUNK as u64,
                     total: 4 * CHUNK as u64,
+                    headline: Some(progress::Headline {
+                        name: "a.bin".into(),
+                        more: 1,
+                    }),
                 };
                 within("the bar at three chunks of four", async {
-                    while home.seen.bars().last() != Some(&vec![three_of_four]) {
+                    while home.seen.bars().last() != Some(&vec![three_of_four.clone()]) {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 })
