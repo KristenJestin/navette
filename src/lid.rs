@@ -150,8 +150,6 @@ pub fn open(hypr: &dyn Hypr, record: &Path) -> io::Result<()> {
             answer => refused.push(format!("Hyprland refused `{rule}`: {answer}")),
         }
     }
-    #[cfg(test)]
-    std::thread::sleep(Duration::from_millis(100)); // TEMPORARY (#140)
     std::fs::remove_file(record)?;
     match refused.is_empty() {
         true => Ok(()),
