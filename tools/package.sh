@@ -1,5 +1,5 @@
 #!/bin/sh
-# Packs a built `navette` with its systemd user unit and a short install note, and writes the
+# Packs a built `navette` with its systemd user unit, its icon and a short install note, and writes the
 # SHA-256 checksum beside the archive. Prints the archive's file name.
 #
 #   tools/package.sh <version> <binary> <out-dir>
@@ -16,6 +16,7 @@ trap 'rm -rf "$stage"' EXIT
 mkdir "$stage/$name"
 install -m 755 "$binary" "$stage/$name/navette"
 install -m 644 "$root/dist/navette-agent.service" "$stage/$name/navette-agent.service"
+install -m 644 "$root/assets/brand/icon-pixel.svg" "$stage/$name/navette.svg"
 install -m 644 "$root/dist/INSTALL.md" "$stage/$name/INSTALL.md"
 
 mkdir -p "$out"
