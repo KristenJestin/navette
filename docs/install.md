@@ -32,7 +32,7 @@ and running it again (to update, say) changes nothing more. `~/.local/bin` must 
 commands from `sha256sum` on.
 
 Then, once `navette pair` has succeeded on the machine (see [the link](link.md)), the same unit
-on both machines runs what the pairing says: `navette serve --audio` at home, `navette agent` on
+on both machines runs what the pairing says: `navette serve --audio` at the desk, `navette agent` on
 the remote machine.
 
 ```

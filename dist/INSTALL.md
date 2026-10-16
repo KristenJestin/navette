@@ -10,9 +10,9 @@ It installs `~/.local/bin/navette`, the icon its notifications show, and the sys
 `navette.service` and `navette-agent.service`, then reloads the user manager. It enables and
 starts nothing, and running it again gives the same result.
 
-Then, on each machine, pair once (`navette pair --listen <LAN-address:port>` at home, which shows
-a PIN; `navette pair <home-address:port>` on the remote machine, which asks for it) and start the
-one unit, which runs what the pairing says (`serve` at home, `agent` on the remote machine):
+Then, on each machine, pair once (`navette pair --listen <LAN-address:port>` at the desk, which shows
+a PIN; `navette pair <desk-address:port>` on the remote machine, which asks for it) and start the
+one unit, which runs what the pairing says (`serve` at the desk, `agent` on the remote machine):
 
 ```
 systemctl --user enable --now navette

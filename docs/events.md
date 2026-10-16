@@ -40,10 +40,10 @@ mode runs (all names invented):
 {"v":1,"role":"desk","version":"0.2.0","state":"mode","peer":"FAR","peer_version":"0.2.3","mode":"office","monitors":["DP-2"],"modes":[{"name":"office","monitors":["DP-2"]}],"mic":"remote"}
 ```
 
-and on the remote machine meanwhile:
+and on the remote machine meanwhile (`NEAR` is the desk's `local_label`):
 
 ```json
-{"v":1,"role":"remote","version":"0.2.3","state":"mode","peer":null,"peer_version":"0.2.0","mode":null,"monitors":["NAVETTE-1"],"modes":[],"mic":null}
+{"v":1,"role":"remote","version":"0.2.3","state":"mode","peer":"NEAR","peer_version":"0.2.0","mode":null,"monitors":["NAVETTE-1"],"modes":[],"mic":null}
 ```
 
 The stream ends (end of file) when `serve` or `agent` stops. It also ends for one reader:
@@ -68,7 +68,7 @@ Every line has every field below, on both machines; a field that does not apply 
 | `role` | `"desk"` | `"remote"` |
 | `version` | this machine's Navette version, as `navette --version` says it (`0.0.0-dev` for a local build): with `peer_version`, a shell tells which side is older | the same |
 | `state` | [where it stands](#state) | the same |
-| `peer` | the remote machine's label: `remote_label` of `mode.conf` (the key before any section), `"REMOTE"` without one | `null`: the desk does not say its label over the link yet; a later version will |
+| `peer` | the remote machine's label: `remote_label` of `mode.conf` (the key before any section), `"REMOTE"` without one | the desk's label: the `local_label` of the desk's `mode.conf` (the key before any section), which the desk says over the link as it comes up; `null` before that, with a desk that sets none, and with a desk that does not say it (an older one) |
 | `peer_version` | the remote machine's Navette version, as its hello said it: while linked (the same minor as this machine's, perhaps another patch: a shell may say "one version behind"), and while `incompatible`; `"0.1"` for any 0.1.x, which does not say its patch; `null` otherwise | the desk's, the same way |
 | `mode` | the name of the mode running, starting or stopping; `null` for the unnamed mode (the one a `monitor =` before any `[section]` defines, alone or beside named modes), and with no mode | `null`: the desk does not say the mode's name over the link |
 | `monitors` | the desk's monitors the mode gives, left to right; `[]` with no mode | the outputs the remote machine makes for the desk (`NAVETTE-1`, ...), left to right; `[]` with no mode |
@@ -126,7 +126,7 @@ The desk's mic goes to one machine at a time ([the mic](mic.md)):
 | Value | Meaning |
 |---|---|
 | `off` | no mode runs, or the desk plays no sound (`navette serve` without `--audio`): the mic stays on the desk |
-| `home` | a mode runs, and the mic stays on the desk. A later version calls the desk "desk" everywhere and says `desk` here: read both as the same |
+| `desk` | a mode runs, and the mic stays on the desk. Before 0.2 the value was `home`: read both as the same |
 | `remote` | the mic goes to the remote machine |
 | `failed` | a mode runs, but the mic cannot go where it should; `navette mic toggle` says why |
 
@@ -148,10 +148,10 @@ answer line, `ok <text>` or `error <why>`, and the stream goes on: the connectio
 |---|---|---|
 | `start` | `navette mode start`: the mode `mode.conf` has (the unnamed one, or the only named one) | `ok DP-2 shows the remote machine's NAVETTE-1`, or `error <why>` |
 | `start <name>` | `navette mode start <name>` | the same |
-| `stop` | `navette mode stop` | `ok DP-2 is back home`, `ok no mode was running` |
-| `mic toggle` | `navette mic toggle` | `ok remote`, `ok home`, or `error <why>` |
+| `stop` | `navette mode stop` | `ok DP-2 is back on the desk`, `ok no mode was running` |
+| `mic toggle` | `navette mic toggle` | `ok remote`, `ok desk`, or `error <why>` |
 | `mic remote` | `navette mic remote` | the same |
-| `mic desk` | `navette mic home` (`mic home` is accepted too) | the same |
+| `mic desk` | `navette mic desk` (`mic home`, the word of 0.1, is accepted too and answers `ok desk`) | the same |
 
 - They are carried out by the very code that serves `navette mode` and `navette mic`, and say
   the same: the texts after `ok` and `error` are for a human, not to be parsed.
@@ -201,7 +201,7 @@ one passes through:
 | `waiting` | `waiting` | Waiting for FAR |
 | `away` | `away` | Not on the desk's network: not dialing it |
 | `dialing` | `dialing` | Dialing the desk, which does not answer yet |
-| `linked` | `linked` | FAR is linked, no mode runs (on the remote machine: The desk is linked, no mode runs) |
+| `linked` | `linked` | FAR is linked, no mode runs (on the remote machine: NEAR is linked, no mode runs, with the desk's label for `peer`, or The desk is linked without one) |
 | `starting` | `starting` | Starting mode office on DP-2 (on the remote machine: Making NAVETTE-1 for the desk) |
 | `mode` | the mode's name, or `mode` | Mode office runs on DP-2; mic: remote (on the remote machine: The desk drives NAVETTE-1) |
 | `stopping` | `stopping` | Giving DP-2 back |

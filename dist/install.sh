@@ -51,8 +51,8 @@ fi
 cat <<'NEXT'
 
 Next, on each machine:
-  1. navette pair, once: `navette pair --listen <LAN-address:port>` at home, which shows a PIN,
-     then `navette pair <home-address:port>` on the remote machine, which asks for it.
+  1. navette pair, once: `navette pair --listen <LAN-address:port>` at the desk, which shows a PIN,
+     then `navette pair <desk-address:port>` on the remote machine, which asks for it.
   2. systemctl --user enable --now navette
 
 navette-agent.service is kept for one minor version; navette.service replaces it.
