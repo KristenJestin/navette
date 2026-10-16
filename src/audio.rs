@@ -51,8 +51,11 @@ use codec::{Decoder, Encoder, FRAME_SAMPLES, MAX_PACKET};
 use jitter::Jitter;
 
 /// The remote's virtual sink.
-pub const SINK: &str = "navette-home-speakers";
-const SINK_DESCRIPTION: &str = "Home speakers (Navette)";
+pub const SINK: &str = "navette-desk-speakers";
+const SINK_DESCRIPTION: &str = "Desk speakers (Navette)";
+/// What 0.1 called the sink, before the desk was called the desk: a default it left behind is
+/// still ours to put back.
+const LEGACY_SINK: &str = "navette-home-speakers";
 /// Home's playback stream.
 pub const PLAYBACK: &str = "navette-remote-sound";
 const PLAYBACK_DESCRIPTION: &str = "Remote machine (Navette)";
@@ -409,6 +412,18 @@ pub trait Graph: Clone + Send + 'static {
     fn is_gone(&self, node: &Self::Node) -> bool;
 }
 
+/// Whether `name` is the node `ours` or what 0.1 called it.
+fn is_ours(name: Option<&str>, ours: &str) -> bool {
+    let legacy = if ours == SINK {
+        Some(LEGACY_SINK)
+    } else if ours == mic::SOURCE {
+        Some(mic::LEGACY_SOURCE)
+    } else {
+        None
+    };
+    name.is_some_and(|name| name == ours || Some(name) == legacy)
+}
+
 /// A default switched to a node of ours. Dropping it puts the previous default back.
 struct Switch<G: Graph> {
     graph: G,
@@ -423,7 +438,7 @@ impl<G: Graph> Switch<G> {
     fn save(graph: G, saved: Saved, device: Device, ours: &str) -> io::Result<Self> {
         let previous = match graph.default_node(device)? {
             // Left on our own node by an agent that died: the user's choice is the one it saved.
-            Some(current) if current.name() == Some(ours) => saved.load(device)?.flatten(),
+            Some(current) if is_ours(current.name(), ours) => saved.load(device)?.flatten(),
             current => current,
         };
         // Saved before switching, so that a crash from here on still knows what to put back.
@@ -480,12 +495,10 @@ pub(super) fn repair_one<G: Graph>(
     let Some(previous) = saved.load(device)? else {
         return Ok(());
     };
-    if graph
+    let current = graph
         .default_node(device)?
-        .and_then(|c| c.name().map(str::to_owned))
-        .as_deref()
-        == Some(ours)
-    {
+        .and_then(|c| c.name().map(str::to_owned));
+    if is_ours(current.as_deref(), ours) {
         graph.set_default_node(device, previous.as_ref())?;
     }
     saved.clear(device)

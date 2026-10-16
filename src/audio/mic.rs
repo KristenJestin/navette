@@ -20,8 +20,10 @@ use super::{
 };
 
 /// The remote's virtual source.
-pub const SOURCE: &str = "navette-home-mic";
-const SOURCE_DESCRIPTION: &str = "Home mic (Navette)";
+pub const SOURCE: &str = "navette-desk-mic";
+const SOURCE_DESCRIPTION: &str = "Desk mic (Navette)";
+/// What 0.1 called the source: see [`super::LEGACY_SINK`].
+pub(super) const LEGACY_SOURCE: &str = "navette-home-mic";
 /// Home's echo-cancelled mic.
 pub const MIC: &str = "navette-mic";
 const MIC_DESCRIPTION: &str = "Mic to the remote machine (Navette)";
