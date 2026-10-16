@@ -545,6 +545,7 @@ mod tests {
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::*;
+    use crate::link::Event;
     use crate::mic::NoSound;
 
     fn office() -> Driven {
@@ -573,7 +574,7 @@ mod tests {
     fn the_desk_running_a_mode_says_the_issue_s_example() {
         assert_eq!(
             desk_in(Link::Linked, Some(office())).line(),
-            r#"{"v":1,"role":"desk","state":"mode","peer":"FAR","mode":"office","monitors":["DP-2"],"modes":[{"name":"office","monitors":["DP-2"]}],"mic":"remote"}"#
+            r#"{"v":1,"role":"desk","state":"mode","peer":"FAR","peer_version":null,"mode":"office","monitors":["DP-2"],"modes":[{"name":"office","monitors":["DP-2"]}],"mic":"remote"}"#
         );
     }
 
@@ -656,7 +657,7 @@ mod tests {
         };
         assert_eq!(
             parts.line(),
-            r#"{"v":1,"role":"remote","state":"mode","peer":null,"mode":null,"monitors":["NAVETTE-1","NAVETTE-2"],"modes":[],"mic":null}"#
+            r#"{"v":1,"role":"remote","state":"mode","peer":null,"peer_version":null,"mode":null,"monitors":["NAVETTE-1","NAVETTE-2"],"modes":[],"mic":null}"#
         );
     }
 
@@ -999,7 +1000,15 @@ mod tests {
         let after = |link, event| link_after(link, &event);
         assert_eq!(after(Link::Dialing, Event::Away), Link::Away);
         assert_eq!(after(Link::Away, Event::Back), Link::Dialing);
-        assert_eq!(after(Link::Dialing, Event::Connected), Link::Linked);
+        assert_eq!(
+            after(
+                Link::Dialing,
+                Event::Connected {
+                    peer: "0.2.0".into()
+                }
+            ),
+            Link::Linked
+        );
         assert_eq!(
             after(Link::Linked, Event::Disconnected(error())),
             Link::Dialing
@@ -1012,6 +1021,69 @@ mod tests {
         );
         // What the agent could not save of its first link: it is linked all the same.
         assert_eq!(after(Link::Linked, Event::Failed(error())), Link::Linked);
+    }
+
+    fn refused(peer: &str) -> Event {
+        Event::Incompatible { peer: peer.into() }
+    }
+
+    fn linked_with(peer: &str) -> Event {
+        Event::Connected { peer: peer.into() }
+    }
+
+    #[test]
+    fn a_refused_version_says_incompatible_with_the_peer_s_version_on_each_side() {
+        let mut desk = Parts::desk();
+        heard(&mut desk, &refused("0.3.0"));
+        let line: serde_json::Value = serde_json::from_str(&desk.line()).unwrap();
+        assert_eq!(line["state"], "incompatible");
+        assert_eq!(line["peer_version"], "0.3.0");
+
+        let mut remote = Parts::remote();
+        heard(&mut remote, &refused("0.1"));
+        heard(&mut remote, &Event::Retrying(Duration::from_secs(60)));
+        let line: serde_json::Value = serde_json::from_str(&remote.line()).unwrap();
+        assert_eq!(line["state"], "incompatible");
+        assert_eq!(line["peer_version"], "0.1");
+        // Off the desk's network, it does not dial: away says more than the last refusal.
+        heard(&mut remote, &Event::Away);
+        assert_eq!(remote.state(), "away");
+    }
+
+    #[test]
+    fn the_same_minor_linked_says_the_peer_s_version_on_each_side() {
+        for mut parts in [Parts::desk(), Parts::remote()] {
+            parts.link = Link::Linked;
+            heard(&mut parts, &linked_with("0.2.3"));
+            let line: serde_json::Value = serde_json::from_str(&parts.line()).unwrap();
+            assert_eq!(line["state"], "linked");
+            assert_eq!(line["peer_version"], "0.2.3");
+        }
+    }
+
+    #[test]
+    fn a_link_after_a_refusal_clears_it_and_a_drop_forgets_the_version() {
+        let mut remote = Parts::remote();
+        heard(&mut remote, &refused("0.3.0"));
+        heard(&mut remote, &linked_with("0.2.0"));
+        assert_eq!(remote.state(), "linked");
+        assert_eq!(remote.peer_version.as_deref(), Some("0.2.0"));
+        heard(
+            &mut remote,
+            &Event::Disconnected(io::Error::other("invented")),
+        );
+        assert_eq!(remote.state(), "dialing");
+        assert_eq!(remote.peer_version, None);
+    }
+
+    #[test]
+    fn a_refusal_while_the_desk_is_linked_leaves_the_link_alone() {
+        let mut desk = Parts::desk();
+        heard(&mut desk, &linked_with("0.2.0"));
+        desk.link = Link::Linked;
+        heard(&mut desk, &refused("0.3.0"));
+        assert_eq!(desk.state(), "linked");
+        assert_eq!(desk.peer_version.as_deref(), Some("0.2.0"));
     }
 
     fn waybar_of(line: &str) -> serde_json::Value {
@@ -1073,6 +1145,20 @@ mod tests {
                 "linked",
                 "The desk is linked, no mode runs",
             ),
+            (
+                desk("incompatible", "null").replace(
+                    r#""peer":"FAR","#,
+                    r#""peer":"FAR","peer_version":"0.3.0","#,
+                ),
+                "incompatible",
+                "FAR runs Navette 0.3.0, another minor version: update the older machine",
+            ),
+            (
+                remote("incompatible")
+                    .replace(r#""peer":null,"#, r#""peer":null,"peer_version":"0.1","#),
+                "incompatible",
+                "The desk runs Navette 0.1, another minor version: update the older machine",
+            ),
         ];
         for (line, text, tooltip) in cases {
             let module = waybar_of(&line);
@@ -1097,11 +1183,11 @@ mod tests {
 
     #[test]
     fn an_unknown_field_or_value_does_not_break_watch_s_parser() {
-        let line = r#"{"v":1,"role":"desk","state":"incompatible","peer":"FAR","peer_version":"9.9.9","new":{"a":[1]},"mode":null,"monitors":[],"modes":[],"mic":"off"}"#;
+        let line = r#"{"v":1,"role":"desk","state":"later","peer":"FAR","peer_version":"9.9.9","new":{"a":[1]},"mode":null,"monitors":[],"modes":[],"mic":"off"}"#;
         let module = waybar_of(line);
-        assert_eq!(module["text"], "incompatible");
-        assert_eq!(module["class"], "incompatible");
-        assert_eq!(word(line).unwrap(), "incompatible");
+        assert_eq!(module["text"], "later");
+        assert_eq!(module["class"], "later");
+        assert_eq!(word(line).unwrap(), "later");
         let mut known = Parts::desk().line();
         known.insert_str(1, r#""later":true,"#);
         assert_eq!(waybar_of(&known)["class"], "waiting");

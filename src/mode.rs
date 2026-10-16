@@ -4205,6 +4205,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_status_says_the_remote_machine_runs_another_minor_and_which_to_update() {
+        let parts = Parts {
+            peer_version: Some("0.1".into()),
+            refused: true,
+            ..Parts::desk()
+        };
+        assert_eq!(
+            status(&parts),
+            format!(
+                "no mode is running; the remote machine is refused: {}",
+                crate::link::refusal("the remote", "0.1")
+            )
+        );
+        assert!(
+            status(&parts).contains("the remote runs Navette 0.1, this machine "),
+            "{}",
+            status(&parts)
+        );
+    }
+
     #[tokio::test]
     async fn the_status_of_the_unnamed_mode_has_no_name() {
         let desk = desk("DP-1");
