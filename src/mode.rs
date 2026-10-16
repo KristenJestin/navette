@@ -383,6 +383,9 @@ fn announce(home: &Home, pressed: &UnboundedSender<()>) {
     let Ok(mode) = Mode::read(&home.config_dir, None) else {
         return;
     };
+    if !mode.here_notice {
+        return;
+    }
     let pressed = pressed.clone();
     home.notifier.offer(
         &format!("{} is here", mode.look.remote_label),
@@ -1984,6 +1987,19 @@ mod tests {
         let _remote = connect(&desk);
         settle().await;
         assert_eq!(offers(&desk), [("REMOTE is here".into(), "Start".into())]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_here_notice_off_a_link_offers_nothing() {
+        let desk = desk("DP-2");
+        std::fs::write(
+            desk._config.path().join(CONFIG_FILE),
+            "monitor = DP-2\nhere_notice = off\n",
+        )
+        .unwrap();
+        let _remote = connect(&desk);
+        settle().await;
+        assert!(offers(&desk).is_empty());
     }
 
     #[tokio::test(start_paused = true)]

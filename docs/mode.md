@@ -43,7 +43,8 @@ A `[name]` section in `mode.conf` defines a mode of its own. The keys before the
 are the default of every mode: `release`, `mic` ([following the keyboard](mic.md#following-the-keyboard)), `mic_hotkey` and the corner's
 `remote_label`, `local_label`, `remote_bar` and `local_bar`, and
 [`local_above`](#homes-overlays) (a section may set its own), and a `monitor` among them is the one unnamed mode, so a file with no sections keeps
-working, and `navette mode start` with no name starts it.
+working, and `navette mode start` with no name starts it. One key is global only, because it
+is about the link and not about a mode: [`here_notice`](#running-it), which a section cannot set.
 
 ```
 release = ctrl+alt+q
@@ -104,7 +105,10 @@ the notification itself, that starts the default mode, as `navette mode start` d
 Dismissing it does nothing more. It comes a few seconds after the link, so that a mode started
 by your own setup as the laptop links is not offered what has just happened; it is not shown
 again while the link stays up, and shows again after the link drops and comes back. With no
-`mode.conf`, there is nothing to start and nothing is shown. It needs `notify-send` with
+`mode.conf`, there is nothing to start and nothing is shown. A shell that shows its own bubble
+for this can turn it off with `here_notice = off` among the keys before any section (`on` is
+the default; any other value is refused, naming the key): the link and everything else stay as
+they are. It needs `notify-send` with
 `--action` (libnotify 0.7.10 or later); without it, one line in the log says so and nothing
 else happens.
 
