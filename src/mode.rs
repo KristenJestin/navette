@@ -1593,6 +1593,8 @@ mod tests {
         refuse: bool,
         /// Whether it goes to the remote machine.
         remote: Mutex<bool>,
+        /// What the mode told it to call the machines.
+        names: Mutex<Option<Names>>,
     }
 
     impl FakeMic {
@@ -1604,7 +1606,8 @@ mod tests {
     }
 
     impl Mic for FakeMic {
-        fn start(&self, remote: bool) -> io::Result<()> {
+        fn start(&self, remote: bool, names: Names) -> io::Result<()> {
+            *self.names.lock().unwrap() = Some(names);
             let said = if remote { "start" } else { "start home" };
             self.log.lock().unwrap().push(said);
             if self.refuse {
@@ -1961,7 +1964,7 @@ mod tests {
         answer(ask(&desk, false).await).await.unwrap();
         assert_eq!(corners(&desk), []);
         let before = heard(&desk).len();
-        desk.board.say("Mic → home");
+        desk.board.say("Mic → desk");
         assert_eq!(heard(&desk).len(), before, "nobody hears the board");
     }
 
@@ -1973,14 +1976,65 @@ mod tests {
         released.send(Keyboard::Home).unwrap();
         until(|| {
             let heard = heard(&desk);
-            heard.contains(&said("DP-1", "Keyboard → home"))
-                && heard.contains(&said("DP-2", "Keyboard → home"))
+            heard.contains(&said("DP-1", "Keyboard → desk"))
+                && heard.contains(&said("DP-2", "Keyboard → desk"))
         })
         .await;
         released.send(Keyboard::Remote).unwrap();
         until(|| heard(&desk).contains(&said("DP-2", "Keyboard → remote"))).await;
         // In the corners only: the desktop's notifications said the start alone.
         assert_eq!(desk.notices.summaries(), ["DP-2 shows the remote machine"]);
+    }
+
+    #[tokio::test]
+    async fn the_corners_and_the_stop_name_the_machines_by_the_labels_of_the_mode() {
+        let desk = desk_with("remote_label = FAR\nlocal_label = NEAR\nmonitor = DP-2\n");
+        let _remote = started(&desk).await;
+        let released = desk.releases.lock().unwrap()[0].clone();
+        released.send(Keyboard::Home).unwrap();
+        until(|| heard(&desk).contains(&said("DP-2", "Keyboard → NEAR"))).await;
+        released.send(Keyboard::Remote).unwrap();
+        until(|| heard(&desk).contains(&said("DP-2", "Keyboard → FAR"))).await;
+        let text = answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(text, "DP-2 is back on NEAR");
+        assert_eq!(
+            desk.notices.summaries().last().map(String::as_str),
+            Some("DP-2 is back on NEAR")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_mic_is_handed_the_labels_of_the_mode_and_the_desk_and_remote_without() {
+        let desk = desk_with("remote_label = FAR\nlocal_label = NEAR\nmonitor = DP-2\n");
+        let _remote = started(&desk).await;
+        assert_eq!(
+            desk.mic.names.lock().unwrap().clone(),
+            Some(Names::new(Some("NEAR"), Some("FAR")))
+        );
+        let plain = self::desk("DP-2");
+        let _remote = started(&plain).await;
+        assert_eq!(
+            plain.mic.names.lock().unwrap().clone(),
+            Some(Names::default())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_on_a_monitor_that_is_not_there_says_which_desk_lacks_it() {
+        let desk = desk_with("local_label = NEAR\nmonitor = DP-9\n");
+        let _remote = connect(&desk);
+        let error = answer(ask(&desk, true).await).await.unwrap_err();
+        assert!(
+            error.to_string().contains("no monitor DP-9 on NEAR ("),
+            "{error}"
+        );
+        let plain = self::desk("DP-9");
+        let _remote = connect(&plain);
+        let error = answer(ask(&plain, true).await).await.unwrap_err();
+        assert!(
+            error.to_string().contains("no monitor DP-9 on the desk ("),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -1991,7 +2045,7 @@ mod tests {
         answer(ask(&desk, false).await).await.unwrap();
         assert_eq!(
             desk.notices.summaries(),
-            ["DP-2 shows the remote machine", "DP-2 is back home"]
+            ["DP-2 shows the remote machine", "DP-2 is back on the desk"]
         );
         answer(ask(&desk, false).await).await.unwrap();
         assert_eq!(desk.notices.summaries().len(), 2, "said once");
@@ -3663,7 +3717,7 @@ mod tests {
                         let _ = reply.send(Err(io::Error::other(why)));
                     }
                     Order::Stop(reply) => {
-                        let _ = reply.send(Ok("DP-1 is back home".into()));
+                        let _ = reply.send(Ok("DP-1 is back on the desk".into()));
                     }
                     Order::Status(reply) => {
                         let _ = reply.send(Ok("no mode is running".into()));
@@ -3677,7 +3731,10 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700);
-        assert_eq!(order(&path, "stop").await.unwrap(), "DP-1 is back home");
+        assert_eq!(
+            order(&path, "stop").await.unwrap(),
+            "DP-1 is back on the desk"
+        );
         let error = order(&path, "start").await.unwrap_err();
         assert_eq!(error.to_string(), "no monitor X for None");
         let error = order(&path, &start_order(Some("office")).unwrap())
@@ -3862,7 +3919,7 @@ mod tests {
             "{rules:?}"
         );
         let text = answer(ask(&desk, false).await).await.unwrap();
-        assert_eq!(text, "DP-3, DP-2 are back home");
+        assert_eq!(text, "DP-3, DP-2 are back on the desk");
         let rules = desk.hypr.window_rules();
         assert_eq!(rules.len(), 4, "{rules:?}");
         assert!(rules[2..].iter().all(|r| r.contains("enabled = false")));
@@ -4095,7 +4152,7 @@ mod tests {
         let text = answer(second).await.unwrap();
         assert_eq!(
             text,
-            "mode `office` stopped, DP-1 is back home; \
+            "mode `office` stopped, DP-1 is back on the desk; \
              DP-2 shows the remote machine's NAVETTE-1"
         );
         assert_eq!(*desk.covered.lock().unwrap(), ["DP-2"]);
@@ -4172,7 +4229,7 @@ mod tests {
         answer(first).await.unwrap();
         assert_eq!(
             answer(ask(&desk, false).await).await.unwrap(),
-            "DP-2 is back home"
+            "DP-2 is back on the desk"
         );
         assert!(desk.covered.lock().unwrap().is_empty());
     }
@@ -4371,7 +4428,7 @@ mod tests {
         let error = answer(ask_mode(&desk, "travel").await).await.unwrap_err();
         assert_eq!(
             error.to_string(),
-            "mode `office` stopped, DP-1 is back home; \
+            "mode `office` stopped, DP-1 is back on the desk; \
              mode `travel` could not start: no layer shell"
         );
         // The first mode really is given back, and the second left nothing.
@@ -4410,20 +4467,20 @@ mod tests {
         let error = answer(second).await.unwrap_err();
         assert_eq!(
             error.to_string(),
-            "mode `office` stopped, DP-1 is back home; mode `travel` could not start: \
+            "mode `office` stopped, DP-1 is back on the desk; mode `travel` could not start: \
              the remote machine could not make its output: NAVETTE-1: no encoder"
         );
     }
 
     #[test]
     fn an_error_of_a_switch_drops_the_nothing_was_changed_of_the_new_mode_only() {
-        let switched = Some("mode `a` stopped, DP-1 is back home");
+        let switched = Some("mode `a` stopped, DP-1 is back on the desk");
         let error = io::Error::new(io::ErrorKind::NotFound, "no monitor X; nothing was changed");
         let said = switch_error(switched, "mode `b`", error);
         assert_eq!(said.kind(), io::ErrorKind::NotFound);
         assert_eq!(
             said.to_string(),
-            "mode `a` stopped, DP-1 is back home; mode `b` could not start: no monitor X"
+            "mode `a` stopped, DP-1 is back on the desk; mode `b` could not start: no monitor X"
         );
         // No switch: the error is the one it was.
         let error = io::Error::other("no monitor X; nothing was changed");
