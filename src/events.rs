@@ -620,7 +620,10 @@ mod tests {
     fn the_desk_running_a_mode_says_the_issue_s_example() {
         assert_eq!(
             desk_in(Link::Linked, Some(office())).line(),
-            r#"{"v":1,"role":"desk","state":"mode","peer":"FAR","peer_version":null,"mode":"office","monitors":["DP-2"],"modes":[{"name":"office","monitors":["DP-2"]}],"mic":"remote"}"#
+            format!(
+                r#"{{"v":1,"role":"desk","version":"{}","state":"mode","peer":"FAR","peer_version":null,"mode":"office","monitors":["DP-2"],"modes":[{{"name":"office","monitors":["DP-2"]}}],"mic":"remote"}}"#,
+                crate::link::NAVETTE_VERSION
+            )
         );
     }
 
@@ -703,7 +706,10 @@ mod tests {
         };
         assert_eq!(
             parts.line(),
-            r#"{"v":1,"role":"remote","state":"mode","peer":null,"peer_version":null,"mode":null,"monitors":["NAVETTE-1","NAVETTE-2"],"modes":[],"mic":null}"#
+            format!(
+                r#"{{"v":1,"role":"remote","version":"{}","state":"mode","peer":null,"peer_version":null,"mode":null,"monitors":["NAVETTE-1","NAVETTE-2"],"modes":[],"mic":null}}"#,
+                crate::link::NAVETTE_VERSION
+            )
         );
     }
 
@@ -1123,6 +1129,33 @@ mod tests {
     }
 
     #[test]
+    fn every_line_says_this_machine_s_own_version() {
+        for parts in [Parts::desk(), Parts::remote()] {
+            let line: serde_json::Value = serde_json::from_str(&parts.line()).unwrap();
+            assert_eq!(line["version"], crate::link::NAVETTE_VERSION);
+        }
+    }
+
+    #[test]
+    fn a_desk_that_does_not_answer_after_a_refusal_is_dialing_not_incompatible() {
+        let mut remote = Parts::remote();
+        link_heard(&mut remote, &refused("0.3.0"));
+        assert_eq!(remote.state(), "incompatible");
+        let down = || io::Error::from(io::ErrorKind::ConnectionRefused);
+        link_heard(&mut remote, &Event::Failed(down()));
+        assert_eq!(remote.state(), "dialing");
+        assert_eq!(remote.peer_version, None);
+        link_heard(&mut remote, &Event::Away);
+        link_heard(&mut remote, &Event::Back);
+        assert_eq!(remote.state(), "dialing");
+        // What the agent could not save of a link that is up leaves its version alone.
+        link_heard(&mut remote, &linked_with("0.2.0"));
+        link_heard(&mut remote, &Event::Failed(io::Error::other("invented")));
+        assert_eq!(remote.state(), "linked");
+        assert_eq!(remote.peer_version.as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
     fn a_refusal_while_the_desk_is_linked_leaves_the_link_alone() {
         let mut desk = Parts::desk();
         link_heard(&mut desk, &linked_with("0.2.0"));
@@ -1204,6 +1237,22 @@ mod tests {
                     .replace(r#""peer":null,"#, r#""peer":null,"peer_version":"0.1","#),
                 "incompatible",
                 "The desk runs Navette 0.1, another minor version: update the older machine",
+            ),
+            (
+                desk("incompatible", "null").replace(
+                    r#""role":"desk","#,
+                    r#""role":"desk","version":"0.2.1","peer_version":"0.3.0","#,
+                ),
+                "incompatible",
+                "FAR runs Navette 0.3.0, this machine 0.2.1: update this machine",
+            ),
+            (
+                remote("incompatible").replace(
+                    r#""role":"remote","#,
+                    r#""role":"remote","version":"0.2.1","peer_version":"0.1","#,
+                ),
+                "incompatible",
+                "The desk runs Navette 0.1, this machine 0.2.1: update the desk",
             ),
         ];
         for (line, text, tooltip) in cases {

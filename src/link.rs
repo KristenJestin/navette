@@ -1013,6 +1013,18 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_old_hello_is_refused_even_by_a_0_1_beta() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let old = async {
+            write_frame(&mut b, &[HELLO, 2]).await.unwrap();
+            b
+        };
+        // The beta after 0.1.0 is 0.1.1-beta.N, of 0.1's minor: 0.1 cannot read its hello.
+        let (heard, _b) = tokio::join!(hello_as(&mut a, fast(), "0.1.1-beta.3"), old);
+        assert_eq!(refused_for(heard).as_deref(), Some("0.1"));
+    }
+
     #[test]
     fn the_refusal_names_the_machine_to_update() {
         assert_eq!(
@@ -1563,12 +1575,12 @@ pub(crate) mod tests {
     }
 
     /// The same, dialing with `dialer`.
-    fn gated_agent_dialing(
+    fn gated_agent_dialing<D: Dial + Clone + Send + Sync + 'static>(
         store: &Store,
         tables: FakeTables,
-        dialer: Counted,
+        dialer: D,
     ) -> (
-        Counted,
+        D,
         tokio::task::JoinHandle<()>,
         mpsc::UnboundedReceiver<Event>,
     ) {
@@ -1694,6 +1706,40 @@ pub(crate) mod tests {
         tokio::time::sleep(2 * A_FEW_SECONDS).await;
         assert_eq!(dialer.dials.load(Ordering::SeqCst), 2);
         agent.abort();
+    }
+
+    /// A desk of another minor that refuses the agent and keeps its end open: whether the agent
+    /// hung up before its wait.
+    #[derive(Clone, Default)]
+    struct Refusing {
+        hung_up: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    impl Dial for Refusing {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn dial(&self) -> io::Result<Self::Stream> {
+            let (agent_side, mut home_side) = tokio::io::duplex(1024);
+            let hung_up = self.hung_up.clone();
+            tokio::spawn(async move {
+                let _ = hello_as(&mut home_side, Heartbeat::default(), "9.0.0").await;
+                let read = tokio::time::timeout(A_FEW_SECONDS, read_frame(&mut home_side)).await;
+                hung_up.lock().unwrap().push(matches!(read, Ok(Err(_))));
+                std::future::pending::<()>().await;
+            });
+            Ok(agent_side)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_agent_refused_for_its_version_hangs_up_before_it_waits() {
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let (desk, agent, mut events) =
+            gated_agent_dialing(&store, FakeTables::behind(HOME_ROUTER), Refusing::default());
+        while !matches!(next(&mut events).await, Event::Retrying(_)) {}
+        tokio::time::sleep(2 * A_FEW_SECONDS).await;
+        agent.abort();
+        assert_eq!(*desk.hung_up.lock().unwrap(), [true]);
     }
 
     #[tokio::test(start_paused = true)]
