@@ -339,3 +339,23 @@ fn an_agent_starts_after_the_previous_one_crashed() {
     let next = Navette::start(&remote, &["agent"]);
     next.wait_for("link up");
 }
+
+#[test]
+fn mode_list_json_without_serve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Navette::start(tmp.path(), &["mode", "list", "--json"]).finish();
+    assert_eq!(output, "[]\n", "no mode.conf: no mode");
+    fs::write(
+        tmp.path().join("mode.conf"),
+        "[default]\nmonitor = DP-2\n[office]\nmonitor = DP-1, DP-2\n",
+    )
+    .unwrap();
+    let (status, output) =
+        Navette::start(tmp.path(), &["mode", "list", "--json"]).finish_with_status();
+    assert!(status.success(), "{output}");
+    assert_eq!(
+        output,
+        "[{\"name\":\"default\",\"monitors\":[\"DP-2\"]},\
+         {\"name\":\"office\",\"monitors\":[\"DP-1\",\"DP-2\"]}]\n"
+    );
+}

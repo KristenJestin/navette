@@ -139,7 +139,11 @@ enum ModeAction {
     /// The monitors come back home.
     Stop,
     /// Say the modes `mode.conf` defines and their monitors.
-    List,
+    List {
+        /// One array of JSON: `[{"name":..,"monitors":[..]}]`, the unnamed mode's name null.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -426,8 +430,11 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let order = match action {
                 ModeAction::Start { name } => mode::start_order(name.as_deref())?,
                 ModeAction::Stop => "stop".to_string(),
-                ModeAction::List => {
-                    println!("{}", mode::list(store.dir())?);
+                ModeAction::List { json } => {
+                    match json {
+                        true => println!("{}", mode::list_json(store.dir())?),
+                        false => println!("{}", mode::list(store.dir())?),
+                    }
                     return Ok(());
                 }
             };

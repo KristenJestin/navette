@@ -17,6 +17,21 @@ use tokio::sync::{oneshot, watch};
 use crate::mic::{self, Routing};
 use crate::mode;
 
+/// The `modes` array, as `navette mode list --json` prints it too.
+pub fn modes_json(modes: &[Defined]) -> String {
+    let modes: Vec<String> = modes
+        .iter()
+        .map(|m| {
+            format!(
+                r#"{{"name":{},"monitors":{}}}"#,
+                serde_json::json!(m.name),
+                serde_json::json!(m.monitors)
+            )
+        })
+        .collect();
+    format!("[{}]", modes.join(","))
+}
+
 /// The contract's version, said on every line: it changes only when a field or a value changes
 /// meaning or goes away, never for a new one (`docs/events.md`).
 pub const VERSION: u32 = 1;
@@ -146,17 +161,6 @@ impl Parts {
     pub fn line(&self) -> String {
         use serde_json::json;
         let shown = self.shown();
-        let modes: Vec<String> = self
-            .modes
-            .iter()
-            .map(|m| {
-                format!(
-                    r#"{{"name":{},"monitors":{}}}"#,
-                    json!(m.name),
-                    json!(m.monitors)
-                )
-            })
-            .collect();
         // Written field by field, in the contract's order, for a human reading it: a JSON map
         // would sort them.
         let fields = [
@@ -172,7 +176,7 @@ impl Parts {
                 "monitors",
                 json!(shown.map_or(&[][..], |d| &d.monitors)).to_string(),
             ),
-            ("modes", format!("[{}]", modes.join(","))),
+            ("modes", modes_json(&self.modes)),
             ("mic", json!(self.mic.map(mic::Status::word)).to_string()),
         ];
         let fields: Vec<String> = fields
@@ -392,7 +396,6 @@ async fn answer(commands: &Commands, line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
     use tokio::net::unix::OwnedWriteHalf;
     use tokio::sync::mpsc::UnboundedReceiver;

@@ -1256,6 +1256,16 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| io::Error::other(e.to_string()))?
 }
 
+/// `navette mode list --json`: the modes of `mode.conf`, as the events say them; none without
+/// the file.
+pub fn list_json(config_dir: &Path) -> io::Result<String> {
+    match config::defined(config_dir) {
+        Ok(modes) => Ok(crate::events::modes_json(&modes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(crate::events::modes_json(&[])),
+        Err(e) => Err(e),
+    }
+}
+
 /// The desk's state as `serve` starts, with what `mode.conf` says.
 pub fn events(config_dir: &Path) -> Arc<Events> {
     Events::new(Parts {
