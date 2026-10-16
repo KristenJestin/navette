@@ -14,7 +14,9 @@ as long as it follows [the reader's rule](#the-readers-rule).
 `$XDG_RUNTIME_DIR/navette/events.sock`, on both machines.
 
 - `navette serve` opens it on the desk and `navette agent` on the remote machine, as they start,
-  whoever starts them (a systemd user unit, a terminal, a script). It goes away with them.
+  whoever starts them (a systemd user unit, a terminal, a script). When they stop, the socket
+  file may stay behind, but nothing answers on it: connecting fails, which is how a reader
+  knows neither runs, and the next start replaces it.
 - It is a Unix socket, readable and writable by the user only (`0600`, in a `0700` directory).
   It is local: the remote machine still listens on no network interface.
 - A socket left behind by a crash is replaced at the next start. A second `navette serve` on the
@@ -66,9 +68,9 @@ Every line has every field below, on both machines; a field that does not apply 
 | `role` | `"desk"` | `"remote"` |
 | `state` | [where it stands](#state) | the same |
 | `peer` | the remote machine's label: `remote_label` of `mode.conf` (the key before any section), `"REMOTE"` without one | `null`: the desk does not say its label over the link yet; a later version will |
-| `mode` | the name of the mode running, starting or stopping; `null` for the unnamed mode (a `mode.conf` without sections), and with no mode | `null`: the desk does not say the mode's name over the link |
+| `mode` | the name of the mode running, starting or stopping; `null` for the unnamed mode (the one a `monitor =` before any `[section]` defines, alone or beside named modes), and with no mode | `null`: the desk does not say the mode's name over the link |
 | `monitors` | the desk's monitors the mode gives, left to right; `[]` with no mode | the outputs the remote machine makes for the desk (`NAVETTE-1`, ...), left to right; `[]` with no mode |
-| `modes` | every mode `mode.conf` defines, as `[{"name": ..., "monitors": [...]}]`, the unnamed one with `"name": null`; a mode the file gets wrong is left out, and so is everything without the file | `[]` |
+| `modes` | every mode `mode.conf` defines, as `[{"name": ..., "monitors": [...]}]`, the unnamed one with `"name": null`; a mode the file gets wrong is left out; without the file, or with a file that cannot be read at all (a broken `[section]` line, say), `[]` | `[]` |
 | `mic` | [where the desk's mic goes](#mic) | `null`: the remote machine does not know where the desk's mic goes |
 
 `monitors` in `modes` are written as `mode.conf` writes them: an output name (`DP-2`) or a
@@ -219,6 +221,9 @@ that reads each line with `JSON.parse`, and the socket itself or `navette` to se
 
 The desk's modes as the `modes` field says them, one JSON array, read from `mode.conf` without
 `navette serve`: a launcher can read it at session start. Without `mode.conf` it prints `[]`.
+A mode the file gets wrong is left out, as in the `modes` field. A file that cannot be read at
+all is an error here, as with `navette mode list`: the command says why on stderr and exits with
+1, while the `modes` field of the events says `[]`.
 
 ```json
 [{"name":"office","monitors":["DP-2"]},{"name":"all","monitors":["DP-1","DP-2"]}]
