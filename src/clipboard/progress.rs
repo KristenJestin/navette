@@ -4,7 +4,7 @@
 //! serves: home shows both, whichever machine pasted.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -122,8 +122,8 @@ pub struct Progress {
     ticking: Rc<Cell<bool>>,
     runs: Rc<Cell<u64>>,
     /// The copies whose serving the user stopped: the peer's next requests for them are
-    /// refused, rather than start them again.
-    stopped: Rc<RefCell<HashSet<u32>>>,
+    /// refused, rather than start them again. Whether the refusal was said already.
+    stopped: Rc<RefCell<HashMap<u32, bool>>>,
 }
 
 impl Progress {
@@ -173,7 +173,7 @@ impl Progress {
     /// The meter, stop flag and run of the peer's paste of copy `serial`, started now with
     /// `total` bytes to serve unless it runs already; none once the user stopped it.
     pub fn serving(&self, serial: u32, total: u64) -> Option<(Meter, Rc<Cell<bool>>, u64)> {
-        if self.stopped.borrow().contains(&serial) {
+        if self.stopped.borrow().contains_key(&serial) {
             return None;
         }
         let crossing = Crossing::Serve(serial);
@@ -186,6 +186,15 @@ impl Progress {
         let (done, stopped) = (Meter::default(), Rc::new(Cell::new(false)));
         let run = self.start(crossing, total, done.clone(), Stop::Source(stopped.clone()));
         Some((done, stopped, run))
+    }
+
+    /// Whether this is the first refusal of the stopped copy `serial` to say: one cancel is said
+    /// once, however many times the peer's application asks again.
+    pub fn first_refusal(&self, serial: u32) -> bool {
+        self.stopped
+            .borrow_mut()
+            .get_mut(&serial)
+            .is_some_and(|said| !std::mem::replace(said, true))
     }
 
     /// `crossing`'s `run` is over; the bar loses it at its next move.
@@ -253,7 +262,7 @@ impl Progress {
             Stop::Source(stopped) => stopped.set(true),
         }
         if let Crossing::Serve(serial) = crossing {
-            self.stopped.borrow_mut().insert(serial);
+            self.stopped.borrow_mut().insert(serial, false);
         }
         Some(crossing)
     }
