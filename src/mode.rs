@@ -2748,7 +2748,16 @@ mod tests {
         let _remote = started(&desk).await;
         desk.events.send(hypr::Event::Placed).unwrap();
         desk.events.send(hypr::Event::ConfigReloaded).unwrap();
-        until(|| !desk.pokes.lock().unwrap().is_empty()).await;
+        // Events are handled in order, so Placed is over before the reload's poke: waiting for
+        // that poke (taken after the 3 rules are sent again) also waits out a wrong poke on Placed.
+        until(|| {
+            desk.pokes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, rules)| *rules == 6)
+        })
+        .await;
         assert_eq!(desk.pokes.lock().unwrap().len(), 1);
     }
 
@@ -2793,10 +2802,16 @@ mod tests {
         assert_eq!(left.len(), 2, "{left:?}");
         let _remote = started(&desk).await;
         let rules = desk.hypr.layer_rules();
-        assert!(rules[2].ends_with("enabled = false }"), "{rules:?}");
-        assert!(rules[3].ends_with("enabled = false }"), "{rules:?}");
-        assert_eq!(rules[2][..30], left[1][..30]);
-        assert_eq!(rules[3][..30], left[0][..30]);
+        // Each leftover is undone by its full name, the last one set first.
+        let name = |rule: &str| rule[2..rule.find(',').unwrap()].to_string();
+        assert_eq!(
+            rules[2],
+            format!("{{ {}, enabled = false }}", name(&left[1]))
+        );
+        assert_eq!(
+            rules[3],
+            format!("{{ {}, enabled = false }}", name(&left[0]))
+        );
     }
 
     #[tokio::test]
