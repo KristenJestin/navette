@@ -4,7 +4,7 @@
 use std::fmt;
 use std::io;
 
-use crate::store::Store;
+use crate::store::{Role, Store};
 
 /// The exit status of a refusal (`EX_CONFIG`): the unit lists it in `RestartPreventExitStatus`,
 /// so that a machine with no usable pairing does not restart in a loop.
@@ -32,14 +32,34 @@ impl fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+impl From<Refused> for io::Error {
+    fn from(refused: Refused) -> Self {
+        io::Error::other(refused)
+    }
+}
+
 /// What to run, from the pairing in `store`.
-pub fn plan(_store: &Store, _audio: bool) -> Result<Plan, Refused> {
-    Err(Refused("not written yet".into()))
+pub fn plan(store: &Store, audio: bool) -> Result<Plan, Refused> {
+    let pairing = store
+        .pairing()
+        // A file that does not read does not heal by itself: restarting would only spin.
+        .map_err(|e| Refused(e.to_string()))?
+        .ok_or_else(|| Refused("not paired; run navette pair first".into()))?;
+    // No wildcard: a role added later must say here what it runs.
+    Ok(match pairing.role {
+        Role::Home => Plan::Serve { audio },
+        Role::Remote => Plan::Agent {
+            audio_ignored: audio,
+        },
+    })
 }
 
 /// The exit status for `error`: [`REFUSED`] for a refusal, 1 for anything else.
-pub fn exit_code(_error: &io::Error) -> u8 {
-    1
+pub fn exit_code(error: &io::Error) -> u8 {
+    match error.get_ref() {
+        Some(inner) if inner.is::<Refused>() => REFUSED,
+        _ => 1,
+    }
 }
 
 #[cfg(test)]

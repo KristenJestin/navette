@@ -91,7 +91,8 @@ impl Store {
         };
         let damaged = || io::Error::other(format!("{} is damaged: pair again", path.display()));
         let text = String::from_utf8(bytes).map_err(|_| damaged())?;
-        let (mut role, mut peer, mut address) = (None, None, None);
+        let (mut peer, mut address) = (None, None);
+        let mut role = Err("has no `role` key".to_string());
         // Absent from a pairing made before it was recorded; present, it must read.
         let mut gateway = Ok(None);
         for line in text.lines() {
@@ -102,9 +103,9 @@ impl Store {
             match key.trim() {
                 "role" => {
                     role = match value {
-                        "home" => Some(Role::Home),
-                        "remote" => Some(Role::Remote),
-                        _ => None,
+                        "home" => Ok(Role::Home),
+                        "remote" => Ok(Role::Remote),
+                        _ => Err(format!("has `role = {value}`, which is not home or remote")),
                     }
                 }
                 "peer" => peer = Fingerprint::from_hex(value),
@@ -113,8 +114,11 @@ impl Store {
                 _ => {}
             }
         }
-        match (role, peer, address, gateway) {
-            (Some(role), Some(peer), Some(address), Ok(gateway)) => Ok(Some(Pairing {
+        // A role that does not read is named: it is the key a hand edit gets wrong.
+        let role =
+            role.map_err(|why| io::Error::other(format!("{} {why}: pair again", path.display())))?;
+        match (peer, address, gateway) {
+            (Some(peer), Some(address), Ok(gateway)) => Ok(Some(Pairing {
                 role,
                 peer,
                 address,
