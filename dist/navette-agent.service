@@ -1,0 +1,29 @@
+# The Navette agent on the remote machine: a systemd user service, no root. It only dials out
+# to the paired home machine and never listens.
+#
+# Install (once `navette pair <home:port>` has succeeded):
+#   cargo install --locked --path . --root ~/.local
+#   install -Dm644 dist/navette-agent.service ~/.config/systemd/user/navette-agent.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now navette-agent
+# Logs: journalctl --user -u navette-agent
+
+[Unit]
+Description=Navette agent: keeps the link to the paired home machine
+# Stopped before PipeWire, so it can put the previous default output back. Ordered only, not
+# wanted: `Wants=` would start PipeWire with the agent, which needs it only once home asks for
+# the sound, and connects then.
+After=pipewire.service wireplumber.service
+
+[Service]
+ExecStart=%h/.local/bin/navette agent
+# The agent redials on its own; this only covers a crash or a missing pairing.
+Restart=on-failure
+RestartSec=10
+# No `NoNewPrivileges=`: the clipboard's virtual folder is mounted by `fusermount3`, which is
+# setuid; with it, the mount fails and a paste of files fetches them all first. The line was a
+# thin layer for a user service anyway: the agent can already reach the user's own service
+# manager over D-Bus, and so start a process without it.
+
+[Install]
+WantedBy=default.target

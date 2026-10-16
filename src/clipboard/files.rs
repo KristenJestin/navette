@@ -1,0 +1,921 @@
+//! Files on the clipboard. On the copying side, what a copy offers: the files the user copied,
+//! directories walked, links and special files left out and named, read again only at paste
+//! time. On the pasting side, where the peer's files go: a private temporary folder, filled through a hidden folder of its own so a cancelled or failed paste leaves
+//! no half-written file, and never outside it or over a file already there, whatever names the
+//! peer sends.
+//!
+//! The walk adapts gliff's `crates/gliff-transport/src/clipboard/files.rs` (MIT, Copyright (c)
+//! 2026 Kevin McConnell; the notice is in full in `src/clipboard.rs`), without its 4 GiB cap:
+//! a copy of any size is offered.
+
+use std::ffi::{CString, OsStr, OsString};
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use gliff_proto::ClipboardFile;
+use gliff_proto::clipboard::{MAX_FILE_ENTRIES, MAX_FILE_PATH_BYTES, safe_relative_path};
+use gliff_transport::clipboard::files::LocalFiles;
+
+use super::progress::Headline;
+use super::vfs::{Fuse, Mounter};
+
+/// What a copy of files offers the peer, and what it leaves out.
+#[derive(Debug, Default)]
+pub struct Copied {
+    pub files: LocalFiles,
+    /// Links and special files (sockets, pipes, devices), by their path in the offer.
+    pub skipped: Vec<String>,
+    /// When each entry last changed: with its path and size, what tells a copy made again of
+    /// the same files from a copy of files changed since.
+    pub modified: Vec<Option<SystemTime>>,
+}
+
+/// Walks the copied paths. Directories are listed recursively; a link is never followed, so a
+/// loop cannot run the walk forever and a copy never reaches past what was copied. Fails when
+/// there are more entries, or longer names, than an offer carries: a huge selection is not
+/// offered at all rather than offered in part.
+pub fn list(roots: &[PathBuf]) -> io::Result<Copied> {
+    let mut out = Copied::default();
+    for root in roots {
+        let name = root
+            .file_name()
+            .ok_or_else(|| invalid(format!("{} has no file name", root.display())))?;
+        walk(root, Path::new(name), &mut out)?;
+    }
+    validate(&out.files.entries).map_err(invalid)?;
+    Ok(out)
+}
+
+fn walk(path: &Path, rel: &Path, out: &mut Copied) -> io::Result<()> {
+    let rel_str = rel
+        .to_str()
+        .ok_or_else(|| invalid(format!("{} is not UTF-8", rel.display())))?
+        .to_string();
+    let meta = std::fs::symlink_metadata(path)?;
+    let kind = meta.file_type();
+    if !kind.is_dir() && !kind.is_file() {
+        out.skipped.push(rel_str);
+        return Ok(());
+    }
+    if out.files.entries.len() >= MAX_FILE_ENTRIES {
+        return Err(invalid(format!(
+            "more than {MAX_FILE_ENTRIES} files copied"
+        )));
+    }
+    out.files.entries.push(ClipboardFile {
+        path: rel_str,
+        size: if kind.is_dir() { 0 } else { meta.len() },
+        dir: kind.is_dir(),
+    });
+    out.files.paths.push(path.to_path_buf());
+    out.modified.push(meta.modified().ok());
+    if kind.is_dir() {
+        let mut children: Vec<_> = std::fs::read_dir(path)?
+            .map(|entry| entry.map(|e| e.file_name()))
+            .collect::<io::Result<_>>()?;
+        children.sort();
+        for child in children {
+            walk(&path.join(&child), &rel.join(&child), out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the entries of a peer's offer are acceptable: every path relative, without `..`,
+/// and distinct, none at the top named like a staging folder (the sweep of stale ones would
+/// remove it from the inbox); no more entries and name bytes than an offer carries. Whatever
+/// their total size, as long as it can be counted: the free space is checked at paste time.
+pub fn validate(files: &[ClipboardFile]) -> Result<(), String> {
+    if files.len() > MAX_FILE_ENTRIES {
+        return Err(format!("more than {MAX_FILE_ENTRIES} files"));
+    }
+    let names: usize = files.iter().map(|f| f.path.len()).sum();
+    if names > MAX_FILE_PATH_BYTES {
+        return Err(format!("names longer than {MAX_FILE_PATH_BYTES} bytes"));
+    }
+    if total(files).is_none() {
+        return Err("sizes past what a count holds".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for f in files {
+        let path =
+            safe_relative_path(&f.path).ok_or_else(|| format!("unsafe name {:?}", f.path))?;
+        let top = path.components().next().map(|c| c.as_os_str().as_bytes());
+        let staging = top.is_some_and(|top| top.starts_with(STAGING.as_bytes()));
+        if staging || !seen.insert(path) || (f.dir && f.size != 0) {
+            return Err(format!("bad entry {:?}", f.path));
+        }
+    }
+    Ok(())
+}
+
+/// The bytes the entries hold, none past what a count holds: a peer can name any sizes.
+pub fn total(files: &[ClipboardFile]) -> Option<u64> {
+    files
+        .iter()
+        .try_fold(0u64, |sum, f| sum.checked_add(f.size))
+}
+
+// How many headlines this thread computed, so a test can tell a copy named once from a copy
+// named again for each of its files.
+#[cfg(test)]
+thread_local! {
+    pub static HEADLINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What names a copy in the corner's bar: the first of the entries at the top of the copy, and
+/// how many others sit beside it. A folder's files do not count, only what the user copied.
+pub fn headline(files: &[ClipboardFile]) -> Option<Headline> {
+    #[cfg(test)]
+    HEADLINES.with(|n| n.set(n.get() + 1));
+    // A copy holds up to `MAX_FILE_ENTRIES` entries, all at the top when it is flat: a set keeps
+    // the pass linear.
+    let mut seen = std::collections::HashSet::new();
+    let mut tops = Vec::new();
+    for f in files {
+        let top = f.path.split('/').next().unwrap_or_default();
+        if seen.insert(top) {
+            tops.push(top);
+        }
+    }
+    let name = tops.first()?.to_string();
+    Some(Headline {
+        name,
+        more: tops.len() - 1,
+    })
+}
+
+/// Opens a copied file to serve it, at paste time: only a regular file, and never through a
+/// link put in its place since the copy (nor a pipe that would block the read).
+pub fn open_copied(path: &Path) -> io::Result<tokio::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid(format!("{} is no longer a file", path.display())));
+    }
+    Ok(tokio::fs::File::from_std(file))
+}
+
+/// Where pasted files go: a private temporary folder, not the user's Downloads. An application
+/// that reads the file list of every new copy (a file manager) makes the files come in with no
+/// paste, so they must not pile up where the user keeps things; a paste copies from here to
+/// where the user pastes.
+#[derive(Clone, Debug)]
+pub struct Inbox {
+    pub dir: PathBuf,
+    /// The bytes free for the user on the disk that holds a folder.
+    pub free: fn(&Path) -> io::Result<u64>,
+    /// The virtual folder where the peer's files show, fetched as they are read; with none,
+    /// or when it cannot be mounted, a paste fetches them all into `dir` first.
+    pub mount: Option<Arc<dyn Mounter>>,
+    /// Where the bytes of the files read through the virtual folder are kept while their
+    /// copy is there: on disk, since a file can be larger than the memory a runtime folder
+    /// holds. Each file there is unlinked as soon as it is made, and goes with its copy.
+    pub cache: PathBuf,
+}
+
+impl Inbox {
+    pub fn new(dir: PathBuf) -> Self {
+        Self {
+            cache: dir.clone(),
+            dir,
+            free: free_space,
+            mount: None,
+        }
+    }
+
+    /// The machine's own: `navette/clipboard` in `$XDG_RUNTIME_DIR` (per user, 0700, cleared at
+    /// logout), else a folder of the user's in the temporary directory. The virtual folder is
+    /// `navette/files` beside it, in `$XDG_RUNTIME_DIR` only: a mount point in the shared
+    /// temporary directory is not this user's alone. The bytes read through it are kept in
+    /// `navette/clipboard` of the user's cache folder, on disk.
+    pub fn of_this_user() -> Self {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from);
+        let mount = runtime
+            .as_deref()
+            .filter(|runtime| runtime.is_absolute())
+            .map(|runtime| {
+                let fuse = Fuse::at(runtime.join("navette").join("files"));
+                Arc::new(fuse) as Arc<dyn Mounter>
+            });
+        let dir = folder_in(runtime.as_deref(), &std::env::temp_dir(), euid());
+        let env = |name| std::env::var_os(name).map(PathBuf::from);
+        let cache = cache_in(env("XDG_CACHE_HOME").as_deref(), env("HOME").as_deref());
+        Self {
+            mount,
+            cache: cache.unwrap_or_else(|| dir.clone()),
+            ..Self::new(dir)
+        }
+    }
+
+    /// Makes the folder, the user's alone, or says why it cannot be trusted: the temporary
+    /// directory is shared, so another user may have made the name first, or put a link there.
+    pub fn prepare(&self) -> io::Result<()> {
+        private(&self.dir)
+    }
+
+    /// Makes the cache folder, the user's alone, or says why it cannot be trusted.
+    pub fn prepare_cache(&self) -> io::Result<()> {
+        private(&self.cache)
+    }
+
+    /// Removes everything in the folder; the folder itself stays. Links are removed, never
+    /// followed.
+    pub fn empty(&self) {
+        empty(&self.dir);
+    }
+
+    /// Removes what a process that died left in the cache folder.
+    pub fn empty_cache(&self) {
+        empty(&self.cache);
+    }
+
+    /// Room for `bytes` more, or why not.
+    pub fn check_room(&self, bytes: u64) -> io::Result<()> {
+        self.prepare()?;
+        self.room(&self.dir, bytes)
+    }
+
+    /// Room in the cache folder for `bytes` more, or why not.
+    pub fn check_cache_room(&self, bytes: u64) -> io::Result<()> {
+        self.prepare_cache()?;
+        self.room(&self.cache, bytes)
+    }
+
+    fn room(&self, dir: &Path, bytes: u64) -> io::Result<()> {
+        let free = (self.free)(dir)?;
+        if free < bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!("{} needed, {} free", human_bytes(bytes), human_bytes(free)),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Makes the folder `dir`, the user's alone, or says why it cannot be trusted: another user
+/// may have made the name first, or put a link there.
+fn private(dir: &Path) -> io::Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.uid() != euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a folder of this user", dir.display()),
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Removes everything in `dir`; the folder itself stays. Links are removed, never followed.
+fn empty(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        if let Err(e) = removed
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "navette: clipboard: {} was not removed: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// The folder under `runtime` (`$XDG_RUNTIME_DIR`) when it is an absolute path, else one named
+/// for the user in `temp`.
+fn folder_in(runtime: Option<&Path>, temp: &Path, uid: u32) -> PathBuf {
+    match runtime {
+        Some(runtime) if runtime.is_absolute() => runtime.join("navette").join("clipboard"),
+        _ => temp.join(format!("navette-clipboard-{uid}")),
+    }
+}
+
+/// The cache folder under `cache` (`$XDG_CACHE_HOME`) when it is an absolute path, else under
+/// `.cache` of `home`; none without either.
+fn cache_in(cache: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    let cache = match (cache, home) {
+        (Some(cache), _) if cache.is_absolute() => cache.to_owned(),
+        (_, Some(home)) if home.is_absolute() => home.join(".cache"),
+        _ => return None,
+    };
+    Some(cache.join("navette").join("clipboard"))
+}
+
+fn euid() -> u32 {
+    // SAFETY: no arguments, no failure.
+    unsafe { libc::geteuid() }
+}
+
+fn free_space(dir: &Path) -> io::Result<u64> {
+    let path = CString::new(dir.as_os_str().as_bytes()).map_err(invalid)?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a statvfs the call fills.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+/// The hidden folder one paste fills in the inbox. Removed with whatever it holds when dropped:
+/// a paste that fails or is cancelled leaves nothing behind.
+pub struct Staging {
+    dir: PathBuf,
+    inbox: PathBuf,
+}
+
+impl Staging {
+    pub fn create_in(inbox: &Inbox) -> io::Result<Self> {
+        inbox.prepare()?;
+        sweep_stale(&inbox.dir);
+        // Pasted files can be private: the folder is the user's alone while it fills.
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        let pid = std::process::id();
+        for n in 0u32.. {
+            let dir = inbox.dir.join(format!("{STAGING}{pid}-{n}"));
+            match builder.create(&dir) {
+                Ok(()) => {
+                    return Ok(Self {
+                        dir,
+                        inbox: inbox.dir.clone(),
+                    });
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
+    }
+
+    /// Where the entry the peer names `path` is written: inside this folder, or nowhere.
+    pub fn path_of(&self, path: &str) -> io::Result<PathBuf> {
+        safe_relative_path(path)
+            .map(|rel| self.dir.join(rel))
+            .ok_or_else(|| invalid(format!("unsafe name {path:?}")))
+    }
+
+    /// Moves each top-level entry into the inbox under its own name, or the name with a suffix
+    /// when one is already there; their paths there. All of them or none: when one cannot be
+    /// moved, those already moved come back, to go with this folder.
+    pub fn finish<'a>(self, tops: impl Iterator<Item = &'a str>) -> io::Result<Vec<PathBuf>> {
+        let mut placed = Vec::new();
+        for top in tops {
+            let to = self
+                .path_of(top)
+                .and_then(|from| Ok((place(&from, &self.inbox, OsStr::new(top))?, from)));
+            match to {
+                Ok(moved) => placed.push(moved),
+                Err(e) => return Err(unplace(placed, e)),
+            }
+        }
+        Ok(placed.into_iter().map(|(to, _)| to).collect())
+    }
+}
+
+/// Moves the entries placed back where they came from, after `e`; what could not be is named
+/// in the error the user reads.
+fn unplace(placed: Vec<(PathBuf, PathBuf)>, e: io::Error) -> io::Error {
+    let stayed: Vec<String> = placed
+        .into_iter()
+        // Back into the staging folder, the paste's alone: nothing there to overwrite.
+        .filter(|(to, from)| std::fs::rename(to, from).is_err())
+        .map(|(to, _)| to.display().to_string())
+        .collect();
+    if stayed.is_empty() {
+        return e;
+    }
+    io::Error::new(
+        e.kind(),
+        format!("{e}; left in place: {}", stayed.join(", ")),
+    )
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.dir)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!("navette: clipboard: a cancelled paste was not removed: {e}");
+        }
+    }
+}
+
+/// The prefix of a staging folder's name, then `<pid>-<n>`.
+const STAGING: &str = ".navette-incoming-";
+
+/// Removes the staging folders of processes that no longer exist: a killed one never drops
+/// its own.
+fn sweep_stale(inbox: &Path) {
+    let Ok(entries) = std::fs::read_dir(inbox) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(STAGING))
+            .and_then(|n| n.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != std::process::id() && !Path::new("/proc").join(pid.to_string()).exists() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Moves `from` into `dir` as `name`, or `name (1)`, `name (2)`… : never over what is there.
+fn place(from: &Path, dir: &Path, name: &OsStr) -> io::Result<PathBuf> {
+    for n in 0u32.. {
+        let to = dir.join(suffixed(name, n));
+        match rename_no_replace(from, &to) {
+            Ok(()) => return Ok(to),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
+}
+
+/// `report.pdf`, then `report (1).pdf`, `report (2).pdf`…
+fn suffixed(name: &OsStr, n: u32) -> OsString {
+    if n == 0 {
+        return name.to_owned();
+    }
+    let path = Path::new(name);
+    let stem = path.file_stem().unwrap_or(name);
+    let mut out = stem.to_owned();
+    out.push(format!(" ({n})"));
+    if let Some(ext) = path.extension() {
+        out.push(".");
+        out.push(ext);
+    }
+    out
+}
+
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    let (c_from, c_to) = (c_path(from)?, c_path(to)?);
+    // SAFETY: two NUL-terminated paths, relative to nothing (they are absolute or the cwd's).
+    let done = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            c_from.as_ptr(),
+            libc::AT_FDCWD,
+            c_to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    let done = if done == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    };
+    or_without_noreplace(done, from, to)
+}
+
+fn c_path(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(invalid)
+}
+
+/// `done`, or on a filesystem without `RENAME_NOREPLACE` (EINVAL), the same move by other
+/// means, never over what is there: a file is linked under its new name then unlinked, a
+/// folder replaces an empty one made for it (which fails if anything got in meanwhile).
+fn or_without_noreplace(done: io::Result<()>, from: &Path, to: &Path) -> io::Result<()> {
+    match done {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
+        done => return done,
+    }
+    if !std::fs::symlink_metadata(from)?.is_dir() {
+        std::fs::hard_link(from, to)?;
+        return std::fs::remove_file(from);
+    }
+    std::fs::create_dir(to)?;
+    std::fs::rename(from, to).map_err(|e| {
+        // Only the empty folder made here goes, never what someone put in it.
+        let _ = std::fs::remove_dir(to);
+        match e.kind() {
+            io::ErrorKind::DirectoryNotEmpty => io::ErrorKind::AlreadyExists.into(),
+            _ => e,
+        }
+    })
+}
+
+/// Bytes as a short figure: `1.5 GiB`.
+pub fn human_bytes(n: u64) -> String {
+    gliff_transport::clipboard::progress::human_bytes(n)
+}
+
+fn invalid(e: impl ToString) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+    use super::*;
+
+    fn names(copied: &Copied) -> Vec<&str> {
+        copied
+            .files
+            .entries
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_copy_is_named_by_its_first_top_entry_and_the_ones_beside_it() {
+        let file = |path: &str, dir: bool| ClipboardFile {
+            path: path.into(),
+            size: 0,
+            dir,
+        };
+        assert_eq!(headline(&[]), None);
+        let one_folder = [
+            file("photos", true),
+            file("photos/2026", true),
+            file("photos/2026/beach.jpg", false),
+        ];
+        assert_eq!(
+            headline(&one_folder),
+            Some(Headline {
+                name: "photos".into(),
+                more: 0
+            })
+        );
+        let four = [
+            file("photos", true),
+            file("photos/a.jpg", false),
+            file("notes.txt", false),
+            file("sheet.ods", false),
+            file("todo.md", false),
+        ];
+        assert_eq!(
+            headline(&four),
+            Some(Headline {
+                name: "photos".into(),
+                more: 3
+            })
+        );
+    }
+
+    #[test]
+    fn the_headline_of_a_flat_copy_of_the_most_entries_is_found_in_one_pass() {
+        let flat: Vec<_> = (0..MAX_FILE_ENTRIES)
+            .map(|i| ClipboardFile {
+                path: format!("file-{i}.bin"),
+                size: 1,
+                dir: false,
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let found = headline(&flat);
+        assert_eq!(
+            found,
+            Some(Headline {
+                name: "file-0.bin".into(),
+                more: MAX_FILE_ENTRIES - 1
+            })
+        );
+        // Far above a pass over the entries, far below the quadratic scan it replaces.
+        assert!(start.elapsed() < std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn a_copied_directory_is_listed_whole_and_its_links_and_pipes_are_left_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let photos = tmp.path().join("photos");
+        std::fs::create_dir_all(photos.join("2026")).unwrap();
+        std::fs::write(photos.join("2026/beach.jpg"), b"sand").unwrap();
+        std::fs::write(photos.join("empty.txt"), b"").unwrap();
+        symlink("/etc/hostname", photos.join("elsewhere")).unwrap();
+        let fifo = CString::new(photos.join("pipe").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        let copied = list(std::slice::from_ref(&photos)).unwrap();
+        assert_eq!(
+            names(&copied),
+            [
+                "photos",
+                "photos/2026",
+                "photos/2026/beach.jpg",
+                "photos/empty.txt"
+            ]
+        );
+        assert_eq!(copied.files.entries[2].size, 4);
+        assert_eq!(copied.files.paths[2], photos.join("2026/beach.jpg"));
+        assert_eq!(copied.skipped, ["photos/elsewhere", "photos/pipe"]);
+    }
+
+    #[test]
+    fn a_copied_link_is_left_out_and_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("real.txt"), b"x").unwrap();
+        symlink(tmp.path().join("real.txt"), tmp.path().join("link.txt")).unwrap();
+        let copied = list(&[tmp.path().join("link.txt"), tmp.path().join("real.txt")]).unwrap();
+        assert_eq!(names(&copied), ["real.txt"]);
+        assert_eq!(copied.skipped, ["link.txt"]);
+    }
+
+    #[test]
+    fn a_copy_of_any_size_is_offered() {
+        let five_gib = ClipboardFile {
+            path: "disk.img".into(),
+            size: 5 << 30,
+            dir: false,
+        };
+        assert_eq!(validate(&[five_gib]), Ok(()));
+    }
+
+    #[test]
+    fn an_offer_whose_sizes_add_up_past_what_a_count_holds_is_refused() {
+        let half = |path: &str| ClipboardFile {
+            path: path.into(),
+            size: 1 << 63,
+            dir: false,
+        };
+        let files = [half("a.bin"), half("b.bin")];
+        assert_eq!(total(&files), None);
+        assert!(validate(&files).is_err());
+    }
+
+    #[test]
+    fn a_name_with_dot_dot_or_an_absolute_path_is_refused() {
+        for bad in ["../evil", "/etc/passwd", "a/../../b", "", "./x"] {
+            let entry = ClipboardFile {
+                path: bad.into(),
+                size: 1,
+                dir: false,
+            };
+            assert!(validate(&[entry]).is_err(), "{bad:?} accepted");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = Staging::create_in(&Inbox::new(tmp.path().into())).unwrap();
+        assert!(staging.path_of("../evil").is_err());
+        assert!(staging.path_of("/etc/passwd").is_err());
+        assert!(staging.path_of("a/b").unwrap().starts_with(&staging.dir));
+    }
+
+    #[test]
+    fn a_name_the_stale_staging_sweep_would_remove_is_refused() {
+        let entry = |path: &str| ClipboardFile {
+            path: path.into(),
+            size: 0,
+            dir: true,
+        };
+        for bad in [".navette-incoming-1-0", ".navette-incoming-x"] {
+            assert!(validate(&[entry(bad)]).is_err(), "{bad:?} accepted");
+        }
+        // Deeper in a folder, the sweep never sees it.
+        let nested = [entry("photos"), entry("photos/.navette-incoming-1-0")];
+        assert_eq!(validate(&nested), Ok(()));
+    }
+
+    #[test]
+    fn a_link_put_in_place_of_a_copied_file_is_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("notes.txt");
+        std::fs::write(tmp.path().join("secret"), b"no").unwrap();
+        symlink(tmp.path().join("secret"), &copied).unwrap();
+        assert!(open_copied(&copied).is_err());
+    }
+
+    #[test]
+    fn an_existing_name_gets_a_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = Inbox::new(tmp.path().join("Navette"));
+        std::fs::create_dir_all(&inbox.dir).unwrap();
+        std::fs::write(inbox.dir.join("report.pdf"), b"old").unwrap();
+        std::fs::write(inbox.dir.join("report (1).pdf"), b"older").unwrap();
+        std::fs::create_dir(inbox.dir.join("photos")).unwrap();
+
+        let staging = Staging::create_in(&inbox).unwrap();
+        std::fs::write(staging.path_of("report.pdf").unwrap(), b"new").unwrap();
+        std::fs::create_dir(staging.path_of("photos").unwrap()).unwrap();
+        let placed = staging
+            .finish(["report.pdf", "photos"].into_iter())
+            .unwrap();
+
+        assert_eq!(
+            placed,
+            [
+                inbox.dir.join("report (2).pdf"),
+                inbox.dir.join("photos (1)")
+            ]
+        );
+        assert_eq!(std::fs::read(inbox.dir.join("report.pdf")).unwrap(), b"old");
+        assert_eq!(std::fs::read(&placed[0]).unwrap(), b"new");
+        // The staging folder went with the paste.
+        assert_eq!(std::fs::read_dir(&inbox.dir).unwrap().count(), 5);
+    }
+
+    #[test]
+    fn a_paste_whose_later_entry_cannot_be_placed_places_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = Inbox::new(tmp.path().into());
+        let staging = Staging::create_in(&inbox).unwrap();
+        std::fs::write(staging.path_of("first.txt").unwrap(), b"one").unwrap();
+        // The second entry is not in the staging folder: it cannot be moved.
+        let failed = staging.finish(["first.txt", "second.txt"].into_iter());
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn without_rename_noreplace_a_file_and_a_folder_move_and_never_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (from, to) = (tmp.path().join("staged"), tmp.path().join("inbox"));
+        std::fs::create_dir_all(from.join("photos")).unwrap();
+        std::fs::create_dir(&to).unwrap();
+        std::fs::write(from.join("report.pdf"), b"new").unwrap();
+        std::fs::write(from.join("photos/beach.jpg"), b"sand").unwrap();
+        std::fs::write(to.join("taken.pdf"), b"mine").unwrap();
+        std::fs::create_dir(to.join("taken")).unwrap();
+        // What renameat2 says on a filesystem without RENAME_NOREPLACE.
+        let unsupported = || Err(io::Error::from_raw_os_error(libc::EINVAL));
+        let moved =
+            |a: &str, b: &str| or_without_noreplace(unsupported(), &from.join(a), &to.join(b));
+
+        moved("report.pdf", "report.pdf").unwrap();
+        moved("photos", "photos").unwrap();
+        assert_eq!(std::fs::read(to.join("report.pdf")).unwrap(), b"new");
+        assert_eq!(std::fs::read(to.join("photos/beach.jpg")).unwrap(), b"sand");
+        assert!(!from.join("report.pdf").exists() && !from.join("photos").exists());
+
+        std::fs::write(from.join("again.pdf"), b"again").unwrap();
+        std::fs::create_dir(from.join("again")).unwrap();
+        let taken = moved("again.pdf", "taken.pdf").unwrap_err();
+        assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(to.join("taken.pdf")).unwrap(), b"mine");
+        let taken = moved("again", "taken").unwrap_err();
+        assert_eq!(taken.kind(), io::ErrorKind::AlreadyExists);
+        assert!(from.join("again.pdf").exists() && from.join("again").exists());
+    }
+
+    #[test]
+    fn a_dropped_staging_folder_leaves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = Inbox::new(tmp.path().into());
+        let staging = Staging::create_in(&inbox).unwrap();
+        std::fs::write(staging.path_of("half.bin").unwrap(), b"half").unwrap();
+        drop(staging);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn too_little_room_is_said_before_anything_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = Inbox {
+            free: |_| Ok(1 << 20),
+            ..Inbox::new(tmp.path().join("Navette"))
+        };
+        let error = inbox.check_room(2 << 30).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert!(error.to_string().contains("2.0 GiB needed"), "{error}");
+        inbox.check_room(1 << 10).unwrap();
+    }
+
+    #[test]
+    fn the_receiving_folder_is_under_the_runtime_directory() {
+        let folder = folder_in(Some(Path::new("/run/user/1000")), Path::new("/tmp"), 1000);
+        assert_eq!(folder, Path::new("/run/user/1000/navette/clipboard"));
+    }
+
+    #[test]
+    fn without_a_runtime_directory_the_receiving_folder_is_the_users_in_the_temp_one() {
+        let folder = folder_in(None, Path::new("/tmp"), 1000);
+        assert_eq!(folder, Path::new("/tmp/navette-clipboard-1000"));
+        // A relative runtime directory is no place to trust either.
+        assert_eq!(
+            folder_in(Some(Path::new("run")), Path::new("/tmp"), 1000),
+            folder
+        );
+    }
+
+    #[test]
+    fn the_receiving_folder_is_made_private_to_the_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("navette").join("clipboard");
+        let inbox = Inbox::new(dir.clone());
+        inbox.check_room(1).unwrap();
+        for made in [&dir, &dir.parent().unwrap().to_path_buf()] {
+            assert_eq!(made.metadata().unwrap().mode() & 0o777, 0o700, "{made:?}");
+        }
+        // One left open by an older run is closed again.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        inbox.check_room(1).unwrap();
+        assert_eq!(dir.metadata().unwrap().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn the_read_cache_is_in_the_user_s_cache_folder_on_disk() {
+        let cache = cache_in(
+            Some(Path::new("/var/cache/kim")),
+            Some(Path::new("/home/kim")),
+        );
+        assert_eq!(
+            cache.unwrap(),
+            Path::new("/var/cache/kim/navette/clipboard")
+        );
+    }
+
+    #[test]
+    fn without_xdg_cache_home_the_read_cache_is_in_the_home_s_cache_folder() {
+        let cache = cache_in(None, Some(Path::new("/home/kim")));
+        assert_eq!(
+            cache.unwrap(),
+            Path::new("/home/kim/.cache/navette/clipboard")
+        );
+        // A relative one is no place to trust.
+        assert_eq!(
+            cache_in(Some(Path::new("cache")), Some(Path::new("/home/kim"))).unwrap(),
+            Path::new("/home/kim/.cache/navette/clipboard")
+        );
+        assert_eq!(cache_in(None, Some(Path::new("home"))), None);
+    }
+
+    #[test]
+    fn the_read_cache_folder_is_made_private_and_emptied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("navette").join("clipboard");
+        let inbox = Inbox {
+            cache: cache.clone(),
+            ..Inbox::new(tmp.path().join("inbox"))
+        };
+        inbox.check_cache_room(1).unwrap();
+        assert_eq!(cache.metadata().unwrap().mode() & 0o777, 0o700);
+        std::fs::write(cache.join(".navette-read-1-0"), b"left by a crash").unwrap();
+        inbox.empty_cache();
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_read_cache_folder_that_is_a_link_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let cache = tmp.path().join("clipboard");
+        std::os::unix::fs::symlink(&elsewhere, &cache).unwrap();
+        let inbox = Inbox {
+            cache,
+            ..Inbox::new(tmp.path().join("inbox"))
+        };
+        assert!(inbox.check_cache_room(1).is_err());
+    }
+
+    #[test]
+    fn a_receiving_folder_that_is_a_link_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let dir = tmp.path().join("clipboard");
+        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+        let inbox = Inbox::new(dir);
+        assert!(inbox.check_room(1).is_err());
+        assert!(Staging::create_in(&inbox).is_err());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn emptying_the_receiving_folder_removes_what_it_holds_and_keeps_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = Inbox::new(tmp.path().join("clipboard"));
+        inbox.check_room(1).unwrap();
+        std::fs::write(inbox.dir.join("report.bin"), b"figures").unwrap();
+        std::fs::create_dir_all(inbox.dir.join("album/2026")).unwrap();
+        std::fs::write(inbox.dir.join("album/2026/photo.bin"), b"pixels").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, b"mine").unwrap();
+        std::os::unix::fs::symlink(&outside, inbox.dir.join("link")).unwrap();
+        inbox.empty();
+        assert_eq!(std::fs::read_dir(&inbox.dir).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"mine");
+        // Nothing to empty is no failure.
+        Inbox::new(tmp.path().join("never-made")).empty();
+    }
+}

@@ -8,3 +8,57 @@ publish = false
 [[bin]]
 name = "navette"
 path = "src/main.rs"
+
+[dependencies]
+bytes = "1"
+clap = { version = "4.6", features = ["derive", "env"] }
+drm-fourcc = "2"
+# The virtual folder of the received files: mounted through `fusermount3`, no libfuse.
+fuser = { version = "0.18", default-features = false }
+gliff-proto = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
+gliff-sw = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
+gliff-transport = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
+gliff-vk = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
+hkdf = "0.12"
+hmac = "0.12"
+hypr-capture = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
+hypr-input = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
+hypr-ipc = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
+hypr-wl = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
+libc = "0.2"
+minicbor = { version = "2", features = ["derive", "alloc"] }
+opus = "0.4"
+pipewire = { version = "0.10", features = ["v0_3_49"] }
+rand = "0.8"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+serde_json = "1"
+sha2 = "0.10"
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+spake2 = "0.4"
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+xkbcommon = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+# Paused time, so a long outage is tested without sleeping through it.
+tokio = { version = "1.53", features = ["test-util"] }
+
+# The tests encode and decode real pictures on the CPU: unoptimised, OpenH264 and the colour
+# conversion are too slow for a picture to be refined at the pace the session keeps.
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+
+[profile.dev.package.openh264]
+opt-level = 3
+
+[profile.dev.package.gliff-sw]
+opt-level = 3
+
+[profile.dev.package.gliff-proto]
+opt-level = 3
