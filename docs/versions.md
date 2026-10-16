@@ -22,7 +22,7 @@ over it. That is the rule the link enforces:
   to update, its events say `incompatible` with `peer_version`, and `navette status` on the desk
   says it. The agent then dials again once a minute, on the desk's network only, and links as
   soon as the older machine is updated. A 0.1.x, whose hello carries no version, is refused as
-  `0.1`.
+  `0.1`, even by a beta of 0.1's minor (`0.1.1-beta.N`): 0.1 cannot read the newer hello.
 - A beta (`vX.Y.Z-beta.N`) counts as its minor. It is the patch after the last release and
   promises nothing beyond what that release did, until it is released.
 - A local build (`0.0.0-dev`) links only with another local build.

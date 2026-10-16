@@ -37,13 +37,13 @@ A line is one JSON object on one line, UTF-8, ended by `\n`. For instance, on th
 mode runs (all names invented):
 
 ```json
-{"v":1,"role":"desk","state":"mode","peer":"FAR","peer_version":"0.2.3","mode":"office","monitors":["DP-2"],"modes":[{"name":"office","monitors":["DP-2"]}],"mic":"remote"}
+{"v":1,"role":"desk","version":"0.2.0","state":"mode","peer":"FAR","peer_version":"0.2.3","mode":"office","monitors":["DP-2"],"modes":[{"name":"office","monitors":["DP-2"]}],"mic":"remote"}
 ```
 
 and on the remote machine meanwhile:
 
 ```json
-{"v":1,"role":"remote","state":"mode","peer":null,"peer_version":"0.2.0","mode":null,"monitors":["NAVETTE-1"],"modes":[],"mic":null}
+{"v":1,"role":"remote","version":"0.2.3","state":"mode","peer":null,"peer_version":"0.2.0","mode":null,"monitors":["NAVETTE-1"],"modes":[],"mic":null}
 ```
 
 The stream ends (end of file) when `serve` or `agent` stops. It also ends for one reader:
@@ -66,6 +66,7 @@ Every line has every field below, on both machines; a field that does not apply 
 |---|---|---|
 | `v` | `1`: the contract's version ([what changes it](#what-changes-v)) | the same |
 | `role` | `"desk"` | `"remote"` |
+| `version` | this machine's Navette version, as `navette --version` says it (`0.0.0-dev` for a local build): with `peer_version`, a shell tells which side is older | the same |
 | `state` | [where it stands](#state) | the same |
 | `peer` | the remote machine's label: `remote_label` of `mode.conf` (the key before any section), `"REMOTE"` without one | `null`: the desk does not say its label over the link yet; a later version will |
 | `peer_version` | the remote machine's Navette version, as its hello said it: while linked (the same minor as this machine's, perhaps another patch: a shell may say "one version behind"), and while `incompatible`; `"0.1"` for any 0.1.x, which does not say its patch; `null` otherwise | the desk's, the same way |
@@ -101,7 +102,7 @@ On the remote machine:
 | `linked` | linked to the desk, no mode runs |
 | `starting` | the desk asked for a mode; the agent is making its outputs |
 | `mode` | the desk drives the outputs in `monitors` |
-| `incompatible` | the desk runs another minor version: `peer_version` says which. The agent dials again once a minute, on the desk's network only; off it, the state is `away` |
+| `incompatible` | the desk runs another minor version: `peer_version` says which. The agent dials again once a minute, on the desk's network only; off it, the state is `away`, and with a desk that does not answer, `dialing` |
 
 Some sequences, as a reader sees them:
 
@@ -204,10 +205,11 @@ one passes through:
 | `starting` | `starting` | Starting mode office on DP-2 (on the remote machine: Making NAVETTE-1 for the desk) |
 | `mode` | the mode's name, or `mode` | Mode office runs on DP-2; mic: remote (on the remote machine: The desk drives NAVETTE-1) |
 | `stopping` | `stopping` | Giving DP-2 back |
-| `incompatible` | `incompatible` | FAR runs Navette 0.3.0, another minor version: update the older machine (on the remote machine: The desk runs ...) |
+| `incompatible` | `incompatible` | FAR runs Navette 0.3.0, this machine 0.2.1: update this machine (on the remote machine: The desk runs ...: update the desk, or this machine) |
 | another | the state | the state |
 
-FAR, 0.3.0, office and DP-2 stand for the line's `peer`, `peer_version`, `mode` and `monitors`. A Waybar module that
+FAR, 0.3.0, 0.2.1, office and DP-2 stand for the line's `peer`, `peer_version`, `version`,
+`mode` and `monitors`. A Waybar module that
 shows it on either machine, and toggles the mic on a click (refused on the remote machine):
 
 ```jsonc
