@@ -1,8 +1,8 @@
-//! Where the home mic goes. It serves one machine at a time: the remote machine while a mode
-//! runs, from the moment it starts, and home again when it stops; in between, `navette mic
-//! toggle|remote|home` (the hotkey, the bar) switches it either way, and with `mic = follow`
+//! Where the desk mic goes. It serves one machine at a time: the remote machine while a mode
+//! runs, from the moment it starts, and the desk again when it stops; in between, `navette mic
+//! toggle|remote|desk` (the hotkey, the bar) switches it either way, and with `mic = follow`
 //! it goes to the side that has the keyboard. Switching only starts or stops sending: the
-//! remote's source stays its default mic for the whole mode, silent while the mic is home, so a
+//! remote's source stays its default mic for the whole mode, silent while the mic is at the desk, so a
 //! call there keeps its device.
 //!
 //! `navette serve` holds the mic, so `navette mic` reaches it over a Unix socket beside the
@@ -26,7 +26,7 @@ use crate::notify::Notifier;
 /// Where the mic goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
-    /// No mode runs: the mic is home, and stays there.
+    /// No mode runs: the mic is at the desk, and stays there.
     Off,
     Home,
     Remote,
@@ -96,14 +96,14 @@ impl Order {
     }
 }
 
-/// What the control socket serves: the mic, or nothing when home plays no sound.
+/// What the control socket serves: the mic, or nothing when the desk plays no sound.
 pub trait Routing: Send + Sync {
     /// Its calls may wait for PipeWire: they are made off the async runtime.
     fn order(&self, order: Order) -> io::Result<Status>;
     fn watch(&self) -> watch::Receiver<Status>;
 }
 
-/// The home mic, at home.
+/// The desk mic, at the desk.
 pub struct Mic<G: Graph> {
     shared: Arc<Shared<G>>,
     toggle_command: String,
@@ -112,7 +112,7 @@ pub struct Mic<G: Graph> {
 /// What the mic's own thread shares with it: it opens the mic again when PipeWire restarts.
 struct Shared<G: Graph> {
     graph: G,
-    /// Where home's default mic is kept while the mic is away.
+    /// Where the desk's default mic is kept while the mic is away.
     saved: Saved,
     /// Held through a start or a stop, which may wait for the link: they never overlap.
     lifecycle: Mutex<()>,
@@ -177,7 +177,7 @@ impl<G: Graph + Sync> Mic<G> {
     }
 
     /// A mode started: the remote's source becomes its default mic, and the mic goes there, or
-    /// stays home unless `remote`. When it cannot, the mode runs without it, and the mic says
+    /// stays at the desk unless `remote`. When it cannot, the mode runs without it, and the mic says
     /// why until the mode stops.
     pub fn start(&self, remote: bool, names: Names) -> io::Result<()> {
         let shared = &self.shared;
@@ -246,7 +246,7 @@ impl<G: Graph + Sync> Mic<G> {
         })
     }
 
-    /// The mode stopped: the mic comes home, and the remote puts its default mic back.
+    /// The mode stopped: the mic comes to the desk, and the remote puts its default mic back.
     pub fn stop(&self) {
         let shared = &self.shared;
         let _lifecycle = lock(&shared.lifecycle);
@@ -286,8 +286,8 @@ impl<G: Graph> Shared<G> {
             *status = now;
             before != now
         });
-        // What the user sees is where the mic is: a mode starting with the mic home, or
-        // stopping with it home, moves nothing.
+        // What the user sees is where the mic is: a mode starting with the mic at the desk, or
+        // stopping with it at the desk, moves nothing.
         if Self::place(before) != Self::place(now) {
             match now {
                 Status::Remote => self
@@ -312,7 +312,7 @@ impl<G: Graph> Shared<G> {
         why
     }
 
-    /// Where the user would say the mic is: no mode means home.
+    /// Where the user would say the mic is: no mode means the desk.
     fn place(status: Status) -> Status {
         match status {
             Status::Off => Status::Home,
@@ -394,7 +394,7 @@ impl<G: Graph + Sync> Routing for Mic<G> {
     }
 }
 
-/// Home plays no sound (`navette serve` without `--audio`): the mic is never sent.
+/// The desk plays no sound (`navette serve` without `--audio`): the mic is never sent.
 pub struct NoSound(watch::Sender<Status>);
 
 impl Default for NoSound {
@@ -501,7 +501,7 @@ async fn connect(path: &Path) -> io::Result<UnixStream> {
     })
 }
 
-/// `navette mic toggle|remote|home|status`: where the mic goes once the order is done.
+/// `navette mic toggle|remote|desk|status`: where the mic goes once the order is done.
 pub async fn ask(path: &Path, order: Order) -> io::Result<Status> {
     tokio::time::timeout(ANSWER, async {
         let (read, mut write) = connect(path).await?.into_split();
@@ -527,7 +527,7 @@ pub async fn ask(path: &Path, order: Order) -> io::Result<Status> {
 }
 
 /// `navette mic watch`: hands `each` where the mic goes, now and at every change, for ever.
-/// While `navette serve` is not running, the mic is home: `off`, until it is back.
+/// While `navette serve` is not running, the mic is at the desk: `off`, until it is back.
 pub async fn watch(path: &Path, mut each: impl FnMut(Status) -> io::Result<()>) -> io::Result<()> {
     let mut last = None;
     let mut tell = |status: Status| -> io::Result<()> {
@@ -587,7 +587,7 @@ mod tests {
     use crate::names::Names;
     use crate::notify::Fake;
 
-    /// A mic at home, `desk-mic`, and the remote's end of its link.
+    /// A mic at the desk, `desk-mic`, and the remote's end of its link.
     fn mic() -> (
         FakeGraph,
         Arc<Mic<FakeGraph>>,
@@ -623,7 +623,7 @@ mod tests {
         (graph, mic, remote, notes, tmp)
     }
 
-    /// The name of home's default mic.
+    /// The name of the desk's default mic.
     fn home_default(graph: &FakeGraph) -> String {
         let state = graph.state();
         let node = state.default_source.as_ref().unwrap();
@@ -642,7 +642,7 @@ mod tests {
             .collect()
     }
 
-    /// Whether what the home mic hears now is sent.
+    /// Whether what the desk mic hears now is sent.
     fn sends(graph: &FakeGraph, remote: &mut mpsc::Receiver<Message>) -> bool {
         let callback = graph.state().mics[0].1.clone();
         (callback.lock().unwrap())(&vec![0.25; 4 * crate::audio::codec::FRAME_SAMPLES]);
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(home_default(&graph), AWAY);
         assert_eq!(mic.order(Order::Toggle).unwrap(), Status::Home);
         assert!(!sends(&graph, &mut remote));
-        // Home's apps have the mic again.
+        // The desk's apps have the mic again.
         assert_eq!(home_default(&graph), "desk-mic");
         assert_eq!(mic.order(Order::Toggle).unwrap(), Status::Remote);
         assert_eq!(home_default(&graph), AWAY);
@@ -815,7 +815,7 @@ mod tests {
             notes.summaries(),
             ["Mic → remote", "Mic → desk", "Mic → remote", "Mic → desk"]
         );
-        // The mode stops with the mic already home: nothing moved, nothing to say.
+        // The mode stops with the mic already at the desk: nothing moved, nothing to say.
         let stopped = mic.clone();
         blocking(move || stopped.stop()).await;
         assert_eq!(notes.summaries().len(), 4);
@@ -937,7 +937,7 @@ mod tests {
         assert!(shown[0].1.contains("no echo canceller"), "{shown:?}");
         assert!(mic.order(Order::Toggle).is_err());
         assert_eq!(notes.summaries(), ["Mic failed", "Mic not switched"]);
-        // The mode stops: the mic is home, and the failure is replaced.
+        // The mode stops: the mic is at the desk, and the failure is replaced.
         let stopped = mic.clone();
         blocking(move || stopped.stop()).await;
         assert_eq!(notes.summaries().last().unwrap(), "Mic → desk");

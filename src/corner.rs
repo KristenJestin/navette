@@ -1,17 +1,17 @@
-//! The corner (#69): while a mode runs, every home monitor shows, at its top left, what is
+//! The corner (#69): while a mode runs, every desk monitor shows, at its top left, what is
 //! linked and where the mic is, with a button that switches the mic.
 //!
 //! - **On each reserved monitor**, over the remote's picture: a warm orange gradient, a
-//!   `REMOTE` tag and the mic button. It is drawn at home and never sent: the remote never
-//!   captures it, and a click on it stays home.
-//! - **On each of home's own monitors**: the same corner, red with a `LOCAL` tag, wherever the
+//!   `REMOTE` tag and the mic button. It is drawn at the desk and never sent: the remote never
+//!   captures it, and a click on it stays at the desk.
+//! - **On each of the desk's own monitors**: the same corner, red with a `LOCAL` tag, wherever the
 //!   mic is.
 //! - **The tags and how far down the corners start** are the mode's to set (`remote_label`, `local_label`,
 //!   `remote_bar`, `local_bar`): see [`Look`].
 //! - **The mic button** is a mic and a round check: on the side that has the mic, the check draws
 //!   in and the button turns green; on the other, it wipes out. A click switches the mic, as the
 //!   hotkey and `navette mic toggle` do; hovering it shows the hotkey.
-//! - **Messages** (`Mic → remote`, `Keyboard → home`, …) show under the button for two seconds,
+//! - **Messages** (`Mic → remote`, `Keyboard → desk`, …) show under the button for two seconds,
 //!   in place of desktop notifications.
 //! - **Files crossing** the clipboard, either way, show as one bar per transfer under the tag,
 //!   as wide as the tag row (more only when the text needs it, at most 20 characters) and
@@ -198,13 +198,13 @@ pub async fn follow(board: Arc<Board>, mut status: watch::Receiver<Status>) {
 pub struct Look {
     /// The tag on the reserved monitors.
     pub remote_label: String,
-    /// The tag on home's own monitors.
+    /// The tag on the desk's own monitors.
     pub home_label: String,
     /// How far below the top of a reserved monitor its corner starts, in logical pixels, over
     /// what the remote shows there.
     pub remote_bar: i32,
-    /// How far below the top of each of home's own monitors its corner starts, in logical
-    /// pixels, over home's bars; with none, the compositor places it below them.
+    /// How far below the top of each of the desk's own monitors its corner starts, in logical
+    /// pixels, over the desk's bars; with none, the compositor places it below them.
     pub home_bar: Option<i32>,
 }
 
@@ -279,7 +279,7 @@ impl Feed {
 pub enum Side {
     /// A reserved monitor, showing the remote machine.
     Remote,
-    /// One of home's own.
+    /// One of the desk's own.
     Home,
 }
 
@@ -1151,7 +1151,7 @@ mod tests {
         );
         assert_eq!(pro.tag().unwrap().1, "REMOTE");
         assert!(is_green(color(&drawn, ring(&pro).0, ring(&pro).1)));
-        // The mic home: the remote's corner stays whole, its check out.
+        // The mic at the desk: the remote's corner stays whole, its check out.
         let home = corner(Side::Remote, Status::Home, now);
         assert!(home.tag().is_some());
         assert!(!is_green(color(
@@ -1207,8 +1207,8 @@ mod tests {
     fn a_message_shows_for_two_seconds() {
         let now = Instant::now();
         let mut pro = corner(Side::Remote, Status::Remote, now);
-        pro.update(Update::Say("Keyboard → home".into()), now);
-        assert_eq!(pro.line(now).as_deref(), Some("Keyboard → home"));
+        pro.update(Update::Say("Keyboard → desk".into()), now);
+        assert_eq!(pro.line(now).as_deref(), Some("Keyboard → desk"));
         assert_eq!(pro.next_draw(now), Some(Next::After(MESSAGE)));
         assert_eq!(pro.line(now + MESSAGE), None);
         assert_eq!(pro.next_draw(now + MESSAGE), None);
@@ -1552,7 +1552,7 @@ mod tests {
         }
         let done = now + CHECK;
         assert_eq!(corners[0].check_at(done), 0.0, "out on the remote's corner");
-        assert_eq!(corners[1].check_at(done), 1.0, "in on home's");
+        assert_eq!(corners[1].check_at(done), 1.0, "in on the desk's");
         following.abort();
     }
 
@@ -1561,11 +1561,11 @@ mod tests {
         let board = Board::default();
         let heard = listening(&board);
         board.show("Mic not switched", "no mode is running");
-        board.show("Mic → home", "");
+        board.show("Mic → desk", "");
         let said = [
             Update::Mic(Status::Off),
             Update::Say("Mic not switched: no mode is running".into()),
-            Update::Say("Mic → home".into()),
+            Update::Say("Mic → desk".into()),
         ];
         for heard in &heard {
             assert_eq!(*heard.lock().unwrap(), said);

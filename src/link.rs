@@ -1,10 +1,10 @@
-//! The link once paired: the remote's agent dials home and keeps a connection, home serves it.
+//! The link once paired: the remote's agent dials the desk and keeps a connection, the desk serves it.
 //! Over it, a hello (Navette's version: the same minor links, another is refused), then gliff's framing carrying a heartbeat each way
 //! and the connection's services (the clipboard bridge, the display), over the same
 //! authenticated stream. The link stays up between two modes, so that a start is quick, but
 //! carries nothing of the user's then: no copy, no sound, no mic, no input.
 //!
-//! The agent reconnects with an exponential backoff whenever the link drops; home keeps the
+//! The agent reconnects with an exponential backoff whenever the link drops; the desk keeps the
 //! newest connection of its one paired remote and drops the older one, which a laptop that
 //! changed network may have left half-open. Once the newer one has said hello, it ends the
 //! older connection, and so its service, before it starts the newer one's: a service such as
@@ -136,7 +136,7 @@ impl Backoff {
 }
 
 impl Default for Backoff {
-    /// Capped at a few seconds: a refused dial to a LAN address costs nothing, and home may be
+    /// Capped at a few seconds: a refused dial to a LAN address costs nothing, and the desk may be
     /// back at any moment, so the agent must not be found asleep for half a minute.
     fn default() -> Self {
         Self::new(Duration::from_secs(1), Duration::from_secs(3))
@@ -155,12 +155,12 @@ pub enum Event {
         peer: String,
     },
     Disconnected(io::Error),
-    /// A connection home refused, or one the agent could not open.
+    /// A connection the desk refused, or one the agent could not open.
     Failed(io::Error),
     Retrying(Duration),
-    /// The agent is not on home's network: it does not dial.
+    /// The agent is not on the desk's network: it does not dial.
     Away,
-    /// The agent is back on home's network: it dials again.
+    /// The agent is back on the desk's network: it dials again.
     Back,
 }
 
@@ -400,7 +400,7 @@ async fn send<W: AsyncWrite + Unpin>(
                     .map_err(io_error)?
             }
             msg = sound.recv(), if sound_open => match msg {
-                // What the remote plays, or the home mic hears, never crosses outside a mode,
+                // What the remote plays, or the desk mic hears, never crosses outside a mode,
                 // whatever the other side asked.
                 Some(msg) if msg.is_frame() && !in_mode(&mode) => {}
                 Some(msg) => {
@@ -687,8 +687,8 @@ async fn audio_received<R: AsyncRead + Unpin>(
     })
 }
 
-/// `navette agent`: dials home, keeps the link up, and dials again whenever it drops. `attach`
-/// starts the connection's service each time the link is up. Away from home's network, it does
+/// `navette agent`: dials the desk, keeps the link up, and dials again whenever it drops. `attach`
+/// starts the connection's service each time the link is up. Away from the desk's network, it does
 /// not dial, and looks again every `RECHECK`. Never returns.
 pub async fn agent<D, T, F, Fut>(
     dialer: D,
@@ -823,7 +823,7 @@ pub fn remote_dialer(store: &Store) -> io::Result<TlsDialer> {
     TlsDialer::new(&store.identity()?, pairing.peer, pairing.address)
 }
 
-/// Home's acceptor, on `listen` or else the address it was paired on.
+/// The desk's acceptor, on `listen` or else the address it was paired on.
 pub async fn home_acceptor(store: &Store, listen: Option<SocketAddr>) -> io::Result<TlsAcceptor> {
     let pairing = paired_as(store, Role::Home)?;
     let address = listen.unwrap_or(pairing.address);
@@ -875,7 +875,7 @@ pub(crate) mod tests {
 
     async fn nothing(_: Wire) {}
 
-    /// The gate of a pairing that does not know home's router: it dials wherever it is.
+    /// The gate of a pairing that does not know the desk's router: it dials wherever it is.
     pub(crate) fn anywhere(store: &Store) -> HomeNetwork<FakeTables> {
         HomeNetwork::new(FakeTables::default(), store.clone()).unwrap()
     }
@@ -1200,7 +1200,7 @@ pub(crate) mod tests {
         let (sound, display) = ends.await.unwrap();
         let packet = Bytes::from_static(&[1, 2, 3]);
         let frames = |seq| {
-            // The remote's sound, and home's mic.
+            // The remote's sound, and the desk's mic.
             for frame in [
                 audio::Message::Frame {
                     session: 1,
@@ -1388,7 +1388,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Home's side of a link that is accepted from a queue of in-memory connections.
+    /// The desk's side of a link that is accepted from a queue of in-memory connections.
     pub(crate) struct Queue(pub(crate) mpsc::UnboundedReceiver<tokio::io::DuplexStream>);
 
     impl Accept for Queue {
@@ -1429,7 +1429,7 @@ pub(crate) mod tests {
                     () = &mut quiet => {}
                     event = home_events.recv() => panic!("the good link moved: {event:?}"),
                 }
-                assert!(!good.is_finished(), "home dropped the good link");
+                assert!(!good.is_finished(), "the desk dropped the good link");
             })
             .await;
     }
@@ -1482,7 +1482,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A dialer that refuses until `home_is_back`, then answers like home does.
+    /// A dialer that refuses until `home_is_back`, then answers like the desk does.
     struct Outage {
         home_is_back: Arc<AtomicBool>,
     }
@@ -1520,10 +1520,10 @@ pub(crate) mod tests {
             events_tx,
             nothing,
         ));
-        // Ten minutes without home: far more failures than it takes to reach the cap.
+        // Ten minutes without the desk: far more failures than it takes to reach the cap.
         tokio::time::sleep(Duration::from_secs(600)).await;
         while events.try_recv().is_ok() {}
-        // Home comes back right after a refused dial, the worst moment: the agent has just
+        // The desk comes back right after a refused dial, the worst moment: the agent has just
         // started its longest wait.
         while !matches!(events.recv().await, Some(Event::Retrying(_))) {}
         home_is_back.store(true, Ordering::SeqCst);
@@ -1536,12 +1536,12 @@ pub(crate) mod tests {
             }
         })
         .await
-        .expect("the agent dials home again");
+        .expect("the agent dials the desk again");
         agent.abort();
         assert!(waited <= A_FEW_SECONDS, "dialled again after {waited:?}");
     }
 
-    /// A dialer that answers like home does, and counts its dials; home a 0.1 if `old`.
+    /// A dialer that answers like the desk does, and counts its dials; the desk a 0.1 if `old`.
     #[derive(Clone, Default)]
     struct Counted {
         dials: Arc<AtomicUsize>,
@@ -1569,7 +1569,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// An agent paired with home's router as `gateway`, on `tables`.
+    /// An agent paired with the desk's router as `gateway`, on `tables`.
     fn gated_agent(
         store: &Store,
         tables: FakeTables,
@@ -1607,7 +1607,7 @@ pub(crate) mod tests {
         std::iter::from_fn(|| events.try_recv().ok()).collect()
     }
 
-    /// Away from home for ten minutes: no dial, and one line said, not one per check.
+    /// Away from the desk for ten minutes: no dial, and one line said, not one per check.
     async fn never_dialed_and_said_once(tables: FakeTables) {
         let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
         let (dialer, agent, mut events) = gated_agent(&store, tables);
@@ -1670,7 +1670,7 @@ pub(crate) mod tests {
             }
         })
         .await
-        .expect("the agent dials home again");
+        .expect("the agent dials the desk again");
         agent.abort();
         assert!(
             back.elapsed() <= RECHECK,
@@ -1912,7 +1912,7 @@ pub(crate) mod tests {
                 until_connected(&mut home_events).await;
                 until_connected(&mut remote_events).await;
 
-                // A stranger with its own certificate, and a silent connection: home refuses both.
+                // A stranger with its own certificate, and a silent connection: the desk refuses both.
                 let stranger = TlsDialer::new(
                     &Identity::generate().unwrap(),
                     desk.home.identity().unwrap().fingerprint(),
@@ -2101,7 +2101,7 @@ pub(crate) mod tests {
         .clone();
         assert_eq!(pointers[0], Pointer::default());
         assert_eq!(&pointers[1].shape.as_ref().unwrap().argb[..], &[3; 4]);
-        // Home's acks, and home's input, go back to output 1.
+        // The desk's acks, and the desk's input, go back to output 1.
         ends.home
             .outbox
             .on(1)
@@ -2135,7 +2135,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_remote_cursor_is_never_lost_behind_a_full_display_queue() {
         let mut ends = display_link(1 << 20).await;
-        // Home's display reads nothing: its queue fills.
+        // The desk's display reads nothing: its queue fills.
         for id in 0..DISPLAY_INBOUND as u64 + 20 {
             let (msg, payloads) = video_frame(id, 16);
             ends.remote.outbox.send(msg, payloads);
@@ -2331,7 +2331,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn frames_the_display_cannot_take_are_acked_and_a_keyframe_asked_for() {
         let mut ends = display_link(1 << 20).await;
-        // Home's display reads nothing: its queue fills.
+        // The desk's display reads nothing: its queue fills.
         for id in 0..DISPLAY_INBOUND as u64 + 20 {
             let (msg, payloads) = video_frame(id, 16);
             ends.remote.outbox.send(msg, payloads);

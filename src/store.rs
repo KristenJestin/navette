@@ -20,7 +20,7 @@ const PAIRING_FILE: &str = "paired.conf";
 pub enum Role {
     /// The machine with the monitors: it listens, on its LAN address only.
     Home,
-    /// The managed laptop: it only dials out to home.
+    /// The managed laptop: it only dials out to the desk.
     Remote,
 }
 
@@ -29,9 +29,9 @@ pub enum Role {
 pub struct Pairing {
     pub role: Role,
     pub peer: Fingerprint,
-    /// Home: the LAN address it listens on. Remote: the home address it dials.
+    /// Desk: the LAN address it listens on. Remote: the desk address it dials.
     pub address: SocketAddr,
-    /// Remote: the hardware address of home's router, its default gateway at home; none for a
+    /// Remote: the hardware address of the desk's router, its default gateway at the desk; none for a
     /// pairing made before it was recorded, or without one known yet.
     pub gateway: Option<Mac>,
 }

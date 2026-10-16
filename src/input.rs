@@ -1,9 +1,9 @@
-//! Input: home's keyboard and pointer, while the pointer is over the reserved monitor, sent to
+//! Input: the desk's keyboard and pointer, while the pointer is over the reserved monitor, sent to
 //! the remote machine and injected there on its output. Focus follows the pointer: the surface
 //! takes the keyboard (and the shortcuts inhibitor, so Super and every bind go too) when the
 //! pointer enters it, and gives both back when it leaves, or when the release hotkey is typed.
 //!
-//! Positions are the surface's own (home's logical pixels) and the remote pointer's extent is
+//! Positions are the surface's own (the desk's logical pixels) and the remote pointer's extent is
 //! the surface's size: the virtual pointer's absolute motion is a fraction of its output, so
 //! the position lands at the same place whatever scale Hyprland chose on either side. Each
 //! motion also carries how far it moved, injected as relative motion before the position: a
@@ -11,11 +11,11 @@
 //! sees only relative motion, and Hyprland sends none for an absolute one.
 //!
 //! **The queue.** Each direction has one bounded queue, which never blocks its writer (the
-//! surface's thread at home, the link's reader on the remote). Its policy keeps a held key from
+//! surface's thread at the desk, the link's reader on the remote). Its policy keeps a held key from
 //! ever staying down: a motion replaces a motion queued right before it; and when the queue is
 //! full (the link stalled for [`QUEUE`] events), what waits is dropped and replaced by a
 //! `ReleaseAll`, keeping only the latest keymap and area. A release is so never lost: it is
-//! queued, or everything held is released. After such a cut, a key still held at home is up on
+//! queued, or everything held is released. After such a cut, a key still held at the desk is up on
 //! the remote until it is pressed again. A keymap replaces one still queued, so the queue holds
 //! one at most, and its memory stays bounded.
 //!
@@ -44,10 +44,10 @@ use crate::display::Keyboard;
 /// of typing and scrolling, far more than a link that keeps up ever holds.
 pub const QUEUE: usize = 256;
 
-/// The longest keymap taken from home: a full xkb keymap is about 100 KB.
+/// The longest keymap taken from the desk: a full xkb keymap is about 100 KB.
 pub const MAX_KEYMAP: usize = 512 * 1024;
 
-/// One input event, home to remote.
+/// One input event, desk to remote.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum Event {
     /// `code` is an evdev keycode.
@@ -89,7 +89,7 @@ pub enum Event {
         #[n(3)]
         stop: bool,
     },
-    /// Home's keymap (xkb text, format v1), so every key types the same on both machines.
+    /// The desk's keymap (xkb text, format v1), so every key types the same on both machines.
     #[n(4)]
     Keymap(#[n(0)] String),
     /// The surface's size in logical pixels: the extent of the positions.
@@ -103,7 +103,7 @@ pub enum Event {
     /// Every key and button held goes up; the locks stay.
     #[n(6)]
     ReleaseAll,
-    /// The locks on at home, by xkb name (`Lock` for Caps Lock, `Mod2` for Num Lock).
+    /// The locks on at the desk, by xkb name (`Lock` for Caps Lock, `Mod2` for Num Lock).
     #[n(7)]
     Locked(#[n(0)] Vec<String>),
 }
@@ -119,10 +119,10 @@ struct Waiting {
 struct Shared {
     waiting: Mutex<Waiting>,
     notify: Notify,
-    /// The keys home's surfaces sent down, on any output, and home still holds as far as they
+    /// The keys the desk's surfaces sent down, on any output, and the desk still holds as far as they
     /// know: the next surface to take the keyboard presses them again on its own output.
     carried: Mutex<BTreeSet<u32>>,
-    /// Where each output's surface stands in home's layout, for a drag that leaves it.
+    /// Where each output's surface stands in the desk's layout, for a drag that leaves it.
     places: Mutex<BTreeMap<u8, Place>>,
     /// The release hotkey gave the keyboard back, and no surface has taken it since: the next
     /// one to, on any output, says so. A flag of the link, not of a surface, so that moving
@@ -130,7 +130,7 @@ struct Shared {
     at_home: AtomicBool,
 }
 
-/// A surface's rectangle in home's layout, in logical pixels.
+/// A surface's rectangle in the desk's layout, in logical pixels.
 #[derive(Clone, Copy, Debug)]
 struct Place {
     x: f64,
@@ -274,7 +274,7 @@ impl Queue {
     }
 }
 
-/// A link's input queues: home fills `to_peer`, the remote reads `from_peer`.
+/// A link's input queues: the desk fills `to_peer`, the remote reads `from_peer`.
 #[derive(Clone, Default)]
 pub struct Wire {
     pub to_peer: Queue,
@@ -297,7 +297,7 @@ struct Mods {
     logo: bool,
 }
 
-/// The chord that gives the keyboard back to home without moving the pointer, as gliff's
+/// The chord that gives the keyboard back to the desk without moving the pointer, as gliff's
 /// `--release-hotkey`: `shift+escape` by default, `none` for no hotkey.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hotkey {
@@ -349,7 +349,7 @@ fn keysym(name: &str) -> Option<xkb::Keysym> {
     (sym.raw() != xkb::keysyms::KEY_NoSymbol).then_some(sym)
 }
 
-/// Home's keyboard state, from its keymap: what the hotkey is matched against.
+/// The desk's keyboard state, from its keymap: what the hotkey is matched against.
 struct Keys {
     keymap: xkb::Keymap,
     state: xkb::State,
@@ -390,7 +390,7 @@ impl Keys {
         self.held.clear();
     }
 
-    /// Home's modifiers as the compositor reports them; `group` is the layout in effect.
+    /// The desk's modifiers as the compositor reports them; `group` is the layout in effect.
     fn set_mods(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
         self.state
             .update_mask(depressed, latched, locked, 0, 0, group);
@@ -471,7 +471,7 @@ pub enum Focus {
     Give,
 }
 
-/// Home's side over the reserved surface, apart from Wayland: what each event of the pointer
+/// The desk's side over the reserved surface, apart from Wayland: what each event of the pointer
 /// and the keyboard sends, and when the surface takes or gives the keyboard.
 pub struct Capture {
     queue: Queue,
@@ -481,14 +481,14 @@ pub struct Capture {
     keymap: String,
     held_keys: BTreeSet<u32>,
     held_buttons: BTreeSet<u32>,
-    /// The hotkey gave the keyboard back; until the pointer leaves, keys stay home.
+    /// The hotkey gave the keyboard back; until the pointer leaves, keys stay at the desk.
     released: bool,
     /// The locks last sent since the keyboard came; `None` sends them at the next modifiers.
     locks_sent: Option<Vec<String>>,
-    /// Hears each time the keyboard goes home by the hotkey, and the first time a surface takes
+    /// Hears each time the keyboard goes to the desk by the hotkey, and the first time a surface takes
     /// it back after; and each time the pointer comes or leaves, the keyboard with it.
     on_release: Option<crate::display::Released>,
-    /// The surface's origin in home's layout, and its size.
+    /// The surface's origin in the desk's layout, and its size.
     at: Option<(i32, i32)>,
     /// The position of the pointer's last motion, the one its next is measured from.
     last: Option<(f64, f64)>,
@@ -543,7 +543,7 @@ impl Capture {
         self.queue.push(Event::Area { width, height });
     }
 
-    /// The surface's origin in home's layout (its monitor's logical position).
+    /// The surface's origin in the desk's layout (its monitor's logical position).
     pub fn at(&mut self, x: i32, y: i32) {
         self.at = Some((x, y));
         self.place();
@@ -575,7 +575,7 @@ impl Capture {
         Focus::Take
     }
 
-    /// The pointer left: whatever is held goes up on the remote, the keyboard goes home.
+    /// The pointer left: whatever is held goes up on the remote, the keyboard goes to the desk.
     pub fn leave(&mut self) -> Focus {
         self.release();
         self.released = false;
@@ -583,10 +583,10 @@ impl Capture {
         Focus::Give
     }
 
-    /// The keyboard came, with the keys already held at home: they count for the hotkey. Those
+    /// The keyboard came, with the keys already held at the desk: they count for the hotkey. Those
     /// that went down on the remote over this surface or another of the link (the pointer
     /// crossing from one work monitor to the next with Shift held) go down again on this
-    /// output, a virtual keyboard's modifiers being its own; the others' releases stay home,
+    /// output, a virtual keyboard's modifiers being its own; the others' releases stay at the desk,
     /// the remote never having had their presses.
     pub fn keyboard_entered(&mut self, keys: &[u32]) {
         if let Some(state) = &mut self.keys {
@@ -609,8 +609,8 @@ impl Capture {
         self.locks_sent = None;
     }
 
-    /// Home's modifiers, which the compositor sends when the keyboard comes and when they
-    /// change: the hotkey reads them, and the remote takes home's locks.
+    /// The desk's modifiers, which the compositor sends when the keyboard comes and when they
+    /// change: the hotkey reads them, and the remote takes the desk's locks.
     pub fn modifiers(&mut self, depressed: u32, latched: u32, locked: u32, group: u32) {
         let Some(keys) = &mut self.keys else { return };
         keys.set_mods(depressed, latched, locked, group);
@@ -629,11 +629,11 @@ impl Capture {
         }
     }
 
-    /// While a button is held, home's compositor keeps the pointer on the surface that had the
+    /// While a button is held, the desk's compositor keeps the pointer on the surface that had the
     /// press, its positions going past the surface's edges (measured on Hyprland 0.56.2): they
     /// go to the work monitor under them, as the remote takes a press on one output's pointer
     /// and the motion on another's as one drag. Off every work monitor, the drag stops at the
-    /// nearest edge, so a remote window never goes where home shows no remote output.
+    /// nearest edge, so a remote window never goes where the desk shows no remote output.
     pub fn motion(&mut self, x: f64, y: f64) {
         let delta = self.last.map(|(last_x, last_y)| (x - last_x, y - last_y));
         self.last = Some((x, y));
@@ -707,7 +707,7 @@ impl Capture {
         if let Some(keys) = &mut self.keys {
             keys.update(code, pressed);
         }
-        // A release whose press the remote never got (held before the pointer came) stays home.
+        // A release whose press the remote never got (held before the pointer came) stays at the desk.
         if track(&mut self.held_keys, code, pressed) {
             self.queue.push(Event::Key { code, pressed });
         }
@@ -754,7 +754,7 @@ pub enum Seat<'a> {
         y: f64,
     },
     PointerLeave,
-    /// With the keys already held at home.
+    /// With the keys already held at the desk.
     KeyboardEnter {
         keys: &'a [u32],
     },
@@ -774,7 +774,7 @@ pub enum Seat<'a> {
     },
 }
 
-/// The surface's hold on home's keyboard: its keyboard interactivity (`on_demand` or `none`)
+/// The surface's hold on the desk's keyboard: its keyboard interactivity (`on_demand` or `none`)
 /// and the shortcuts inhibitor.
 pub trait Grab {
     fn interactive(&mut self, on: bool);
@@ -841,7 +841,7 @@ fn track(held: &mut BTreeSet<u32>, code: u32, pressed: bool) -> bool {
 
 /// Injects input on the remote's output (the port behind which tests put a fake).
 pub trait Injectors: Send + Sync {
-    /// Starts injecting on `output`, with home's keymap when it is known.
+    /// Starts injecting on `output`, with the desk's keymap when it is known.
     fn start(&self, output: &str, keymap: Option<&str>) -> io::Result<Box<dyn Inject>>;
 }
 
@@ -902,7 +902,7 @@ fn commands(event: Event) -> Vec<hypr_input::InputCmd> {
         Event::Motion { x, y, delta } => {
             let motion = InputCmd::Motion { x, y };
             return match delta {
-                // The relative motion first, so the position puts the pointer where home's is.
+                // The relative motion first, so the position puts the pointer where the desk's is.
                 Some((dx, dy)) if (dx, dy) != (0.0, 0.0) => {
                     vec![InputCmd::Relative { dx, dy }, motion]
                 }
@@ -1098,7 +1098,7 @@ mod tests {
                 Event::ReleaseAll
             ]
         );
-        // Its release, typed at home, is not sent again.
+        // Its release, typed at the desk, is not sent again.
         capture.key(KEY_LEFTSHIFT, false);
         assert_eq!(sent(&queue), []);
     }
@@ -1187,7 +1187,7 @@ mod tests {
         assert_eq!(heard(&mut heard_by), []);
         release_hotkey(&mut capture);
         assert_eq!(heard(&mut heard_by), [Keyboard::Home]);
-        // Keys typed at home afterwards say nothing more.
+        // Keys typed at the desk afterwards say nothing more.
         capture.key(KEY_T, true);
         assert_eq!(heard(&mut heard_by), []);
     }
@@ -1289,7 +1289,7 @@ mod tests {
     const KEY_RIGHTSHIFT: u32 = 54;
     const KEY_LEFTCTRL: u32 = 29;
 
-    /// Home's keymap on the maintainer's desk: French, with Omarchy's keyboard options.
+    /// The desk's keymap on the maintainer's desk: French, with Omarchy's keyboard options.
     fn omarchy_fr() -> String {
         hypr_input::keymap_from_names(&hypr_input::KeymapNames {
             layout: "fr".into(),
@@ -1299,7 +1299,7 @@ mod tests {
         .unwrap()
     }
 
-    /// Over the surface with home's keymap on the maintainer's desk, and `locked` at home.
+    /// Over the surface with the desk's keymap on the maintainer's desk, and `locked` at the desk.
     fn armed_on_the_desk(locked: u32) -> (Capture, Queue) {
         let queue = Queue::default();
         let mut capture = Capture::new(queue.clone(), Hotkey::parse(DEFAULT_HOTKEY).unwrap());
@@ -1759,7 +1759,7 @@ mod tests {
                 (1, key(KEY_T, false)),
             ]
         );
-        // To a home monitor: everything goes up, the second output's Shift with it.
+        // To a desk monitor: everything goes up, the second output's Shift with it.
         second.leave();
         assert_eq!(sent_on(&queue), [(1, Event::ReleaseAll)]);
         second.key(KEY_LEFTSHIFT, false);
@@ -1774,7 +1774,7 @@ mod tests {
         first.enter(1900.0, 500.0);
         first.key(KEY_LEFTSHIFT, true);
         first.leave();
-        // Let go over a home monitor, then the pointer comes to the second.
+        // Let go over a desk monitor, then the pointer comes to the second.
         second.enter(10.0, 500.0);
         second.keyboard_entered(&[]);
         assert_eq!(
@@ -1785,7 +1785,7 @@ mod tests {
         assert_eq!(sent_on(&queue), []);
     }
 
-    /// Two work monitors side by side, right of a home one: 1920x1080 at x 1920, then
+    /// Two work monitors side by side, right of a desk one: 1920x1080 at x 1920, then
     /// 2560x1440 at x 3840; their sizes already sent.
     fn two_work_monitors() -> (Queue, Capture, Capture) {
         let queue = Queue::default();
@@ -1804,7 +1804,7 @@ mod tests {
         let (queue, mut first, _second) = two_work_monitors();
         first.enter(1800.0, 500.0);
         first.button(BTN_LEFT, true);
-        // Home's compositor keeps the pointer on the first surface while the button is held,
+        // The desk's compositor keeps the pointer on the first surface while the button is held,
         // its positions past the surface's right edge.
         first.motion(1919.0, 500.0);
         first.motion(2020.0, 510.0);
@@ -1850,7 +1850,7 @@ mod tests {
     #[test]
     fn a_drag_stops_at_the_outer_edge_of_the_reserved_monitors() {
         let (queue, mut first, mut second) = two_work_monitors();
-        // Onto the home monitor on the left: the first work monitor's left edge.
+        // Onto the desk monitor on the left: the first work monitor's left edge.
         first.enter(10.0, 500.0);
         first.button(BTN_LEFT, true);
         first.motion(-300.0, 500.0);

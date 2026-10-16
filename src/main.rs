@@ -1,8 +1,8 @@
-//! `navette`: the work-from-home mode. The machine with the monitors ("home") pairs once with
-//! the work laptop ("remote"), then `navette serve` at home and `navette agent` on the laptop
-//! keep an authenticated link between them. `navette mode start [name]` gives the home monitors
+//! `navette`: the work-from-home mode. The machine with the monitors ("desk") pairs once with
+//! the work laptop ("remote"), then `navette serve` at the desk and `navette agent` on the laptop
+//! keep an authenticated link between them. `navette mode start [name]` gives the desk monitors
 //! of a mode to the remote machine, `navette mode stop` gives them back, `navette status` says
-//! what runs; `navette serve --audio` brings the remote machine's sound home and sends the home
+//! what runs; `navette serve --audio` brings the remote machine's sound to the desk and sends the desk
 //! mic there while a mode runs; `navette mic` switches it.
 
 use std::io::BufRead;
@@ -229,8 +229,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let pin = Pin::parse(&line).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "a PIN is six digits")
             })?;
-            // Home's router, as this machine sees it now, on home's network: the agent dials
-            // home only behind it.
+            // The desk's router, as this machine sees it now, on the desk's network: the agent dials
+            // the desk only behind it.
             let gateway = network::routers(&ProcNet, home.ip()).first().copied();
             pair::remote(&store, home, gateway, &pin, Timeouts::default()).await?;
             // A running agent read the previous pairing when it started: restart it.
@@ -255,12 +255,12 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let gpu = tokio::task::spawn_blocking(decode::open_gpu)
                 .await
                 .map_err(std::io::Error::other)?;
-            // Without `--audio`, home never reaches PipeWire.
+            // Without `--audio`, the desk never reaches PipeWire.
             let graph = audio.then(PipeWire::default);
             let toggle = mic::toggle_command(&std::env::current_exe()?);
             let saved = audio::Saved::in_dir(audio::Saved::default_dir()?);
             if let Some(graph) = graph.clone() {
-                // Home's mic back first, if a previous run died with it away.
+                // The desk's mic back first, if a previous run died with it away.
                 let saved = saved.clone();
                 tokio::task::spawn_blocking(move || audio::mic::repair_home(&graph, &saved))
                     .await
@@ -401,7 +401,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let saved = audio::Saved::in_dir(audio::Saved::default_dir()?);
             // The latest link's audio thread; each one joins the one before it.
             let audio_thread = Arc::new(Mutex::new(None));
-            // Home shows the files crossing, and stops them: this machine only says how a paste
+            // The desk shows the files crossing, and stops them: this machine only says how a paste
             // ended.
             let shown = Shown::notifications(Arc::new(notify::NotifySend::new(notify::Command)));
             let kept = clipboard::Kept::default();
@@ -532,7 +532,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                     mic::Order::Home
                 }
                 MicAction::Status { json } => {
-                    // No `navette serve`: the mic is home.
+                    // No `navette serve`: the mic is at the desk.
                     let status = mic::ask(&path, mic::Order::Status)
                         .await
                         .unwrap_or(mic::Status::Off);

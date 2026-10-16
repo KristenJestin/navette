@@ -7,7 +7,7 @@
 //! never worked around.
 //!
 //! The lid is watched on a thread of its own ([`Watch`]): logind and Hyprland answer it there,
-//! never in the loop that carries home's input. logind's `LidClosed` is read once a second:
+//! never in the loop that carries the desk's input. logind's `LidClosed` is read once a second:
 //! `busctl monitor` is refused to a user (measured in #36), and a read cannot miss a change.
 //!
 //! The rules that bring the screen back are written to a file before the screen is disabled,

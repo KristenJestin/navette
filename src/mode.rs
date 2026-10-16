@@ -1,19 +1,19 @@
-//! The mode, at home: the paired machine takes the home monitors named in the config, one or
+//! The mode, at the desk: the paired machine takes the desk monitors named in the config, one or
 //! more. `navette mode start` checks everything first (the config, the monitors, the link) and
-//! changes nothing when a check fails; then home covers each monitor with its surface, asks the
-//! remote for one output per monitor, in home's left-to-right order, and shows each stream on
+//! changes nothing when a check fails; then the desk covers each monitor with its surface, asks the
+//! remote for one output per monitor, in the desk's left-to-right order, and shows each stream on
 //! its surface. `navette mode stop`, or the link dropping, gives the monitors back; so does any
-//! one surface going away. Home monitors are never moved or reconfigured: the changes to the
-//! home desk are the monitors' workspaces, moved whole to another home monitor and back (#48,
+//! one surface going away. The desk monitors are never moved or reconfigured: the changes to the
+//! the desk are the monitors' workspaces, moved whole to another desk monitor and back (#48,
 //! with no slide at the first visit, #118),
-//! a window rule per monitor that opens home windows on that home monitor rather than hidden
-//! under a surface (#2), the layer rules that draw the remote's picture above home's overlays but
+//! a window rule per monitor that opens the desk windows on that desk monitor rather than hidden
+//! under a surface (#2), the layer rules that draw the remote's picture above the desk's overlays but
 //! under the tools the user starts (#116) and, with a mic, the hotkey that switches it, made
 //! through the desk recorder so they are undone on stop, on a dropped link and after a crash,
-//! and made again after a config reload. A home window that lands on a given monitor all the
-//! same (moved, dragged, opened on an explicit workspace) is sent back to a home monitor as
-//! Hyprland reports it (#31). The remote's sound plays at home, and the home mic goes to the
-//! remote machine, for as long as the mode runs. Every home monitor shows its corner meanwhile
+//! and made again after a config reload. A desk window that lands on a given monitor all the
+//! same (moved, dragged, opened on an explicit workspace) is sent back to a desk monitor as
+//! Hyprland reports it (#31). The remote's sound plays at the desk, and the desk mic goes to the
+//! remote machine, for as long as the mode runs. Every desk monitor shows its corner meanwhile
 //! (#69), and a notification says when the mode is up and when it stops.
 //!
 //! `navette serve` owns the link and the surface, so the two commands reach it over a Unix
@@ -49,7 +49,7 @@ mod config;
 pub use config::list;
 use config::{Mode, resolve};
 
-/// The `order` of the layer rule on Navette's picture: lower than any of home's overlays, which
+/// The `order` of the layer rule on Navette's picture: lower than any of the desk's overlays, which
 /// have 0 unless the user's own rules say otherwise, so it is drawn after them (#116).
 const PICTURE_ORDER: i32 = -1000;
 /// The `order` of the `local_above` layers: drawn after the picture.
@@ -82,14 +82,14 @@ const MIC_FOLLOWS: Duration = if cfg!(test) {
     Duration::from_millis(500)
 };
 
-/// The home mic, which goes to the remote machine while a mode runs (the port behind which
+/// The desk mic, which goes to the remote machine while a mode runs (the port behind which
 /// tests put a fake). Its calls wait for PipeWire and the link: they are made off the executor.
 pub trait Mic: Send + Sync {
-    /// The mic goes to the remote machine, or stays home unless `remote`.
+    /// The mic goes to the remote machine, or stays at the desk unless `remote`.
     fn start(&self, remote: bool, names: Names) -> io::Result<()>;
     /// It goes to that side, as the hotkey sends it, unless it is there already.
     fn follow(&self, remote: bool) -> io::Result<()>;
-    /// It comes back home.
+    /// It comes back to the desk.
     fn stop(&self);
     /// The shell command the hotkey runs to switch it.
     fn toggle_command(&self) -> String;
@@ -104,16 +104,16 @@ impl Drop for MicSent {
     }
 }
 
-/// The remote's sound, played at home while a mode runs (the port behind which tests put a
+/// The remote's sound, played at the desk while a mode runs (the port behind which tests put a
 /// fake). Its calls wait for PipeWire and the link: they are made off the executor.
 pub trait Sound: Send + Sync {
-    /// The remote's sound comes home.
+    /// The remote's sound comes to the desk.
     fn start(&self) -> io::Result<()>;
     /// The remote plays it on its own output again.
     fn stop(&self);
 }
 
-/// The remote's sound played at home, until dropped.
+/// The remote's sound played at the desk, until dropped.
 struct SoundPlayed(Arc<dyn Sound>);
 
 impl Drop for SoundPlayed {
@@ -122,9 +122,9 @@ impl Drop for SoundPlayed {
     }
 }
 
-/// Covers a home monitor (the port behind which tests put a fake).
+/// Covers a desk monitor (the port behind which tests put a fake).
 pub trait Screens: Send + Sync {
-    /// Covers `monitor`; the guard takes the cover away when dropped. Home's input over it goes
+    /// Covers `monitor`; the guard takes the cover away when dropped. The desk's input over it goes
     /// to `input`, until `hotkey`, which `released` then hears. `ended` hears it if the cover
     /// goes away on its own. The cover shows the corner `feed` tells.
     fn open(
@@ -136,13 +136,13 @@ pub trait Screens: Send + Sync {
         feed: Feed,
     ) -> io::Result<Box<dyn Screen>>;
 
-    /// Shows the corner on `monitor`, one of home's own, until the guard is dropped.
+    /// Shows the corner on `monitor`, one of the desk's own, until the guard is dropped.
     fn corner(&self, monitor: &str, feed: Feed) -> io::Result<Box<dyn Send>>;
 }
 
 pub trait Screen: Send {
     fn pictures(&self) -> Box<dyn FnMut(Picture) + Send>;
-    /// The remote pointer: its image, shown at home's pointer over the cover.
+    /// The remote pointer: its image, shown at the desk's pointer over the cover.
     fn cursor(&self, pointer: Pointer);
     /// The layouts in which the GPU's pictures can be handed over as dmabufs, with no copy.
     fn dmabuf_modifiers(&self) -> Vec<u64>;
@@ -207,7 +207,7 @@ pub enum Order {
     Status(oneshot::Sender<io::Result<String>>),
 }
 
-/// What home needs to run a mode.
+/// What the desk needs to run a mode.
 pub struct Home {
     pub config_dir: PathBuf,
     pub hypr: Arc<dyn Hypr>,
@@ -216,7 +216,7 @@ pub struct Home {
     pub gpu: Arc<HomeGpu>,
     /// Where the desk recorder keeps what it must undo.
     pub desk_record: PathBuf,
-    /// The mic, when home plays the remote's sound.
+    /// The mic, when the desk plays the remote's sound.
     pub mic: Option<Arc<dyn Mic>>,
     /// The remote's sound, with `navette serve --audio`.
     pub sound: Option<Arc<dyn Sound>>,
@@ -228,7 +228,7 @@ pub struct Home {
     pub events: Arc<Events>,
 }
 
-/// Home's GPU, kept from one mode to the next until a decoder lost it. A lost device fails
+/// The desk's GPU, kept from one mode to the next until a decoder lost it. A lost device fails
 /// every decode, so the next mode must not build its first decoder on it.
 pub struct HomeGpu<T = Arc<Gpu>> {
     gpu: Mutex<Option<T>>,
@@ -263,11 +263,11 @@ impl<T: Clone> HomeGpu<T> {
     }
 }
 
-/// The workspace each given monitor showed when home windows were last sent home.
+/// The workspace each given monitor showed when the desk windows were last sent to the desk.
 type Seen = Vec<(String, i64)>;
 
 struct Active {
-    /// Home first, before the rest goes.
+    /// The desk first, before the rest goes.
     _mic: Option<MicSent>,
     _sound: Option<SoundPlayed>,
     /// The mode's name, `None` for the unnamed one.
@@ -278,12 +278,12 @@ struct Active {
     generation: u32,
     /// The monitors given, left to right: monitor `i` shows output `i`.
     monitors: Vec<String>,
-    /// The home monitor that takes the home windows the cover would hide; none when every
+    /// The desk monitor that takes the desk windows the cover would hide; none when every
     /// monitor is given.
     home_monitor: Option<String>,
     seen: Arc<Mutex<Seen>>,
     shown: Vec<Shown>,
-    /// The corners on home's own monitors.
+    /// The corners on the desk's own monitors.
     _corners: Vec<Box<dyn Send>>,
     desk: Arc<Mutex<Desk<Eval>>>,
     /// Why a surface or a decoder cannot go on.
@@ -497,7 +497,7 @@ pub async fn serve(
     loop {
         tell(&home, peer.as_ref(), active.as_ref(), &mut told);
         // The link carries the user's clipboard and sound once the remote started the mode,
-        // and no longer once home stops it.
+        // and no longer once the desk stops it.
         if let Some(peer) = &peer {
             let running = active.as_ref().is_some_and(|a| a.starting.is_none());
             peer.mode
@@ -665,7 +665,7 @@ pub async fn serve(
                         eprintln!("navette: the desk could not be restored after a reload: {e}");
                     }
                     // The layer rules are back, but in effect only once each monitor is sorted
-                    // again: until then, an overlay of home's that maps lands above the picture.
+                    // again: until then, an overlay of the desk's that maps lands above the picture.
                     if reloaded && let Some(a) = &active {
                         for shown in &a.shown {
                             shown.screen.poke();
@@ -769,7 +769,7 @@ fn pointer_over(hypr: &dyn Hypr, given: &[hypr::Monitor]) -> bool {
 
 /// What the running mode's surface and decoder say.
 enum Said {
-    /// The keyboard went home by the release hotkey, or came back to the remote, or went with
+    /// The keyboard went to the desk by the release hotkey, or came back to the remote, or went with
     /// the pointer.
     Keyboard(Keyboard),
     /// Why they gave up.
@@ -822,9 +822,9 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
 /// A mode whose checks all passed.
 struct Plan {
     mode: Mode,
-    /// The monitors it gives, in home's left-to-right order.
+    /// The monitors it gives, in the desk's left-to-right order.
     given: Vec<hypr::Monitor>,
-    /// Every monitor at home.
+    /// Every monitor at the desk.
     monitors: Vec<hypr::Monitor>,
 }
 
@@ -838,7 +838,7 @@ async fn check<'p>(
     let hypr = home.hypr.clone();
     let monitors = blocking(move || hypr::monitors(&*hypr)).await?;
     let mut given = resolve(&mode.monitors, &monitors, &mode.names)?;
-    // The remote's outputs keep home's physical order, whatever the config's.
+    // The remote's outputs keep the desk's physical order, whatever the config's.
     given.sort_by_key(|m| (m.x, m.y));
     let Some(peer) = peer.filter(|p| !p.outbox.is_closed()) else {
         return Err(io::Error::new(
@@ -1058,8 +1058,8 @@ async fn launch(
 
 /// One decoding GPU per output, none shared: a `Gpu` is not thread-safe (one Vulkan queue,
 /// one VA-API display), and two decoders submitting on one at once lost the device on an
-/// NVIDIA GPU. The first output takes home's; each other one opens its own. Without a GPU at
-/// home, every output decodes on the CPU. With one, an output that cannot have its own fails
+/// NVIDIA GPU. The first output takes the desk's; each other one opens its own. Without a GPU at
+/// the desk, every output decodes on the CPU. With one, an output that cannot have its own fails
 /// the start: the remote is offered streams the CPU does not decode.
 fn decoding_gpus<T>(
     first: Option<T>,
@@ -1084,9 +1084,9 @@ fn decoding_gpus<T>(
     Ok(gpus)
 }
 
-/// Opens the desk (undoing what a previous run left) and keeps home windows off the `given`
-/// monitors: their workspaces go to `other`, the leftmost home monitor kept home, and so do
-/// windows that would open on any of their workspaces. Draws the remote's picture above home's
+/// Opens the desk (undoing what a previous run left) and keeps at the desk windows off the `given`
+/// monitors: their workspaces go to `other`, the leftmost the desk monitor kept at the desk, and so do
+/// windows that would open on any of their workspaces. Draws the remote's picture above the desk's
 /// overlays, except the `local_above` ones (#116). With a mic, binds its hotkey.
 async fn open_desk(
     home: &Home,
@@ -1120,7 +1120,7 @@ async fn open_desk(
                 desk.apply(change).map_err(desk_error)?;
             }
             // The workspace a monitor with the focus shows is shown where it goes (measured
-            // on Hyprland 0.56.2): home shows again what it showed.
+            // on Hyprland 0.56.2): the desk shows again what it showed.
             if let Some(shows) = home_shows.filter(|_| held.iter().any(|w| w.shown)) {
                 let lua = hypr::show_workspace(other, shows);
                 if let Err(e) = hypr::dispatch(&*hypr, &format!("eval {lua}")) {
@@ -1141,7 +1141,7 @@ async fn open_desk(
         }
         // Before the surfaces map: Hyprland 0.56.2 sorts a monitor's overlay layers by `order`,
         // highest first, only when one maps, unmaps or commits its layer-shell state, and draws
-        // the last on top. Navette's picture then stays above an overlay of home's that maps
+        // the last on top. Navette's picture then stays above an overlay of the desk's that maps
         // later (an OSD, a shell restarted), and the tools the user starts on purpose stay above
         // it. A mode without the rules still shows the picture.
         let above = [(
@@ -1189,10 +1189,10 @@ fn regex_escaped(text: &str) -> String {
     out
 }
 
-/// Moves to the home monitor the home windows that landed on the given ones, where a cover
+/// Moves to the desk monitor the desk windows that landed on the given ones, where a cover
 /// hides them (#31). These moves are not desk changes: nothing puts a window back under a cover,
-/// so a stop leaves them home. A failure is said, and the next event tries again.
-/// `sending` is the mode's given monitors, home monitor and workspaces seen.
+/// so a stop leaves them at the desk. A failure is said, and the next event tries again.
+/// `sending` is the mode's given monitors, the desk monitor and workspaces seen.
 async fn send_home(home: &Home, sending: (Vec<String>, Option<String>, Arc<Mutex<Seen>>)) {
     let (given, Some(to), seen) = sending else {
         return;
@@ -1451,7 +1451,7 @@ mod tests {
         hotkeys: Arc<Mutex<Vec<Option<Hotkey>>>>,
         /// The cursors the screens were given, with their monitor.
         cursors: Arc<Mutex<Vec<(String, Pointer)>>>,
-        /// Where each screen sends home's input, with its monitor.
+        /// Where each screen sends the desk's input, with its monitor.
         inputs: Arc<Mutex<Vec<(String, input::Queue)>>>,
         /// Where each screen says its hotkey gave the keyboard back.
         releases: Arc<Mutex<Vec<Released>>>,
@@ -1780,7 +1780,7 @@ mod tests {
         to_home: mpsc::Sender<Incoming>,
         pointer: watch::Sender<Vec<Pointer>>,
         input: input::Wire,
-        /// What home's clipboard and sound read: whether a mode runs.
+        /// What the desk's clipboard and sound read: whether a mode runs.
         mode: watch::Receiver<bool>,
     }
 
@@ -1853,7 +1853,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("home never got there");
+        panic!("the desk never got there");
     }
 
     fn starts(remote: &Remote) -> Vec<OutputCopy> {
@@ -1896,7 +1896,7 @@ mod tests {
             .unwrap();
         let text = answer(pending).await.unwrap();
         assert!(text.contains("DP-2"), "{text}");
-        // Home windows that would open on DP-2's workspace go to DP-1 instead.
+        // The desk windows that would open on DP-2's workspace go to DP-1 instead.
         let rules = desk.hypr.window_rules();
         assert_eq!(rules.len(), 1);
         assert!(
@@ -1918,7 +1918,7 @@ mod tests {
         until(|| desk.hypr.focused() == [("0xb2".to_string(), false)]).await;
     }
 
-    /// The corners showing, by monitor and side, in home's order.
+    /// The corners showing, by monitor and side, in the desk's order.
     fn corners(desk: &Desk) -> Vec<(String, Side)> {
         let mut shown = desk.corners.shown.lock().unwrap().clone();
         shown.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2401,7 +2401,7 @@ mod tests {
         let remote = connect(&desk);
         let pending = ask(&desk, true).await;
         until(|| !starts(&remote).is_empty()).await;
-        // Asked, not started: the remote may not carry yet, and home waits for it.
+        // Asked, not started: the remote may not carry yet, and the desk waits for it.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!*remote.mode.borrow());
         remote
@@ -2509,7 +2509,7 @@ mod tests {
 
     #[tokio::test]
     async fn with_mic_follow_the_mode_starts_with_the_mic_where_the_keyboard_is() {
-        // The pointer over DP-1, at home.
+        // The pointer over DP-1, at the desk.
         let desk = follows();
         let _remote = started(&desk).await;
         assert_eq!(mic_log(&desk), ["start home"]);
@@ -2563,11 +2563,11 @@ mod tests {
         let _remote = started(&desk).await;
         keyboard(&desk, Keyboard::Came);
         until(|| mic_log(&desk) == ["start home", "to remote"]).await;
-        // The hotkey brings the mic home, the keyboard staying with the remote.
+        // The hotkey brings the mic to the desk, the keyboard staying with the remote.
         desk.mic.by_hand(false);
         tokio::time::sleep(MIC_FOLLOWS * 3).await;
         assert_eq!(mic_log(&desk), ["start home", "to remote", "by hand"]);
-        // The keyboard comes home, where the mic already is, then goes back: the mic follows.
+        // The keyboard comes to the desk, where the mic already is, then goes back: the mic follows.
         keyboard(&desk, Keyboard::Left);
         tokio::time::sleep(MIC_FOLLOWS * 3).await;
         assert_eq!(mic_log(&desk), ["start home", "to remote", "by hand"]);
@@ -2673,7 +2673,7 @@ mod tests {
                 fps_cap: 60,
             }))
             .unwrap();
-        // Home has no GPU here: the CPU decoder is the last, and a keyframe it fails ends it.
+        // The desk has no GPU here: the CPU decoder is the last, and a keyframe it fails ends it.
         remote
             .to_home
             .try_send(video(ServerMsg::VideoFrame {
@@ -2948,7 +2948,7 @@ mod tests {
     async fn a_reserved_monitor_shows_the_workspace_it_showed_before_once_the_mode_stops() {
         let desk = per_monitor_desk("monitor = DP-1\n");
         let _remote = started(&desk).await;
-        // Home still shows what it showed; the covered monitor something else.
+        // The desk still shows what it showed; the covered monitor something else.
         assert_eq!(desk.hypr.shown("DP-3"), 1);
         assert_ne!(desk.hypr.shown("DP-1"), 11);
         answer(ask(&desk, false).await).await.unwrap();
@@ -2963,7 +2963,7 @@ mod tests {
             assert_eq!(desk.hypr.place(window), ("DP-3".to_string(), workspace));
         }
         assert_eq!(desk.hypr.place("0x1a"), ("DP-3".to_string(), 1));
-        // Nothing is merged into what home shows, and nothing is left under the cover.
+        // Nothing is merged into what the desk shows, and nothing is left under the cover.
         let shown = desk.hypr.shown("DP-1");
         assert!(desk.hypr.workspaces().iter().all(|(_, m)| m != "DP-1"));
         assert!(shown != 11 && shown != 12 && shown != 13, "{shown}");
@@ -3070,7 +3070,7 @@ mod tests {
     async fn a_workspace_visited_at_home_during_the_mode_comes_back_without_a_slide_from_home() {
         let desk = per_monitor_desk("monitor = DP-1\n");
         let _remote = started(&desk).await;
-        // Home goes to two of the moved workspaces, which lays their windows out on DP-3.
+        // The desk goes to two of the moved workspaces, which lays their windows out on DP-3.
         desk.hypr.switch_to("DP-3", 12);
         desk.hypr.switch_to("DP-3", 13);
         desk.hypr.switch_to("DP-3", 1);
@@ -3451,7 +3451,7 @@ mod tests {
     async fn a_mode_names_its_own_corner_labels() {
         let desk = desk_with("remote_label = FAR\n[office]\nmonitor = DP-2\nlocal_label = NEAR\n");
         let _remote = started(&desk).await;
-        // The home corner and the reserved monitor's corner each carry their own tag.
+        // The desk corner and the reserved monitor's corner each carry their own tag.
         let feeds = desk.feeds.lock().unwrap().clone();
         let tags = |side| {
             feeds
@@ -3890,7 +3890,7 @@ mod tests {
             .collect()
     }
 
-    /// The maintainer's desk, with one more on the right: a portrait monitor kept home, then
+    /// The maintainer's desk, with one more on the right: a portrait monitor kept at the desk, then
     /// three landscape ones.
     fn four_monitors(config_text: &str) -> Desk {
         let mut portrait = FakeMonitor::new("HDMI-A-1", 2560, 1440, 0);
@@ -3955,7 +3955,7 @@ mod tests {
         let (_remote, _) = started_with(&desk, &["NAVETTE-1", "NAVETTE-2"]).await;
         let rules = desk.hypr.window_rules();
         assert_eq!(rules.len(), 2, "{rules:?}");
-        // To the leftmost monitor kept home.
+        // To the leftmost monitor kept at the desk.
         assert!(
             rules[0].contains(r#"match = { workspace = "m[DP-3]" }, monitor = "HDMI-A-1""#),
             "{rules:?}"
@@ -4068,12 +4068,12 @@ mod tests {
         "[office]\nmonitor = DP-1\n[travel]\nmonitor = DP-2\n"
     }
 
-    /// Answers the remote's side of a start: the output it made, once home asked for it.
+    /// Answers the remote's side of a start: the output it made, once the desk asked for it.
     async fn made(remote: &Remote, asked: usize) {
         made_for(remote, asked, None).await;
     }
 
-    /// The generation home gave its `nth` start (from 0).
+    /// The generation the desk gave its `nth` start (from 0).
     fn generation_of(remote: &Remote, nth: usize) -> u32 {
         remote
             .outbox
@@ -4084,7 +4084,7 @@ mod tests {
                 _ => None,
             })
             .nth(nth)
-            .expect("home numbers its starts")
+            .expect("the desk numbers its starts")
     }
 
     /// The remote made its output for the start of this generation (none: an agent that does
@@ -4214,7 +4214,7 @@ mod tests {
             })
             .collect();
         assert_eq!(sequence, ["start", "stop", "start"]);
-        // The mic and the sound went back home with the first mode, and came again.
+        // The mic and the sound went back to the desk with the first mode, and came again.
         assert_eq!(mic_log(&desk), ["start", "stop", "start"]);
         assert_eq!(sound_log(&desk), ["start", "stop", "start"]);
         assert!(
@@ -4551,7 +4551,7 @@ mod tests {
             .map(|g| Arc::as_ptr(g.as_ref().unwrap()))
             .collect();
         assert_eq!(distinct.len(), 3);
-        // On the CPU at home, no GPU is opened for the others.
+        // On the CPU at the desk, no GPU is opened for the others.
         let gpus = decoding_gpus(None, &names(2), open).unwrap();
         assert_eq!(gpus, [None, None]);
         assert_eq!(opened.get(), 2);
@@ -4595,7 +4595,7 @@ mod tests {
 
     #[test]
     fn a_gpu_home_that_cannot_open_a_device_for_an_output_says_which() {
-        // Home's GPU offered the remote a stream the CPU does not decode.
+        // The desk's GPU offered the remote a stream the CPU does not decode.
         let opened = std::cell::Cell::new(0);
         let open = || {
             opened.set(opened.get() + 1);

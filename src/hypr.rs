@@ -1,4 +1,4 @@
-//! The Hyprland port: what Navette asks of the home compositor, behind a trait so the logic
+//! The Hyprland port: what Navette asks of the desk compositor, behind a trait so the logic
 //! around it is tested with a fake.
 //!
 //! The real implementation talks to the instance's sockets directly, as `hyprctl` does: the
@@ -41,7 +41,7 @@ impl From<io::Error> for HyprError {
     }
 }
 
-/// The home compositor, as Navette uses it.
+/// The desk compositor, as Navette uses it.
 pub trait Hyprland {
     /// Runs a Lua chunk at runtime (`hyprctl eval`).
     fn eval(&mut self, lua: &str) -> Result<(), HyprError>;
@@ -236,7 +236,7 @@ pub fn dispatch(hypr: &dyn Hypr, command: &str) -> io::Result<()> {
     }
 }
 
-/// Gives the keyboard to the home window that had it last, among those shown on a monitor not
+/// Gives the keyboard to the desk window that had it last, among those shown on a monitor not
 /// `covered` (Hyprland's focus history), without moving the pointer: its address, or
 /// `None` when there is no such window.
 pub fn focus_last_window(hypr: &dyn Hypr, covered: &[String]) -> io::Result<Option<String>> {
@@ -287,17 +287,17 @@ pub fn focus_last_window(hypr: &dyn Hypr, covered: &[String]) -> io::Result<Opti
     Ok(Some(address.to_string()))
 }
 
-/// Sends to the `home` monitor every home window that is on a workspace of a `covered` monitor,
+/// Sends to the `home` monitor every desk window that is on a workspace of a `covered` monitor,
 /// where the cover would hide it; says what it moved (`window <address>`, `workspace <name>`).
 ///
-/// A workspace the covered monitor does not show goes home whole, and so does the one it shows
+/// A workspace the covered monitor does not show goes to the desk whole, and so does the one it shows
 /// when it is not the one `seen` there at the previous call: a workspace moved there whole.
 /// (Hyprland says the monitor shows it before it says it moved, so the events cannot tell.)
 /// The user's grouping is kept, and a workspace not shown stays out of sight. The
-/// windows of the workspace it shows go home one by one, to the workspace `home` shows: moving
+/// windows of the workspace it shows go to the desk one by one, to the workspace `home` shows: moving
 /// that workspace would make `home` switch to it and take the focus (measured on Hyprland
 /// 0.56.2), hiding what it showed for one window dragged or opened there. Only the window that
-/// has the keyboard keeps it, and brings the pointer home. Special workspaces stay: Hyprland
+/// has the keyboard keeps it, and brings the pointer to the desk. Special workspaces stay: Hyprland
 /// shows them over whichever monitor asks.
 pub fn send_home(
     hypr: &dyn Hypr,
@@ -372,7 +372,7 @@ pub fn send_home(
                 ),
             )?;
             // Hyprland put the pointer on the covered monitor with the window that has the
-            // keyboard (a move it followed, a drag): the focus warps it back home with it.
+            // keyboard (a move it followed, a drag): the focus warps it back to the desk with it.
             if has_keyboard {
                 dispatch(
                     hypr,

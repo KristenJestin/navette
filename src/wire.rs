@@ -2,7 +2,7 @@
 //! the raw bytes it declares) carrying Navette's own messages. A heartbeat shows the sender
 //! alive; the clipboard messages are the five of gliff's transfer engine, so its rules (chunk
 //! size, ack window, serials) apply unchanged; the display's are its orders, gliff's stream
-//! messages (a video frame's bytes follow it) and their feedback; the input's, home's keyboard
+//! messages (a video frame's bytes follow it) and their feedback; the input's, the desk's keyboard
 //! and pointer. A message this build does not know is skipped,
 //! so a newer peer can add some without breaking an older one.
 //!
@@ -72,29 +72,29 @@ pub enum LinkMsg {
     // names its output, none for output 0 (so a one-output mode reads as before).
     #[n(20)]
     Display(#[n(0)] Display),
-    /// Remote to home; a video frame's two streams (`data_len`, then `aux_len` bytes) follow.
+    /// Remote to desk; a video frame's two streams (`data_len`, then `aux_len` bytes) follow.
     #[n(21)]
     Video(#[n(0)] ServerMsg, #[n(1)] Option<u8>),
-    /// Home to remote.
+    /// Desk to remote.
     #[n(22)]
     Feedback(#[n(0)] ClientMsg, #[n(1)] Option<u8>),
-    // Input (`crate::input`), home to remote, a block of numbers of its own; an event names
+    // Input (`crate::input`), desk to remote, a block of numbers of its own; an event names
     // the output it is for as a stream's message does.
     #[n(30)]
     Input(#[n(0)] input::Event, #[n(1)] Option<u8>),
-    /// Remote to home, once a mode: the picture runs without input.
+    /// Remote to desk, once a mode: the picture runs without input.
     #[n(31)]
     NoInput {
         #[n(0)]
         reason: String,
     },
-    /// Remote to home: the mode runs, but the remote leaves its lid alone (`closed_lid`).
+    /// Remote to desk: the mode runs, but the remote leaves its lid alone (`closed_lid`).
     #[n(32)]
     NoLid {
         #[n(0)]
         reason: String,
     },
-    /// Home to remote, once the link is up: how the desk's user calls the desk (`local_label`),
+    /// Desk to remote, once the link is up: how the desk's user calls the desk (`local_label`),
     /// for the remote's own messages. An older peer skips it, and a desk with no label sends
     /// none.
     #[n(33)]
@@ -120,7 +120,7 @@ pub enum LinkMsg {
         #[n(2)]
         data_len: u32,
     },
-    // Home's mic (`crate::audio::mic`), home to remote, a block of numbers of its own.
+    // The desk's mic (`crate::audio::mic`), desk to remote, a block of numbers of its own.
     #[n(51)]
     MicStart {
         #[n(0)]
@@ -138,7 +138,7 @@ pub enum LinkMsg {
         #[n(2)]
         data_len: u32,
     },
-    /// The level the remote's sink and home's playback share, both ways, only when one side's
+    /// The level the remote's sink and the desk's playback share, both ways, only when one side's
     /// mixer moves it: the linear gain of each channel, which the other side applies.
     #[n(54)]
     AudioVolume {

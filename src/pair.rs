@@ -1,24 +1,24 @@
 //! `navette pair`: the one-time exchange that makes two machines trust each other.
 //!
-//! Home listens on its LAN address and shows a six-digit PIN; the remote dials it and the user
+//! The desk listens on its LAN address and shows a six-digit PIN; the remote dials it and the user
 //! types the PIN there. One connection is accepted per pairing session, whatever its outcome,
 //! and the session ends after a timeout. Over that plain TCP connection:
 //!
-//! 1. SPAKE2 (Ed25519 group), home as A, the remote as B, the PIN as the password. Each side
+//! 1. SPAKE2 (Ed25519 group), the desk as A, the remote as B, the PIN as the password. Each side
 //!    sends its SPAKE2 message (`msg_a`, then `msg_b`) and derives the shared key `K`. A peer
 //!    without the PIN gets one guess per session, and can test nothing offline.
 //! 2. HKDF-SHA256 from `K` gives three HMAC-SHA256 keys: `k_remote`, `k_home`, `k_done`.
 //! 3. The remote sends its certificate fingerprint `fp_r` with
-//!    `HMAC(k_remote, msg_a ‖ msg_b ‖ fp_r)`. Home checks it: a wrong PIN stops here.
-//! 4. Home sends `fp_h` with `HMAC(k_home, msg_a ‖ msg_b ‖ fp_r ‖ fp_h)`. The remote checks it,
-//!    records home, and answers `HMAC(k_done, msg_a ‖ msg_b ‖ fp_r ‖ fp_h)`.
-//! 5. Home checks that answer and only then records the remote.
+//!    `HMAC(k_remote, msg_a ‖ msg_b ‖ fp_r)`. The desk checks it: a wrong PIN stops here.
+//! 4. The desk sends `fp_h` with `HMAC(k_home, msg_a ‖ msg_b ‖ fp_r ‖ fp_h)`. The remote checks it,
+//!    records the desk, and answers `HMAC(k_done, msg_a ‖ msg_b ‖ fp_r ‖ fp_h)`.
+//! 5. The desk checks that answer and only then records the remote.
 //!
 //! A fingerprint is the SHA-256 of a certificate; the link then pins it (see `transport`). Each
 //! side records its peer only after checking a MAC that only the holder of the same PIN could
 //! make, so a wrong PIN, a man in the middle or a cut connection leaves nothing trusted on the
 //! side that noticed. The one partial case: if the connection drops after step 4, the remote
-//! trusts home but home does not trust the remote, so the link is refused and pairing is run
+//! trusts the desk but the desk does not trust the remote, so the link is refused and pairing is run
 //! again. Nothing secret crosses: the fingerprints are not secrets, and `K` never leaves memory.
 
 use std::fmt;
@@ -44,7 +44,7 @@ const ID_REMOTE: &[u8] = b"navette-pair-v1 remote";
 /// How long each step of a pairing session may take.
 #[derive(Clone, Copy, Debug)]
 pub struct Timeouts {
-    /// Home: how long it waits for the remote to dial.
+    /// Desk: how long it waits for the remote to dial.
     pub wait: Duration,
     /// Both: how long the exchange may take once connected.
     pub exchange: Duration,
@@ -85,7 +85,7 @@ impl fmt::Debug for Pin {
     }
 }
 
-/// Home's side of one pairing session, on a listener already bound to its LAN address. Records
+/// The desk's side of one pairing session, on a listener already bound to its LAN address. Records
 /// the remote in `store` only if the exchange succeeds.
 pub async fn home(
     store: &Store,
@@ -114,8 +114,8 @@ pub async fn home(
     })
 }
 
-/// The remote's side: dials home at `address`. Records home in `store` only if the exchange
-/// succeeds, with `gateway`, the hardware address of home's router (see `network`).
+/// The remote's side: dials the desk at `address`. Records the desk in `store` only if the exchange
+/// succeeds, with `gateway`, the hardware address of the desk's router (see `network`).
 pub async fn remote(
     store: &Store,
     address: SocketAddr,
@@ -234,7 +234,7 @@ async fn exchange_remote(
         .into_bytes();
     write_frame(stream, &[own.as_bytes().as_slice(), &tag].concat()).await?;
 
-    // Home closes without answering when the PIN is wrong.
+    // The desk closes without answering when the PIN is wrong.
     let frame = read_frame(stream).await.map_err(|e| match e.kind() {
         io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset => wrong_pin(),
         _ => e,
@@ -332,7 +332,7 @@ mod tests {
         home.unwrap();
         remote.unwrap();
         assert_eq!(d.remote.pairing().unwrap().unwrap().gateway, router);
-        // Home's own pairing has no use for it.
+        // The desk's own pairing has no use for it.
         assert_eq!(d.home.pairing().unwrap().unwrap().gateway, None);
     }
 

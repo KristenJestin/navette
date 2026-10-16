@@ -114,7 +114,7 @@ pub struct Parts {
 }
 
 impl Parts {
-    /// The desk as `serve` starts: no remote machine, no mode, the mic home.
+    /// The desk as `serve` starts: no remote machine, no mode, the mic at the desk.
     pub fn desk() -> Self {
         Self {
             role: Role::Desk,
@@ -916,7 +916,7 @@ mod tests {
         assert_eq!(reader.next().await, "ok did start None");
         reader.say("stop").await;
         assert_eq!(reader.next().await, "ok did stop");
-        // The mic answers as `mic.sock` does: here, home plays no sound.
+        // The mic answers as `mic.sock` does: here, the desk plays no sound.
         reader.say("mic toggle").await;
         let answer = reader.next().await;
         assert!(
@@ -1331,7 +1331,7 @@ mod tests {
         assert_eq!(waybar_of(&known)["class"], "waiting");
         assert_eq!(word(&known).unwrap(), "waiting");
         assert_eq!(waybar("not json"), None);
-        assert_eq!(waybar("ok DP-2 is back home"), None);
+        assert_eq!(waybar("ok DP-2 is back on the desk"), None);
     }
 
     /// `watch` on `path`, its lines handed over as they come.

@@ -1,4 +1,4 @@
-//! `navette run`: which command this machine's pairing says to run (`serve` at home, `agent` on
+//! `navette run`: which command this machine's pairing says to run (`serve` at the desk, `agent` on
 //! the remote machine), so that one systemd unit serves both machines.
 
 use std::fmt;
@@ -13,10 +13,10 @@ pub const REFUSED: u8 = 78;
 /// What the pairing says to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Plan {
-    /// Home: `navette serve`.
+    /// Desk: `navette serve`.
     Serve { audio: bool },
     /// Remote: `navette agent`. `audio_ignored` is set when `--audio` was given, which only
-    /// home uses.
+    /// the desk uses.
     Agent { audio_ignored: bool },
 }
 

@@ -1,4 +1,4 @@
-//! `mode.conf`: the modes the maintainer defines at home, each naming the home monitors the
+//! `mode.conf`: the modes the maintainer defines at the desk, each naming the desk monitors the
 //! remote machine takes. Keys before any `[section]` are the default of every mode, and a
 //! `monitor` among them is the one unnamed mode, so a file written before modes had names keeps
 //! working. A `[name]` section is a named mode: its `monitor`, and any of `release`, `mic`,
@@ -45,7 +45,7 @@ pub struct Mode {
     /// `here_notice = off` turns off the notification that the remote machine is here. It is
     /// about the link, not about a mode: only the keys before any section set it.
     pub here_notice: bool,
-    /// The layer namespaces of home's own tools drawn above the remote's picture.
+    /// The layer namespaces of the desk's own tools drawn above the remote's picture.
     pub local_above: Vec<String>,
     pub look: Look,
     /// What the sentences call the machines: the labels as set, not the corner's tags.
@@ -424,7 +424,7 @@ pub fn desk_label(config_dir: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The home monitors the specs name, in the order given: by output name, or by the start of the
+/// The desk monitors the specs name, in the order given: by output name, or by the start of the
 /// description (Hyprland's `desc:`), so a change of connector order breaks nothing. A monitor
 /// that is not there, a description that fits two, or one monitor named twice, changes nothing.
 pub fn resolve(specs: &[String], monitors: &[Monitor], names: &Names) -> io::Result<Vec<Monitor>> {
