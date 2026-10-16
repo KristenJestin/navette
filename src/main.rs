@@ -20,6 +20,7 @@ use navette::clipboard::progress::Shown;
 use navette::corner::{self, Board};
 use navette::desk::Desk;
 use navette::display::{decode, remote};
+use navette::events;
 use navette::hypr::{self, Eval};
 use navette::input;
 use navette::lid;
@@ -102,6 +103,22 @@ enum Command {
         #[command(subcommand)]
         action: MicAction,
     },
+    /// Both machines: say where Navette stands, then again at every change, until stopped: for
+    /// a bar or a shell (`docs/events.md`).
+    ///
+    /// Reads `navette serve` or `navette agent`, whichever runs here; with neither, `off`, until
+    /// one starts.
+    Watch {
+        /// The lines of JSON as they come, each a whole state.
+        #[arg(long, conflicts_with = "waybar")]
+        json: bool,
+        /// Lines of JSON for a Waybar custom module (`text`, `alt`, `class`, `tooltip`).
+        #[arg(long)]
+        waybar: bool,
+        /// The current state only, then exit.
+        #[arg(long)]
+        once: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -138,7 +155,11 @@ enum ModeAction {
     /// The monitors come back home.
     Stop,
     /// Say the modes `mode.conf` defines and their monitors.
-    List,
+    List {
+        /// One array of JSON: `[{"name":..,"monitors":[..]}]`, the unnamed mode's name null.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -213,10 +234,11 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 acceptor.local_addr()?
             );
             let (events, log) = mpsc::unbounded_channel();
-            tokio::spawn(print_events(log));
+            tokio::spawn(print_events(log, |_| {}));
             let control = mode::listen(&mode::control_path()?)?;
             let mic_control = mic::control_path()?;
             let mic_control = mode::listen(&mic_control)?;
+            let stream = events::listen(&events::path()?)?;
             let gpu = tokio::task::spawn_blocking(decode::open_gpu)
                 .await
                 .map_err(std::io::Error::other)?;
@@ -251,6 +273,14 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 });
             }
             tokio::spawn(corner::follow(board.clone(), routing.watch()));
+            let state = mode::events(store.dir());
+            tokio::spawn(events::follow_mic(state.clone(), routing.watch()));
+            let (orders, orders_rx) = mpsc::unbounded_channel();
+            let commands = events::Commands::Desk {
+                orders: orders.clone(),
+                mic: routing.clone(),
+            };
+            let stream = tokio::spawn(events::serve(stream, state.clone(), Arc::new(commands)));
             let mic_control = tokio::spawn(mic::serve(mic_control, routing));
             let home = Home {
                 config_dir: store.dir().to_path_buf(),
@@ -262,9 +292,9 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 sound: sound.clone().map(|sound| sound as Arc<dyn mode::Sound>),
                 board: board.clone(),
                 notifier: Arc::new(notify::NotifySend::new(notify::Command)),
+                events: state,
             };
             let (peers, peers_rx) = mpsc::unbounded_channel();
-            let (orders, orders_rx) = mpsc::unbounded_channel();
             let (hypr_events, hypr_events_rx) = mpsc::unbounded_channel();
             hypr::watch_events(hypr_events);
             let modes = tokio::spawn(mode::serve(home, peers_rx, orders_rx, hypr_events_rx));
@@ -309,6 +339,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             tokio::task::spawn_blocking(clipboard::vfs::unmounted).await?;
             control.abort();
             let _ = control.await;
+            stream.abort();
+            let _ = stream.await;
             let _ = modes.await;
             mic_control.abort();
             let _ = mic_control.await;
@@ -319,8 +351,21 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let _one_agent = AgentLock::take(&single::agent_lock_path()?)?;
             let dialer = link::remote_dialer(&store)?;
             let home_network = network::HomeNetwork::new(ProcNet, store.clone())?;
+            // Only after the lock: the socket of a running agent is never taken from it.
+            let state = events::Events::new(events::Parts::remote());
+            match events::path().and_then(|path| events::listen(&path)) {
+                Ok(stream) => {
+                    let refused = Arc::new(events::Commands::Remote);
+                    tokio::spawn(events::serve(stream, state.clone(), refused));
+                }
+                // The link matters more than a bar.
+                Err(e) => eprintln!("navette: no events.sock, a bar cannot follow the agent: {e}"),
+            }
             let (events, log) = mpsc::unbounded_channel();
-            tokio::spawn(print_events(log));
+            let followed = state.clone();
+            tokio::spawn(print_events(log, move |event| {
+                followed.update(|p| p.link = events::link_after(p.link, event));
+            }));
             let (peers, peers_rx) = mpsc::unbounded_channel();
             let (hypr_events, hypr_events_rx) = mpsc::unbounded_channel();
             hypr::watch_events(hypr_events);
@@ -332,6 +377,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 lid_record: lid::record_path(),
                 lid_poll: lid::POLL,
                 notifier: Arc::new(notify::NotifySend::new(notify::Command)),
+                events: state,
             };
             let mut display = tokio::spawn(remote::serve(peers_rx, ports, hypr_events_rx));
             let graph = PipeWire::default();
@@ -400,13 +446,32 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let order = match action {
                 ModeAction::Start { name } => mode::start_order(name.as_deref())?,
                 ModeAction::Stop => "stop".to_string(),
-                ModeAction::List => {
-                    println!("{}", mode::list(store.dir())?);
+                ModeAction::List { json } => {
+                    match json {
+                        true => println!("{}", mode::list_json(store.dir())?),
+                        false => println!("{}", mode::list(store.dir())?),
+                    }
                     return Ok(());
                 }
             };
             println!("{}", mode::order(&mode::control_path()?, &order).await?);
             Ok(())
+        }
+        Command::Watch { json, waybar, once } => {
+            events::watch(&events::path()?, once, |line| {
+                use std::io::Write;
+                let shown = match (json, waybar) {
+                    (true, _) => Some(line.to_string()),
+                    (_, true) => events::waybar(line),
+                    _ => events::word(line),
+                };
+                let Some(shown) = shown else { return Ok(()) };
+                let mut out = std::io::stdout().lock();
+                writeln!(out, "{shown}")?;
+                // A bar reads it through a pipe: each line at once.
+                out.flush()
+            })
+            .await
         }
         Command::Status => {
             println!("{}", mode::order(&mode::control_path()?, "status").await?);
@@ -456,9 +521,11 @@ async fn stopped() -> std::io::Result<()> {
     }
 }
 
-/// The link's events, on stderr (the journal, under systemd). They name no key or certificate.
-async fn print_events(mut events: mpsc::UnboundedReceiver<Event>) {
+/// The link's events, on stderr (the journal, under systemd), each handed to `then` too. They
+/// name no key or certificate.
+async fn print_events(mut events: mpsc::UnboundedReceiver<Event>, then: impl Fn(&Event)) {
     while let Some(event) = events.recv().await {
+        then(&event);
         match event {
             Event::Connected => eprintln!("navette: link up"),
             Event::Disconnected(e) => eprintln!("navette: link down: {e}"),

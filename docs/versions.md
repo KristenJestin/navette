@@ -8,7 +8,7 @@ Navette is in `0.x`: a 1.0 is the maintainer's decision. From 1.0, a breaking ch
 major version (semantic-release counts it from the `BREAKING CHANGE:` footer of a commit). Until
 then it moves the minor, and the promises below hold **within a minor version** (`0.3.x`).
 
-A change is breaking when it breaks one of three promises.
+A change is breaking when it breaks one of four promises.
 
 ## The link between the two machines
 
@@ -27,6 +27,14 @@ Not breaking: a new message the other side may ignore.
 
 Breaking: a command or a flag removed or renamed, or one that no longer does what it did.
 Not breaking: a new command, a new optional flag.
+
+## The events
+
+The lines of `events.sock` and `navette watch`, and the commands on that socket, are a contract
+of their own, with its version `v` on every line ([the events](events.md)).
+
+Breaking: what changes `v` there (a field or a value removed, renamed or changing meaning).
+Not breaking: a new field, a new value, a new command.
 
 ## The config files
 

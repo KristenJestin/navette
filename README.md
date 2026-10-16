@@ -77,6 +77,7 @@ work-from-home mode (pairing, modes, monitor mapping, mic routing, rollback) is 
 - [The mode](docs/mode.md): the monitors, named modes, the corner, the laptop's workspaces and
   lid, keyboard and pointer, decoding.
 - [The remote machine's sound](docs/audio.md) and [the home mic](docs/mic.md).
+- [Events](docs/events.md): where each machine stands, for a bar or a shell (`navette watch`).
 - [What a version promises](docs/versions.md).
 
 ## Install

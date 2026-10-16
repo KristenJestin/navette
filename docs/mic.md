@@ -127,6 +127,8 @@ A bar runs `navette mic watch --json` for as long as it lives, shows the state, 
 A Quickshell bar does the same with a `Process` running `navette mic watch --json`, a
 `SplitParser` that reads each line with `JSON.parse`, and `Quickshell.execDetached(["navette",
 "mic", "toggle"])` on a click. `navette mic status --json` gives one line, for a bar that polls.
+For the whole state on either machine, the mic included, a bar reads `navette watch`
+([the events](events.md)).
 
 ## The messages
 

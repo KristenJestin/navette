@@ -6,6 +6,7 @@ pub mod clipboard;
 pub mod corner;
 pub mod desk;
 pub mod display;
+pub mod events;
 pub mod frame;
 pub mod hypr;
 pub mod identity;
