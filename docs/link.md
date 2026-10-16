@@ -212,7 +212,9 @@ it links within that.
 - **No router known yet** (pairing, or that first link, came before any traffic through the
   router, so the ARP table did not have it): the same, the next link learns it.
 - **A new router at the desk** has another hardware address: the agent never dials again,
-  and its journal says so, until `navette pair` is run again on both machines.
+  and its journal says so, until `navette pair` is run again on both machines and the agent
+  restarted (`systemctl --user restart navette-agent`), since a running agent read the
+  previous pairing when it started.
 
 ## Pairing protocol
 

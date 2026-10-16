@@ -137,6 +137,18 @@ fn two_machines_pair_with_a_pin_and_the_remote_connects_on_its_own() {
 }
 
 #[test]
+fn pairing_again_says_to_restart_a_running_agent() {
+    // A running agent read the previous pairing (the desk's router, say) when it started.
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (_serve, _agent, printed) = paired_link(&home, &remote);
+    assert!(
+        printed.contains("systemctl --user restart navette-agent"),
+        "{printed}"
+    );
+}
+
+#[test]
 fn no_key_or_certificate_is_ever_printed_or_logged() {
     let tmp = tempfile::tempdir().unwrap();
     let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));

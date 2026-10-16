@@ -198,7 +198,11 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             // home only behind it.
             let gateway = network::gateways(&ProcNet).first().copied();
             pair::remote(&store, home, gateway, &pin, Timeouts::default()).await?;
-            println!("Paired. Start the agent: systemctl --user enable --now navette-agent");
+            // A running agent read the previous pairing when it started: restart it.
+            println!(
+                "Paired. Start the agent, or restart it to use this pairing: \
+                 systemctl --user enable navette-agent && systemctl --user restart navette-agent"
+            );
             Ok(())
         }
         Command::Pair { .. } => unreachable!("clap requires --listen or the home address"),
