@@ -540,7 +540,7 @@ fn run(
         .outputs
         .outputs()
         .find(|o| state.outputs.info(o).and_then(|i| i.name).as_deref() == Some(output_name))
-        .ok_or_else(|| io::Error::other(format!("no monitor {output_name} at home")))?;
+        .ok_or_else(|| io::Error::other(format!("no monitor {output_name} on the desk")))?;
     state.transform = state
         .outputs
         .info(&output)
@@ -1630,7 +1630,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 size,
             } => match read_keymap(fd, size) {
                 Ok(text) => state.seat(Seat::Keymap(text)),
-                Err(e) => tracing::warn!("cannot read home's keymap: {e}"),
+                Err(e) => tracing::warn!("cannot read the desk's keymap: {e}"),
             },
             Event::Enter { surface, keys, .. } if state.over(&surface).is_some() => {
                 let (codes, _) = keys.as_chunks::<4>();

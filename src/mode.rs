@@ -1075,7 +1075,7 @@ fn decoding_gpus<T>(
         }
         let gpu = open().ok_or_else(|| {
             io::Error::other(format!(
-                "no GPU could be opened to decode {name} (home decodes on the GPU, each \
+                "no GPU could be opened to decode {name} (the desk decodes on the GPU, each \
                  monitor on a device of its own); nothing was changed"
             ))
         })?;
@@ -4604,7 +4604,7 @@ mod tests {
         let e = decoding_gpus(Some(0), &names(3), open).unwrap_err();
         assert_eq!(
             e.to_string(),
-            "no GPU could be opened to decode DP-3 (home decodes on the GPU, each monitor on \
+            "no GPU could be opened to decode DP-3 (the desk decodes on the GPU, each monitor on \
              a device of its own); nothing was changed"
         );
     }

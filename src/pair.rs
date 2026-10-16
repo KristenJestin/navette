@@ -129,7 +129,7 @@ pub async fn remote(
         exchange_remote(&mut stream, pin, identity.fingerprint()).await
     })
     .await
-    .map_err(|_| timed_out("the home machine stopped answering"))??;
+    .map_err(|_| timed_out("the desk stopped answering"))??;
     store.save_pairing(&Pairing {
         role: Role::Remote,
         peer: home,

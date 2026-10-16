@@ -424,7 +424,7 @@ impl Thread {
         match self.decoders.cpu(dual) {
             Ok(d) => Some(d),
             Err(e) => {
-                let why = format!("home cannot decode the picture: {e}");
+                let why = format!("the desk cannot decode the picture: {e}");
                 eprintln!("navette: {why}");
                 let _ = self.ended.send(why);
                 None

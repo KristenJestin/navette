@@ -372,7 +372,7 @@ fn run(
         }
     }
     let output =
-        found.ok_or_else(|| io::Error::other(format!("no monitor {output_name} at home")))?;
+        found.ok_or_else(|| io::Error::other(format!("no monitor {output_name} on the desk")))?;
     state.scale = state
         .outputs
         .info(&output)

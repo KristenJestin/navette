@@ -54,10 +54,10 @@ struct Cli {
 enum Command {
     /// Pair this machine with the other one, once.
     ///
-    /// At home, `navette pair --listen <LAN-address:port>` shows a PIN. On the remote machine,
-    /// `navette pair <home-address:port>` asks for it.
+    /// At the desk, `navette pair --listen <LAN-address:port>` shows a PIN. On the remote machine,
+    /// `navette pair <desk-address:port>` asks for it.
     Pair {
-        /// Home: the LAN address and port to listen on (never 0.0.0.0 or ::).
+        /// Desk: the LAN address and port to listen on (never 0.0.0.0 or ::).
         #[arg(
             long,
             value_name = "ADDR:PORT",
@@ -65,32 +65,32 @@ enum Command {
             required_unless_present = "home"
         )]
         listen: Option<SocketAddr>,
-        /// Remote: the home machine's address and port.
-        #[arg(value_name = "HOME:PORT")]
+        /// Remote: the desk's address and port.
+        #[arg(value_name = "DESK:PORT")]
         home: Option<SocketAddr>,
     },
-    /// Home: wait for the paired remote machine and keep its link up.
+    /// Desk: wait for the paired remote machine and keep its link up.
     Serve {
         /// The LAN address and port to listen on [default: the one used to pair].
         #[arg(long, value_name = "ADDR:PORT")]
         listen: Option<SocketAddr>,
-        /// While a mode runs, play the remote machine's sound here, mixed with home sound, and
-        /// send it the home mic.
+        /// While a mode runs, play the remote machine's sound here, mixed with the desk's sound,
+        /// and send it the desk's mic.
         #[arg(long)]
         audio: bool,
     },
-    /// Remote: dial the paired home machine and keep the link up (a systemd user service).
+    /// Remote: dial the paired desk and keep the link up (a systemd user service).
     Agent,
-    /// Run what this machine's pairing says: `serve` at home, `agent` on the remote machine.
+    /// Run what this machine's pairing says: `serve` at the desk, `agent` on the remote machine.
     ///
     /// The same command, signals, logs and exit status as the one it runs, so that one systemd
     /// unit (`navette.service`) serves both machines. Not paired, it exits with status 78.
     Run {
-        /// Home: as `navette serve --audio`. Ignored on the remote machine, which says so.
+        /// Desk: as `navette serve --audio`. Ignored on the remote machine, which says so.
         #[arg(long)]
         audio: bool,
     },
-    /// Home: give the configured monitors to the remote machine, or take them back.
+    /// Desk: give the configured monitors to the remote machine, or take them back.
     ///
     /// The monitors are named in `mode.conf` in the config directory: `monitor = <output name>`,
     /// or `monitor = desc:<start of the monitor's description>`. A `[name]` section defines a
@@ -101,13 +101,14 @@ enum Command {
         #[command(subcommand)]
         action: ModeAction,
     },
-    /// Home: say which mode runs, and whether the remote machine is connected.
+    /// Desk: say which mode runs, and whether the remote machine is connected.
     ///
     /// `navette serve` must be running.
     Status,
-    /// Home: send the home mic to the remote machine or keep it home, while a mode runs.
+    /// Desk: send the desk's mic to the remote machine or keep it at the desk, while a mode runs.
     ///
-    /// A mode sends it to the remote machine when it starts, and brings it home when it stops.
+    /// A mode sends it to the remote machine when it starts, and brings it back to the desk when
+    /// it stops.
     /// `navette serve --audio` must be running.
     Mic {
         #[command(subcommand)]
@@ -165,7 +166,7 @@ enum ModeAction {
         #[arg(value_name = "NAME")]
         name: Option<String>,
     },
-    /// The monitors come back home.
+    /// The monitors come back to the desk.
     Stop,
     /// Say the modes `mode.conf` defines and their monitors.
     List {
@@ -222,7 +223,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         Command::Pair {
             home: Some(home), ..
         } => {
-            eprint!("PIN shown on the home machine: ");
+            eprint!("PIN shown on the desk: ");
             let mut line = String::new();
             std::io::stdin().lock().read_line(&mut line)?;
             let pin = Pin::parse(&line).ok_or_else(|| {

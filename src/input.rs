@@ -527,7 +527,9 @@ impl Capture {
         }
         self.keys = Keys::new(&text);
         if self.keys.is_none() && self.hotkey.is_some() {
-            eprintln!("navette: home's keymap does not compile here; the release hotkey is off");
+            eprintln!(
+                "navette: the desk's keymap does not compile here; the release hotkey is off"
+            );
         }
         self.keymap.clone_from(&text);
         if text.len() <= MAX_KEYMAP {
@@ -685,7 +687,7 @@ impl Capture {
         if pressed && let Some(hotkey) = &self.hotkey {
             match self.keys.as_ref().map(|keys| keys.chord(hotkey, code)) {
                 Some(Chord::Hotkey) => {
-                    tracing::info!("the release hotkey: the keyboard goes home");
+                    tracing::info!("the release hotkey: the keyboard goes back to the desk");
                     self.release();
                     self.released = true;
                     self.queue.shared.at_home.store(true, Ordering::Relaxed);
@@ -697,7 +699,9 @@ impl Capture {
                     "the release hotkey's key, not with the hotkey's modifiers"
                 ),
                 Some(Chord::OtherKey) => {}
-                None => tracing::debug!("no keymap from home: the release hotkey cannot be read"),
+                None => {
+                    tracing::debug!("no keymap from the desk: the release hotkey cannot be read")
+                }
             }
         }
         if let Some(keys) = &mut self.keys {
@@ -870,7 +874,9 @@ impl Injectors for LiveInjectors {
         // A keymap this machine cannot compile still leaves the default one.
         let input = match start(keymap) {
             Err(hypr_input::Error::Xkb(e)) if keymap.is_some() => {
-                eprintln!("navette: home's keymap was refused ({e}); typing with the default one");
+                eprintln!(
+                    "navette: the desk's keymap was refused ({e}); typing with the default one"
+                );
                 start(None)
             }
             other => other,

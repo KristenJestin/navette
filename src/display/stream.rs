@@ -236,7 +236,7 @@ impl Session {
     ) -> io::Result<(Self, UnboundedReceiver<Incoming>)> {
         if !caps.codecs.contains(&Codec::H264) {
             return Err(io::Error::other(
-                "home decodes no codec this machine encodes",
+                "the desk decodes no codec this machine encodes",
             ));
         }
         let render_node = hypr_capture::render_node(None);
@@ -254,7 +254,7 @@ impl Session {
         };
         if !chroma_ok {
             return Err(io::Error::other(
-                "home decodes no chroma mode this machine encodes",
+                "the desk decodes no chroma mode this machine encodes",
             ));
         }
         let video = VideoTier::open(VideoMode::resolve(None), &render_node);

@@ -140,7 +140,7 @@ impl<G: Graph> HomeMic<G> {
         // Named, not followed: the default goes silent while the mic is away.
         let mic = graph
             .mic_in_use()?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home has no mic"))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "the desk has no mic"))?;
         let sending = Sending {
             remote_machine,
             session,

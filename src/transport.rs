@@ -121,7 +121,9 @@ impl Dial for TlsDialer {
         };
         tokio::time::timeout(self.timeout, connect)
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "home did not answer in time"))?
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "the desk did not answer in time")
+            })?
     }
 }
 

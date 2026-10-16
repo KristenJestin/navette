@@ -778,7 +778,10 @@ impl<G: Graph> Capture<G> {
         };
         if self.home.try_send(volume).is_ok() {
             self.level.told(level);
-            eprintln!("navette: audio: the sink is at {}, told home", shown(level));
+            eprintln!(
+                "navette: audio: the sink is at {}, told the desk",
+                shown(level)
+            );
         }
     }
 
@@ -789,7 +792,7 @@ impl<G: Graph> Capture<G> {
         }
         self.level.applying(level);
         match self.sink.set_level(level) {
-            Ok(()) => eprintln!("navette: audio: home set the sink to {}", shown(level)),
+            Ok(()) => eprintln!("navette: audio: the desk set the sink to {}", shown(level)),
             Err(e) => eprintln!("navette: audio: could not set the sink's volume: {e}"),
         }
     }
@@ -1017,7 +1020,7 @@ impl<G: Graph> Home<G> {
         if self.remote.try_send(volume).is_ok() {
             playback.level.told(level);
             eprintln!(
-                "navette: audio: home's output is at {}, told the remote",
+                "navette: audio: the desk's output is at {}, told the remote",
                 shown(level)
             );
         }
@@ -1058,7 +1061,7 @@ impl<G: Graph> Home<G> {
                 // Not an error, but the one place to see why a level was not heard.
                 eprintln!(
                     "navette: audio: the remote set the volume to {}, ignored: not the session \
-                     home plays",
+                     the desk plays",
                     shown(level)
                 );
                 return Ok(());
@@ -1066,7 +1069,7 @@ impl<G: Graph> Home<G> {
             playback.level.applying(level);
             self.graph.set_level(&playback.output, level)?;
             eprintln!(
-                "navette: audio: the remote set the volume to {}, on home's output",
+                "navette: audio: the remote set the volume to {}, on the desk's output",
                 shown(level)
             );
             return Ok(());

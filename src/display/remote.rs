@@ -364,7 +364,7 @@ pub async fn serve_peer(
                 // A compositor's keymap is compiled whole; an `include` would have this
                 // machine's xkbcommon read files of its own for home.
                 Some((_, input::Event::Keymap(text))) if text.contains("include") => {
-                    eprintln!("navette: home's keymap includes files: refused, the last one stays");
+                    eprintln!("navette: the desk's keymap includes files: refused, the last one stays");
                 }
                 Some((output, event)) => {
                     let index = usize::from(output);
