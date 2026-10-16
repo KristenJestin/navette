@@ -231,8 +231,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             pair::remote(&store, home, gateway, &pin, Timeouts::default()).await?;
             // A running agent read the previous pairing when it started: restart it.
             println!(
-                "Paired. Start the agent, or restart it to use this pairing: \
-                 systemctl --user enable navette-agent && systemctl --user restart navette-agent"
+                "Paired. Start Navette, or restart it to use this pairing: \
+                 systemctl --user enable navette && systemctl --user restart navette"
             );
             Ok(())
         }

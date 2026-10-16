@@ -40,6 +40,14 @@ systemctl --user daemon-reload || {
     exit 1
 }
 
+# Two units enabled on one remote machine would start two agents, and the second is refused by the
+# lock and restarted every 10 s: say so, but change nothing.
+if [ "$(systemctl --user is-enabled navette-agent.service 2>/dev/null || true)" = enabled ]; then
+    echo
+    echo "navette-agent.service is enabled here: run 'systemctl --user disable --now navette-agent'"
+    echo "before enabling navette, which replaces it."
+fi
+
 cat <<'NEXT'
 
 Next, on each machine:

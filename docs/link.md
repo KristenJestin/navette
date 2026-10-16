@@ -20,8 +20,9 @@ navette pair 192.0.2.10:7420              # asks for the PIN
 ```
 
 Then `navette serve` at home (it listens on the address used to pair; `--listen` changes it)
-and `navette agent` on the remote machine, as a systemd user service
-(`dist/navette-agent.service`, how to install it is written at its top).
+and `navette agent` on the remote machine, both through `navette run` in the one systemd user
+service `navette.service` (how to install it is written in [the install guide](install.md);
+it replaces the former `navette-agent.service`).
 
 Both commands keep their files in `$XDG_CONFIG_HOME/navette` (`--config-dir` or
 `NAVETTE_CONFIG_DIR` to move it): `identity.key` and `identity.crt` (this machine's Navette
@@ -221,7 +222,7 @@ within that.
   recorded and the agent dials as it did before.
 - **A new router at the desk** has another hardware address: the agent never dials again,
   and its journal says so, until `navette pair` is run again on both machines and the agent
-  restarted (`systemctl --user restart navette-agent`), since a running agent read the
+  restarted (`systemctl --user restart navette`), since a running agent read the
   previous pairing when it started.
 
 ## Pairing protocol

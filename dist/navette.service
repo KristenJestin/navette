@@ -14,8 +14,9 @@ Description=Navette: keeps the link between the home machine and the remote mach
 # started by uwsm (Omarchy), `graphical-session.target` is reached only once the compositor has
 # reported ready, which is after `uwsm finalize` has put WAYLAND_DISPLAY and
 # HYPRLAND_INSTANCE_SIGNATURE in the user manager's environment: `After=` is what makes them
-# visible to the service. A manual start is refused by the target itself, so `WantedBy=` is what
-# starts this at login, and `PartOf=` stops it with the session instead of leaving it dialing a
+# visible to the service. The target refuses a manual start (`systemctl --user start
+# graphical-session.target` fails), but this service can be started by hand: `WantedBy=` is what
+# starts it at login, and `PartOf=` stops it with the session instead of leaving it dialing a
 # compositor that is gone.
 PartOf=graphical-session.target
 # PipeWire: ordered only, not wanted. `Wants=` would start it with Navette, which needs it only
