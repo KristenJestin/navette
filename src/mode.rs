@@ -2040,6 +2040,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_desk_says_its_label_to_the_remote_when_the_link_comes_up() {
+        let desk = desk_with("local_label = NEAR\nmonitor = DP-2\n");
+        let remote = connect(&desk);
+        until(|| remote.outbox.queued().contains(&Msg::Desk("NEAR".into()))).await;
+    }
+
+    #[tokio::test]
+    async fn the_label_the_desk_says_is_the_one_before_any_section() {
+        let desk = desk_with("local_label = NEAR\n[office]\nmonitor = DP-2\nlocal_label = HERE\n");
+        let remote = connect(&desk);
+        until(|| remote.outbox.queued().contains(&Msg::Desk("NEAR".into()))).await;
+        assert!(!remote.outbox.queued().contains(&Msg::Desk("HERE".into())));
+    }
+
+    #[tokio::test]
+    async fn with_no_label_the_desk_says_none_and_the_remote_says_the_desk() {
+        let desk = desk("DP-2");
+        let remote = connect(&desk);
+        // The orders are taken after the link: once this is answered, the link was served.
+        answer(ask(&desk, false).await).await.unwrap();
+        assert!(
+            !remote
+                .outbox
+                .queued()
+                .iter()
+                .any(|m| matches!(m, Msg::Desk(_))),
+            "{:?}",
+            remote.outbox.queued()
+        );
+    }
+
+    #[tokio::test]
     async fn starting_and_stopping_a_mode_notifies_each_machine_once() {
         let desk = desk("DP-2");
         let _remote = started(&desk).await;

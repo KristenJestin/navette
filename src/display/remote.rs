@@ -1191,13 +1191,13 @@ mod tests {
     async fn starting_and_stopping_a_mode_notifies_each_machine_once() {
         let agent = agent();
         agent.inbox.try_send(start_of(vec![copy()])).unwrap();
-        let driven = "2 screens driven from home (NAVETTE-1, NAVETTE-2)";
+        let driven = "2 screens driven from the desk (NAVETTE-1, NAVETTE-2)";
         until(|| agent.notices.summaries() == [driven]).await;
         agent
             .inbox
             .try_send(Incoming::Display(Display::Stop))
             .unwrap();
-        let stopped = "2 screens driven from home stopped (NAVETTE-1, NAVETTE-2)";
+        let stopped = "2 screens driven from the desk stopped (NAVETTE-1, NAVETTE-2)";
         until(|| agent.notices.summaries() == [driven, stopped]).await;
         // A stop with no mode, and a start that fails, say nothing.
         agent
@@ -1215,6 +1215,52 @@ mod tests {
         })
         .await;
         assert_eq!(agent.notices.summaries(), [driven, stopped]);
+    }
+
+    #[tokio::test]
+    async fn the_agent_names_the_desk_by_the_label_it_was_told() {
+        let agent = agent();
+        agent.inbox.try_send(Incoming::Desk("NEAR".into())).unwrap();
+        agent.inbox.try_send(start_of(vec![copy()])).unwrap();
+        let driven = "2 screens driven from NEAR (NAVETTE-1, NAVETTE-2)";
+        until(|| agent.notices.summaries() == [driven]).await;
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        let stopped = "2 screens driven from NEAR stopped (NAVETTE-1, NAVETTE-2)";
+        until(|| agent.notices.summaries() == [driven, stopped]).await;
+    }
+
+    /// The next line `events.sock` says, parsed.
+    async fn next_said(agent: &Agent) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let line = agent.said.lock().unwrap().try_recv();
+                match line {
+                    Ok(line) => return serde_json::from_str(&line).unwrap(),
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("a line in time")
+    }
+
+    #[tokio::test]
+    async fn the_desk_s_label_is_the_peer_of_the_remote_s_events_while_linked() {
+        let agent = agent();
+        assert_eq!(next_said(&agent).await["peer"], serde_json::Value::Null);
+        agent.inbox.try_send(Incoming::Desk("NEAR".into())).unwrap();
+        let told = next_said(&agent).await;
+        assert_eq!(told["peer"], "NEAR");
+        assert_eq!(told["state"], "linked");
+        // The label goes with the link: the next one may be another desk's.
+        drop(agent.inbox);
+        agent.task.await.unwrap();
+        let left: serde_json::Value =
+            serde_json::from_str(&agent.said.lock().unwrap().try_recv().unwrap()).unwrap();
+        assert_eq!(left["peer"], serde_json::Value::Null);
     }
 
     #[tokio::test]

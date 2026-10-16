@@ -2188,6 +2188,18 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn the_desk_s_label_crosses_the_link_to_the_remote() {
+        let mut ends = display_link(64 * 1024).await;
+        ends.home
+            .outbox
+            .send(DisplayMsg::Desk("NEAR".into()), Vec::new());
+        match incoming(&mut ends.remote).await {
+            Incoming::Desk(label) => assert_eq!(label, "NEAR"),
+            other => panic!("expected the label, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn a_peer_gone_in_the_middle_of_a_frame_ends_the_link_in_time() {
         let (a, mut b) = tokio::io::duplex(64 * 1024);
         // The frame's header says 100 kB follow; the peer sends 10 and is heard no more.

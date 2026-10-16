@@ -348,6 +348,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_desk_s_label_survives_the_trip_through_the_link() {
+        let bytes = minicbor::to_vec(LinkMsg::from((0, Msg::Desk("NEAR".into())))).unwrap();
+        let back: LinkMsg = minicbor::decode(&bytes).unwrap();
+        assert_eq!(
+            back,
+            LinkMsg::Desk {
+                label: "NEAR".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_peer_skips_the_desk_s_label_and_reads_on() {
+        // What a 0.2.0 reads: the messages it has, none of them number 33.
+        #[derive(Debug, PartialEq, Decode)]
+        enum Older {
+            #[n(0)]
+            Heartbeat,
+        }
+        let (a, b) = tokio::io::duplex(4096);
+        let (mut write, mut read) = (Framed::new(a), Framed::new(b));
+        write
+            .write_msg(&LinkMsg::Desk {
+                label: "NEAR".into(),
+            })
+            .await
+            .unwrap();
+        write.write_msg(&LinkMsg::Heartbeat).await.unwrap();
+        assert_eq!(read.read_msg::<Older>().await.unwrap(), Older::Heartbeat);
+    }
+
     #[tokio::test]
     async fn a_message_of_a_newer_peer_is_skipped_with_its_bytes() {
         #[derive(Encode)]
