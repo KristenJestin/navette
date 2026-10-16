@@ -13,7 +13,7 @@ tool.
 | `icon.svg` | the icon: the mark on a dark rounded square |
 | `icon-full.svg` | the full icon, a blue square with dark strokes |
 | `mark-pixel.svg` | the second logo: the same mark drawn on a pixel grid, like the corner's tags, centred by construction (the cream chevron is the blue one turned half a turn) |
-| `icon-pixel.svg` | the pixel icon: the pixel mark on a night blue rounded square |
+| `icon-pixel.svg` | the icon of the app: the pixel mark on a night blue rounded square. The archive of a version carries it as `navette.svg`, installed in the icon theme, and every notification names it |
 | `favicon.svg` | the favicon, drawn for 16 to 64 pixels |
 | `social-preview.svg` | the social preview of the repository and the banner of the README: the pixel mark, the name, the tagline, and the home desk with a mode running, drawn (no capture) |
 

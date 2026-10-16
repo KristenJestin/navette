@@ -33,7 +33,7 @@ fn run(program: &str, args: &[&str], dir: &Path) -> String {
 }
 
 #[test]
-fn the_archive_holds_the_binary_the_unit_and_the_install_note() {
+fn the_archive_holds_the_binary_the_unit_the_icon_and_the_install_note() {
     let tmp = tempfile::tempdir().unwrap();
     let archive = package("0.2.4-beta.21", tmp.path());
     assert_eq!(archive, "navette-0.2.4-beta.21-linux-x86_64.tar.gz");
@@ -50,8 +50,23 @@ fn the_archive_holds_the_binary_the_unit_and_the_install_note() {
             format!("{dir}/INSTALL.md"),
             format!("{dir}/navette"),
             format!("{dir}/navette-agent.service"),
+            format!("{dir}/navette.svg"),
         ]
     );
+}
+
+#[test]
+fn the_icon_in_the_archive_is_the_pixel_icon_of_the_brand() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = package("1.0.0", tmp.path());
+    run("tar", &["-xzf", &archive], tmp.path());
+    let packed = fs::read(tmp.path().join("navette-1.0.0-linux-x86_64/navette.svg")).unwrap();
+    let brand = fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/brand/icon-pixel.svg"
+    ))
+    .unwrap();
+    assert_eq!(packed, brand);
 }
 
 #[test]
