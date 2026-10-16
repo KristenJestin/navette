@@ -203,6 +203,8 @@ enum Show {
     Picture(Picture),
     /// The remote pointer changed: the newest waits in [`Newest`].
     Pointer,
+    /// The monitor's layers are to be sorted again.
+    Poke,
 }
 
 /// The newest value only: a writer replaces what the reader has not taken yet, so remote
@@ -369,6 +371,13 @@ impl Surface {
             && let Some(pictures) = &self.pictures
         {
             let _ = pictures.send(Show::Pointer);
+        }
+    }
+
+    /// Has the compositor sort the monitor's layers again, with the layer rules as they are now.
+    pub fn poke(&self) {
+        if let Some(pictures) = &self.pictures {
+            let _ = pictures.send(Show::Poke);
         }
     }
 }
@@ -574,6 +583,14 @@ fn run(
             ChannelEvent::Msg(Show::Pointer) => {
                 if let Some(pointer) = pointer.take() {
                     state.remote_cursor(pointer);
+                }
+            }
+            // Hyprland 0.56.2 sorts the monitor's layers on any commit of layer-shell state,
+            // even one that changes nothing (measured in #116): no remap, no blank frame.
+            ChannelEvent::Msg(Show::Poke) => {
+                if let Some(layer) = &state.layer {
+                    layer.set_exclusive_zone(-1);
+                    layer.commit();
                 }
             }
             ChannelEvent::Closed => state.exit = Some(None),

@@ -625,6 +625,8 @@ pub mod fake {
         requests: Vec<String>,
         /// `hl.window_rule` tables, as sent.
         window_rules: Vec<String>,
+        /// `hl.layer_rule` tables, as sent.
+        layer_rules: Vec<String>,
         /// The Lua chunks that bind keys or disable a bind, as sent.
         binds: Vec<String>,
         down: bool,
@@ -868,6 +870,11 @@ pub mod fake {
             self.state.lock().unwrap().window_rules.clone()
         }
 
+        /// The layer rules sent, in order, `enabled = false` ones included.
+        pub fn layer_rules(&self) -> Vec<String> {
+            self.state.lock().unwrap().layer_rules.clone()
+        }
+
         pub fn binds(&self) -> Vec<String> {
             self.state.lock().unwrap().binds.clone()
         }
@@ -1098,6 +1105,12 @@ pub mod fake {
             if let Some(rule) = command.strip_prefix("eval hl.window_rule(") {
                 state
                     .window_rules
+                    .push(rule.trim_end_matches(')').to_string());
+                return Ok("ok".into());
+            }
+            if let Some(rule) = command.strip_prefix("eval hl.layer_rule(") {
+                state
+                    .layer_rules
                     .push(rule.trim_end_matches(')').to_string());
                 return Ok("ok".into());
             }
