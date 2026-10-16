@@ -410,6 +410,33 @@ mod tests {
         assert_eq!(d.home.pairing().unwrap(), None);
     }
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    // The names of the machines changed (home is the desk), the bytes of the pairing did not: a
+    // 0.1 remote machine and a 0.2 desk must still agree, so the labels stay what they were.
+    // The expected keys come from an HKDF-SHA256 computed apart, over the shared secret 0..32.
+    #[test]
+    fn the_pairing_labels_of_an_old_transcript_are_unchanged() {
+        assert_eq!(ID_HOME, b"navette-pair-v1 home");
+        assert_eq!(ID_REMOTE, b"navette-pair-v1 remote");
+        let shared: Vec<u8> = (0..32).collect();
+        let keys = Keys::derive(&shared);
+        assert_eq!(
+            hex(&keys.remote),
+            "04f4033e44fbcefc03b48de39ccbcae45442d8ffa76057cd303406b5a6b6a973"
+        );
+        assert_eq!(
+            hex(&keys.home),
+            "62098bdaf934dddd97fabdc73dc92f272cf0d8aad560d48a95ba5cf96b56c3db"
+        );
+        assert_eq!(
+            hex(&keys.done),
+            "197309908edfed7bff87586a22733ca1fa66b378f9a3dc0b5385347b20de69b4"
+        );
+    }
+
     #[test]
     fn a_pin_is_six_digits() {
         for _ in 0..100 {
