@@ -81,8 +81,9 @@ work-from-home mode (pairing, modes, monitor mapping, mic routing, rollback) is 
 
 ## Install
 
-A release or the beta of `dev`, without building, on both machines, and the agent's unit on the
-laptop: [`docs/install.md`](docs/install.md). Install the same version on both.
+A release or the beta of `dev`, without building, on both machines with the icon its
+notifications show, and the agent's unit on the laptop: [`docs/install.md`](docs/install.md).
+Install the same version on both.
 
 ## Build
 
@@ -100,7 +101,9 @@ cargo test
 
 ## Licence and credits
 
+<img src="assets/brand/png/icon-pixel-266.png" alt="The icon of Navette, the crossed chevrons drawn in pixels" width="72" align="right">
+
 Apache-2.0. Code reused from gliff (MIT) keeps its MIT notice ([`LICENSES`](LICENSES)).
-The logo and the banner are in [`assets/brand`](assets/brand/README.md); the banner is drawn with
-Figtree and JetBrains Mono, under the SIL Open Font License 1.1
+The logo, the icon and the banner are in [`assets/brand`](assets/brand/README.md); the banner is
+drawn with Figtree and JetBrains Mono, under the SIL Open Font License 1.1
 ([`assets/brand/fonts`](assets/brand/fonts/README.md)).

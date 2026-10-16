@@ -21,10 +21,11 @@ sha256sum --check navette-*.sha256
 tar -xzf navette-*.tar.gz
 cd navette-*-linux-x86_64
 install -Dm755 navette ~/.local/bin/navette
+install -Dm644 navette.svg ~/.local/share/icons/hicolor/scalable/apps/navette.svg
 navette --version
 ```
 
-`~/.local/bin` must be in your `PATH`. Without `gh`, download the two files from the Releases page
+`~/.local/bin` must be in your `PATH`. The icon is the one Navette's notifications show. Without `gh`, download the two files from the Releases page
 in a browser and run the same commands from `sha256sum` on.
 
 On the **remote machine** (the work laptop) only, once `navette pair <home:port>` has succeeded
@@ -63,6 +64,7 @@ On both machines:
 
 ```
 rm ~/.local/bin/navette
+rm ~/.local/share/icons/hicolor/scalable/apps/navette.svg
 rm -r ~/.config/navette     # the identity and the pairing; pair again to use Navette later
 ```
 
