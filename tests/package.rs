@@ -170,6 +170,8 @@ struct Machine {
     fakes: PathBuf,
     log: PathBuf,
     archive: PathBuf,
+    /// Whether the old `navette-agent.service` is enabled here.
+    old_agent_enabled: bool,
 }
 
 impl Machine {
@@ -192,6 +194,7 @@ impl Machine {
             fakes,
             log,
             archive,
+            old_agent_enabled: false,
         }
     }
 
@@ -208,6 +211,10 @@ impl Machine {
             .env("HOME", &self.home)
             .env("PATH", path)
             .env("FAKE_SYSTEMCTL_LOG", &self.log)
+            .env(
+                "FAKE_AGENT_ENABLED",
+                if self.old_agent_enabled { "1" } else { "" },
+            )
             .output()
             .unwrap()
     }
@@ -286,7 +293,14 @@ fn the_install_script_puts_the_binary_the_icon_and_the_units_in_the_home_folder(
 fn the_install_script_reloads_systemd_and_enables_and_starts_nothing() {
     let machine = Machine::new();
     assert!(machine.install().status.success());
-    assert_eq!(machine.systemctl_calls(), ["--user daemon-reload"]);
+    // It reloads and looks at the old unit; `enable`, `start` and `restart` never come.
+    assert_eq!(
+        machine.systemctl_calls(),
+        [
+            "--user daemon-reload",
+            "--user is-enabled navette-agent.service"
+        ]
+    );
 }
 
 #[test]
@@ -323,7 +337,12 @@ fn running_the_install_script_twice_gives_the_same_result() {
     assert_eq!(said(&second), said(&first));
     assert_eq!(
         machine.systemctl_calls(),
-        ["--user daemon-reload", "--user daemon-reload"]
+        [
+            "--user daemon-reload",
+            "--user is-enabled navette-agent.service",
+            "--user daemon-reload",
+            "--user is-enabled navette-agent.service"
+        ]
     );
 }
 
@@ -359,4 +378,32 @@ fn the_install_script_names_a_file_missing_next_to_it_and_installs_nothing() {
         said(&output)
     );
     assert!(!machine.home.join(".local").exists());
+}
+
+#[test]
+fn the_install_script_tells_to_disable_the_old_agent_unit_when_it_is_enabled() {
+    let mut machine = Machine::new();
+    machine.old_agent_enabled = true;
+    let output = machine.install();
+    assert!(output.status.success(), "{}", said(&output));
+    assert!(
+        said(&output).contains("systemctl --user disable --now navette-agent"),
+        "{}",
+        said(&output)
+    );
+    // It only says so: no call but the reload and the question.
+    assert_eq!(
+        machine.systemctl_calls(),
+        [
+            "--user daemon-reload",
+            "--user is-enabled navette-agent.service"
+        ]
+    );
+}
+
+#[test]
+fn the_install_script_does_not_mention_disabling_when_the_old_agent_unit_is_not_enabled() {
+    let machine = Machine::new();
+    let said = said(&machine.install());
+    assert!(!said.contains("disable --now"), "{said}");
 }

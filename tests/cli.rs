@@ -143,9 +143,10 @@ fn pairing_again_says_to_restart_a_running_agent() {
     let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
     let (_serve, _agent, printed) = paired_link(&home, &remote);
     assert!(
-        printed.contains("systemctl --user restart navette-agent"),
+        printed.contains("systemctl --user enable navette && systemctl --user restart navette"),
         "{printed}"
     );
+    assert!(!printed.contains("navette-agent"), "{printed}");
 }
 
 #[test]
@@ -300,7 +301,7 @@ fn a_second_agent_refuses_to_start_while_one_runs() {
         "{output}"
     );
     assert!(
-        output.contains("systemctl --user status navette-agent"),
+        output.contains("(systemctl --user status navette)"),
         "{output}"
     );
 }
