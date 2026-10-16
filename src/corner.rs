@@ -15,7 +15,8 @@
 //!   in place of desktop notifications.
 //! - **Files crossing** the clipboard, either way, show as one bar per transfer under the tag,
 //!   as wide as the tag row (more only when the text needs it, at most 20 characters) and
-//!   stacked tightly, filled by the part done and saying the copy's name and what is left; a click on a bar stops its transfer, the others going on.
+//!   stacked tightly, filled by the part done and saying the copy's name and what is left; a
+//!   click on a bar stops its transfer, the others going on.
 //!
 //! [`Board`] carries the mic's place and the messages to every corner open; [`Corner`] is one
 //! corner, drawn in software into ARGB pixels. Its text uses a 5×8 bitmap font of its own, so
@@ -1387,7 +1388,7 @@ mod tests {
             assert!(text.chars().count() <= BAR_CHARS, "{text}");
             assert!(text.ends_with("2.0 GiB x"));
         }
-        // A bar without a known name says what round one said.
+        // A copy whose list is not known names nothing: the bar says the size and the cross only.
         let mut unnamed = named("x", 0, 2);
         unnamed.headline = None;
         assert_eq!(bar_text(&unnamed), "2.0 GiB x");
