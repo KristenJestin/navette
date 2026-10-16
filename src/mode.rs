@@ -7,7 +7,8 @@
 //! home desk are the monitors' workspaces, moved whole to another home monitor and back (#48,
 //! with no slide at the first visit, #118),
 //! a window rule per monitor that opens home windows on that home monitor rather than hidden
-//! under a surface (#2) and, with a mic, the hotkey that switches it, made
+//! under a surface (#2), the layer rules that draw the remote's picture above home's overlays but
+//! under the tools the user starts (#116) and, with a mic, the hotkey that switches it, made
 //! through the desk recorder so they are undone on stop, on a dropped link and after a crash,
 //! and made again after a config reload. A home window that lands on a given monitor all the
 //! same (moved, dragged, opened on an explicit workspace) is sent back to a home monitor as
@@ -34,6 +35,7 @@ use crate::corner::{Board, Feed};
 use crate::desk::{Change, Desk, DeskError};
 use crate::display::decode::{self, Decoding, Picture, Video};
 use crate::display::output;
+use crate::display::surface::NAMESPACE as SURFACE_NAMESPACE;
 use crate::display::wire::{Display, Incoming, MAX_OUTPUTS, Msg, OutputCopy, Peer, Pointer};
 use crate::display::{Ended, Keyboard, Released};
 use crate::hypr::{self, Eval, Hypr, lua_string};
@@ -44,6 +46,12 @@ mod config;
 
 pub use config::list;
 use config::{Mode, resolve};
+
+/// The `order` of the layer rule on Navette's picture: lower than any of home's overlays, which
+/// have 0 unless the user's own rules say otherwise, so it is drawn after them (#116).
+const PICTURE_ORDER: i32 = -1000;
+/// The `order` of the `local_above` layers: drawn after the picture.
+const LOCAL_ABOVE_ORDER: i32 = -2000;
 
 /// How long the remote has to make its output.
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -138,6 +146,9 @@ pub trait Screen: Send {
     fn dmabuf_modifiers(&self) -> Vec<u64>;
     /// Set once the compositor refused a dmabuf: the GPU's pictures are read back from then on.
     fn dmabuf_refused(&self) -> Arc<AtomicBool>;
+    /// Has the compositor sort the monitor's layers again: Hyprland 0.56.2 applies a layer
+    /// rule's `order` only when a layer maps, unmaps or commits layer-shell state.
+    fn poke(&self);
 }
 
 /// The real cover: a layer surface on the monitor.
@@ -179,6 +190,10 @@ impl Screen for crate::display::surface::Surface {
 
     fn dmabuf_refused(&self) -> Arc<AtomicBool> {
         crate::display::surface::Surface::dmabuf_refused(self)
+    }
+
+    fn poke(&self) {
+        crate::display::surface::Surface::poke(self)
     }
 }
 
@@ -529,12 +544,20 @@ pub async fn serve(
                     let desk = a.desk.clone();
                     // A reload may put a workspace back where the user's rules want it.
                     let sweep = matches!(event, hypr::Event::Placed | hypr::Event::ConfigReloaded);
+                    let reloaded = event == hypr::Event::ConfigReloaded;
                     let sending = (a.monitors.clone(), a.home_monitor.clone(), a.seen.clone());
                     let handled =
                         blocking(move || desk.lock().unwrap().handle(&event).map_err(desk_error))
                             .await;
                     if let Err(e) = handled {
                         eprintln!("navette: the home desk could not be restored after a reload: {e}");
+                    }
+                    // The layer rules are back, but in effect only once each monitor is sorted
+                    // again: until then, an overlay of home's that maps lands above the picture.
+                    if reloaded && let Some(a) = &active {
+                        for shown in &a.shown {
+                            shown.screen.poke();
+                        }
                     }
                     if sweep {
                         send_home(&home, sending).await;
@@ -774,7 +797,14 @@ async fn launch(
         .filter(|m| !names.contains(&m.name) && !m.disabled)
         .min_by_key(|m| (m.x, m.y))
         .map(|m| m.name.clone());
-    let desk = open_desk(home, &names, home_monitor.clone(), &mode.mic_hotkey).await?;
+    let desk = open_desk(
+        home,
+        &names,
+        home_monitor.clone(),
+        &mode.mic_hotkey,
+        &mode.local_above,
+    )
+    .await?;
     // The hotkey is shown over the mic button; with no mic, there is no button.
     let hint = home.mic.as_ref().map(|_| mode.mic_hotkey.clone());
     let feed = Feed::new(home.board.clone(), hint, mode.look.clone());
@@ -918,14 +948,17 @@ fn decoding_gpus<T>(
 
 /// Opens the desk (undoing what a previous run left) and keeps home windows off the `given`
 /// monitors: their workspaces go to `other`, the leftmost home monitor kept home, and so do
-/// windows that would open on any of their workspaces. With a mic, binds its hotkey.
+/// windows that would open on any of their workspaces. Draws the remote's picture above home's
+/// overlays, except the `local_above` ones (#116). With a mic, binds its hotkey.
 async fn open_desk(
     home: &Home,
     given: &[String],
     other: Option<String>,
     mic_hotkey: &str,
+    local_above: &[String],
 ) -> io::Result<Desk<Eval>> {
     let (hypr, record, given) = (home.hypr.clone(), home.desk_record.clone(), given.to_vec());
+    let local_above = local_above.to_vec();
     let mic_bind = home
         .mic
         .as_ref()
@@ -968,6 +1001,30 @@ async fn open_desk(
             desk.apply(Change::window_rule(&name, &fields))
                 .map_err(desk_error)?;
         }
+        // Before the surfaces map: Hyprland 0.56.2 sorts a monitor's overlay layers by `order`,
+        // highest first, only when one maps, unmaps or commits its layer-shell state, and draws
+        // the last on top. Navette's picture then stays above an overlay of home's that maps
+        // later (an OSD, a shell restarted), and the tools the user starts on purpose stay above
+        // it. A mode without the rules still shows the picture.
+        let above = [(
+            SURFACE_NAMESPACE.to_string(),
+            "above".to_string(),
+            PICTURE_ORDER,
+        )];
+        let below = local_above.iter().enumerate().map(|(index, namespace)| {
+            let base = format!("local-above-{}", index + 1);
+            (namespace.clone(), base, LOCAL_ABOVE_ORDER)
+        });
+        for (namespace, base, order) in above.into_iter().chain(below) {
+            let fields = format!(
+                "match = {{ namespace = {} }}, order = {order}",
+                lua_string(&format!("^{}$", regex_escaped(&namespace)))
+            );
+            let rule = Change::layer_rule(&desk.rule_name(&base), &fields);
+            if let Err(e) = desk.apply(rule) {
+                eprintln!("navette: the layer `{namespace}` keeps its place: {e}");
+            }
+        }
         // Live over the remote's monitor too, where every other shortcut goes to the remote.
         // A mode without its hotkey is still a mode: the bar and `navette mic` switch it.
         if let Some((keys, command)) = mic_bind {
@@ -980,6 +1037,18 @@ async fn open_desk(
         Ok(desk)
     })
     .await
+}
+
+/// `text` matched as is by Hyprland's regular expressions.
+fn regex_escaped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Moves to the home monitor the home windows that landed on the given ones, where a cover
@@ -1211,6 +1280,9 @@ mod tests {
         corners: Corners,
         /// What each corner was handed, by monitor.
         feeds: Arc<Mutex<Vec<(String, Feed)>>>,
+        /// Each poke of a screen, by monitor, with how many layer rules Hyprland had then.
+        pokes: Arc<Mutex<Vec<(String, usize)>>>,
+        hypr: Option<Arc<FakeHypr>>,
     }
 
     /// The corners showing, by monitor and side, and what each heard.
@@ -1263,6 +1335,8 @@ mod tests {
         monitor: String,
         covered: Arc<Mutex<Vec<String>>>,
         cursors: Arc<Mutex<Vec<(String, Pointer)>>>,
+        pokes: Arc<Mutex<Vec<(String, usize)>>>,
+        hypr: Option<Arc<FakeHypr>>,
         _corner: FakeCorner,
     }
 
@@ -1295,6 +1369,8 @@ mod tests {
                 monitor: monitor.to_string(),
                 covered: self.covered.clone(),
                 cursors: self.cursors.clone(),
+                pokes: self.pokes.clone(),
+                hypr: self.hypr.clone(),
                 _corner: corner,
             }))
         }
@@ -1324,6 +1400,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((self.monitor.clone(), pointer));
+        }
+
+        fn poke(&self) {
+            let rules = self.hypr.as_ref().map_or(0, |h| h.layer_rules().len());
+            self.pokes
+                .lock()
+                .unwrap()
+                .push((self.monitor.clone(), rules));
         }
     }
 
@@ -1412,6 +1496,7 @@ mod tests {
         refuse: Arc<Mutex<Vec<String>>>,
         corners: Corners,
         feeds: Arc<Mutex<Vec<(String, Feed)>>>,
+        pokes: Arc<Mutex<Vec<(String, usize)>>>,
         board: Arc<Board>,
         notices: Arc<crate::notify::Fake>,
         peers: UnboundedSender<Peer>,
@@ -1441,7 +1526,10 @@ mod tests {
         let mic = Arc::new(mic);
         let sound = Arc::new(FakeSound::default());
         let hypr = Arc::new(FakeHypr::with(monitors));
-        let screens = FakeScreens::default();
+        let screens = FakeScreens {
+            hypr: Some(hypr.clone()),
+            ..FakeScreens::default()
+        };
         let covered = screens.covered.clone();
         let ends = screens.ends.clone();
         let hotkeys = screens.hotkeys.clone();
@@ -1452,6 +1540,7 @@ mod tests {
         let inputs = screens.inputs.clone();
         let corners = screens.corners.clone();
         let feeds = screens.feeds.clone();
+        let pokes = screens.pokes.clone();
         let board = Arc::new(Board::default());
         let notices = Arc::new(crate::notify::Fake::default());
         let (peers, peers_rx) = mpsc::unbounded_channel();
@@ -1484,6 +1573,7 @@ mod tests {
             inputs,
             corners,
             feeds,
+            pokes,
             board,
             notices,
             peers,
@@ -2430,6 +2520,7 @@ mod tests {
             &["DP-1".to_string()],
             Some("DP-3".to_string()),
             "SUPER + CTRL + M",
+            &[],
         )
         .await
         .unwrap()
@@ -2539,6 +2630,7 @@ mod tests {
             &["DP-1".to_string()],
             Some("DP-3".to_string()),
             "SUPER + CTRL + M",
+            &[],
         )
         .await
         .unwrap()
@@ -2569,6 +2661,142 @@ mod tests {
         until(|| desk.hypr.window_rules().len() == 2).await;
         let rules = desk.hypr.window_rules();
         assert_eq!(rules[0], rules[1]);
+    }
+
+    /// The rule that draws Navette's picture last among the overlay layers.
+    const ABOVE: &str = r#"match = { namespace = "^navette$" }, order = -1000"#;
+
+    fn below(namespace: &str) -> String {
+        format!(r#"match = {{ namespace = "^{namespace}$" }}, order = -2000"#)
+    }
+
+    #[tokio::test]
+    async fn mode_start_sends_the_layer_rules_for_navette_s_namespace_and_the_listed_ones_only() {
+        let desk = desk_with("monitor = DP-2\nlocal_above = selection, invented.picker\n");
+        let _remote = started(&desk).await;
+        let rules = desk.hypr.layer_rules();
+        assert_eq!(rules.len(), 3, "{rules:?}");
+        assert!(rules[0].contains(ABOVE), "{rules:?}");
+        assert!(rules[1].contains(&below("selection")), "{rules:?}");
+        // A namespace is matched whole, its dots as dots.
+        assert!(
+            rules[2].contains(&below("invented\\\\.picker")),
+            "{rules:?}"
+        );
+        assert!(rules.iter().all(|r| r.contains("name = \"navette-")));
+    }
+
+    #[tokio::test]
+    async fn by_default_slurp_s_and_hyprpicker_s_overlays_stay_above() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        let rules = desk.hypr.layer_rules();
+        assert_eq!(rules.len(), 3, "{rules:?}");
+        assert!(rules[1].contains(&below("selection")), "{rules:?}");
+        assert!(rules[2].contains(&below("hyprpicker")), "{rules:?}");
+    }
+
+    #[tokio::test]
+    async fn with_local_above_none_only_navette_s_rule_is_sent() {
+        let desk = desk_with("monitor = DP-2\nlocal_above = none\n");
+        let _remote = started(&desk).await;
+        let rules = desk.hypr.layer_rules();
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert!(rules[0].contains(ABOVE), "{rules:?}");
+    }
+
+    #[tokio::test]
+    async fn the_layer_rules_are_set_before_the_surfaces_map() {
+        let desk = desk("DP-2");
+        let (hypr, seen) = (desk.hypr.clone(), Arc::new(Mutex::new(Vec::new())));
+        let at_open = seen.clone();
+        *desk.on_open.lock().unwrap() = Some(Box::new(move || {
+            at_open.lock().unwrap().push(hypr.layer_rules().len());
+        }));
+        let _remote = started(&desk).await;
+        assert_eq!(*seen.lock().unwrap(), [3]);
+    }
+
+    #[tokio::test]
+    async fn configreloaded_sends_the_layer_rules_again_then_pokes_each_surface() {
+        let desk = desk_on(
+            "monitor = DP-2, DP-3\n",
+            vec![
+                FakeMonitor::new("DP-1", 1920, 1080, 0),
+                FakeMonitor::new("DP-2", 1920, 1080, 1920),
+                FakeMonitor::new("DP-3", 1920, 1080, 3840),
+            ],
+            FakeMic::default(),
+        );
+        let (_remote, text) = started_with(&desk, &["NAVETTE-1", "NAVETTE-2"]).await;
+        text.unwrap();
+        assert!(desk.pokes.lock().unwrap().is_empty());
+        desk.events.send(hypr::Event::ConfigReloaded).unwrap();
+        until(|| desk.pokes.lock().unwrap().len() == 2).await;
+        let rules = desk.hypr.layer_rules();
+        assert_eq!(rules.len(), 6, "{rules:?}");
+        assert_eq!(rules[..3], rules[3..]);
+        assert_eq!(
+            *desk.pokes.lock().unwrap(),
+            [("DP-2".to_string(), 6), ("DP-3".to_string(), 6)]
+        );
+    }
+
+    #[tokio::test]
+    async fn another_event_pokes_no_surface() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        desk.events.send(hypr::Event::Placed).unwrap();
+        desk.events.send(hypr::Event::ConfigReloaded).unwrap();
+        until(|| !desk.pokes.lock().unwrap().is_empty()).await;
+        assert_eq!(desk.pokes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mode_stop_disables_the_layer_rules() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        answer(ask(&desk, false).await).await.unwrap();
+        let rules = desk.hypr.layer_rules();
+        assert_eq!(rules.len(), 6, "{rules:?}");
+        for (set, undone) in rules[..3].iter().zip(rules[3..].iter().rev()) {
+            let name = &set[..set.find(',').unwrap()];
+            assert_eq!(*undone, format!("{{ {}, enabled = false }}", &name[2..]));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_layer_rules_a_crashed_mode_left_are_disabled_at_the_next_start() {
+        let desk = desk("DP-2");
+        let crashed = Home {
+            config_dir: desk._config.path().to_path_buf(),
+            hypr: desk.hypr.clone(),
+            screens: Arc::new(FakeScreens::default()),
+            gpu: Arc::new(HomeGpu::new(None)),
+            desk_record: desk._config.path().join("desk"),
+            mic: None,
+            sound: None,
+            board: Arc::default(),
+            notifier: Arc::new(crate::notify::Fake::default()),
+        };
+        open_desk(
+            &crashed,
+            &["DP-2".to_string()],
+            Some("DP-1".to_string()),
+            "SUPER + CTRL + M",
+            &["selection".to_string()],
+        )
+        .await
+        .unwrap()
+        .crash();
+        let left = desk.hypr.layer_rules();
+        assert_eq!(left.len(), 2, "{left:?}");
+        let _remote = started(&desk).await;
+        let rules = desk.hypr.layer_rules();
+        assert!(rules[2].ends_with("enabled = false }"), "{rules:?}");
+        assert!(rules[3].ends_with("enabled = false }"), "{rules:?}");
+        assert_eq!(rules[2][..30], left[1][..30]);
+        assert_eq!(rules[3][..30], left[0][..30]);
     }
 
     #[tokio::test]
