@@ -203,11 +203,13 @@ struct LocalOffer {
     /// Mime types the compositor's current selection advertises.
     mime_types: Vec<String>,
     files: LocalFiles,
+    /// What names `files` in the corner's bar, found once when the copy is offered.
+    headline: Option<progress::Headline>,
     /// The links and special files the copy left out; named once, at the first paste.
     skipped: Vec<String>,
     /// The copies of files made before, by serial, the latest last: their files are still
     /// served, not their other types.
-    older: std::collections::VecDeque<(u32, LocalFiles)>,
+    older: std::collections::VecDeque<(u32, LocalFiles, Option<progress::Headline>)>,
 }
 
 #[derive(Default)]
@@ -406,7 +408,7 @@ impl<C: Compositor> Bridge<C> {
         let current = self.local.borrow().serial;
         let older = matches!(item, ClipboardItem::File(_))
             && serial != current
-            && self.local.borrow().older.iter().any(|(s, _)| *s == serial);
+            && self.local.borrow().older.iter().any(|(s, ..)| *s == serial);
         if serial != current && !older {
             // The selection moved on since the peer saw the offer: refuse, so its paste fails
             // on its own, rather than serve data it did not ask for.
@@ -441,9 +443,13 @@ impl<C: Compositor> Bridge<C> {
             ClipboardItem::File(index) => {
                 let (path, size, total, skipped, headline) = {
                     let mut local = self.local.borrow_mut();
-                    let copied = match older {
-                        false => &local.files,
-                        true => &local.older.iter().find(|(s, _)| *s == serial).unwrap().1,
+                    let (copied, headline) = match older {
+                        false => (&local.files, &local.headline),
+                        true => {
+                            let (_, files, headline) =
+                                local.older.iter().find(|(s, ..)| *s == serial).unwrap();
+                            (files, headline)
+                        }
                     };
                     let Some(path) = copied.path_for(&item).map(PathBuf::from) else {
                         log(format_args!(
@@ -453,7 +459,7 @@ impl<C: Compositor> Bridge<C> {
                         return;
                     };
                     let size = copied.entries[index as usize].size;
-                    let headline = files::headline(&copied.entries);
+                    let headline = headline.clone();
                     // Listed and validated: the sum is counted.
                     let total = files::total(&copied.entries).unwrap_or(u64::MAX);
                     let skipped = match older {
@@ -517,10 +523,11 @@ impl<C: Compositor> Bridge<C> {
         {
             let mut local = self.local.borrow_mut();
             let files = std::mem::take(&mut local.files);
+            let headline = local.headline.take();
             if !files.entries.is_empty() {
                 let serial = local.serial;
-                local.older.retain(|(s, _)| *s != serial);
-                local.older.push_back((serial, files));
+                local.older.retain(|(s, ..)| *s != serial);
+                local.older.push_back((serial, files, headline));
                 if local.older.len() > OLDER_SERVED {
                     local.older.pop_front();
                 }
@@ -563,6 +570,7 @@ impl<C: Compositor> Bridge<C> {
             // Copied again: what the user stopped of it may cross again.
             progress.resume(serial);
             let entries = copied.files.entries.clone();
+            let headline = files::headline(&entries);
             log(format_args!(
                 "offer {serial} sent: {} files, {} types",
                 entries.len(),
@@ -572,6 +580,7 @@ impl<C: Compositor> Bridge<C> {
                 let mut local = local.borrow_mut();
                 local.serial = serial;
                 local.files = copied.files;
+                local.headline = headline;
                 local.skipped = copied.skipped;
             }
             let _ = transfers
@@ -3018,6 +3027,29 @@ mod tests {
                     let shown: Vec<_> = bars.iter().flatten().collect();
                     assert!(shown.iter().all(|bar| bar.headline == trip), "{bars:?}");
                 }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_copy_is_named_once_however_many_files_it_serves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copied = tmp.path().join("trip");
+        std::fs::create_dir(&copied).unwrap();
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            std::fs::write(copied.join(name), vec![3; 1 << 10]).unwrap();
+        }
+        let list = uri_list_of(&[copied]);
+        LocalSet::new()
+            .run_until(async {
+                let (home, remote) = desk(tmp.path());
+                files::HEADLINES.with(|n| n.set(0));
+                paste_on_the_remote(&home, &remote, &list).await;
+                the_bar_went(&home.seen, 3 << 10).await;
+                the_bar_went(&remote.seen, 3 << 10).await;
+                // One for the copy served by home, one for the paste on the remote; not one
+                // per file served.
+                assert_eq!(files::HEADLINES.with(|n| n.get()), 2);
             })
             .await;
     }

@@ -236,6 +236,8 @@ enum Kind {
 
 struct Offer {
     files: Vec<ClipboardFile>,
+    /// What names it in the corner's bar, found once when it is offered.
+    headline: Option<Headline>,
     /// Its folder's inode, and every inode under it.
     inodes: Vec<u64>,
     /// Still the peer's copy: no newer one replaced it.
@@ -487,7 +489,7 @@ impl Folder {
             serial,
             index,
             total,
-            headline: crate::clipboard::files::headline(&offer.files),
+            headline: offer.headline.clone(),
             content: content.clone(),
         };
         if self.asked.send(asked).is_err() {
@@ -632,6 +634,7 @@ impl Tree {
         }
         let offer = Offer {
             files: files.to_vec(),
+            headline: crate::clipboard::files::headline(files),
             inodes: (first..self.next).collect(),
             current: true,
             open: 0,

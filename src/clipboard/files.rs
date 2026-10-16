@@ -120,13 +120,25 @@ pub fn total(files: &[ClipboardFile]) -> Option<u64> {
         .try_fold(0u64, |sum, f| sum.checked_add(f.size))
 }
 
+// How many headlines this thread computed, so a test can tell a copy named once from a copy
+// named again for each of its files.
+#[cfg(test)]
+thread_local! {
+    pub static HEADLINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// What names a copy in the corner's bar: the first of the entries at the top of the copy, and
 /// how many others sit beside it. A folder's files do not count, only what the user copied.
 pub fn headline(files: &[ClipboardFile]) -> Option<Headline> {
+    #[cfg(test)]
+    HEADLINES.with(|n| n.set(n.get() + 1));
+    // A copy holds up to `MAX_FILE_ENTRIES` entries, all at the top when it is flat: a set keeps
+    // the pass linear.
+    let mut seen = std::collections::HashSet::new();
     let mut tops = Vec::new();
     for f in files {
         let top = f.path.split('/').next().unwrap_or_default();
-        if !tops.contains(&top) {
+        if seen.insert(top) {
             tops.push(top);
         }
     }
@@ -570,6 +582,28 @@ mod tests {
                 more: 3
             })
         );
+    }
+
+    #[test]
+    fn the_headline_of_a_flat_copy_of_the_most_entries_is_found_in_one_pass() {
+        let flat: Vec<_> = (0..MAX_FILE_ENTRIES)
+            .map(|i| ClipboardFile {
+                path: format!("file-{i}.bin"),
+                size: 1,
+                dir: false,
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let found = headline(&flat);
+        assert_eq!(
+            found,
+            Some(Headline {
+                name: "file-0.bin".into(),
+                more: MAX_FILE_ENTRIES - 1
+            })
+        );
+        // Far above a pass over the entries, far below the quadratic scan it replaces.
+        assert!(start.elapsed() < std::time::Duration::from_millis(250));
     }
 
     #[test]
