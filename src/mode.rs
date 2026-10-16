@@ -556,9 +556,13 @@ pub async fn serve(
             },
             order = orders.recv() => match order {
                 Some(Order::Start(name, reply)) => {
-                    here_at = None;
                     begin(&home, peer.as_ref(), name.as_deref(), reply, &mut generation, &mut active)
                         .await;
+                    // Only a mode that really started: a start refused says nothing of what
+                    // the user does next, and the link is still worth announcing.
+                    if active.is_some() {
+                        here_at = None;
+                    }
                 }
                 Some(Order::Stop(reply)) => {
                     let given = active.as_ref().map(Active::given_back);
@@ -2124,6 +2128,16 @@ mod tests {
         answer(pending).await.unwrap();
         settle().await;
         assert!(offers(&desk).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_that_fails_within_the_moment_still_offers() {
+        let desk = desk("DP-2");
+        let _remote = connect(&desk);
+        let pending = ask_mode(&desk, "nope").await;
+        assert!(answer(pending).await.is_err());
+        settle().await;
+        assert_eq!(offers(&desk), [("REMOTE is here".into(), "Start".into())]);
     }
 
     #[tokio::test(start_paused = true)]
