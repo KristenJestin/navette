@@ -67,6 +67,8 @@ pub enum Msg {
     NoInput(String),
     /// Remote to home: the mode goes on, but the lid is left alone (the reason).
     NoLid(String),
+    /// Home to remote, once the link is up: how the desk's user calls it (`local_label`).
+    Desk(String),
 }
 
 /// The display's orders and their answers.
@@ -159,6 +161,7 @@ pub enum Incoming {
     },
     NoInput(String),
     NoLid(String),
+    Desk(String),
 }
 
 /// One live connection, as the display and its input see it. `inbox` ends when the link drops.

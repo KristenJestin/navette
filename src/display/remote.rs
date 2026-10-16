@@ -33,6 +33,7 @@ use crate::events::{Driven, Events, Phase};
 use crate::hypr::{self, Hypr};
 use crate::input::{self, Inject, Injectors};
 use crate::lid::{self, Logind};
+use crate::names::Names;
 use crate::notify::Notifier;
 
 /// The first wait before a lost stream is started again, doubled after each failure up to
@@ -179,6 +180,9 @@ struct Active {
     generation: Option<u32>,
     /// The outputs, once the user was told home drives them: told again when the mode stops.
     told: Option<Vec<String>>,
+    /// The desk as the sentences put it (`the desk`, or its label), as told when the mode
+    /// started.
+    desk: String,
 }
 
 struct Output {
@@ -304,6 +308,8 @@ pub async fn serve_peer(
     let hypr = &ports.hypr;
     let mut active: Option<Active> = None;
     let mut home = Home::default();
+    // What the desk said it is called, if it did.
+    let mut desk = Names::default();
     let mut input_open = true;
     let mut told = None;
     loop {
@@ -325,6 +331,7 @@ pub async fn serve_peer(
                     match start(copies, caps) {
                         Ok(mut mode) => {
                             mode.generation = generation;
+                            mode.desk = desk.the_desk();
                             // Whatever home asks: one of the release before may say `Some(false)`.
                             mode.lid = watch_lid(ports, &peer.outbox);
                             mode.bring_up(0, ports, &home, &peer.outbox);
@@ -337,6 +344,15 @@ pub async fn serve_peer(
                     }
                 }
                 Some(Incoming::Display(Display::Stop)) => stop(&mut active, ports).await,
+                Some(Incoming::Desk(label)) => {
+                    desk = Names::new(Some(label.as_str()), None);
+                    if let Some(mode) = &mut active {
+                        mode.desk = desk.the_desk();
+                    }
+                    // None for an empty label, which names nothing.
+                    let peer = Some(label).filter(|label| !label.is_empty());
+                    ports.events.update(|p| p.peer = peer);
+                }
                 Some(Incoming::Feedback { output, msg }) => {
                     if let Some(running) = active.as_ref().and_then(|a| a.running(output.into())) {
                         let _ = running.feedback.send(msg);
@@ -440,7 +456,7 @@ pub async fn serve_peer(
                                     generation: mode.generation,
                                 };
                                 peer.outbox.send(Msg::Display(started), Vec::new());
-                                ports.notifier.show(&driven(&names, ""), "");
+                                ports.notifier.show(&driven(&mode.desk, &names, ""), "");
                                 mode.told = Some(names);
                             }
                         }
@@ -480,6 +496,8 @@ pub async fn serve_peer(
     }
     stop(&mut active, ports).await;
     tell(ports, None, &mut told);
+    // The next link may be another desk's.
+    ports.events.update(|p| p.peer = None);
 }
 
 /// Tells the events which outputs home drives, when they changed since they were last told:
@@ -558,6 +576,7 @@ fn start(copies: Vec<OutputCopy>, caps: ClientCaps) -> Result<Active, String> {
         lid: None,
         generation: None,
         told: None,
+        desk: Names::default().the_desk(),
     })
 }
 
@@ -689,6 +708,7 @@ async fn stop(active: &mut Option<Active>, ports: &Ports) {
         return;
     };
     let told = mode.told.take();
+    let desk = mode.desk.clone();
     // A start cannot be cut short: removed now, its output would be made again after.
     let starting = match mode.up.take() {
         Some((_, start)) => start.await.ok(),
@@ -714,16 +734,17 @@ async fn stop(active: &mut Option<Active>, ports: &Ports) {
         }
     }
     if let Some(names) = told {
-        ports.notifier.show(&driven(&names, " stopped"), "");
+        ports.notifier.show(&driven(&desk, &names, " stopped"), "");
     }
 }
 
-/// What the agent says when home starts driving its outputs, `2 screens driven from home
-/// (NAVETTE-1, NAVETTE-2)`, and with ` stopped` when it stops.
-fn driven(names: &[String], then: &str) -> String {
+/// What the agent says when the desk starts driving its outputs, `2 screens driven from the
+/// desk (NAVETTE-1, NAVETTE-2)` (`desk` being what it is called), and with ` stopped` when it
+/// stops.
+fn driven(desk: &str, names: &[String], then: &str) -> String {
     let screens = if names.len() > 1 { "screens" } else { "screen" };
     format!(
-        "{} {screens} driven from home{then} ({})",
+        "{} {screens} driven from {desk}{then} ({})",
         names.len(),
         names.join(", ")
     )

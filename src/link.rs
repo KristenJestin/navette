@@ -601,6 +601,13 @@ async fn receive<R: AsyncRead + Unpin>(
                 let _ = display.try_send(Incoming::NoLid(reason));
                 continue;
             }
+            // Said in notifications: only what a corner could draw is taken.
+            LinkMsg::Desk { label } => {
+                if crate::corner::check_label(&label).is_ok() {
+                    let _ = display.try_send(Incoming::Desk(label));
+                }
+                continue;
+            }
             msg => msg,
         };
         let Some(clip) = clip.into_clipboard().map(checked) else {

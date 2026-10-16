@@ -94,6 +94,14 @@ pub enum LinkMsg {
         #[n(0)]
         reason: String,
     },
+    /// Home to remote, once the link is up: how the desk's user calls the desk (`local_label`),
+    /// for the remote's own messages. An older peer skips it, and a desk with no label sends
+    /// none.
+    #[n(33)]
+    Desk {
+        #[n(0)]
+        label: String,
+    },
     // The remote machine's sound (`crate::audio`), a block of numbers of its own.
     #[n(48)]
     AudioStart {
@@ -158,6 +166,7 @@ impl From<(u8, Msg)> for LinkMsg {
             Msg::Feedback(msg) => Self::Feedback(msg, output_id(output)),
             Msg::NoInput(reason) => Self::NoInput { reason },
             Msg::NoLid(reason) => Self::NoLid { reason },
+            Msg::Desk(label) => Self::Desk { label },
         }
     }
 }
@@ -241,6 +250,7 @@ impl LinkMsg {
             | Self::Input(..)
             | Self::NoInput { .. }
             | Self::NoLid { .. }
+            | Self::Desk { .. }
             | Self::AudioStart { .. }
             | Self::AudioStop
             | Self::AudioFrame { .. }

@@ -511,6 +511,11 @@ pub async fn serve(
             new = peers.recv() => match new {
                 Some(new) => {
                     link_lost(&mut active, "the link was replaced").await;
+                    // Before anything else is said on the link: the remote's own messages
+                    // name the desk by it.
+                    if let Some(label) = config::desk_label(&home.config_dir) {
+                        new.outbox.send(Msg::Desk(label), Vec::new());
+                    }
                     peer = Some(new);
                     here_at = Some(tokio::time::Instant::now() + ARRIVAL_DELAY);
                 }
