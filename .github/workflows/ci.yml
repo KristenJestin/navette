@@ -45,3 +45,33 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  # TEMPORARY (#140): the three flaky tests, looped under CPU load. Removed before the merge.
+  stress:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [remote, cli]
+    steps:
+      - uses: actions/checkout@v4
+      - run: tools/install-build-libraries.sh
+      - run: cargo test --locked --no-run
+      - name: Loop under load
+        run: |
+          for _ in $(seq "$(nproc)"); do (while :; do :; done) & done
+          if [ "${{ matrix.suite }}" = remote ]; then
+            args=(--lib -- display::remote::tests --test-threads=32)
+          else
+            args=(--test cli -- --test-threads=16)
+          fi
+          fail=0
+          for i in $(seq 60); do
+            if ! out=$(cargo test --locked "${args[@]}" 2>&1); then
+              fail=$((fail + 1))
+              echo "== iteration $i"
+              echo "$out" | grep -E "FAILED|panicked|left:|right:|established|never got" | head -20
+            fi
+          done
+          echo "failed iterations: $fail of 60"
+          [ "$fail" = 0 ]
