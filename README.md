@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/brand/png/social-preview.png" alt="Navette: navette mode start office gives two home monitors to the work laptop, with its link, display and mic" width="100%">
+<img src="assets/brand/png/social-preview.png" alt="Navette: the home desk with a mode running, its first monitor at home and the two others showing the work laptop, closed on the desk" width="100%">
 
 [![Latest version](https://img.shields.io/github/v/release/KristenJestin/navette?include_prereleases)](https://github.com/KristenJestin/navette/releases)
 [![Licence: Apache-2.0](https://img.shields.io/github/license/KristenJestin/navette)](LICENSE)
