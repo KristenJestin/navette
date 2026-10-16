@@ -8,12 +8,12 @@
 //! key of the `default` metadata, the one `wpctl set-default` writes.
 //!
 //! Like any sink, it applies its volume and mute to what it receives, which is the remote's
-//! mixer acting on it. The sound that goes home is read from its monitor instead, which carries
+//! mixer acting on it. The sound that goes to the desk is read from its monitor instead, which carries
 //! it as the apps played it (`monitor.channel-volumes` is false). The volume and mute that the
 //! sink holds are followed by [`Mixer`] and told by the loop, at most every [`LEVEL_EVERY`], so
 //! that the controls one change sets are told together.
 //!
-//! Home's default output is the `default.audio.sink` key, the sink the session manager gives
+//! The desk's default output is the `default.audio.sink` key, the sink the session manager gives
 //! the apps, followed as it moves. Its volume is read from the node's props, as `wpctl` reads
 //! it, and set on the card's active route when the sink is a card's, as the session manager's
 //! own mixer does, or on the node's props otherwise.
@@ -342,7 +342,7 @@ impl Rate {
 
 /// A level asked for a stream, kept until the stream has the controls to take it: until then,
 /// PipeWire drops the controls it is given, with only a warning in its own log, and the
-/// remote's first level, told as soon as home's stream opens, would be lost.
+/// remote's first level, told as soon as the desk's stream opens, would be lost.
 #[derive(Default)]
 struct Asked(Cell<Option<Level>>);
 
@@ -1244,7 +1244,7 @@ fn sink_properties(name: &str, description: &str) -> pw::properties::PropertiesB
     let mut props = properties(name, description);
     props.insert(*pw::keys::MEDIA_CLASS, "Audio/Sink");
     // The monitor carries the sound before the sink's volume, whatever the machine's own
-    // defaults say: home's volume is the only one heard.
+    // defaults say: the desk's volume is the only one heard.
     props.insert("monitor.channel-volumes", "false");
     props
 }
@@ -1389,7 +1389,7 @@ fn open_playback(
     let mut props = properties(name, description);
     props.insert(*pw::keys::MEDIA_TYPE, "Audio");
     props.insert(*pw::keys::MEDIA_CATEGORY, "Playback");
-    // At 100 %, home's output volume the only one heard: WirePlumber would put back a
+    // At 100 %, the desk's output volume the only one heard: WirePlumber would put back a
     // volume it kept from an earlier run.
     props.insert("state.restore-props", "false");
     playing(
@@ -1416,7 +1416,7 @@ fn open_source(
 
 /// PipeWire's echo canceller (WebRTC), loaded here: it captures `mic`, named rather than the
 /// default, which goes silent while the mic is away, and the monitor of the default output as
-/// what to cancel, so that home's own default output is left as it is. Its source is no
+/// what to cancel, so that desk's own default output is left as it is. Its source is no
 /// default: only this stream records from it.
 fn echo_cancel_args(name: &str, description: &str, mic: &str) -> String {
     let quoted = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
@@ -2205,7 +2205,7 @@ mod tests {
 
     #[test]
     fn the_sink_s_monitor_carries_the_sound_before_its_volume() {
-        let props = sink_properties("navette-home-speakers", "Home speakers");
+        let props = sink_properties("navette-desk-speakers", "Desk speakers");
         assert_eq!(props.get("monitor.channel-volumes"), Some("false"));
         assert_eq!(props.get(*pw::keys::MEDIA_CLASS), Some("Audio/Sink"));
     }

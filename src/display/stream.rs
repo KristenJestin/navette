@@ -1,11 +1,11 @@
 //! The remote's picture path for one output: capture it (`hypr-capture`), encode it (gliff-vk
 //! and VA-API on the GPU, Dual420 as gliff does; gliff-sw on the CPU when the GPU cannot),
-//! pace it and adapt the rate to the link, and send it home, with the cursor's image apart.
+//! pace it and adapt the rate to the link, and send it to the desk, with the cursor's image apart.
 //!
 //! Adapted from gliff-server's `session.rs` (gliff, MIT, see `LICENSES/gliff-MIT.txt`): the
 //! capture, pacing, refinement, ladder and fallback logic is gliff's. What Navette drops: the
 //! handshake (the display's `Start` order replaces it), input and clipboard (their own modules),
-//! resizing to a client window and mirroring (the output copies a home monitor, fixed).
+//! resizing to a client window and mirroring (the output copies a desk monitor, fixed).
 
 use std::io;
 use std::os::fd::AsFd;
@@ -59,7 +59,7 @@ impl Drop for Stream {
     }
 }
 
-/// Starts streaming `source` into `outbox`; `feedback` carries home's acks. Returns once the
+/// Starts streaming `source` into `outbox`; `feedback` carries the desk's acks. Returns once the
 /// capture and the encoder are up. `ended` gets the reason if the stream stops on its own
 /// (the output or Hyprland went away).
 pub fn start(
@@ -236,7 +236,7 @@ impl Session {
     ) -> io::Result<(Self, UnboundedReceiver<Incoming>)> {
         if !caps.codecs.contains(&Codec::H264) {
             return Err(io::Error::other(
-                "home decodes no codec this machine encodes",
+                "the desk decodes no codec this machine encodes",
             ));
         }
         let render_node = hypr_capture::render_node(None);
@@ -254,7 +254,7 @@ impl Session {
         };
         if !chroma_ok {
             return Err(io::Error::other(
-                "home decodes no chroma mode this machine encodes",
+                "the desk decodes no chroma mode this machine encodes",
             ));
         }
         let video = VideoTier::open(VideoMode::resolve(None), &render_node);
@@ -586,7 +586,7 @@ impl Session {
     }
 
     fn send_config(&mut self) {
-        // The scale home divides stream pixels by to reach the remote's logical space.
+        // The scale the desk divides stream pixels by to reach the remote's logical space.
         let scale = self.source.scale * self.stream.0 as f32 / self.output.0.max(1) as f32;
         self.outbox.send(
             Msg::Video(ServerMsg::StreamConfig {
@@ -993,7 +993,7 @@ fn encode_on_cpu(
     })
 }
 
-/// The encoder's largest picture, no larger than home said it decodes.
+/// The encoder's largest picture, no larger than the desk said it decodes.
 fn within_home(max: (u32, u32), caps: &ClientCaps) -> (u32, u32) {
     (max.0.min(caps.max_width), max.1.min(caps.max_height))
 }
@@ -1011,7 +1011,7 @@ fn start_capture(
             .map_err(|e| other("capture", e))?,
     );
     config.render_node = render_node.to_path_buf();
-    // The cursor's image goes home on its own, for home's compositor to draw at home's pointer,
+    // The cursor's image goes to the desk on its own, for the desk's compositor to draw at the desk's pointer,
     // as gliff does: with no delay, and never in the picture.
     config.cursor = true;
     // One extra ring slot: the session pins the last sent frame for refinement.
@@ -1026,7 +1026,7 @@ fn start_capture(
 }
 
 /// What the stream hears of a capture event. Of the cursor's moves, only its visibility goes
-/// on, and only when it changes (`visible` keeps the last): home draws the cursor at home's
+/// on, and only when it changes (`visible` keeps the last): the desk draws the cursor at the desk's
 /// pointer.
 fn captured(ev: CaptureEvent, visible: &mut Option<bool>) -> Option<Incoming> {
     Some(match ev {
@@ -1086,7 +1086,7 @@ mod tests {
             Some(_) => panic!("not the cursor's visibility"),
         };
         assert_eq!(seen(true), Some(true));
-        // A move with the cursor still shown is not news: home draws it at its own pointer.
+        // A move with the cursor still shown is not news: the desk draws it at its own pointer.
         assert_eq!(seen(true), None);
         assert_eq!(seen(false), Some(false));
         assert_eq!(seen(false), None);
@@ -1195,7 +1195,7 @@ mod tests {
         captures: UnboundedReceiver<Incoming>,
         outbox: Outbox,
         runtime: tokio::runtime::Runtime,
-        /// The rate controller hears of home's acks; when not, its target stays where it
+        /// The rate controller hears of the desk's acks; when not, its target stays where it
         /// started.
         acks: bool,
     }
@@ -1237,7 +1237,7 @@ mod tests {
         }
 
         /// Lets the session send up to `max` frames, refinement passes included, as if each
-        /// were due; returns how many it sent. Home takes each one off the link at once.
+        /// were due; returns how many it sent. The desk takes each one off the link at once.
         fn frames(&mut self, max: usize) -> usize {
             let mut sent = 0;
             while sent < max {
@@ -1351,7 +1351,7 @@ mod tests {
         }
     }
 
-    /// One frame decoded at home.
+    /// One frame decoded at the desk.
     struct Arrival {
         at: Instant,
         /// Since the picture last changed, when the frame arrived.
@@ -1461,7 +1461,7 @@ mod tests {
     }
 
     /// Runs a real session on the CPU tier against a fake capture driven by `script`, over a
-    /// simulated `lan` to a home that decodes on the CPU and acks every frame. Returns every
+    /// simulated `lan` to a desk that decodes on the CPU and acks every frame. Returns every
     /// frame decoded while the script ran. Dual420, as the remote's GPU tier encodes.
     fn measure<S, F>(width: u32, height: u32, lan: Lan, script: S) -> Vec<Arrival>
     where
@@ -1514,7 +1514,7 @@ mod tests {
             };
             tokio::select! {
                 _ = script => {}
-                _ = home => unreachable!("home runs until the script ends"),
+                _ = home => unreachable!("the desk runs until the script ends"),
             }
         });
         let _ = stop_tx.send(());
@@ -1522,7 +1522,7 @@ mod tests {
         std::mem::take(&mut *arrivals.lock().unwrap())
     }
 
-    /// Home: writes each frame at the link's rate, decodes it and acks it.
+    /// Desk: writes each frame at the link's rate, decodes it and acks it.
     async fn home(
         outbox: Outbox,
         feedback: UnboundedSender<ClientMsg>,
@@ -1545,7 +1545,7 @@ mod tests {
                     height,
                     ..
                 }) => {
-                    // As home does: a pace-only change keeps the decoder.
+                    // As the desk does: a pace-only change keeps the decoder.
                     if config != Some((chroma, width, height)) {
                         config = Some((chroma, width, height));
                         decoder =
@@ -1564,7 +1564,7 @@ mod tests {
                         .as_mut()
                         .expect("a config before the frames")
                         .decode(&payloads[0], &payloads[1])
-                        .expect("home decodes the frame")
+                        .expect("the desk decodes the frame")
                         .expect("no picture held back");
                     let at = Instant::now();
                     let (picture, changed_at, changing) = scene.last_change();

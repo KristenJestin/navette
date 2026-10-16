@@ -1,7 +1,7 @@
-//! Whether the remote machine is on home's network, so that the agent never dials home's
+//! Whether the remote machine is on the desk's network, so that the agent never dials the desk's
 //! address from another one (an office LAN, a train's Wi-Fi), where the same private address
 //! may be anybody's. A subnet says nothing: the same private subnet exists on many networks.
-//! Home's network is known by the hardware address of its router, the remote's gateway on the
+//! The desk's network is known by the hardware address of its router, the remote's gateway on the
 //! way to the desk, recorded at pairing.
 //!
 //! The answer comes from the kernel's routing and ARP tables, read from `/proc`: nothing is
@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use crate::store::Store;
 
-/// How often an agent away from home looks again. Reading two files sends nothing, and a
-/// laptop back home links within this.
+/// How often an agent away from the desk looks again. Reading two files sends nothing, and a
+/// laptop back to the desk links within this.
 pub const RECHECK: Duration = Duration::from_secs(10);
 
 /// A hardware (MAC) address.
@@ -174,13 +174,13 @@ fn resolved(arp: &str, device: &str, ip: Ipv4Addr) -> Option<Mac> {
     })
 }
 
-/// The agent's gate: it dials only on home's network.
+/// The agent's gate: it dials only on the desk's network.
 pub struct HomeNetwork<T> {
     tables: T,
     store: Store,
     /// The desk's address, from the pairing.
     desk: Option<IpAddr>,
-    /// Home's gateway, as recorded in the pairing; none for a pairing older than this check.
+    /// The desk's gateway, as recorded in the pairing; none for a pairing older than this check.
     gateway: Option<Mac>,
 }
 
@@ -196,8 +196,8 @@ impl<T: Tables> HomeNetwork<T> {
         })
     }
 
-    /// Whether to dial home: one of this machine's default gateways is home's. A pairing that
-    /// does not know home's yet dials, as it did before.
+    /// Whether to dial the desk: one of this machine's default gateways is the desk's. A pairing that
+    /// does not know the desk's yet dials, as it did before.
     pub fn at_home(&self) -> bool {
         match self.gateway {
             // Any router on the way to the desk, not only the preferred route's.
@@ -208,8 +208,8 @@ impl<T: Tables> HomeNetwork<T> {
         }
     }
 
-    /// After a link has been up: a pairing without home's gateway learns it now, since this
-    /// machine just reached home, and keeps it.
+    /// After a link has been up: a pairing without the desk's gateway learns it now, since this
+    /// machine just reached the desk, and keeps it.
     pub fn linked(&mut self) -> io::Result<()> {
         if self.gateway.is_some() {
             return Ok(());
@@ -309,7 +309,7 @@ pub(crate) mod tests {
         Mac::parse(text).unwrap()
     }
 
-    /// A remote's store paired with home, which knows home's router as `gateway`.
+    /// A remote's store paired with the desk, which knows the desk's router as `gateway`.
     pub(crate) fn paired_remote(gateway: Option<&str>) -> (tempfile::TempDir, Store) {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(tmp.path());

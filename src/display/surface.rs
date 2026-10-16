@@ -1,4 +1,4 @@
-//! Home's surface on the reserved monitor (the kind chosen in #2): a layer-shell surface on the
+//! The desk's surface on the reserved monitor (the kind chosen in #2): a layer-shell surface on the
 //! overlay layer, bound to that output, anchored on every edge, above the bar. A GPU picture is
 //! a dmabuf handed to the compositor as is (linux-dmabuf), with no copy: linear when the
 //! compositor takes linear XRGB8888, else in one of the tiled layouts it lists (Hyprland on an
@@ -10,7 +10,7 @@
 //! Focus follows the pointer (#7): the surface takes the keyboard (`on_demand`) and a shortcuts
 //! inhibitor, so Super and every bind but the `dont_inhibit` ones reach the remote, when the
 //! pointer enters it, and gives both back when it leaves or the release hotkey is typed.
-//! - It is mapped with no keyboard, so its appearing does not take home's keys (#2: a layer
+//! - It is mapped with no keyboard, so its appearing does not take the desk's keys (#2: a layer
 //!   surface that can take the keyboard takes it when it appears).
 //! - Hyprland 0.56 hands the keyboard over at the next motion over the surface, which a real
 //!   pointer crossing gives at once.
@@ -19,14 +19,14 @@
 //! - Not `exclusive`: Hyprland then keeps the pointer on the surface wherever it goes.
 //!
 //! The pointer and keyboard events go to [`crate::input::Capture`]. The remote cursor's image is
-//! the surface's pointer image, so home's compositor draws it at home's pointer with no delay,
+//! the surface's pointer image, so the desk's compositor draws it at the desk's pointer with no delay,
 //! as gliff's client does (gliff, MIT, see `LICENSES/gliff-MIT.txt`); before the first one, or
 //! for one with nothing to show, the pointer is the default arrow. While
 //! [`super::REMOTE_CURSOR`] is off, it is always the default arrow.
 //!
-//! The corner (#69) is a subsurface at the top left, `remote_bar` pixels down: drawn at home over
+//! The corner (#69) is a subsurface at the top left, `remote_bar` pixels down: drawn at the desk over
 //! the picture, never part of it. Its input region is the mic button: the pointer over it is
-//! over the corner, not the picture, and what it does there stays home. Going from the picture
+//! over the corner, not the picture, and what it does there stays at the desk. Going from the picture
 //! to the button and back is no leave of the monitor: the keyboard, the shortcuts and what is
 //! held stay with the remote; only the motion stops while over the button.
 
@@ -235,7 +235,7 @@ impl<T> Newest<T> {
 }
 
 /// What the pointer over the surface shows of the remote's: all of it, or, with
-/// [`REMOTE_CURSOR`] off, nothing (home's default arrow, never hidden).
+/// [`REMOTE_CURSOR`] off, nothing (the desk's default arrow, never hidden).
 fn shown(pointer: Pointer) -> Pointer {
     if REMOTE_CURSOR {
         pointer
@@ -256,7 +256,7 @@ pub struct Surface {
 }
 
 impl Surface {
-    /// Puts the surface on `output` and waits until the compositor has placed it. Home's input
+    /// Puts the surface on `output` and waits until the compositor has placed it. The desk's input
     /// over it goes to `input`; `hotkey` gives the keyboard back. `ended` hears it if the
     /// surface goes away on its own: the monitor unplugged, the compositor gone. Its corner
     /// shows what `feed` tells.
@@ -449,7 +449,7 @@ fn run(
     let mut event_loop: EventLoop<'static, State> = EventLoop::try_new()?;
     if inhibit.is_none() {
         eprintln!(
-            "navette: the compositor cannot inhibit its shortcuts: they stay home over the \
+            "navette: the compositor cannot inhibit its shortcuts: they stay at the desk over the \
              remote monitor"
         );
     }
@@ -540,7 +540,7 @@ fn run(
         .outputs
         .outputs()
         .find(|o| state.outputs.info(o).and_then(|i| i.name).as_deref() == Some(output_name))
-        .ok_or_else(|| io::Error::other(format!("no monitor {output_name} at home")))?;
+        .ok_or_else(|| io::Error::other(format!("no monitor {output_name} on the desk")))?;
     state.transform = state
         .outputs
         .info(&output)
@@ -548,7 +548,7 @@ fn run(
         .unwrap_or(wl_output::Transform::Normal);
     state.physical_width = state.outputs.info(&output).and_then(|i| pixels_wide(&i));
     state.monitor = Some(output.clone());
-    // Where the monitor stands in home's layout: a drag carried past the surface's edge goes on
+    // Where the monitor stands in the desk's layout: a drag carried past the surface's edge goes on
     // to the work monitor beside it.
     if let Some(info) = state.outputs.info(&output) {
         let (x, y) = info.logical_position.unwrap_or(info.location);
@@ -703,7 +703,7 @@ struct Hover {
 /// The keyboard's focus on the picture or its corner.
 #[derive(Clone, Copy, Debug)]
 enum Typing<'a> {
-    /// With the keys already held at home.
+    /// With the keys already held at the desk.
     Enter {
         keys: &'a [u32],
     },
@@ -760,7 +760,7 @@ enum Pointing {
 }
 
 /// Hands a pointer event to what the pointer is over: the picture's to the capture, which sends
-/// them to the remote; the corner's to the corner, which keeps them home, a press of the left
+/// them to the remote; the corner's to the corner, which keeps them at the desk, a press of the left
 /// button switching the mic. The compositor sends the leave of one and the enter of the other in
 /// one frame: the monitor is left only at the end of a frame that took the pointer off both.
 /// True when the corner must be drawn again.
@@ -1630,7 +1630,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 size,
             } => match read_keymap(fd, size) {
                 Ok(text) => state.seat(Seat::Keymap(text)),
-                Err(e) => tracing::warn!("cannot read home's keymap: {e}"),
+                Err(e) => tracing::warn!("cannot read the desk's keymap: {e}"),
             },
             Event::Enter { surface, keys, .. } if state.over(&surface).is_some() => {
                 let (codes, _) = keys.as_chunks::<4>();
@@ -1953,7 +1953,7 @@ mod tests {
         }
 
         /// The keyboard follows the pointer from one of the client's surfaces to the other,
-        /// the keys held at home with it, before the pointer's events (Hyprland 0.56.2).
+        /// the keys held at the desk with it, before the pointer's events (Hyprland 0.56.2).
         fn keyboard_moves(&mut self, held: &[u32]) {
             self.type_on(&[Typing::Leave, Typing::Enter { keys: held }]);
         }
@@ -2060,7 +2060,7 @@ mod tests {
                 .sent()
                 .iter()
                 .any(|e| matches!(e, input::Event::Key { .. })),
-            "the keys stay home"
+            "the keys stay at the desk"
         );
     }
 
@@ -2120,7 +2120,7 @@ mod tests {
         let drawn = scale(Some(3840.0), Some((1920, 1080)));
         assert_eq!(drawn, 2.0);
         assert!(!again(Some(drawn), drawn), "nothing changed");
-        // Home's monitor set to scale 1.5: the surface is configured smaller.
+        // The desk's monitor set to scale 1.5: the surface is configured smaller.
         assert!(again(Some(drawn), scale(Some(3840.0), Some((2560, 1440)))));
         // Its mode changed, the surface's logical size not.
         assert!(again(Some(drawn), scale(Some(2560.0), Some((1920, 1080)))));

@@ -309,7 +309,7 @@ mod tests {
         notifier.show("Mic → remote", "");
         let first = next(&seen);
         assert!(!first.contains(&"--replace-id".to_owned()), "{first:?}");
-        notifier.show("Mic → home", "");
+        notifier.show("Mic → desk", "");
         notifier.show("Mic → remote", "");
         // The service numbered the first 7, the second 8.
         let second = next(&seen);
@@ -328,7 +328,7 @@ mod tests {
     fn with_no_notification_service_each_message_is_tried_and_none_replaces() {
         let (notifier, seen) = notifier(true);
         notifier.show("Mic → remote", "");
-        notifier.show("Mic → home", "");
+        notifier.show("Mic → desk", "");
         for _ in 0..2 {
             let args = next(&seen);
             assert!(!args.contains(&"--replace-id".to_owned()), "{args:?}");

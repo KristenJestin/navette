@@ -114,7 +114,7 @@ pub struct Parts {
 }
 
 impl Parts {
-    /// The desk as `serve` starts: no remote machine, no mode, the mic home.
+    /// The desk as `serve` starts: no remote machine, no mode, the mic at the desk.
     pub fn desk() -> Self {
         Self {
             role: Role::Desk,
@@ -817,6 +817,41 @@ mod tests {
         (Commands::Desk { orders, mic }, heard)
     }
 
+    /// A mic that keeps the orders it got and answers each as if the mic were at the desk.
+    struct Recording(Mutex<Vec<mic::Order>>, watch::Sender<mic::Status>);
+
+    impl Routing for Recording {
+        fn order(&self, order: mic::Order) -> io::Result<mic::Status> {
+            self.0.lock().unwrap().push(order);
+            Ok(mic::Status::Home)
+        }
+
+        fn watch(&self) -> watch::Receiver<mic::Status> {
+            self.1.subscribe()
+        }
+    }
+
+    #[tokio::test]
+    async fn mic_desk_and_mic_home_are_the_same_command_and_the_answer_says_desk() {
+        let mic = Arc::new(Recording(
+            Mutex::default(),
+            watch::Sender::new(mic::Status::Off),
+        ));
+        let (orders, _taken) = mpsc::unbounded_channel();
+        let commands = Commands::Desk {
+            orders,
+            mic: mic.clone(),
+        };
+        let (_dir, path) = served(Events::new(linked_desk()), commands);
+        let mut reader = Reader::connect(&path).await;
+        reader.next().await;
+        for word in ["desk", "home"] {
+            reader.say(&format!("mic {word}")).await;
+            assert_eq!(reader.next().await, "ok desk");
+        }
+        assert_eq!(*mic.0.lock().unwrap(), [mic::Order::Home, mic::Order::Home]);
+    }
+
     #[tokio::test]
     async fn the_first_line_is_the_current_state_on_each_side() {
         let desk = Events::new(linked_desk());
@@ -881,7 +916,7 @@ mod tests {
         assert_eq!(reader.next().await, "ok did start None");
         reader.say("stop").await;
         assert_eq!(reader.next().await, "ok did stop");
-        // The mic answers as `mic.sock` does: here, home plays no sound.
+        // The mic answers as `mic.sock` does: here, the desk plays no sound.
         reader.say("mic toggle").await;
         let answer = reader.next().await;
         assert!(
@@ -1045,7 +1080,7 @@ mod tests {
         reader.quiet().await;
         mic.send(mic::Status::Home).unwrap();
         let line: serde_json::Value = serde_json::from_str(&reader.next().await).unwrap();
-        assert_eq!(line["mic"], "home");
+        assert_eq!(line["mic"], "desk");
         assert_eq!(line["state"], "linked");
         mic.send(mic::Status::Failed).unwrap();
         let line: serde_json::Value = serde_json::from_str(&reader.next().await).unwrap();
@@ -1296,7 +1331,7 @@ mod tests {
         assert_eq!(waybar_of(&known)["class"], "waiting");
         assert_eq!(word(&known).unwrap(), "waiting");
         assert_eq!(waybar("not json"), None);
-        assert_eq!(waybar("ok DP-2 is back home"), None);
+        assert_eq!(waybar("ok DP-2 is back on the desk"), None);
     }
 
     /// `watch` on `path`, its lines handed over as they come.

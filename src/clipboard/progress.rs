@@ -1,7 +1,7 @@
-//! What the user sees of the files crossing, both ways: one bar per transfer, at home in the
+//! What the user sees of the files crossing, both ways: one bar per transfer, at the desk in the
 //! corner, and a notification when a paste fails or is stopped; and how they stop one, by a
 //! click on its bar. The pasting side counts the bytes it writes, the copying side the bytes it
-//! serves: home shows both, whichever machine pasted.
+//! serves: the desk shows both, whichever machine pasted.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -72,7 +72,7 @@ pub struct Shown {
 
 impl Shown {
     /// No bar and nobody to cancel: notifications only. The remote machine's, whose transfers
-    /// home shows and stops.
+    /// the desk shows and stops.
     pub fn notifications(notifier: Arc<dyn Notifier>) -> Self {
         Self {
             bar: Arc::new(|_| {}),

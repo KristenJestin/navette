@@ -1,6 +1,6 @@
 //! Each machine's own Navette identity: a key pair and a self-signed certificate made by
 //! Navette. It opens the link between the two Navette instances and nothing else; it is neither
-//! a work nor a home credential. Peers pin each other by the SHA-256 of the certificate, so there
+//! a work nor a desk credential. Peers pin each other by the SHA-256 of the certificate, so there
 //! is no CA and no host name to check.
 
 use std::fmt;

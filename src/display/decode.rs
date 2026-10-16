@@ -1,4 +1,4 @@
-//! Home's decode: on the GPU (VA-API and gliff-vk's recombine, the picture handed over as a
+//! The desk's decode: on the GPU (VA-API and gliff-vk's recombine, the picture handed over as a
 //! dmabuf with no copy, in a layout the compositor takes), or on the CPU (gliff-sw) when the GPU cannot. Runs on its own
 //! thread, acks every frame so the remote keeps pacing, and measures what it does.
 //!
@@ -28,7 +28,7 @@ const LINEAR: u64 = 0;
 const IDLE_DRAIN: Duration = Duration::from_millis(150);
 /// How often the numbers are written to the log.
 const REPORT_EVERY: Duration = Duration::from_secs(10);
-/// Frames waiting for the decoder; past this, home has fallen behind and drops frames until a
+/// Frames waiting for the decoder; past this, the desk has fallen behind and drops frames until a
 /// keyframe rather than queue them without end.
 const QUEUE: usize = 4;
 /// Decodes failing in a row before a decoder is given up for a new one; a failed keyframe
@@ -63,7 +63,7 @@ pub fn open_gpu() -> Option<Arc<Gpu>> {
     }
 }
 
-/// What home decodes. The CPU asks for one 4:2:0 stream, so it decodes one stream, not two.
+/// What the desk decodes. The CPU asks for one 4:2:0 stream, so it decodes one stream, not two.
 pub fn caps(gpu: &Option<Arc<Gpu>>, max: (u32, u32)) -> ClientCaps {
     ClientCaps {
         codecs: vec![Codec::H264],
@@ -424,7 +424,7 @@ impl Thread {
         match self.decoders.cpu(dual) {
             Ok(d) => Some(d),
             Err(e) => {
-                let why = format!("home cannot decode the picture: {e}");
+                let why = format!("the desk cannot decode the picture: {e}");
                 eprintln!("navette: {why}");
                 let _ = self.ended.send(why);
                 None
@@ -547,7 +547,7 @@ impl Thread {
                                 decoder = self.decoder(config, false);
                             } else {
                                 let why = format!(
-                                    "home cannot decode {output} any more, {} decoder(s) lost, \
+                                    "the desk cannot decode {output} any more, {} decoder(s) lost, \
                                      the CPU's last: {e}",
                                     stats.lost
                                 );
@@ -760,7 +760,7 @@ mod tests {
     }
 
     /// Encodes ten pictures, hands them to `decoders` and checks that all ten are decoded, shown
-    /// and acked. Each frame is handed over once the one before was taken: home drops frames it
+    /// and acked. Each frame is handed over once the one before was taken: the desk drops frames it
     /// cannot keep up with, so a feed faster than the decoder would lose some on a slow runner.
     fn cpu_round_trip(decoders: Box<dyn Decoders>) {
         let (width, height) = (320u32, 240u32);
@@ -829,7 +829,7 @@ mod tests {
         }
     }
 
-    /// The decoders home can make: one GPU decoder per entry of `gpus`, failing after so many
+    /// The decoders the desk can make: one GPU decoder per entry of `gpus`, failing after so many
     /// frames, and a CPU one when `cpu` says so. Each one made is written down.
     #[derive(Default)]
     struct Fakes {

@@ -1,8 +1,8 @@
-//! `navette`: the work-from-home mode. The machine with the monitors ("home") pairs once with
-//! the work laptop ("remote"), then `navette serve` at home and `navette agent` on the laptop
-//! keep an authenticated link between them. `navette mode start [name]` gives the home monitors
+//! `navette`: the work-from-home mode. The machine with the monitors ("desk") pairs once with
+//! the work laptop ("remote"), then `navette serve` at the desk and `navette agent` on the laptop
+//! keep an authenticated link between them. `navette mode start [name]` gives the desk monitors
 //! of a mode to the remote machine, `navette mode stop` gives them back, `navette status` says
-//! what runs; `navette serve --audio` brings the remote machine's sound home and sends the home
+//! what runs; `navette serve --audio` brings the remote machine's sound to the desk and sends the desk
 //! mic there while a mode runs; `navette mic` switches it.
 
 use std::io::BufRead;
@@ -54,10 +54,10 @@ struct Cli {
 enum Command {
     /// Pair this machine with the other one, once.
     ///
-    /// At home, `navette pair --listen <LAN-address:port>` shows a PIN. On the remote machine,
-    /// `navette pair <home-address:port>` asks for it.
+    /// At the desk, `navette pair --listen <LAN-address:port>` shows a PIN. On the remote machine,
+    /// `navette pair <desk-address:port>` asks for it.
     Pair {
-        /// Home: the LAN address and port to listen on (never 0.0.0.0 or ::).
+        /// Desk: the LAN address and port to listen on (never 0.0.0.0 or ::).
         #[arg(
             long,
             value_name = "ADDR:PORT",
@@ -65,32 +65,32 @@ enum Command {
             required_unless_present = "home"
         )]
         listen: Option<SocketAddr>,
-        /// Remote: the home machine's address and port.
-        #[arg(value_name = "HOME:PORT")]
+        /// Remote: the desk's address and port.
+        #[arg(value_name = "DESK:PORT")]
         home: Option<SocketAddr>,
     },
-    /// Home: wait for the paired remote machine and keep its link up.
+    /// Desk: wait for the paired remote machine and keep its link up.
     Serve {
         /// The LAN address and port to listen on [default: the one used to pair].
         #[arg(long, value_name = "ADDR:PORT")]
         listen: Option<SocketAddr>,
-        /// While a mode runs, play the remote machine's sound here, mixed with home sound, and
-        /// send it the home mic.
+        /// While a mode runs, play the remote machine's sound here, mixed with the desk's sound,
+        /// and send it the desk's mic.
         #[arg(long)]
         audio: bool,
     },
-    /// Remote: dial the paired home machine and keep the link up (a systemd user service).
+    /// Remote: dial the paired desk and keep the link up (a systemd user service).
     Agent,
-    /// Run what this machine's pairing says: `serve` at home, `agent` on the remote machine.
+    /// Run what this machine's pairing says: `serve` at the desk, `agent` on the remote machine.
     ///
     /// The same command, signals, logs and exit status as the one it runs, so that one systemd
     /// unit (`navette.service`) serves both machines. Not paired, it exits with status 78.
     Run {
-        /// Home: as `navette serve --audio`. Ignored on the remote machine, which says so.
+        /// Desk: as `navette serve --audio`. Ignored on the remote machine, which says so.
         #[arg(long)]
         audio: bool,
     },
-    /// Home: give the configured monitors to the remote machine, or take them back.
+    /// Desk: give the configured monitors to the remote machine, or take them back.
     ///
     /// The monitors are named in `mode.conf` in the config directory: `monitor = <output name>`,
     /// or `monitor = desc:<start of the monitor's description>`. A `[name]` section defines a
@@ -101,13 +101,14 @@ enum Command {
         #[command(subcommand)]
         action: ModeAction,
     },
-    /// Home: say which mode runs, and whether the remote machine is connected.
+    /// Desk: say which mode runs, and whether the remote machine is connected.
     ///
     /// `navette serve` must be running.
     Status,
-    /// Home: send the home mic to the remote machine or keep it home, while a mode runs.
+    /// Desk: send the desk's mic to the remote machine or keep it at the desk, while a mode runs.
     ///
-    /// A mode sends it to the remote machine when it starts, and brings it home when it stops.
+    /// A mode sends it to the remote machine when it starts, and brings it back to the desk when
+    /// it stops.
     /// `navette serve --audio` must be running.
     Mic {
         #[command(subcommand)]
@@ -137,9 +138,12 @@ enum MicAction {
     Toggle,
     /// Send it to the remote machine.
     Remote,
-    /// Keep it home.
+    /// Keep it at the desk.
+    Desk,
+    /// The word of 0.1 for `desk`, still taken.
+    #[command(hide = true)]
     Home,
-    /// Say where it goes: `remote`, `home`, or `off` with no mode running.
+    /// Say where it goes: `remote`, `desk`, or `off` with no mode running.
     Status {
         /// One line of JSON (`text`, `alt`, `class`, `tooltip`), for a bar.
         #[arg(long)]
@@ -162,7 +166,7 @@ enum ModeAction {
         #[arg(value_name = "NAME")]
         name: Option<String>,
     },
-    /// The monitors come back home.
+    /// The monitors come back to the desk.
     Stop,
     /// Say the modes `mode.conf` defines and their monitors.
     List {
@@ -219,14 +223,14 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         Command::Pair {
             home: Some(home), ..
         } => {
-            eprint!("PIN shown on the home machine: ");
+            eprint!("PIN shown on the desk: ");
             let mut line = String::new();
             std::io::stdin().lock().read_line(&mut line)?;
             let pin = Pin::parse(&line).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "a PIN is six digits")
             })?;
-            // Home's router, as this machine sees it now, on home's network: the agent dials
-            // home only behind it.
+            // The desk's router, as this machine sees it now, on the desk's network: the agent dials
+            // the desk only behind it.
             let gateway = network::routers(&ProcNet, home.ip()).first().copied();
             pair::remote(&store, home, gateway, &pin, Timeouts::default()).await?;
             // A running agent read the previous pairing when it started: restart it.
@@ -236,7 +240,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             );
             Ok(())
         }
-        Command::Pair { .. } => unreachable!("clap requires --listen or the home address"),
+        Command::Pair { .. } => unreachable!("clap requires --listen or the desk address"),
         Command::Serve { listen, audio } => {
             let acceptor = link::home_acceptor(&store, listen).await?;
             eprintln!(
@@ -251,12 +255,12 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let gpu = tokio::task::spawn_blocking(decode::open_gpu)
                 .await
                 .map_err(std::io::Error::other)?;
-            // Without `--audio`, home never reaches PipeWire.
+            // Without `--audio`, the desk never reaches PipeWire.
             let graph = audio.then(PipeWire::default);
             let toggle = mic::toggle_command(&std::env::current_exe()?);
             let saved = audio::Saved::in_dir(audio::Saved::default_dir()?);
             if let Some(graph) = graph.clone() {
-                // Home's mic back first, if a previous run died with it away.
+                // The desk's mic back first, if a previous run died with it away.
                 let saved = saved.clone();
                 tokio::task::spawn_blocking(move || audio::mic::repair_home(&graph, &saved))
                     .await
@@ -397,7 +401,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let saved = audio::Saved::in_dir(audio::Saved::default_dir()?);
             // The latest link's audio thread; each one joins the one before it.
             let audio_thread = Arc::new(Mutex::new(None));
-            // Home shows the files crossing, and stops them: this machine only says how a paste
+            // The desk shows the files crossing, and stops them: this machine only says how a paste
             // ended.
             let shown = Shown::notifications(Arc::new(notify::NotifySend::new(notify::Command)));
             let kept = clipboard::Kept::default();
@@ -519,9 +523,16 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let order = match action {
                 MicAction::Toggle => mic::Order::Toggle,
                 MicAction::Remote => mic::Order::Remote,
-                MicAction::Home => mic::Order::Home,
+                MicAction::Desk => mic::Order::Home,
+                MicAction::Home => {
+                    eprintln!(
+                        "navette: `navette mic home` is now `navette mic desk`; the old word \
+                         still works for now"
+                    );
+                    mic::Order::Home
+                }
                 MicAction::Status { json } => {
-                    // No `navette serve`: the mic is home.
+                    // No `navette serve`: the mic is at the desk.
                     let status = mic::ask(&path, mic::Order::Status)
                         .await
                         .unwrap_or(mic::Status::Off);
