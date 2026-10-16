@@ -14,7 +14,9 @@
 //! - **Messages** (`Mic → remote`, `Keyboard → home`, …) show under the button for two seconds,
 //!   in place of desktop notifications.
 //! - **Files crossing** the clipboard, either way, show as one bar per transfer under the tag,
-//!   with what is left; a click on a bar stops its transfer, the others going on.
+//!   as wide as the tag row (more only when the text needs it, at most 20 characters) and
+//!   stacked tightly, filled by the part done and saying the copy's name and what is left; a
+//!   click on a bar stops its transfer, the others going on.
 //!
 //! [`Board`] carries the mic's place and the messages to every corner open; [`Corner`] is one
 //! corner, drawn in software into ARGB pixels. Its text uses a 5×8 bitmap font of its own, so
@@ -26,7 +28,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use crate::clipboard::files::human_bytes;
-use crate::clipboard::progress::{Bar, Cancel};
+use crate::clipboard::progress::{Bar, Cancel, Headline};
 use crate::mic::Status;
 use crate::notify::Notifier;
 
@@ -404,8 +406,14 @@ const GLOW: (f64, f64) = (150.0, 80.0);
 const DOT: f64 = 2.0;
 /// The longest message shown, in characters; a longer one ends with `…`.
 const LONGEST: usize = 64;
-/// The narrowest a bar of files crossing is.
-const BAR_WIDTH: f64 = 160.0;
+/// A bar of files crossing is as tall as the font's eight rows, the descenders of `g`, `p` and
+/// `y` included, with a pixel of air: several of them stack under the tag without going far
+/// below the room the tag row and a message already take.
+const BAR_ROW: f64 = 17.0;
+/// The air between two bars, and between the tag row and the first bar.
+const BAR_GAP: f64 = 2.0;
+/// The longest text of a bar of files crossing, in characters: its name is cut to fit.
+const BAR_CHARS: usize = 20;
 
 /// One corner: what it shows, and how it is drawn.
 pub struct Corner {
@@ -549,30 +557,46 @@ impl Corner {
         })
     }
 
-    /// The bars of the transfers shown, one under the other below the tag: where a click
-    /// stops one.
+    /// The bars of the transfers shown, one under the other below the tag, all as wide as the
+    /// tag row or as their longest text: where a click stops one.
     pub fn bars(&self) -> Vec<(Rect, Bar)> {
-        let mut y = PAD;
-        self.files
-            .iter()
-            .take(BARS_SHOWN)
+        let shown = self.files.iter().take(BARS_SHOWN);
+        let widest = shown
+            .clone()
+            .map(|bar| text_width(&bar_text(bar)) + 2.0 * 6.0)
+            .fold(self.row_width(), f64::max);
+        let mut y = PAD + ROW;
+        shown
             .map(|bar| {
-                y += ROW + 6.0;
+                y += BAR_GAP;
                 let rect = Rect {
                     x: PAD,
                     y,
-                    width: (text_width(&bar_text(bar)) + 2.0 * 6.0).max(BAR_WIDTH),
-                    height: ROW,
+                    width: widest,
+                    height: BAR_ROW,
                 };
-                (rect, *bar)
+                y += BAR_ROW;
+                (rect, bar.clone())
             })
             .collect()
     }
 
+    /// How wide the tag and the button make the first row.
+    fn row_width(&self) -> f64 {
+        let right = self.button().map_or_else(
+            || self.tag().map_or(PAD, |(tag, _)| tag.x + tag.width),
+            |button| button.x + button.width,
+        );
+        right - PAD
+    }
+
     /// The top of the line under the button: under the bars when there are some.
     fn line_y(&self) -> f64 {
-        let rows = 1 + self.files.len().min(BARS_SHOWN);
-        PAD + rows as f64 * (ROW + 6.0)
+        let bottom = self
+            .bars()
+            .last()
+            .map_or(PAD + ROW, |(bar, _)| bar.y + bar.height);
+        bottom + 6.0
     }
 
     /// The line under the button: the message, else the hint while hovered.
@@ -621,6 +645,10 @@ impl Corner {
             id: 0,
             done: 0,
             total: u64::MAX,
+            headline: Some(Headline {
+                name: "M".repeat(BAR_CHARS),
+                more: 0,
+            }),
         };
         widest.update(Update::Files(vec![bar; BARS_SHOWN]), now);
         widest.update(Update::Say("M".repeat(LONGEST)), now);
@@ -665,18 +693,23 @@ impl Corner {
             pen.check(cx, cy, check, accent);
         }
         for (bar, files) in self.bars() {
-            pen.rounded(bar, 5.0, PILL);
+            pen.rounded(bar, 4.0, PILL);
             let part = (files.done as f64 / files.total.max(1) as f64).min(1.0);
             if part > 0.0 {
                 let done = Rect {
                     width: (bar.width * part).max(10.0),
                     ..bar
                 };
-                pen.rounded(done, 5.0, FILL);
+                pen.rounded(done, 4.0, FILL);
             }
-            pen.rounded_outline(bar, 5.0, BORDER);
+            pen.rounded_outline(bar, 4.0, BORDER);
             let text = bar_text(&files);
-            pen.text(bar.x + 6.0, bar.y + (ROW - 7.0 * DOT) / 2.0, &text, LABEL);
+            pen.text(
+                bar.x + 6.0,
+                bar.y + (BAR_ROW - 8.0 * DOT) / 2.0,
+                &text,
+                LABEL,
+            );
         }
         if let Some(line) = self.line(now) {
             let row = Rect {
@@ -693,9 +726,31 @@ impl Corner {
 }
 
 /// What a bar of files crossing says.
+///
+/// The copy's name (and how many more it holds), what is left and the cancel mark: the fill says
+/// how far it is. The name is cut with `…` so that the whole stays within [`BAR_CHARS`]; what is
+/// left and the mark never are.
 fn bar_text(bar: &Bar) -> String {
-    let percent = (bar.done as u128 * 100 / bar.total.max(1) as u128).min(100);
-    format!("Files {percent}%, {} left  x", human_bytes(bar.left()))
+    let tail = format!("{} x", human_bytes(bar.left()));
+    let Some(Headline { name, more }) = &bar.headline else {
+        return tail;
+    };
+    let more = if *more > 0 {
+        format!(" +{more}")
+    } else {
+        String::new()
+    };
+    let room = BAR_CHARS.saturating_sub(tail.chars().count() + 1 + more.chars().count());
+    if room == 0 {
+        return tail;
+    }
+    let name = if name.chars().count() > room {
+        let cut: String = name.chars().take(room - 1).collect();
+        format!("{cut}…")
+    } else {
+        name.clone()
+    };
+    format!("{name}{more} {tail}")
 }
 
 /// Draws in logical pixels on a canvas of physical ones.
@@ -1000,6 +1055,7 @@ const FONT: &[(char, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clipboard::progress::Headline;
 
     fn corner(side: Side, mic: Status, now: Instant) -> Corner {
         let look = Look::default();
@@ -1207,9 +1263,10 @@ mod tests {
             id: 1,
             done: 1 << 30,
             total: 3 << 30,
+            headline: None,
         };
-        pro.update(Update::Files(vec![files]), now);
-        assert_eq!(bar_text(&files), "Files 33%, 2.0 GiB left  x");
+        pro.update(Update::Files(vec![files.clone()]), now);
+        assert_eq!(bar_text(&files), "2.0 GiB x");
         let (bar, _) = pro.bars()[0];
         let (width, height) = pro.size(now);
         assert!(f64::from(width) >= bar.x + bar.width && f64::from(height) >= bar.y + bar.height);
@@ -1230,6 +1287,165 @@ mod tests {
     }
 
     #[test]
+    fn several_transfers_do_not_grow_the_corner_past_the_bound() {
+        let now = Instant::now();
+        let bare = corner(Side::Remote, Status::Remote, now);
+        let (bare_width, bare_height) = bare.size(now);
+        // Two pastes of a 2 GiB file, then a third: the bound is the corner without bars for
+        // the width, and for the height too up to two transfers, one more row after.
+        let transfer = |id, done_gib: u64, name: &str, more| Bar {
+            id,
+            done: done_gib << 30,
+            total: 2 << 30,
+            headline: Some(Headline {
+                name: name.into(),
+                more,
+            }),
+        };
+        let all = [
+            transfer(1, 1, "big-backup-of-the-year.tar", 0),
+            transfer(2, 0, "photos", 3),
+            transfer(3, 2, "a.txt", 0),
+        ];
+        // No wider than the longest bar there is, plus the corner's padding on both sides.
+        let longest = 2.0 * PAD + text_width(&"M".repeat(BAR_CHARS)) + 2.0 * 6.0;
+        for count in 1..=BARS_SHOWN {
+            let mut pro = bare_clone(now);
+            pro.update(Update::Files(all[..count].to_vec()), now);
+            let (width, height) = pro.size(now);
+            assert!(
+                width <= bare_width.max(longest.ceil() as u32),
+                "{count} transfers: {width} wider than the {BAR_CHARS}-character bar"
+            );
+            let bound = if count <= 2 {
+                bare_height
+            } else {
+                bare_height + (BAR_ROW + BAR_GAP).ceil() as u32
+            };
+            assert!(height <= bound, "{count} transfers: {height} > {bound}");
+
+            // Each one is still there to click: inside the corner, clear of the others and of
+            // the tag row, and named by its own click.
+            let bars = pro.bars();
+            assert_eq!(bars.len(), count);
+            let row_bottom = PAD + ROW;
+            let mut above = row_bottom;
+            for (rect, bar) in &bars {
+                assert!(rect.y >= above, "{count} transfers: bars overlap");
+                above = rect.y + rect.height;
+                assert!(rect.x + rect.width <= f64::from(width), "inside the corner");
+                assert!(above <= f64::from(height), "inside the corner");
+                pro.point_at(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+                assert_eq!(pro.press(), Press::Cancel(bar.id));
+                pro.point_at(rect.x + 1.0, rect.y + rect.height - 1.0);
+                assert_eq!(pro.press(), Press::Cancel(bar.id), "its corners too");
+            }
+            // The room the surface is given holds them.
+            let (room_width, room_height) = pro.room();
+            assert!(room_width >= width && room_height >= height);
+        }
+    }
+
+    #[test]
+    fn the_bars_never_cover_the_mic_button() {
+        let now = Instant::now();
+        let mut pro = bare_clone(now);
+        let bar = |id| Bar {
+            id,
+            done: 1,
+            total: 3,
+            headline: None,
+        };
+        pro.update(Update::Files((1..=3).map(bar).collect()), now);
+        let button = pro.button().unwrap();
+        for (rect, _) in pro.bars() {
+            assert!(rect.y >= button.y + button.height, "under the button");
+        }
+    }
+
+    fn named(name: &str, more: usize, left_gib: u64) -> Bar {
+        Bar {
+            id: 1,
+            done: 0,
+            total: left_gib << 30,
+            headline: Some(Headline {
+                name: name.into(),
+                more,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_bar_names_its_copy_and_keeps_the_size_and_the_cross_whole() {
+        // Fits: the name, then what is left, then the cross.
+        assert_eq!(bar_text(&named("notes.txt", 0, 2)), "notes.txt 2.0 GiB x");
+        assert_eq!(bar_text(&named("photos", 3, 2)), "photos +3 2.0 GiB x");
+        // Cut with `…`, within twenty characters; the size and the cross stay.
+        let long = bar_text(&named("holiday-videos-2026.mkv", 0, 2));
+        assert_eq!(long, "holiday-v… 2.0 GiB x");
+        let with_more = bar_text(&named("holiday-videos-2026", 12, 2));
+        assert_eq!(with_more, "holid… +12 2.0 GiB x");
+        for text in [&long, &with_more] {
+            assert!(text.chars().count() <= BAR_CHARS, "{text}");
+            assert!(text.ends_with("2.0 GiB x"));
+        }
+        // A copy whose list is not known names nothing: the bar says the size and the cross only.
+        let mut unnamed = named("x", 0, 2);
+        unnamed.headline = None;
+        assert_eq!(bar_text(&unnamed), "2.0 GiB x");
+    }
+
+    #[test]
+    fn the_text_of_a_bar_stays_inside_the_bar() {
+        // The same bar named with letters that hang below the line, and with letters that do
+        // not: whatever differs between the two is the descenders, and none may fall outside.
+        let now = Instant::now();
+        for scale in [1.0, 2.0, 3.0] {
+            let drawn = |name: &str| {
+                let mut pro = bare_clone(now);
+                pro.update(Update::Files(vec![named(name, 0, 1)]), now);
+                (pro.bars()[0].0, pro.draw(now, scale))
+            };
+            let (bar, hanging) = drawn("gypqgypq");
+            let (_, level) = drawn("AAAAAAAA");
+            assert_eq!((hanging.width, hanging.height), (level.width, level.height));
+            let inside = |x: u32, y: u32| {
+                let (x, y) = (x as f64 / scale, y as f64 / scale);
+                x >= bar.x && x < bar.x + bar.width && y >= bar.y && y < bar.y + bar.height
+            };
+            for y in 0..hanging.height {
+                for x in 0..hanging.width {
+                    assert!(
+                        inside(x, y) || hanging.at(x, y) == level.at(x, y),
+                        "scale {scale}: the text drew at ({x}, {y}), outside the bar {bar:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_bars_share_the_width_of_the_longest_text() {
+        let now = Instant::now();
+        let mut pro = bare_clone(now);
+        let short = named("a", 0, 1);
+        let long = Bar {
+            id: 2,
+            ..named("holiday-videos-2026.mkv", 0, 1)
+        };
+        pro.update(Update::Files(vec![short, long.clone()]), now);
+        let rects = pro.bars();
+        assert_eq!(rects[0].0.width, rects[1].0.width);
+        let wanted = text_width(&bar_text(&long)) + 2.0 * 6.0;
+        assert_eq!(rects[0].0.width, wanted.max(pro.row_width()));
+        assert!(rects[0].0.width > pro.row_width(), "wider than the tag row");
+    }
+
+    fn bare_clone(now: Instant) -> Corner {
+        corner(Side::Remote, Status::Remote, now)
+    }
+
+    #[test]
     fn a_click_on_a_bar_stops_its_transfer_and_anywhere_else_switches_the_mic() {
         let now = Instant::now();
         let board = Arc::new(Board::default());
@@ -1244,10 +1460,14 @@ mod tests {
             id,
             done: 0,
             total: 10,
+            headline: None,
         };
         pro.update(Update::Files(vec![bar(5), bar(9)]), now);
         let (second, button) = (pro.bars()[1].0, pro.button().unwrap());
-        assert!(second.y >= pro.bars()[0].0.y + ROW, "one under the other");
+        assert!(
+            second.y >= pro.bars()[0].0.y + BAR_ROW,
+            "one under the other"
+        );
 
         pro.point_at(second.x + second.width / 2.0, second.y + 4.0);
         assert_eq!(pro.press(), Press::Cancel(9));
@@ -1271,6 +1491,7 @@ mod tests {
             id: 1,
             done: 1,
             total: 2,
+            headline: None,
         }];
         board.files(files.clone());
         let heard = listening(&board);

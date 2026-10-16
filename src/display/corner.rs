@@ -681,6 +681,7 @@ mod tests {
             id: 1,
             done: 1,
             total: u64::MAX,
+            headline: None,
         };
         corner.update(Update::Files(vec![bar; 5]), now);
         sizes.push(corner.size(now));

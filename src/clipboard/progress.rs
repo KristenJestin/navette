@@ -22,13 +22,24 @@ use crate::notify::Notifier;
 /// How often the bar moves while files cross.
 pub const CADENCE: Duration = Duration::from_millis(250);
 
+/// What tells a copy of files from another: the name of the first file or folder it holds, and
+/// how many more there are at its top.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Headline {
+    pub name: String,
+    pub more: usize,
+}
+
 /// One transfer of files crossing now: bytes done of the bytes it holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bar {
     /// Which transfer: what a click on its bar names.
     pub id: u64,
     pub done: u64,
     pub total: u64,
+    /// The copy's headline, from whichever machine knows its list of files; none when the
+    /// list is not known.
+    pub headline: Option<Headline>,
 }
 
 impl Bar {
@@ -107,6 +118,7 @@ pub enum Stop {
 struct Running {
     /// Tells this run from a later one of the same crossing.
     run: u64,
+    headline: Option<Headline>,
     done: Meter,
     total: u64,
     stop: Stop,
@@ -139,13 +151,21 @@ impl Progress {
 
     /// `crossing` starts, `total` bytes to go through `done`; the bar shows it from now, at
     /// [`CADENCE`]. Its run, to end it with. Needs a `LocalSet`.
-    pub fn start(&self, crossing: Crossing, total: u64, done: Meter, stop: Stop) -> u64 {
+    pub fn start(
+        &self,
+        crossing: Crossing,
+        headline: Option<Headline>,
+        total: u64,
+        done: Meter,
+        stop: Stop,
+    ) -> u64 {
         let run = self.runs.get() + 1;
         self.runs.set(run);
         self.running.borrow_mut().insert(
             crossing,
             Running {
                 run,
+                headline,
                 done,
                 total,
                 stop,
@@ -172,7 +192,12 @@ impl Progress {
 
     /// The meter, stop flag and run of the peer's paste of copy `serial`, started now with
     /// `total` bytes to serve unless it runs already; none once the user stopped it.
-    pub fn serving(&self, serial: u32, total: u64) -> Option<(Meter, Rc<Cell<bool>>, u64)> {
+    pub fn serving(
+        &self,
+        serial: u32,
+        headline: Option<Headline>,
+        total: u64,
+    ) -> Option<(Meter, Rc<Cell<bool>>, u64)> {
         if self.stopped.borrow().contains_key(&serial) {
             return None;
         }
@@ -184,7 +209,13 @@ impl Progress {
             return Some((running.done.clone(), stopped.clone(), running.run));
         }
         let (done, stopped) = (Meter::default(), Rc::new(Cell::new(false)));
-        let run = self.start(crossing, total, done.clone(), Stop::Source(stopped.clone()));
+        let run = self.start(
+            crossing,
+            headline,
+            total,
+            done.clone(),
+            Stop::Source(stopped.clone()),
+        );
         Some((done, stopped, run))
     }
 
@@ -227,6 +258,7 @@ impl Progress {
     pub fn reading(
         &self,
         serial: u32,
+        headline: Option<Headline>,
         total: u64,
         done: Meter,
     ) -> (Meter, Rc<RefCell<Vec<AbortHandle>>>, u64) {
@@ -237,7 +269,13 @@ impl Progress {
             return (running.done.clone(), tasks.clone(), running.run);
         }
         let tasks = Rc::new(RefCell::new(Vec::new()));
-        let run = self.start(crossing, total, done.clone(), Stop::Tasks(tasks.clone()));
+        let run = self.start(
+            crossing,
+            headline,
+            total,
+            done.clone(),
+            Stop::Tasks(tasks.clone()),
+        );
         (done, tasks, run)
     }
 
@@ -277,6 +315,7 @@ impl Progress {
                     id: crossing.id(),
                     done: r.done.get(),
                     total: r.total,
+                    headline: r.headline.clone(),
                 };
                 (r.run, bar)
             })
@@ -372,7 +411,7 @@ mod tests {
     /// Serves one file of copy 1, offered at `size` bytes, the copy's files holding `total`,
     /// whose source holds `held` bytes: to its end, then dropped as gliff drops it.
     async fn serve(progress: &Progress, size: u64, total: u64, held: usize) {
-        let (done, stopped, run) = progress.serving(1, total).unwrap();
+        let (done, stopped, run) = progress.serving(1, None, total).unwrap();
         let mut served = Served {
             source: Chunks(VecDeque::from([Bytes::from(vec![0; held])])),
             size,
@@ -399,6 +438,7 @@ mod tests {
             id,
             done,
             total: 10,
+            headline: None,
         }]
     }
 
@@ -437,7 +477,7 @@ mod tests {
                 let (progress, bars) = tracker();
                 serve(&progress, 4, 10, 4).await;
                 tokio::time::sleep(IDLE_TIMEOUT / 2).await;
-                let (_done, _stopped, _run) = progress.serving(1, 10).unwrap();
+                let (_done, _stopped, _run) = progress.serving(1, None, 10).unwrap();
                 tokio::time::sleep(IDLE_TIMEOUT).await;
                 assert_eq!(last(&bars), served(4));
             })
@@ -448,8 +488,14 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let (progress, bars) = tracker();
-                let (first, first_stopped, _) = progress.serving(1, 10).unwrap();
-                let (second, _, _) = progress.serving(2, 20).unwrap();
+                let photos = Headline {
+                    name: "photos".into(),
+                    more: 3,
+                };
+                // One copy knows its name, the other does not.
+                let (first, first_stopped, _) =
+                    progress.serving(1, Some(photos.clone()), 10).unwrap();
+                let (second, _, _) = progress.serving(2, None, 20).unwrap();
                 first.add(3);
                 second.add(5);
                 tokio::time::sleep(CADENCE * 2).await;
@@ -460,12 +506,14 @@ mod tests {
                         Bar {
                             id: one,
                             done: 3,
-                            total: 10
+                            total: 10,
+                            headline: Some(photos),
                         },
                         Bar {
                             id: two,
                             done: 5,
-                            total: 20
+                            total: 20,
+                            headline: None,
                         }
                     ]
                 );
@@ -477,11 +525,12 @@ mod tests {
                     [Bar {
                         id: two,
                         done: 5,
-                        total: 20
+                        total: 20,
+                        headline: None,
                     }]
                 );
                 assert!(
-                    progress.serving(1, 10).is_none(),
+                    progress.serving(1, None, 10).is_none(),
                     "its next file is refused"
                 );
             })

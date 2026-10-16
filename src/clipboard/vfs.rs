@@ -28,6 +28,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gliff_proto::ClipboardFile;
 use gliff_proto::clipboard::safe_relative_path;
+
+use super::progress::Headline;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// The folder's own inode.
@@ -49,6 +51,8 @@ pub enum Asked {
         serial: u32,
         index: u32,
         total: u64,
+        /// What names the copy in its bar.
+        headline: Option<Headline>,
         content: Arc<Content>,
     },
     /// The copy `serial` went: a newer one replaced it, and its transfer is over.
@@ -232,6 +236,8 @@ enum Kind {
 
 struct Offer {
     files: Vec<ClipboardFile>,
+    /// What names it in the corner's bar, found once when it is offered.
+    headline: Option<Headline>,
     /// Its folder's inode, and every inode under it.
     inodes: Vec<u64>,
     /// Still the peer's copy: no newer one replaced it.
@@ -483,6 +489,7 @@ impl Folder {
             serial,
             index,
             total,
+            headline: offer.headline.clone(),
             content: content.clone(),
         };
         if self.asked.send(asked).is_err() {
@@ -627,6 +634,7 @@ impl Tree {
         }
         let offer = Offer {
             files: files.to_vec(),
+            headline: crate::clipboard::files::headline(files),
             inodes: (first..self.next).collect(),
             current: true,
             open: 0,
@@ -1026,6 +1034,7 @@ mod tests {
             index: 1,
             total: 10,
             content,
+            ..
         }) = asked.try_recv()
         else {
             panic!("file 1 of copy 7 asked");

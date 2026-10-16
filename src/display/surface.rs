@@ -1719,6 +1719,7 @@ mod tests {
             id: 1,
             done: 1,
             total: 4,
+            headline: None,
         };
         corner.update(
             crate::corner::Update::Files(vec![files]),
