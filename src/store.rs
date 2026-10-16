@@ -237,6 +237,64 @@ mod tests {
         assert_eq!(mode(&tmp.path().join(PAIRING_FILE)), 0o600);
     }
 
+    fn pairing_text(role: &str) -> (Fingerprint, String) {
+        let peer = Identity::generate().unwrap().fingerprint();
+        let text = format!(
+            "role = {role}\npeer = {}\naddress = 192.0.2.10:7420\n",
+            peer.to_hex()
+        );
+        (peer, text)
+    }
+
+    #[test]
+    fn a_new_pairing_at_the_desk_writes_role_desk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path());
+        store
+            .save_pairing(&Pairing {
+                role: Role::Home,
+                peer: Identity::generate().unwrap().fingerprint(),
+                address: "192.0.2.10:7420".parse().unwrap(),
+                gateway: None,
+            })
+            .unwrap();
+        let text = fs::read_to_string(tmp.path().join(PAIRING_FILE)).unwrap();
+        assert!(text.contains("role = desk\n"), "{text}");
+        assert!(!text.contains("home"), "{text}");
+        assert_eq!(store.pairing().unwrap().unwrap().role, Role::Home);
+    }
+
+    #[test]
+    fn a_pairing_made_by_0_1_with_role_home_still_loads_as_the_desk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (peer, text) = pairing_text("home");
+        fs::write(tmp.path().join(PAIRING_FILE), text).unwrap();
+        let pairing = Store::new(tmp.path()).pairing().unwrap().unwrap();
+        assert_eq!(pairing.role, Role::Home);
+        assert_eq!(pairing.peer, peer);
+        // Read as it is: nothing is rewritten, so no pairing is redone.
+        let text = fs::read_to_string(tmp.path().join(PAIRING_FILE)).unwrap();
+        assert!(text.starts_with("role = home\n"), "{text}");
+    }
+
+    #[test]
+    fn a_pairing_with_role_desk_loads_as_the_desk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, text) = pairing_text("desk");
+        fs::write(tmp.path().join(PAIRING_FILE), text).unwrap();
+        let pairing = Store::new(tmp.path()).pairing().unwrap().unwrap();
+        assert_eq!(pairing.role, Role::Home);
+    }
+
+    #[test]
+    fn a_role_that_is_neither_desk_nor_remote_says_which_two_are_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, text) = pairing_text("boss");
+        fs::write(tmp.path().join(PAIRING_FILE), text).unwrap();
+        let error = Store::new(tmp.path()).pairing().unwrap_err().to_string();
+        assert!(error.contains("not desk or remote"), "{error}");
+    }
+
     #[test]
     fn a_pairing_made_before_the_gateway_was_recorded_reads_without_one() {
         let tmp = tempfile::tempdir().unwrap();

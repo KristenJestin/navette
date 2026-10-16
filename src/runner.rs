@@ -130,7 +130,7 @@ mod tests {
         let (tmp, store) = paired_as(Role::Home);
         let file = tmp.path().join("paired.conf");
         let text = fs::read_to_string(&file).unwrap();
-        fs::write(&file, text.replace("role = home", "role = boss")).unwrap();
+        fs::write(&file, text.replace("role = desk", "role = boss")).unwrap();
         let refused = plan(&store, false).unwrap_err().to_string();
         assert!(refused.contains("role"), "{refused}");
         assert!(refused.contains("boss"), "{refused}");
@@ -142,7 +142,7 @@ mod tests {
         let (tmp, store) = paired_as(Role::Home);
         let file = tmp.path().join("paired.conf");
         let text = fs::read_to_string(&file).unwrap();
-        fs::write(&file, text.replace("role = home\n", "")).unwrap();
+        fs::write(&file, text.replace("role = desk\n", "")).unwrap();
         let refused = plan(&store, false).unwrap_err().to_string();
         assert!(refused.contains("role"), "{refused}");
         assert!(refused.contains(file.to_str().unwrap()), "{refused}");

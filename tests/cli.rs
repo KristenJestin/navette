@@ -498,3 +498,20 @@ fn run_ends_on_sigterm_like_the_command_it_runs() {
         assert_eq!(status.code(), Some(0), "{output}");
     }
 }
+
+#[test]
+fn pairing_writes_role_desk_and_a_pairing_that_says_home_still_runs_serve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (serve, _agent) = run_link(&home, &remote, &[]);
+    let file = home.join("paired.conf");
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.contains("role = desk\n"), "{text}");
+    let far = fs::read_to_string(remote.join("paired.conf")).unwrap();
+    assert!(far.contains("role = remote\n"), "{far}");
+    // A pairing made by 0.1.0: nothing is paired again.
+    drop(serve);
+    fs::write(&file, text.replace("role = desk", "role = home")).unwrap();
+    let again = Navette::start(&home, &["run"]);
+    again.wait_for("waiting for the paired remote machine");
+}
