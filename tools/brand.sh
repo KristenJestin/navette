@@ -22,4 +22,8 @@ rsvg-convert -w 512 -h 512 "$brand/icon-full.svg" -o "$brand/png/icon-full-512.p
 for size in 16 32; do
   rsvg-convert -w "$size" -h "$size" "$brand/favicon.svg" -o "$brand/png/favicon-$size.png"
 done
+# The pixel icon is 38 cells wide: rendered at whole multiples, so every cell has the same size.
+for size in 266 532; do
+  rsvg-convert -w "$size" -h "$size" "$brand/icon-pixel.svg" -o "$brand/png/icon-pixel-$size.png"
+done
 rsvg-convert "$brand/social-preview.svg" -o "$brand/png/social-preview.png"
