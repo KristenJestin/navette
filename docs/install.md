@@ -49,6 +49,8 @@ systemctl --user restart navette-agent
 ```
 
 The config in `~/.config/navette` stays: no new pairing is needed within a minor version.
+An agent paired before it recorded the desk's router learns it at its next link (see
+[the link](link.md#only-from-the-desks-network)).
 
 ## Remove everything
 

@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use crate::identity::{Fingerprint, Identity};
+use crate::network::Mac;
 
 const CERT_FILE: &str = "identity.crt";
 const KEY_FILE: &str = "identity.key";
@@ -30,6 +31,9 @@ pub struct Pairing {
     pub peer: Fingerprint,
     /// Home: the LAN address it listens on. Remote: the home address it dials.
     pub address: SocketAddr,
+    /// Remote: the hardware address of home's router, its default gateway at home; none for a
+    /// pairing made before it was recorded, or without one known yet.
+    pub gateway: Option<Mac>,
 }
 
 /// Navette's config directory.
@@ -88,6 +92,8 @@ impl Store {
         let damaged = || io::Error::other(format!("{} is damaged: pair again", path.display()));
         let text = String::from_utf8(bytes).map_err(|_| damaged())?;
         let (mut role, mut peer, mut address) = (None, None, None);
+        // Absent from a pairing made before it was recorded; present, it must read.
+        let mut gateway = Ok(None);
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -103,14 +109,16 @@ impl Store {
                 }
                 "peer" => peer = Fingerprint::from_hex(value),
                 "address" => address = value.parse().ok(),
+                "gateway" => gateway = Mac::parse(value).map(Some).ok_or(()),
                 _ => {}
             }
         }
-        match (role, peer, address) {
-            (Some(role), Some(peer), Some(address)) => Ok(Some(Pairing {
+        match (role, peer, address, gateway) {
+            (Some(role), Some(peer), Some(address), Ok(gateway)) => Ok(Some(Pairing {
                 role,
                 peer,
                 address,
+                gateway,
             })),
             _ => Err(damaged()),
         }
@@ -122,12 +130,15 @@ impl Store {
             Role::Home => "home",
             Role::Remote => "remote",
         };
-        let text = format!(
+        let mut text = format!(
             "# Written by `navette pair`. The peer is the SHA-256 of its certificate.\n\
              role = {role}\npeer = {}\naddress = {}\n",
             pairing.peer.to_hex(),
             pairing.address
         );
+        if let Some(gateway) = pairing.gateway {
+            text.push_str(&format!("gateway = {gateway}\n"));
+        }
         self.write_private(PAIRING_FILE, text.as_bytes())
     }
 
@@ -215,10 +226,43 @@ mod tests {
             role: Role::Remote,
             peer: Identity::generate().unwrap().fingerprint(),
             address: "192.0.2.10:7420".parse().unwrap(),
+            gateway: Mac::parse("02:00:00:00:00:01"),
         };
         store.save_pairing(&pairing).unwrap();
         assert_eq!(store.pairing().unwrap(), Some(pairing));
         assert_eq!(mode(&tmp.path().join(PAIRING_FILE)), 0o600);
+    }
+
+    #[test]
+    fn a_pairing_made_before_the_gateway_was_recorded_reads_without_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = Identity::generate().unwrap().fingerprint();
+        fs::write(
+            tmp.path().join(PAIRING_FILE),
+            format!(
+                "role = remote\npeer = {}\naddress = 192.0.2.10:7420\n",
+                peer.to_hex()
+            ),
+        )
+        .unwrap();
+        let pairing = Store::new(tmp.path()).pairing().unwrap().unwrap();
+        assert_eq!(pairing.gateway, None);
+        assert_eq!(pairing.peer, peer);
+    }
+
+    #[test]
+    fn a_damaged_gateway_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = Identity::generate().unwrap().fingerprint();
+        fs::write(
+            tmp.path().join(PAIRING_FILE),
+            format!(
+                "role = remote\npeer = {}\naddress = 192.0.2.10:7420\ngateway = 02:00\n",
+                peer.to_hex()
+            ),
+        )
+        .unwrap();
+        assert!(Store::new(tmp.path()).pairing().is_err());
     }
 
     #[test]

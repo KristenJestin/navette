@@ -26,6 +26,7 @@ use navette::lid;
 use navette::link::{self, Backoff, Event, Heartbeat, Wire};
 use navette::mic::{self, Mic, NoSound, Routing};
 use navette::mode::{self, Home, HomeGpu};
+use navette::network::{self, ProcNet};
 use navette::notify;
 use navette::pair::{self, Pin, Timeouts};
 use navette::single::{self, AgentLock};
@@ -193,8 +194,15 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let pin = Pin::parse(&line).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "a PIN is six digits")
             })?;
-            pair::remote(&store, home, &pin, Timeouts::default()).await?;
-            println!("Paired. Start the agent: systemctl --user enable --now navette-agent");
+            // Home's router, as this machine sees it now, on home's network: the agent dials
+            // home only behind it.
+            let gateway = network::routers(&ProcNet, home.ip()).first().copied();
+            pair::remote(&store, home, gateway, &pin, Timeouts::default()).await?;
+            // A running agent read the previous pairing when it started: restart it.
+            println!(
+                "Paired. Start the agent, or restart it to use this pairing: \
+                 systemctl --user enable navette-agent && systemctl --user restart navette-agent"
+            );
             Ok(())
         }
         Command::Pair { .. } => unreachable!("clap requires --listen or the home address"),
@@ -310,6 +318,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             // Before anything is dialed: a second agent would drop the first one's link.
             let _one_agent = AgentLock::take(&single::agent_lock_path()?)?;
             let dialer = link::remote_dialer(&store)?;
+            let home_network = network::HomeNetwork::new(ProcNet, store.clone())?;
             let (events, log) = mpsc::unbounded_channel();
             tokio::spawn(print_events(log));
             let (peers, peers_rx) = mpsc::unbounded_channel();
@@ -352,6 +361,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             };
             let agent = link::agent(
                 dialer,
+                home_network,
                 Heartbeat::default(),
                 Backoff::default(),
                 events,
@@ -456,6 +466,12 @@ async fn print_events(mut events: mpsc::UnboundedReceiver<Event>) {
             Event::Retrying(delay) => {
                 eprintln!("navette: dialing again in {} s", delay.as_secs_f32())
             }
+            Event::Away => eprintln!(
+                "navette: not on the desk's network: not dialing it, checking again every \
+                 {} s (after a new router there, pair again)",
+                network::RECHECK.as_secs()
+            ),
+            Event::Back => eprintln!("navette: on the desk's network: dialing it"),
         }
     }
 }
