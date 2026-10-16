@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::audio::mic::HomeMic;
 use crate::audio::{Graph, Message, Saved, lock};
+use crate::names::Names;
 use crate::notify::Notifier;
 
 /// Where the mic goes.
@@ -37,13 +38,15 @@ impl Status {
     pub fn word(self) -> &'static str {
         match self {
             Status::Off => "off",
-            Status::Home => "home",
+            Status::Home => "desk",
             Status::Remote => "remote",
             Status::Failed => "failed",
         }
     }
 
+    /// `home` is what a `navette serve` of 0.1 says, before the desk was called the desk.
     fn parse(word: &str) -> Option<Self> {
+        let word = if word == "home" { "desk" } else { word };
         [Status::Off, Status::Home, Status::Remote, Status::Failed]
             .into_iter()
             .find(|s| s.word() == word)
@@ -53,8 +56,8 @@ impl Status {
     /// `tooltip`), which any bar can read.
     pub fn json(self) -> String {
         let tooltip = match self {
-            Status::Off => "No mode is running: the mic is home",
-            Status::Home => "The mic is home",
+            Status::Off => "No mode is running: the mic is at the desk",
+            Status::Home => "The mic is at the desk",
             Status::Remote => "The mic goes to the remote machine",
             Status::Failed => {
                 "The mic cannot go to the remote machine: `navette mic toggle` says why"
@@ -79,12 +82,14 @@ impl Order {
         match self {
             Order::Toggle => "toggle",
             Order::Remote => "remote",
-            Order::Home => "home",
+            Order::Home => "desk",
             Order::Status => "status",
         }
     }
 
+    /// `home` is the word of 0.1, still taken as `desk`.
     fn parse(word: &str) -> Option<Self> {
+        let word = if word == "home" { "desk" } else { word };
         [Order::Toggle, Order::Remote, Order::Home, Order::Status]
             .into_iter()
             .find(|o| o.word() == word)
@@ -116,6 +121,8 @@ struct Shared<G: Graph> {
     status: watch::Sender<Status>,
     /// Says where the mic went, at each switch: the corners.
     notifier: Arc<dyn Notifier>,
+    /// What the corners call the two machines: the labels of the mode that ran last.
+    names: Mutex<Names>,
 }
 
 struct State<G: Graph> {
@@ -158,6 +165,7 @@ impl<G: Graph + Sync> Mic<G> {
                 }),
                 status: watch::Sender::new(Status::Off),
                 notifier,
+                names: Mutex::new(Names::default()),
             }),
             toggle_command,
         }
@@ -171,9 +179,10 @@ impl<G: Graph + Sync> Mic<G> {
     /// A mode started: the remote's source becomes its default mic, and the mic goes there, or
     /// stays home unless `remote`. When it cannot, the mode runs without it, and the mic says
     /// why until the mode stops.
-    pub fn start(&self, remote: bool) -> io::Result<()> {
+    pub fn start(&self, remote: bool, names: Names) -> io::Result<()> {
         let shared = &self.shared;
         let _lifecycle = lock(&shared.lifecycle);
+        *lock(&shared.names) = names;
         let started = {
             let mut state = lock(&shared.state);
             if state.running.is_some() {
@@ -281,13 +290,17 @@ impl<G: Graph> Shared<G> {
         // stopping with it home, moves nothing.
         if Self::place(before) != Self::place(now) {
             match now {
-                Status::Remote => self.notifier.show("Mic → remote", ""),
+                Status::Remote => self
+                    .notifier
+                    .show(&format!("Mic → {}", lock(&self.names).remote), ""),
                 Status::Failed => {
                     let failure = state.running.as_ref().and_then(|r| r.failure.as_deref());
                     self.notifier
                         .show("Mic failed", failure.unwrap_or_default());
                 }
-                Status::Home | Status::Off => self.notifier.show("Mic → home", ""),
+                Status::Home | Status::Off => self
+                    .notifier
+                    .show(&format!("Mic → {}", lock(&self.names).desk), ""),
             }
         }
     }
@@ -355,9 +368,10 @@ impl<G: Graph + Sync> Routing for Mic<G> {
         let mut state = lock(&shared.state);
         let current = *shared.status.borrow();
         let Some(running) = &mut state.running else {
-            return Err(shared.refused(io::Error::other(
-                "no mode is running: the mic is home until one starts",
-            )));
+            let desk = lock(&shared.names).the_desk();
+            return Err(shared.refused(io::Error::other(format!(
+                "no mode is running: the mic is at {desk} until one starts"
+            ))));
         };
         if let Some(failure) = &running.failure {
             return Err(shared.refused(io::Error::other(failure.clone())));
@@ -394,7 +408,7 @@ impl Routing for NoSound {
         match order {
             Order::Status => Ok(Status::Off),
             _ => Err(io::Error::other(
-                "home plays no sound: start `navette serve --audio` to send the mic",
+                "the desk plays no sound: start `navette serve --audio` to send the mic",
             )),
         }
     }
@@ -541,8 +555,8 @@ pub async fn watch(path: &Path, mut each: impl FnMut(Status) -> io::Result<()>) 
 }
 
 impl<G: Graph + Sync> crate::mode::Mic for Mic<G> {
-    fn start(&self, remote: bool) -> io::Result<()> {
-        Mic::start(self, remote)
+    fn start(&self, remote: bool, names: Names) -> io::Result<()> {
+        Mic::start(self, remote, names)
     }
 
     fn follow(&self, remote: bool) -> io::Result<()> {

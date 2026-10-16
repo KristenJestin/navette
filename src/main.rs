@@ -137,9 +137,12 @@ enum MicAction {
     Toggle,
     /// Send it to the remote machine.
     Remote,
-    /// Keep it home.
+    /// Keep it at the desk.
+    Desk,
+    /// The word of 0.1 for `desk`, still taken.
+    #[command(hide = true)]
     Home,
-    /// Say where it goes: `remote`, `home`, or `off` with no mode running.
+    /// Say where it goes: `remote`, `desk`, or `off` with no mode running.
     Status {
         /// One line of JSON (`text`, `alt`, `class`, `tooltip`), for a bar.
         #[arg(long)]
@@ -519,7 +522,14 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let order = match action {
                 MicAction::Toggle => mic::Order::Toggle,
                 MicAction::Remote => mic::Order::Remote,
-                MicAction::Home => mic::Order::Home,
+                MicAction::Desk => mic::Order::Home,
+                MicAction::Home => {
+                    eprintln!(
+                        "navette: `navette mic home` is now `navette mic desk`; the old word \
+                         still works for now"
+                    );
+                    mic::Order::Home
+                }
                 MicAction::Status { json } => {
                     // No `navette serve`: the mic is home.
                     let status = mic::ask(&path, mic::Order::Status)

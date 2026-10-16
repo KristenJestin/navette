@@ -15,6 +15,7 @@ use crate::display::wire::MAX_OUTPUTS;
 use crate::events::Defined;
 use crate::hypr::Monitor;
 use crate::input::{self, Hotkey};
+use crate::names::Names;
 
 pub const CONFIG_FILE: &str = "mode.conf";
 /// The keys that switch the mic, unless the config names others: free in Omarchy's own
@@ -47,6 +48,8 @@ pub struct Mode {
     /// The layer namespaces of home's own tools drawn above the remote's picture.
     pub local_above: Vec<String>,
     pub look: Look,
+    /// What the sentences call the machines: the labels as set, not the corner's tags.
+    pub names: Names,
 }
 
 /// The settings of one section; the first one, before any `[name]`, has no name.
@@ -304,6 +307,7 @@ impl File {
             remote_bar,
             home_bar,
         };
+        let names = Names::new(local_label, value("remote_label"));
         Ok(Mode {
             name: section.name.clone(),
             monitors,
@@ -314,6 +318,7 @@ impl File {
             here_notice,
             local_above,
             look,
+            names,
         })
     }
 }
@@ -406,10 +411,23 @@ pub fn remote_label(config_dir: &Path) -> String {
         .unwrap_or_else(|| Look::default().remote_label)
 }
 
+/// The desk's label as the link carries it, `local_label` (or `home_label`) before any
+/// section: the one the remote machine can say. None when it is not set, or the corner could not
+/// draw it, in which case no mode would start either.
+pub fn desk_label(config_dir: &Path) -> Option<String> {
+    let file = File::read(config_dir).ok()?;
+    let before = &file.sections[0];
+    before
+        .get("local_label")
+        .or_else(|| before.get("home_label"))
+        .filter(|label| !label.is_empty() && corner::check_label(label).is_ok())
+        .map(str::to_string)
+}
+
 /// The home monitors the specs name, in the order given: by output name, or by the start of the
 /// description (Hyprland's `desc:`), so a change of connector order breaks nothing. A monitor
 /// that is not there, a description that fits two, or one monitor named twice, changes nothing.
-pub fn resolve(specs: &[String], monitors: &[Monitor]) -> io::Result<Vec<Monitor>> {
+pub fn resolve(specs: &[String], monitors: &[Monitor], names: &Names) -> io::Result<Vec<Monitor>> {
     let there = || {
         monitors
             .iter()
@@ -434,7 +452,8 @@ pub fn resolve(specs: &[String], monitors: &[Monitor]) -> io::Result<Vec<Monitor
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "no monitor {spec} at home (there are: {}); nothing was changed",
+                        "no monitor {spec} on {} (there are: {}); nothing was changed",
+                        names.the_desk(),
                         there()
                     ),
                 ));

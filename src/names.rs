@@ -28,6 +28,14 @@ impl Names {
             remote: name(remote, "remote"),
         }
     }
+
+    /// The desk as a sentence puts it after a preposition: `the desk`, or the label as it is.
+    pub fn the_desk(&self) -> String {
+        match self.desk.as_str() {
+            "desk" => "the desk".to_string(),
+            label => label.to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -55,6 +63,12 @@ mod tests {
             (names.desk.as_str(), names.remote.as_str()),
             ("desk", "FAR")
         );
+    }
+
+    #[test]
+    fn after_a_preposition_the_desk_is_the_desk_and_a_label_stays_as_it_is() {
+        assert_eq!(Names::default().the_desk(), "the desk");
+        assert_eq!(Names::new(Some("NEAR"), None).the_desk(), "NEAR");
     }
 
     #[test]

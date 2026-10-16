@@ -41,6 +41,7 @@ use crate::display::{Ended, Keyboard, Released};
 use crate::events::{Driven, Events, Link, Parts, Phase};
 use crate::hypr::{self, Eval, Hypr, lua_string};
 use crate::input::{self, Hotkey};
+use crate::names::Names;
 use crate::notify::Notifier;
 
 mod config;
@@ -85,7 +86,7 @@ const MIC_FOLLOWS: Duration = if cfg!(test) {
 /// tests put a fake). Its calls wait for PipeWire and the link: they are made off the executor.
 pub trait Mic: Send + Sync {
     /// The mic goes to the remote machine, or stays home unless `remote`.
-    fn start(&self, remote: bool) -> io::Result<()>;
+    fn start(&self, remote: bool, names: Names) -> io::Result<()>;
     /// It goes to that side, as the hotkey sends it, unless it is there already.
     fn follow(&self, remote: bool) -> io::Result<()>;
     /// It comes back home.
@@ -825,7 +826,7 @@ async fn check<'p>(
     let mode = Mode::read(&home.config_dir, name)?;
     let hypr = home.hypr.clone();
     let monitors = blocking(move || hypr::monitors(&*hypr)).await?;
-    let mut given = resolve(&mode.monitors, &monitors)?;
+    let mut given = resolve(&mode.monitors, &monitors, &mode.names)?;
     // The remote's outputs keep home's physical order, whatever the config's.
     given.sort_by_key(|m| (m.x, m.y));
     let Some(peer) = peer.filter(|p| !p.outbox.is_closed()) else {
@@ -931,6 +932,7 @@ async fn launch(
     // The hotkey is shown over the mic button; with no mic, there is no button.
     let hint = home.mic.as_ref().map(|_| mode.mic_hotkey.clone());
     let feed = Feed::new(home.board.clone(), hint, mode.look.clone());
+    let labels = mode.names.clone();
     let home_monitors: Vec<String> = monitors
         .iter()
         .filter(|m| !names.contains(&m.name) && !m.disabled)
@@ -992,7 +994,7 @@ async fn launch(
         });
         let mic = mic.map(|mic| {
             let remote = pointed.is_none_or(|(hypr, given)| pointer_over(&*hypr, &given));
-            if let Err(e) = mic.start(remote) {
+            if let Err(e) = mic.start(remote, labels) {
                 eprintln!(
                     "navette: mic: it stays home, it could not go to the remote machine: {e}"
                 );
