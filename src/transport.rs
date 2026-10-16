@@ -83,7 +83,7 @@ pub async fn bind_lan(address: SocketAddr) -> io::Result<TcpListener> {
 }
 
 /// Dials the desk over TCP and TLS 1.3, presenting this machine's identity and accepting only the
-/// paired the desk certificate.
+/// certificate of the desk it paired with.
 pub struct TlsDialer {
     address: SocketAddr,
     connector: tokio_rustls::TlsConnector,
