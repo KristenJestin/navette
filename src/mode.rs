@@ -366,7 +366,7 @@ fn switch_error(switched: Option<&str>, title: &str, e: io::Error) -> io::Error 
 }
 
 /// What `navette status` says, from the state the events say: the mode, and whether the remote
-/// machine is there for the next.
+/// machine is there for the next, or refused for its version.
 fn status(parts: &Parts) -> String {
     let mode = match &parts.mode {
         None => "no mode is running".to_string(),
@@ -383,9 +383,12 @@ fn status(parts: &Parts) -> String {
             format!("{title} {verb} {}", driven.monitors.join(", "))
         }
     };
-    let link = match parts.link {
-        Link::Linked => "connected",
-        _ => "not connected",
+    let link = match (parts.link, &parts.peer_version) {
+        (Link::Linked, _) => "connected".to_string(),
+        (_, Some(peer)) if parts.refused => {
+            format!("refused: {}", crate::link::refusal("the remote", peer))
+        }
+        _ => "not connected".to_string(),
     };
     format!("{mode}; the remote machine is {link}")
 }
@@ -4202,6 +4205,27 @@ mod tests {
         assert_eq!(
             status_of(&desk).await,
             "no mode is running; the remote machine is connected"
+        );
+    }
+
+    #[test]
+    fn the_status_says_the_remote_machine_runs_another_minor_and_which_to_update() {
+        let parts = Parts {
+            peer_version: Some("0.1".into()),
+            refused: true,
+            ..Parts::desk()
+        };
+        assert_eq!(
+            status(&parts),
+            format!(
+                "no mode is running; the remote machine is refused: {}",
+                crate::link::refusal("the remote", "0.1")
+            )
+        );
+        assert!(
+            status(&parts).contains("the remote runs Navette 0.1, this machine "),
+            "{}",
+            status(&parts)
         );
     }
 
