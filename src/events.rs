@@ -175,6 +175,7 @@ impl Parts {
         let fields = [
             ("v", json!(VERSION).to_string()),
             ("role", json!(self.role.word()).to_string()),
+            ("version", json!(crate::link::NAVETTE_VERSION).to_string()),
             ("state", json!(self.state()).to_string()),
             ("peer", json!(self.peer).to_string()),
             ("peer_version", json!(self.peer_version).to_string()),
@@ -310,6 +311,12 @@ pub fn link_heard(parts: &mut Parts, event: &crate::link::Event) {
             parts.refused = true;
         }
         Event::Disconnected(_) => parts.peer_version = None,
+        // The agent's dial that did not reach the desk: it dials a desk that is down, no
+        // longer one that refuses it. On the desk, a failure is another connection's.
+        Event::Failed(_) if parts.role == Role::Remote && parts.link != Link::Linked => {
+            parts.peer_version = None;
+            parts.refused = false;
+        }
         Event::Failed(_) | Event::Retrying(_) | Event::Away | Event::Back => {}
     }
 }
@@ -551,14 +558,15 @@ pub fn waybar(line: &str) -> Option<String> {
         "mode" => (state, format!("The desk drives {monitors}")),
         "stopping" => (state, format!("Giving {monitors} back")),
         "incompatible" => {
-            let version = text_of("peer_version").unwrap_or("another version");
-            (
-                state,
-                format!(
-                    "{} runs Navette {version}, another minor version: update the older machine",
+            let peer = text_of("peer_version").unwrap_or("another version");
+            let tooltip = match text_of("version") {
+                Some(ours) => capital(&crate::link::refusal_of(&other, peer, ours)),
+                None => format!(
+                    "{} runs Navette {peer}, another minor version: update the older machine",
                     capital(&other)
                 ),
-            )
+            };
+            (state, tooltip)
         }
         // A state of a later version: shown as it is.
         _ => (state, state.to_string()),

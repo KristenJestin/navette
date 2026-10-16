@@ -187,21 +187,20 @@ async fn hello_as<S: AsyncRead + AsyncWrite + Unpin>(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no hello from the peer"))??;
     let no_hello = || io::Error::new(io::ErrorKind::InvalidData, "no hello from the peer");
+    let refuse = |peer: String| {
+        let ours = ours.to_string();
+        io::Error::new(io::ErrorKind::InvalidData, Incompatible { peer, ours })
+    };
     let peer = match frame.as_slice() {
         [HELLO, NAMED, version @ ..] => readable(version).ok_or_else(no_hello)?,
-        [HELLO, _] => OLD.to_string(),
+        // Whatever this machine runs, even a beta of 0.1's minor: 0.1 cannot read its hello.
+        [HELLO, _] => return Err(refuse(OLD.to_string())),
         _ => return Err(no_hello()),
     };
     if same_minor(&peer, ours) {
         Ok(peer)
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            Incompatible {
-                peer,
-                ours: ours.to_string(),
-            },
-        ))
+        Err(refuse(peer))
     }
 }
 
@@ -259,7 +258,7 @@ pub fn refusal(other: &str, peer: &str) -> String {
     refusal_of(other, peer, NAVETTE_VERSION)
 }
 
-fn refusal_of(other: &str, peer: &str, ours: &str) -> String {
+pub(crate) fn refusal_of(other: &str, peer: &str, ours: &str) -> String {
     let update = match (minor(peer), minor(ours)) {
         (Some((0, 0)), _) | (_, Some((0, 0))) => {
             "a local build links only with another local build".to_string()
@@ -713,7 +712,7 @@ pub async fn agent<D, T, F, Fut>(
             let _ = events.send(Event::Back);
         }
         match dialer.dial().await {
-            Ok(mut stream) => match hello(&mut stream, heartbeat).await {
+            Ok(mut stream) => match hello(&mut stream, heartbeat).await.map_err(refused) {
                 Ok(peer) => {
                     backoff.reset();
                     if let Err(e) = network.linked() {
@@ -723,16 +722,17 @@ pub async fn agent<D, T, F, Fut>(
                     let ended = run(stream, heartbeat, &attach).await;
                     let _ = events.send(Event::Disconnected(ended));
                 }
-                Err(e) => {
-                    let event = refused(e);
-                    let version = matches!(event, Event::Incompatible { .. });
+                Err(refusal @ Event::Incompatible { .. }) => {
+                    // Hung up before the wait, not held open for it.
+                    drop(stream);
+                    let _ = events.send(refusal);
+                    // The gate is looked at again at the top of the loop, before the dial.
+                    let _ = events.send(Event::Retrying(REFUSED_REDIAL));
+                    tokio::time::sleep(REFUSED_REDIAL).await;
+                    continue;
+                }
+                Err(event) => {
                     let _ = events.send(event);
-                    if version {
-                        // The gate is looked at again at the top of the loop, before the dial.
-                        let _ = events.send(Event::Retrying(REFUSED_REDIAL));
-                        tokio::time::sleep(REFUSED_REDIAL).await;
-                        continue;
-                    }
                 }
             },
             Err(e) => {
