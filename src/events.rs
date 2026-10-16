@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
 use tokio::net::unix::OwnedReadHalf;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::{oneshot, watch};
 
@@ -394,9 +394,133 @@ async fn answer(commands: &Commands, line: &str) -> String {
     }
 }
 
+/// What `navette watch` says while neither `serve` nor `agent` runs here.
+pub const OFF: &str = r#"{"v":1,"state":"off"}"#;
+/// How often `navette watch` looks for a socket that is not there.
+const RETRY: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(2)
+};
+
+/// `navette watch`: hands `each` the state line, then one per change, for ever; [`OFF`] while
+/// nothing serves the socket, until it is back. With `once`, the current line only.
+pub async fn watch(
+    path: &Path,
+    once: bool,
+    mut each: impl FnMut(&str) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut last: Option<String> = None;
+    let mut tell = |line: &str| -> io::Result<()> {
+        if last.as_deref() != Some(line) {
+            last = Some(line.to_string());
+            each(line)?;
+        }
+        Ok(())
+    };
+    loop {
+        // Never written to: the socket stays open both ways for as long as it reads.
+        if let Ok(stream) = UnixStream::connect(path).await {
+            let mut lines = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                // A state line; an answer to a command starts with `ok` or `error`.
+                if !line.starts_with('{') {
+                    continue;
+                }
+                tell(&line)?;
+                if once {
+                    return Ok(());
+                }
+            }
+        }
+        tell(OFF)?;
+        if once {
+            return Ok(());
+        }
+        tokio::time::sleep(RETRY).await;
+    }
+}
+
+/// A state line as a Waybar custom module's (`text`, `alt`, `class`, `tooltip`); none for a
+/// line that is not one. Unknown fields are ignored, and an unknown state passes as it is.
+pub fn waybar(line: &str) -> Option<String> {
+    use serde_json::{Value, json};
+    let line: Value = serde_json::from_str(line).ok()?;
+    let state = line.get("state")?.as_str()?;
+    let text_of = |key: &str| line.get(key).and_then(Value::as_str);
+    let desk = text_of("role") == Some("desk");
+    let monitors = line
+        .get("monitors")
+        .and_then(Value::as_array)
+        .map(|m| {
+            m.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let other = match (text_of("peer"), desk) {
+        (Some(peer), _) => peer.to_string(),
+        (None, true) => "the remote machine".to_string(),
+        (None, false) => "the desk".to_string(),
+    };
+    let title = match text_of("mode") {
+        Some(name) => format!("mode {name}"),
+        None => "the mode".to_string(),
+    };
+    let (text, tooltip) = match state {
+        "off" => (state, "Navette is not running here".to_string()),
+        "waiting" => (state, format!("Waiting for {other}")),
+        "away" => (
+            state,
+            "Not on the desk's network: not dialing it".to_string(),
+        ),
+        "dialing" => (
+            state,
+            "Dialing the desk, which does not answer yet".to_string(),
+        ),
+        "linked" => (
+            state,
+            format!("{} is linked, no mode runs", capital(&other)),
+        ),
+        "starting" if desk => (state, format!("Starting {title} on {monitors}")),
+        "starting" => (state, format!("Making {monitors} for the desk")),
+        "mode" if desk => {
+            let mut tooltip = format!("{} runs on {monitors}", capital(&title));
+            if let Some(mic) = text_of("mic") {
+                tooltip.push_str(&format!("; mic: {mic}"));
+            }
+            (text_of("mode").unwrap_or(state), tooltip)
+        }
+        "mode" => (state, format!("The desk drives {monitors}")),
+        "stopping" => (state, format!("Giving {monitors} back")),
+        // A state of a later version: shown as it is.
+        _ => (state, state.to_string()),
+    };
+    Some(format!(
+        r#"{{"text":{},"alt":{},"class":{},"tooltip":{}}}"#,
+        json!(text),
+        json!(state),
+        json!(state),
+        json!(tooltip)
+    ))
+}
+
+fn capital(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+/// A state line as a word, for a human: its state.
+pub fn word(line: &str) -> Option<String> {
+    let line: serde_json::Value = serde_json::from_str(line).ok()?;
+    Some(line.get("state")?.as_str()?.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use tokio::net::UnixStream;
     use tokio::net::unix::OwnedWriteHalf;
     use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -868,5 +992,202 @@ mod tests {
         );
         // What the agent could not save of its first link: it is linked all the same.
         assert_eq!(after(Link::Linked, Event::Failed(error())), Link::Linked);
+    }
+
+    fn waybar_of(line: &str) -> serde_json::Value {
+        serde_json::from_str(&waybar(line).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn waybar_maps_each_state() {
+        let desk = |state: &str, mode: &str| {
+            format!(
+                r#"{{"v":1,"role":"desk","state":"{state}","peer":"FAR","mode":{mode},"monitors":["DP-2"],"modes":[],"mic":"remote"}}"#
+            )
+        };
+        let remote = |state: &str| {
+            format!(
+                r#"{{"v":1,"role":"remote","state":"{state}","peer":null,"mode":null,"monitors":[],"modes":[],"mic":null}}"#
+            )
+        };
+        let cases = [
+            (OFF.to_string(), "off", "Navette is not running here"),
+            (desk("waiting", "null"), "waiting", "Waiting for FAR"),
+            (
+                desk("linked", "null"),
+                "linked",
+                "FAR is linked, no mode runs",
+            ),
+            (
+                desk("starting", r#""office""#),
+                "starting",
+                "Starting mode office on DP-2",
+            ),
+            (
+                desk("mode", r#""office""#),
+                "office",
+                "Mode office runs on DP-2; mic: remote",
+            ),
+            (
+                desk("mode", "null"),
+                "mode",
+                "The mode runs on DP-2; mic: remote",
+            ),
+            (
+                desk("stopping", r#""office""#),
+                "stopping",
+                "Giving DP-2 back",
+            ),
+            (
+                remote("away"),
+                "away",
+                "Not on the desk's network: not dialing it",
+            ),
+            (
+                remote("dialing"),
+                "dialing",
+                "Dialing the desk, which does not answer yet",
+            ),
+            (
+                remote("linked"),
+                "linked",
+                "The desk is linked, no mode runs",
+            ),
+        ];
+        for (line, text, tooltip) in cases {
+            let module = waybar_of(&line);
+            let state = serde_json::from_str::<serde_json::Value>(&line).unwrap()["state"].clone();
+            assert_eq!(module["text"], text, "{line}");
+            assert_eq!(module["alt"], state, "{line}");
+            assert_eq!(module["class"], state, "{line}");
+            assert_eq!(module["tooltip"], tooltip, "{line}");
+        }
+        let starting = remote("starting").replace("[]", r#"["NAVETTE-1"]"#);
+        assert_eq!(
+            waybar_of(&starting)["tooltip"],
+            "Making NAVETTE-1 for the desk"
+        );
+        let driven = remote("mode").replace("[]", r#"["NAVETTE-1","NAVETTE-2"]"#);
+        assert_eq!(waybar_of(&driven)["text"], "mode");
+        assert_eq!(
+            waybar_of(&driven)["tooltip"],
+            "The desk drives NAVETTE-1, NAVETTE-2"
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_or_value_does_not_break_watch_s_parser() {
+        let line = r#"{"v":1,"role":"desk","state":"incompatible","peer":"FAR","peer_version":"9.9.9","new":{"a":[1]},"mode":null,"monitors":[],"modes":[],"mic":"off"}"#;
+        let module = waybar_of(line);
+        assert_eq!(module["text"], "incompatible");
+        assert_eq!(module["class"], "incompatible");
+        assert_eq!(word(line).unwrap(), "incompatible");
+        let mut known = Parts::desk().line();
+        known.insert_str(1, r#""later":true,"#);
+        assert_eq!(waybar_of(&known)["class"], "waiting");
+        assert_eq!(word(&known).unwrap(), "waiting");
+        assert_eq!(waybar("not json"), None);
+        assert_eq!(waybar("ok DP-2 is back home"), None);
+    }
+
+    /// `watch` on `path`, its lines handed over as they come.
+    fn watching(
+        path: &Path,
+        once: bool,
+    ) -> (
+        tokio::task::JoinHandle<io::Result<()>>,
+        UnboundedReceiver<String>,
+    ) {
+        let (heard, hears) = mpsc::unbounded_channel();
+        let path = path.to_path_buf();
+        let task = tokio::spawn(async move {
+            watch(&path, once, move |line| {
+                let _ = heard.send(line.to_string());
+                Ok(())
+            })
+            .await
+        });
+        (task, hears)
+    }
+
+    async fn heard(hears: &mut UnboundedReceiver<String>) -> String {
+        tokio::time::timeout(Duration::from_secs(5), hears.recv())
+            .await
+            .expect("a line in time")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn watch_prints_off_with_no_socket_and_picks_the_stream_up_when_it_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("navette").join("events.sock");
+        let (_task, mut hears) = watching(&path, false);
+        assert_eq!(heard(&mut hears).await, OFF);
+        // Retrying says nothing new.
+        tokio::time::sleep(RETRY * 3).await;
+        assert!(hears.try_recv().is_err());
+
+        let events = Events::new(linked_desk());
+        let listener = listen(&path).unwrap();
+        let served = tokio::spawn(serve(listener, events.clone(), Arc::new(Commands::Remote)));
+        assert_eq!(heard(&mut hears).await, linked_desk().line());
+        events.update(|p| p.link = Link::Waiting);
+        assert_eq!(heard(&mut hears).await, events.parts().line());
+
+        // It goes away: off, then back.
+        served.abort();
+        let _ = served.await;
+        drop(events);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(heard(&mut hears).await, OFF);
+        let events = Events::new(Parts::remote());
+        tokio::spawn(serve(
+            listen(&path).unwrap(),
+            events,
+            Arc::new(Commands::Remote),
+        ));
+        assert_eq!(heard(&mut hears).await, Parts::remote().line());
+    }
+
+    #[tokio::test]
+    async fn watch_relays_a_line_with_an_unknown_field_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = listen(&path).unwrap();
+        let later = r#"{"v":1,"role":"desk","state":"later","peer":null,"surprise":[1,{"x":2}]}"#;
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(format!("{later}\n").as_bytes())
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (_task, mut hears) = watching(&path, false);
+        assert_eq!(heard(&mut hears).await, later);
+    }
+
+    #[tokio::test]
+    async fn watch_once_prints_the_current_line_or_off_and_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("navette").join("events.sock");
+        let (task, mut hears) = watching(&path, true);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("done at once")
+            .unwrap()
+            .unwrap();
+        assert_eq!(heard(&mut hears).await, OFF);
+        assert!(hears.recv().await.is_none());
+
+        let (_dir, path) = served(Events::new(linked_desk()), Commands::Remote);
+        let (task, mut hears) = watching(&path, true);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("done at once")
+            .unwrap()
+            .unwrap();
+        assert_eq!(heard(&mut hears).await, linked_desk().line());
+        assert!(hears.recv().await.is_none());
     }
 }

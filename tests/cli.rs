@@ -359,3 +359,51 @@ fn mode_list_json_without_serve() {
          {\"name\":\"office\",\"monitors\":[\"DP-1\",\"DP-2\"]}]\n"
     );
 }
+
+#[test]
+fn watch_once_without_serve_or_agent_says_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (status, output) =
+        Navette::start(tmp.path(), &["watch", "--json", "--once"]).finish_with_status();
+    assert!(status.success(), "{output}");
+    assert_eq!(output, "{\"v\":1,\"state\":\"off\"}\n");
+    let output = Navette::start(tmp.path(), &["watch", "--waybar", "--once"]).finish();
+    assert!(output.contains(r#""class":"off""#), "{output}");
+    let output = Navette::start(tmp.path(), &["watch", "--once"]).finish();
+    assert_eq!(output, "off\n");
+}
+
+/// `navette watch --json --once` on `config`'s machine, until its state is `state`.
+fn watched_until(config: &Path, state: &str) -> String {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let output = Navette::start(config, &["watch", "--json", "--once"]).finish();
+        if output.contains(&format!(r#""state":"{state}""#)) {
+            return output;
+        }
+        assert!(Instant::now() < deadline, "never {state}: {output}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn each_machine_says_where_it_stands_on_its_events_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (_serve, _agent, _) = paired_link(&home, &remote);
+    let desk = watched_until(&home, "linked");
+    assert!(desk.contains(r#""role":"desk""#), "{desk}");
+    assert!(desk.contains(r#""peer":"REMOTE""#), "{desk}");
+    let far = watched_until(&remote, "linked");
+    assert!(far.contains(r#""role":"remote""#), "{far}");
+    // The remote drives nothing: a command there is refused.
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(remote.join("run/navette/events.sock")).unwrap();
+    stream.write_all(b"stop\n").unwrap();
+    let mut lines = BufReader::new(stream).lines();
+    assert!(lines.next().unwrap().unwrap().starts_with('{'));
+    assert_eq!(
+        lines.next().unwrap().unwrap(),
+        "error the remote does not drive the mode"
+    );
+}

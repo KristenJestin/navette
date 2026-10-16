@@ -103,6 +103,22 @@ enum Command {
         #[command(subcommand)]
         action: MicAction,
     },
+    /// Both machines: say where Navette stands, then again at every change, until stopped: for
+    /// a bar or a shell (`docs/events.md`).
+    ///
+    /// Reads `navette serve` or `navette agent`, whichever runs here; with neither, `off`, until
+    /// one starts.
+    Watch {
+        /// The lines of JSON as they come, each a whole state.
+        #[arg(long, conflicts_with = "waybar")]
+        json: bool,
+        /// Lines of JSON for a Waybar custom module (`text`, `alt`, `class`, `tooltip`).
+        #[arg(long)]
+        waybar: bool,
+        /// The current state only, then exit.
+        #[arg(long)]
+        once: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -440,6 +456,22 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             };
             println!("{}", mode::order(&mode::control_path()?, &order).await?);
             Ok(())
+        }
+        Command::Watch { json, waybar, once } => {
+            events::watch(&events::path()?, once, |line| {
+                use std::io::Write;
+                let shown = match (json, waybar) {
+                    (true, _) => Some(line.to_string()),
+                    (_, true) => events::waybar(line),
+                    _ => events::word(line),
+                };
+                let Some(shown) = shown else { return Ok(()) };
+                let mut out = std::io::stdout().lock();
+                writeln!(out, "{shown}")?;
+                // A bar reads it through a pipe: each line at once.
+                out.flush()
+            })
+            .await
         }
         Command::Status => {
             println!("{}", mode::order(&mode::control_path()?, "status").await?);
