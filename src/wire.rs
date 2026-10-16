@@ -6,11 +6,12 @@
 //! and pointer. A message this build does not know is skipped,
 //! so a newer peer can add some without breaking an older one.
 //!
-//! To extend the link without a new [`VERSION`](crate::link::VERSION), add a top-level variant
-//! to [`LinkMsg`] with a number never used before, or an optional field (`Option`, a new `#[n]`)
-//! at the end of an existing one: an older peer skips the first and ignores the second. Any
-//! other change is malformed to an older peer and ends the link, a new variant of a nested enum
-//! (`ClipboardItem`, say) included: change the version instead.
+//! To extend the link within a minor version, add a top-level variant to [`LinkMsg`] with a
+//! number never used before, or an optional field (`Option`, a new `#[n]`) at the end of an
+//! existing one: an older peer skips the first and ignores the second. Any other change is
+//! malformed to an older peer and ends the link, a new variant of a nested enum
+//! (`ClipboardItem`, say) included: make it a `feat`, a new minor version, which the hello of
+//! the previous one refuses (`docs/versions.md`).
 
 use bytes::Bytes;
 use gliff_proto::{ClientMsg, ClipboardFile, ClipboardItem, ClipboardMsg, ServerMsg};

@@ -1,5 +1,5 @@
 //! The link once paired: the remote's agent dials home and keeps a connection, home serves it.
-//! Over it, a hello (the link's version), then gliff's framing carrying a heartbeat each way
+//! Over it, a hello (Navette's version: the same minor links, another is refused), then gliff's framing carrying a heartbeat each way
 //! and the connection's services (the clipboard bridge, the display), over the same
 //! authenticated stream. The link stays up between two modes, so that a start is quick, but
 //! carries nothing of the user's then: no copy, no sound, no mic, no input.
@@ -35,10 +35,25 @@ use crate::store::{Role, Store};
 use crate::transport::{Accept, Dial, TlsAcceptor, TlsDialer};
 use crate::wire::{Clip, LinkMsg, checked, output_id};
 
-/// The version of the link's messages; peers of another version refuse each other.
-pub const VERSION: u8 = 2;
+/// This Navette's version, as `navette --version` says it: two machines link only within a
+/// minor version (`docs/versions.md`).
+pub const NAVETTE_VERSION: &str = match option_env!("NAVETTE_VERSION") {
+    Some(version) => version,
+    None => "0.0.0-dev",
+};
 
 const HELLO: u8 = 1;
+/// After `HELLO`, 0.1 put its link version (1 or 2) and nothing more; from 0.2, this byte, then
+/// Navette's version. An old peer is still told apart, and refused by name.
+const NAMED: u8 = 0;
+/// What a peer that says the old hello runs.
+const OLD: &str = "0.1";
+/// The longest version a peer may say: far above `1.12.3-beta.45+abcdef`.
+const LONGEST_VERSION: usize = 64;
+
+/// How long the agent waits after the desk refused its version, or it refused the desk's: only
+/// an update of one machine changes the answer, so there is no point dialing every few seconds.
+pub const REFUSED_REDIAL: Duration = Duration::from_secs(60);
 
 /// Clipboard messages read from the peer and not yet taken by the bridge. The reader never
 /// waits on a service: past this many, a message for it is dropped, so a stuck service cannot
@@ -131,7 +146,14 @@ impl Default for Backoff {
 /// What the link went through, for the log. Never carries a key or a certificate.
 #[derive(Debug)]
 pub enum Event {
-    Connected,
+    /// Linked to a peer of the same minor version: the version it said.
+    Connected {
+        peer: String,
+    },
+    /// The peer runs another minor version: the version it said.
+    Incompatible {
+        peer: String,
+    },
     Disconnected(io::Error),
     /// A connection home refused, or one the agent could not open.
     Failed(io::Error),
@@ -142,25 +164,142 @@ pub enum Event {
     Back,
 }
 
-/// Both sides say hello first; a peer of another version is refused.
+/// Both sides say hello first, with their Navette version; a peer of another minor version is
+/// refused. Returns the peer's version. It runs inside the authenticated link, and the version
+/// is trusted for this comparison only.
 pub async fn hello<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     heartbeat: Heartbeat,
-) -> io::Result<()> {
-    write_frame(stream, &[HELLO, VERSION]).await?;
+) -> io::Result<String> {
+    hello_as(stream, heartbeat, NAVETTE_VERSION).await
+}
+
+/// [`hello`], saying `ours` as this machine's version.
+async fn hello_as<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    heartbeat: Heartbeat,
+    ours: &str,
+) -> io::Result<String> {
+    let mut said = vec![HELLO, NAMED];
+    said.extend_from_slice(ours.as_bytes());
+    write_frame(stream, &said).await?;
     let frame = tokio::time::timeout(heartbeat.timeout, read_frame(stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no hello from the peer"))??;
-    match frame.as_slice() {
-        [HELLO, VERSION] => Ok(()),
-        [HELLO, other] => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("the peer speaks link version {other}, this machine {VERSION}: update both"),
-        )),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "no hello from the peer",
-        )),
+    let no_hello = || io::Error::new(io::ErrorKind::InvalidData, "no hello from the peer");
+    let refuse = |peer: String| {
+        let ours = ours.to_string();
+        io::Error::new(io::ErrorKind::InvalidData, Incompatible { peer, ours })
+    };
+    let peer = match frame.as_slice() {
+        [HELLO, NAMED, version @ ..] => readable(version).ok_or_else(no_hello)?,
+        // Whatever this machine runs, even a beta of 0.1's minor: 0.1 cannot read its hello.
+        [HELLO, _] => return Err(refuse(OLD.to_string())),
+        _ => return Err(no_hello()),
+    };
+    if same_minor(&peer, ours) {
+        Ok(peer)
+    } else {
+        Err(refuse(peer))
+    }
+}
+
+/// A version as a peer says it: short, plain, and starting with its major and minor numbers,
+/// so that it is safe in a log line and can be compared.
+fn readable(version: &[u8]) -> Option<String> {
+    let version = std::str::from_utf8(version).ok()?;
+    let plain = version
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b));
+    (version.len() <= LONGEST_VERSION && plain && minor(version).is_some())
+        .then(|| version.to_string())
+}
+
+/// A version's major and minor numbers: `0.2` of `0.2.1-beta.3`, `0.0` of a local build.
+fn minor(version: &str) -> Option<(u64, u64)> {
+    let mut numbers = version.splitn(3, '.');
+    let major = numbers.next()?.parse().ok()?;
+    let minor = numbers.next()?;
+    let digits = minor
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(minor, |end| &minor[..end]);
+    Some((major, digits.parse().ok()?))
+}
+
+/// The rule: the same major and minor. A local build is `0.0`, which no release is, so it
+/// links only with another local build.
+fn same_minor(a: &str, b: &str) -> bool {
+    minor(a).is_some_and(|a| Some(a) == minor(b))
+}
+
+/// The error of a hello refused for the peer's version.
+#[derive(Debug)]
+struct Incompatible {
+    peer: String,
+    ours: String,
+}
+
+impl std::fmt::Display for Incompatible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", refusal_of("the peer", &self.peer, &self.ours))
+    }
+}
+
+impl std::error::Error for Incompatible {}
+
+/// The version a hello was refused for, if it was refused for its version.
+pub fn incompatible(error: &io::Error) -> Option<&str> {
+    let refused = error.get_ref()?.downcast_ref::<Incompatible>()?;
+    Some(&refused.peer)
+}
+
+/// What a refusal says: what `other` runs, what this machine runs, and which to update.
+pub fn refusal(other: &str, peer: &str) -> String {
+    refusal_of(other, peer, NAVETTE_VERSION)
+}
+
+pub(crate) fn refusal_of(other: &str, peer: &str, ours: &str) -> String {
+    let update = match (minor(peer), minor(ours)) {
+        (Some((0, 0)), _) | (_, Some((0, 0))) => {
+            "a local build links only with another local build".to_string()
+        }
+        (theirs, ours) if theirs < ours => format!("update {other}"),
+        _ => "update this machine".to_string(),
+    };
+    format!("{other} runs Navette {peer}, this machine {ours}: {update}")
+}
+
+/// Says a version refusal once, not at each of the agent's redials, nor the wait before each:
+/// again only after a link, or for another version.
+#[derive(Default)]
+pub struct RefusalLog {
+    refused: Option<String>,
+}
+
+impl RefusalLog {
+    /// Whether `event` is to be said.
+    pub fn says(&mut self, event: &Event) -> bool {
+        match event {
+            Event::Incompatible { peer } => {
+                self.refused.replace(peer.clone()).as_ref() != Some(peer)
+            }
+            Event::Retrying(_) => self.refused.is_none(),
+            Event::Connected { .. } | Event::Failed(_) | Event::Disconnected(_) => {
+                self.refused = None;
+                true
+            }
+            Event::Away | Event::Back => true,
+        }
+    }
+}
+
+/// The event of a failed hello.
+fn refused(error: io::Error) -> Event {
+    match incompatible(&error) {
+        Some(peer) => Event::Incompatible {
+            peer: peer.to_string(),
+        },
+        None => Event::Failed(error),
     }
 }
 
@@ -573,18 +712,27 @@ pub async fn agent<D, T, F, Fut>(
             let _ = events.send(Event::Back);
         }
         match dialer.dial().await {
-            Ok(mut stream) => match hello(&mut stream, heartbeat).await {
-                Ok(()) => {
+            Ok(mut stream) => match hello(&mut stream, heartbeat).await.map_err(refused) {
+                Ok(peer) => {
                     backoff.reset();
                     if let Err(e) = network.linked() {
                         let _ = events.send(Event::Failed(e));
                     }
-                    let _ = events.send(Event::Connected);
+                    let _ = events.send(Event::Connected { peer });
                     let ended = run(stream, heartbeat, &attach).await;
                     let _ = events.send(Event::Disconnected(ended));
                 }
-                Err(e) => {
-                    let _ = events.send(Event::Failed(e));
+                Err(refusal @ Event::Incompatible { .. }) => {
+                    // Hung up before the wait, not held open for it.
+                    drop(stream);
+                    let _ = events.send(refusal);
+                    // The gate is looked at again at the top of the loop, before the dial.
+                    let _ = events.send(Event::Retrying(REFUSED_REDIAL));
+                    tokio::time::sleep(REFUSED_REDIAL).await;
+                    continue;
+                }
+                Err(event) => {
+                    let _ = events.send(event);
                 }
             },
             Err(e) => {
@@ -637,16 +785,16 @@ pub async fn serve<A, F, Fut>(
         tokio::select! {
             Some(mut stream) = connections.recv() => {
                 greetings.spawn_local(async move {
-                    hello(&mut stream, heartbeat).await.map(|()| stream)
+                    hello(&mut stream, heartbeat).await.map(|peer| (stream, peer))
                 });
             }
             Some(greeted) = greetings.join_next() => match greeted {
-                Ok(Ok(stream)) => {
+                Ok(Ok((stream, peer))) => {
                     // Only a connection that said hello replaces the link. The older link, with
                     // its service, is gone before the newer one's starts.
                     session.abort_all();
                     while session.join_next().await.is_some() {}
-                    let _ = events.send(Event::Connected);
+                    let _ = events.send(Event::Connected { peer });
                     let (events, attach) = (events.clone(), attach.clone());
                     session.spawn_local(async move {
                         let ended = run(stream, heartbeat, attach).await;
@@ -654,7 +802,7 @@ pub async fn serve<A, F, Fut>(
                     });
                 }
                 Ok(Err(e)) => {
-                    let _ = events.send(Event::Failed(e));
+                    let _ = events.send(refused(e));
                 }
                 Err(_) => {}
             },
@@ -738,7 +886,7 @@ pub(crate) mod tests {
 
     async fn until_connected(events: &mut mpsc::UnboundedReceiver<Event>) {
         loop {
-            if let Event::Connected = next(events).await {
+            if let Event::Connected { .. } = next(events).await {
                 return;
             }
         }
@@ -799,15 +947,133 @@ pub(crate) mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
+    /// Both ends of an in-memory link say hello as `a` and `b`: what each heard.
+    async fn hellos(a: &str, b: &str) -> (io::Result<String>, io::Result<String>) {
+        let (mut ends_a, mut ends_b) = tokio::io::duplex(1024);
+        tokio::join!(
+            hello_as(&mut ends_a, fast(), a),
+            hello_as(&mut ends_b, fast(), b)
+        )
+    }
+
+    /// The version a hello was refused for, if it was.
+    fn refused_for(heard: io::Result<String>) -> Option<String> {
+        incompatible(&heard.expect_err("refused")).map(str::to_string)
+    }
+
     #[tokio::test]
-    async fn a_peer_of_another_version_is_refused() {
+    async fn the_same_minor_links_and_each_side_sees_the_other_s_version() {
+        let (a, b) = hellos("0.2.0", "0.2.3").await;
+        assert_eq!(a.unwrap(), "0.2.3");
+        assert_eq!(b.unwrap(), "0.2.0");
+    }
+
+    #[tokio::test]
+    async fn another_minor_is_refused_on_both_sides_naming_the_peer_s_version() {
+        let (a, b) = hellos("0.2.1", "0.3.0").await;
+        assert_eq!(refused_for(a).as_deref(), Some("0.3.0"));
+        assert_eq!(refused_for(b).as_deref(), Some("0.2.1"));
+    }
+
+    #[tokio::test]
+    async fn a_prerelease_counts_as_its_minor() {
+        let (a, b) = hellos("0.2.1-beta.3", "0.2.0").await;
+        assert_eq!(a.unwrap(), "0.2.0");
+        assert_eq!(b.unwrap(), "0.2.1-beta.3");
+        let (a, _) = hellos("0.2.1-beta.3", "0.3.0").await;
+        assert_eq!(refused_for(a).as_deref(), Some("0.3.0"));
+    }
+
+    #[tokio::test]
+    async fn a_local_build_links_only_with_another_local_build() {
+        let (a, b) = hellos("0.0.0-dev", "0.2.0").await;
+        assert_eq!(refused_for(a).as_deref(), Some("0.2.0"));
+        assert_eq!(refused_for(b).as_deref(), Some("0.0.0-dev"));
+        let (a, b) = hellos("0.0.0-dev", "0.0.0-dev").await;
+        assert_eq!(a.unwrap(), "0.0.0-dev");
+        assert_eq!(b.unwrap(), "0.0.0-dev");
+    }
+
+    #[tokio::test]
+    async fn an_old_hello_is_refused_as_0_1_naming_it() {
         let (mut a, mut b) = tokio::io::duplex(1024);
-        let other = async {
-            write_frame(&mut b, &[HELLO, VERSION + 1]).await.unwrap();
+        let old = async {
+            // What every 0.1.x says, and nothing more.
+            write_frame(&mut b, &[HELLO, 2]).await.unwrap();
             b
         };
-        let (result, _b) = tokio::join!(hello(&mut a, fast()), other);
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let (heard, mut b) = tokio::join!(hello_as(&mut a, fast(), "0.2.0"), old);
+        assert_eq!(refused_for(heard).as_deref(), Some("0.1"));
+        // What 0.1 reads first is still a hello frame: a frame starting with `HELLO`.
+        let frame = read_frame(&mut b).await.unwrap();
+        assert_eq!(frame.first(), Some(&HELLO));
+        assert_eq!(
+            refusal_of("the remote", "0.1", "0.2.0"),
+            "the remote runs Navette 0.1, this machine 0.2.0: update the remote"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_hello_is_refused_even_by_a_0_1_beta() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let old = async {
+            write_frame(&mut b, &[HELLO, 2]).await.unwrap();
+            b
+        };
+        // The beta after 0.1.0 is 0.1.1-beta.N, of 0.1's minor: 0.1 cannot read its hello.
+        let (heard, _b) = tokio::join!(hello_as(&mut a, fast(), "0.1.1-beta.3"), old);
+        assert_eq!(refused_for(heard).as_deref(), Some("0.1"));
+    }
+
+    #[test]
+    fn the_refusal_names_the_machine_to_update() {
+        assert_eq!(
+            refusal_of("the remote", "0.2.3", "0.3.0"),
+            "the remote runs Navette 0.2.3, this machine 0.3.0: update the remote"
+        );
+        assert_eq!(
+            refusal_of("the desk", "0.4.0", "0.3.1"),
+            "the desk runs Navette 0.4.0, this machine 0.3.1: update this machine"
+        );
+        assert_eq!(
+            refusal_of("the desk", "0.0.0-dev", "0.3.1"),
+            "the desk runs Navette 0.0.0-dev, this machine 0.3.1: a local build links only \
+             with another local build"
+        );
+    }
+
+    #[test]
+    fn a_version_refusal_is_logged_once_until_a_link_or_another_version() {
+        let refused = |peer: &str| Event::Incompatible { peer: peer.into() };
+        let mut log = RefusalLog::default();
+        assert!(log.says(&refused("0.1")));
+        // The agent's wait and its next refusal, a minute later, say nothing new.
+        assert!(!log.says(&Event::Retrying(REFUSED_REDIAL)));
+        assert!(!log.says(&refused("0.1")));
+        assert!(log.says(&refused("0.3.0")));
+        assert!(log.says(&Event::Connected {
+            peer: "0.2.0".into()
+        }));
+        assert!(log.says(&Event::Retrying(Duration::from_secs(1))));
+        assert!(log.says(&refused("0.3.0")));
+    }
+
+    #[tokio::test]
+    async fn a_hello_with_an_unreadable_version_is_no_hello() {
+        let saids: [&[u8]; 4] = [b"\x1b[2Jboom", b"", b"latest", &[b'0'; 65]];
+        for said in saids {
+            let (mut a, mut b) = tokio::io::duplex(1024);
+            let other = async {
+                let mut frame = vec![HELLO, NAMED];
+                frame.extend_from_slice(said);
+                write_frame(&mut b, &frame).await.unwrap();
+                b
+            };
+            let (heard, _b) = tokio::join!(hello_as(&mut a, fast(), "0.2.0"), other);
+            let error = heard.expect_err("no hello");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(incompatible(&error), None, "{said:?}");
+        }
     }
 
     #[tokio::test]
@@ -1145,7 +1411,7 @@ pub(crate) mod tests {
 
                 let (home_end, mut bad) = tokio::io::duplex(1024);
                 connections.send(home_end).unwrap();
-                write_frame(&mut bad, &[HELLO, VERSION + 1]).await.unwrap();
+                write_frame(&mut bad, &[HELLO + 1, 2]).await.unwrap();
                 match next(&mut home_events).await {
                     Event::Failed(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
                     other => panic!("the bad hello must fail alone: {other:?}"),
@@ -1257,7 +1523,7 @@ pub(crate) mod tests {
         let back = tokio::time::Instant::now();
         let waited = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
-                if let Event::Connected = events.recv().await.expect("the agent is alive") {
+                if let Event::Connected { .. } = events.recv().await.expect("the agent is alive") {
                     return back.elapsed();
                 }
             }
@@ -1268,10 +1534,11 @@ pub(crate) mod tests {
         assert!(waited <= A_FEW_SECONDS, "dialled again after {waited:?}");
     }
 
-    /// A dialer that answers like home does, and counts its dials.
+    /// A dialer that answers like home does, and counts its dials; home a 0.1 if `old`.
     #[derive(Clone, Default)]
     struct Counted {
         dials: Arc<AtomicUsize>,
+        old: bool,
     }
 
     impl Dial for Counted {
@@ -1280,7 +1547,14 @@ pub(crate) mod tests {
         async fn dial(&self) -> io::Result<Self::Stream> {
             self.dials.fetch_add(1, Ordering::SeqCst);
             let (agent_side, mut home_side) = tokio::io::duplex(1024);
+            let old = self.old;
             tokio::spawn(async move {
+                if old {
+                    let _ = write_frame(&mut home_side, &[HELLO, 2]).await;
+                    // 0.1 refuses the newer hello and hangs up.
+                    let _ = read_frame(&mut home_side).await;
+                    return;
+                }
                 let _ = hello(&mut home_side, Heartbeat::default()).await;
                 std::future::pending::<()>().await;
             });
@@ -1297,7 +1571,19 @@ pub(crate) mod tests {
         tokio::task::JoinHandle<()>,
         mpsc::UnboundedReceiver<Event>,
     ) {
-        let dialer = Counted::default();
+        gated_agent_dialing(store, tables, Counted::default())
+    }
+
+    /// The same, dialing with `dialer`.
+    fn gated_agent_dialing<D: Dial + Clone + Send + Sync + 'static>(
+        store: &Store,
+        tables: FakeTables,
+        dialer: D,
+    ) -> (
+        D,
+        tokio::task::JoinHandle<()>,
+        mpsc::UnboundedReceiver<Event>,
+    ) {
         let (events_tx, events) = mpsc::unbounded_channel();
         let agent = tokio::spawn(agent(
             dialer.clone(),
@@ -1331,7 +1617,10 @@ pub(crate) mod tests {
         let (_, agent, mut events) = gated_agent(&store, FakeTables::behind(HOME_ROUTER));
         let first = tokio::time::timeout(A_FEW_SECONDS, events.recv()).await;
         agent.abort();
-        assert!(matches!(first, Ok(Some(Event::Connected))), "{first:?}");
+        assert!(
+            matches!(first, Ok(Some(Event::Connected { .. }))),
+            "{first:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1366,7 +1655,7 @@ pub(crate) mod tests {
             let mut said = Vec::new();
             loop {
                 let event = events.recv().await.expect("the agent is alive");
-                let connected = matches!(event, Event::Connected);
+                let connected = matches!(event, Event::Connected { .. });
                 said.push(event);
                 if connected {
                     return said;
@@ -1384,10 +1673,124 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 said.as_slice(),
-                [Event::Away, Event::Back, Event::Connected]
+                [Event::Away, Event::Back, Event::Connected { .. }]
             ),
             "said {said:?}"
         );
+    }
+
+    fn old_desk() -> Counted {
+        Counted {
+            old: true,
+            ..Counted::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_agent_refused_for_its_version_redials_once_a_minute() {
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let (dialer, agent, mut events) =
+            gated_agent_dialing(&store, FakeTables::behind(HOME_ROUTER), old_desk());
+        let refused = next(&mut events).await;
+        assert!(
+            matches!(&refused, Event::Incompatible { peer } if peer == "0.1"),
+            "{refused:?}"
+        );
+        assert!(
+            matches!(next(&mut events).await, Event::Retrying(d) if d == REFUSED_REDIAL),
+            "the wait after a refusal is a minute"
+        );
+        assert_eq!(REFUSED_REDIAL, Duration::from_secs(60));
+        tokio::time::sleep(REFUSED_REDIAL - A_FEW_SECONDS).await;
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 1, "redialed too soon");
+        tokio::time::sleep(2 * A_FEW_SECONDS).await;
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 2);
+        agent.abort();
+    }
+
+    /// A desk of another minor that refuses the agent and keeps its end open: whether the agent
+    /// hung up before its wait.
+    #[derive(Clone, Default)]
+    struct Refusing {
+        hung_up: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    impl Dial for Refusing {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn dial(&self) -> io::Result<Self::Stream> {
+            let (agent_side, mut home_side) = tokio::io::duplex(1024);
+            let hung_up = self.hung_up.clone();
+            tokio::spawn(async move {
+                let _ = hello_as(&mut home_side, Heartbeat::default(), "9.0.0").await;
+                let read = tokio::time::timeout(A_FEW_SECONDS, read_frame(&mut home_side)).await;
+                hung_up.lock().unwrap().push(matches!(read, Ok(Err(_))));
+                std::future::pending::<()>().await;
+            });
+            Ok(agent_side)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_agent_refused_for_its_version_hangs_up_before_it_waits() {
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let (desk, agent, mut events) =
+            gated_agent_dialing(&store, FakeTables::behind(HOME_ROUTER), Refusing::default());
+        while !matches!(next(&mut events).await, Event::Retrying(_)) {}
+        tokio::time::sleep(2 * A_FEW_SECONDS).await;
+        agent.abort();
+        assert_eq!(*desk.hung_up.lock().unwrap(), [true]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_agent_refused_for_its_version_checks_the_desk_s_network_before_redialing() {
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let tables = FakeTables::behind(HOME_ROUTER);
+        let (dialer, agent, mut events) = gated_agent_dialing(&store, tables.clone(), old_desk());
+        while !matches!(next(&mut events).await, Event::Retrying(_)) {}
+        tables.move_behind(OTHER_ROUTER);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        agent.abort();
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
+        let said = drained(&mut events);
+        assert!(matches!(said.as_slice(), [Event::Away]), "said {said:?}");
+    }
+
+    #[tokio::test]
+    async fn the_desk_refuses_an_old_remote_and_says_its_version() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (connections, queue) = mpsc::unbounded_channel();
+                let (events, mut home_events) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(serve(Queue(queue), fast(), events, nothing));
+                let (home_end, mut old) = tokio::io::duplex(1024);
+                connections.send(home_end).unwrap();
+                write_frame(&mut old, &[HELLO, 2]).await.unwrap();
+                match next(&mut home_events).await {
+                    Event::Incompatible { peer } => assert_eq!(peer, "0.1"),
+                    other => panic!("refused for its version: {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn linked_each_side_says_the_other_s_version() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (connections, queue) = mpsc::unbounded_channel();
+                let (events, mut home_events) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(serve(Queue(queue), fast(), events, nothing));
+                let (home_end, mut remote) = tokio::io::duplex(1024);
+                connections.send(home_end).unwrap();
+                let heard = hello(&mut remote, fast()).await.unwrap();
+                assert_eq!(heard, NAVETTE_VERSION);
+                match next(&mut home_events).await {
+                    Event::Connected { peer } => assert_eq!(peer, NAVETTE_VERSION),
+                    other => panic!("linked: {other:?}"),
+                }
+            })
+            .await;
     }
 
     #[tokio::test(start_paused = true)]
