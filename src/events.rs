@@ -292,7 +292,7 @@ pub fn link_after(link: Link, event: &crate::link::Event) -> Link {
 
 /// The parts after one of the link's events, on either machine: the remote's link, and on both
 /// the other machine's version.
-pub fn heard(parts: &mut Parts, event: &crate::link::Event) {
+pub fn link_heard(parts: &mut Parts, event: &crate::link::Event) {
     use crate::link::Event;
     if parts.role == Role::Remote {
         parts.link = link_after(parts.link, event);
@@ -1080,19 +1080,19 @@ mod tests {
     #[test]
     fn a_refused_version_says_incompatible_with_the_peer_s_version_on_each_side() {
         let mut desk = Parts::desk();
-        heard(&mut desk, &refused("0.3.0"));
+        link_heard(&mut desk, &refused("0.3.0"));
         let line: serde_json::Value = serde_json::from_str(&desk.line()).unwrap();
         assert_eq!(line["state"], "incompatible");
         assert_eq!(line["peer_version"], "0.3.0");
 
         let mut remote = Parts::remote();
-        heard(&mut remote, &refused("0.1"));
-        heard(&mut remote, &Event::Retrying(Duration::from_secs(60)));
+        link_heard(&mut remote, &refused("0.1"));
+        link_heard(&mut remote, &Event::Retrying(Duration::from_secs(60)));
         let line: serde_json::Value = serde_json::from_str(&remote.line()).unwrap();
         assert_eq!(line["state"], "incompatible");
         assert_eq!(line["peer_version"], "0.1");
         // Off the desk's network, it does not dial: away says more than the last refusal.
-        heard(&mut remote, &Event::Away);
+        link_heard(&mut remote, &Event::Away);
         assert_eq!(remote.state(), "away");
     }
 
@@ -1100,7 +1100,7 @@ mod tests {
     fn the_same_minor_linked_says_the_peer_s_version_on_each_side() {
         for mut parts in [Parts::desk(), Parts::remote()] {
             parts.link = Link::Linked;
-            heard(&mut parts, &linked_with("0.2.3"));
+            link_heard(&mut parts, &linked_with("0.2.3"));
             let line: serde_json::Value = serde_json::from_str(&parts.line()).unwrap();
             assert_eq!(line["state"], "linked");
             assert_eq!(line["peer_version"], "0.2.3");
@@ -1110,11 +1110,11 @@ mod tests {
     #[test]
     fn a_link_after_a_refusal_clears_it_and_a_drop_forgets_the_version() {
         let mut remote = Parts::remote();
-        heard(&mut remote, &refused("0.3.0"));
-        heard(&mut remote, &linked_with("0.2.0"));
+        link_heard(&mut remote, &refused("0.3.0"));
+        link_heard(&mut remote, &linked_with("0.2.0"));
         assert_eq!(remote.state(), "linked");
         assert_eq!(remote.peer_version.as_deref(), Some("0.2.0"));
-        heard(
+        link_heard(
             &mut remote,
             &Event::Disconnected(io::Error::other("invented")),
         );
@@ -1125,9 +1125,9 @@ mod tests {
     #[test]
     fn a_refusal_while_the_desk_is_linked_leaves_the_link_alone() {
         let mut desk = Parts::desk();
-        heard(&mut desk, &linked_with("0.2.0"));
+        link_heard(&mut desk, &linked_with("0.2.0"));
         desk.link = Link::Linked;
-        heard(&mut desk, &refused("0.3.0"));
+        link_heard(&mut desk, &refused("0.3.0"));
         assert_eq!(desk.state(), "linked");
         assert_eq!(desk.peer_version.as_deref(), Some("0.2.0"));
     }

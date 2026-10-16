@@ -275,7 +275,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let state = mode::events(store.dir());
             let followed = state.clone();
             tokio::spawn(print_events(log, "the remote", move |event| {
-                followed.update(|p| events::heard(p, event));
+                followed.update(|p| events::link_heard(p, event));
             }));
             tokio::spawn(events::follow_mic(state.clone(), routing.watch()));
             let (orders, orders_rx) = mpsc::unbounded_channel();
@@ -367,7 +367,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let (events, log) = mpsc::unbounded_channel();
             let followed = state.clone();
             tokio::spawn(print_events(log, "the desk", move |event| {
-                followed.update(|p| events::heard(p, event));
+                followed.update(|p| events::link_heard(p, event));
             }));
             let (peers, peers_rx) = mpsc::unbounded_channel();
             let (hypr_events, hypr_events_rx) = mpsc::unbounded_channel();
