@@ -37,13 +37,13 @@ A line is one JSON object on one line, UTF-8, ended by `\n`. For instance, on th
 mode runs (all names invented):
 
 ```json
-{"v":1,"role":"desk","state":"mode","peer":"FAR","mode":"office","monitors":["DP-2"],"modes":[{"name":"office","monitors":["DP-2"]}],"mic":"remote"}
+{"v":1,"role":"desk","state":"mode","peer":"FAR","peer_version":"0.2.3","mode":"office","monitors":["DP-2"],"modes":[{"name":"office","monitors":["DP-2"]}],"mic":"remote"}
 ```
 
 and on the remote machine meanwhile:
 
 ```json
-{"v":1,"role":"remote","state":"mode","peer":null,"mode":null,"monitors":["NAVETTE-1"],"modes":[],"mic":null}
+{"v":1,"role":"remote","state":"mode","peer":null,"peer_version":"0.2.0","mode":null,"monitors":["NAVETTE-1"],"modes":[],"mic":null}
 ```
 
 The stream ends (end of file) when `serve` or `agent` stops. It also ends for one reader:
@@ -68,6 +68,7 @@ Every line has every field below, on both machines; a field that does not apply 
 | `role` | `"desk"` | `"remote"` |
 | `state` | [where it stands](#state) | the same |
 | `peer` | the remote machine's label: `remote_label` of `mode.conf` (the key before any section), `"REMOTE"` without one | `null`: the desk does not say its label over the link yet; a later version will |
+| `peer_version` | the remote machine's Navette version, as its hello said it: while linked (the same minor as this machine's, perhaps another patch: a shell may say "one version behind"), and while `incompatible`; `"0.1"` for any 0.1.x, which does not say its patch; `null` otherwise | the desk's, the same way |
 | `mode` | the name of the mode running, starting or stopping; `null` for the unnamed mode (the one a `monitor =` before any `[section]` defines, alone or beside named modes), and with no mode | `null`: the desk does not say the mode's name over the link |
 | `monitors` | the desk's monitors the mode gives, left to right; `[]` with no mode | the outputs the remote machine makes for the desk (`NAVETTE-1`, ...), left to right; `[]` with no mode |
 | `modes` | every mode `mode.conf` defines, as `[{"name": ..., "monitors": [...]}]`, the unnamed one with `"name": null`; a mode the file gets wrong is left out; without the file, or with a file that cannot be read at all (a broken `[section]` line, say), `[]` | `[]` |
@@ -89,6 +90,7 @@ On the desk:
 | `starting` | a mode was asked for and passed its checks; the desk waits for the remote machine to make its outputs |
 | `mode` | a mode runs: `mode` and `monitors` say which |
 | `stopping` | the desk is giving the mode's monitors back, however the mode ends: `mode stop`, the link dropping, a failure, or a switch to another mode |
+| `incompatible` | the remote machine dialed, but runs another minor version: `peer_version` says which ([what a version promises](versions.md)). It stays until a link comes up |
 
 On the remote machine:
 
@@ -99,6 +101,7 @@ On the remote machine:
 | `linked` | linked to the desk, no mode runs |
 | `starting` | the desk asked for a mode; the agent is making its outputs |
 | `mode` | the desk drives the outputs in `monitors` |
+| `incompatible` | the desk runs another minor version: `peer_version` says which. The agent dials again once a minute, on the desk's network only; off it, the state is `away` |
 
 Some sequences, as a reader sees them:
 
@@ -107,7 +110,10 @@ Some sequences, as a reader sees them:
 - a switch from one mode to another, on the desk: `mode` → `stopping` → `starting` → `mode`;
 - a start the remote machine cannot make: `starting` → `stopping` → `linked` on the desk,
   `starting` → `linked` on the remote machine;
-- remote machine: `away` → `dialing` → `linked` → `starting` → `mode` → `linked`.
+- remote machine: `away` → `dialing` → `linked` → `starting` → `mode` → `linked`;
+- one machine updated to a new minor, the other not: `waiting` → `incompatible` on the desk,
+  `dialing` → `incompatible` on the remote machine; once the other is updated too, `linked` on
+  both.
 
 A start refused by its checks (no link, an unknown monitor, a broken `mode.conf`) changes
 nothing, and says nothing.
@@ -128,9 +134,7 @@ The desk's mic goes to one machine at a time ([the mic](mic.md)):
 - **Ignore the fields you do not know.** A later version may add some.
 - **Ignore, or show as they are, the values you do not know**, in `state`, `mic`, `role` or any
   other field whose values are listed here. A new state must not break a bar: show it as text,
-  and keep the last known style if you like. One already foreseen is a state for a link that
-  refuses the other machine's version, with a field naming that version, so the shell can say
-  which machine to update.
+  and keep the last known style if you like.
 - Do not depend on the order of the fields or on spacing: parse the JSON.
 - A line that does not start with `{` is an answer to a command (below), never a state.
 
@@ -200,9 +204,10 @@ one passes through:
 | `starting` | `starting` | Starting mode office on DP-2 (on the remote machine: Making NAVETTE-1 for the desk) |
 | `mode` | the mode's name, or `mode` | Mode office runs on DP-2; mic: remote (on the remote machine: The desk drives NAVETTE-1) |
 | `stopping` | `stopping` | Giving DP-2 back |
+| `incompatible` | `incompatible` | FAR runs Navette 0.3.0, another minor version: update the older machine (on the remote machine: The desk runs ...) |
 | another | the state | the state |
 
-FAR, office and DP-2 stand for the line's `peer`, `mode` and `monitors`. A Waybar module that
+FAR, 0.3.0, office and DP-2 stand for the line's `peer`, `peer_version`, `mode` and `monitors`. A Waybar module that
 shows it on either machine, and toggles the mic on a click (refused on the remote machine):
 
 ```jsonc
@@ -231,7 +236,8 @@ all is an error here, as with `navette mode list`: the command says why on stder
 
 ### What stays as it was
 
-`navette status`, `navette mic status|watch [--json]` (the mic alone, in its own Waybar shape),
+`navette status` (which now also says, on the desk, that the remote machine is refused for its
+version and which machine to update), `navette mic status|watch [--json]` (the mic alone, in its own Waybar shape),
 and the sockets behind `navette mode` and `navette mic` (`control.sock`, `mic.sock`) work as
 before: they read the same state, and a program written for them needs no change.
 
