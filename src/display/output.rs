@@ -176,7 +176,7 @@ pub fn follow_cursor(hypr: &dyn Hypr) -> io::Result<()> {
 }
 
 /// Whether `m` holds the layout's point (`x`, `y`).
-fn covers(m: &Monitor, x: f64, y: f64) -> bool {
+pub fn covers(m: &Monitor, x: f64, y: f64) -> bool {
     let width = logical_width(m.width, m.height, m.transform, m.scale);
     let height = logical_width(m.height, m.width, m.transform, m.scale);
     let (left, top) = (f64::from(m.x), f64::from(m.y));

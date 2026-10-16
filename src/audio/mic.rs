@@ -129,12 +129,13 @@ struct Away<G: Graph> {
 
 impl<G: Graph> HomeMic<G> {
     /// Opens the mic home's apps have now and sends it to the remote machine, its frames to
-    /// `remote_machine` under `session`.
+    /// `remote_machine` under `session`, or keeps it home unless `remote`.
     pub fn start(
         graph: G,
         saved: Saved,
         remote_machine: mpsc::Sender<Message>,
         session: u32,
+        remote: bool,
     ) -> io::Result<Self> {
         // Named, not followed: the default goes silent while the mic is away.
         let mic = graph
@@ -156,7 +157,7 @@ impl<G: Graph> HomeMic<G> {
             mic,
             sending,
         };
-        home_mic.send_to(true)?;
+        home_mic.send_to(remote)?;
         Ok(home_mic)
     }
 
@@ -399,7 +400,7 @@ mod tests {
         home_graph.state().default_source = Some(DefaultNode::named("desk-mic"));
         let (_home_tmp, home_saved) = super::super::tests::saved();
         let to_remote = home_peer.to_peer.clone();
-        let _mic = HomeMic::start(home_graph.clone(), home_saved, to_remote, 3).unwrap();
+        let _mic = HomeMic::start(home_graph.clone(), home_saved, to_remote, 3, true).unwrap();
         speak(&home_graph, 20);
         assert!(
             heard(&remote_graph).await,
@@ -419,7 +420,7 @@ mod tests {
         graph.state().default_source = Some(DefaultNode::named("desk-mic"));
         let (tmp, saved) = saved();
         let (to_remote, frames) = mpsc::channel(super::super::QUEUE);
-        let mic = HomeMic::start(graph.clone(), saved.clone(), to_remote, 1).unwrap();
+        let mic = HomeMic::start(graph.clone(), saved.clone(), to_remote, 1, true).unwrap();
         (graph, tmp, saved, mic, frames)
     }
 
@@ -524,7 +525,7 @@ mod tests {
     fn a_home_with_no_mic_says_so() {
         let (_tmp, saved) = saved();
         let (to_remote, _frames) = mpsc::channel(super::super::QUEUE);
-        let error = HomeMic::start(FakeGraph::default(), saved, to_remote, 1)
+        let error = HomeMic::start(FakeGraph::default(), saved, to_remote, 1, true)
             .err()
             .unwrap();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);

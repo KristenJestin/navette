@@ -2,7 +2,8 @@
 
 The home mic serves one machine at a time. When a mode starts it goes to the remote machine;
 when the mode stops it comes back home. While the mode runs, a hotkey, `navette mic` or a bar
-switches it either way. It needs `navette serve --audio`, the switch that plays the remote
+switches it either way, or, with `mic = follow`, it goes to the side that has the keyboard
+([following the keyboard](#following-the-keyboard)). It needs `navette serve --audio`, the switch that plays the remote
 machine's sound at home ([the sound](audio.md)).
 
 - **On the remote machine**, the agent opens a virtual source, *Home mic (Navette)*
@@ -61,6 +62,32 @@ the same keys, so Navette disables its own instead; `hyprctl binds` lists the di
 the next reload. A bind of the user's on the same keys still fires as well: pick free keys. Keys
 Hyprland refuses do not stop the mode: it runs without the hotkey, `navette serve` says why, and
 the bar and `navette mic` still switch the mic.
+
+## Following the keyboard
+
+By default the mic stays where it was sent (`mic = fixed`): reading a message on the other
+machine mid-call does not cut the call. With `mic = follow` in `mode.conf`, global or per
+`[name]` section like `release`, the side that has the keyboard has the mic:
+
+```
+[call]
+monitor = DP-2
+mic = follow
+```
+
+- When the mode starts, the mic goes where the keyboard is: to the remote machine when the
+  pointer is over a monitor the mode gives, home otherwise. It comes home when the mode stops.
+- Each time the keyboard changes side, the pointer going onto a reserved monitor or back onto a
+  home one, or the release hotkey giving it back to home, the mic goes there, as the hotkey
+  sends it: the corners say `Mic → remote` or `Mic → home`, and a switch that cannot happen says
+  `Mic not switched: <why>`.
+- It goes once the keyboard has stayed on its new side for half a second: a pointer only
+  passing over a monitor on its way to another moves nothing. The mic never switches to the
+  side that has it already, and one switch is never queued behind another.
+- The hotkey, the corner's button and `navette mic` still switch it by hand; the next change of
+  side takes over again.
+- Without `navette serve --audio` there is no mic, and the key changes nothing. Any other value
+  than `fixed` or `follow` stops the start with a message, and nothing is changed.
 
 ## Saying where it went
 
@@ -132,6 +159,10 @@ never is.
    the mic is remote, and the home mic again while it is home; a home app recording from the
    default hears silence, then the mic.
 6. `navette mode stop`: on the laptop, `wpctl status` shows the previous default source again.
+7. With `mic = follow` in the mode, start it again and move the pointer from a home monitor
+   onto a reserved one and back, stopping on each: the corner's check follows the pointer,
+   half a second after it stops. Sweep the pointer across a monitor quickly: the mic does not
+   switch.
 
 Between two private PipeWire instances, with the speakers' monitor looped back into a virtual
 mic as the echo, the canceller took the echo down by 6 to 20 dB once it had adapted, after some

@@ -1,7 +1,7 @@
 //! `mode.conf`: the modes the maintainer defines at home, each naming the home monitors the
 //! remote machine takes. Keys before any `[section]` are the default of every mode, and a
 //! `monitor` among them is the one unnamed mode, so a file written before modes had names keeps
-//! working. A `[name]` section is a named mode: its `monitor`, and any of `release`,
+//! working. A `[name]` section is a named mode: its `monitor`, and any of `release`, `mic`,
 //! `mic_hotkey`, `remote_label`, `local_label`, `remote_bar`, `local_bar` it wants other than the
 //! default.
 //! `#` starts a comment.
@@ -34,6 +34,8 @@ pub struct Mode {
     /// What the file says that is no longer read, on one line.
     pub notice: Option<String>,
     pub mic_hotkey: String,
+    /// `mic = follow`: the mic goes to the side that has the keyboard.
+    pub mic_follows: bool,
     pub look: Look,
 }
 
@@ -227,6 +229,15 @@ impl File {
             .filter(|keys| !keys.is_empty())
             .unwrap_or(MIC_HOTKEY)
             .to_string();
+        let mic_follows = match value("mic").unwrap_or_default() {
+            "" | "fixed" => false,
+            "follow" => true,
+            other => {
+                return Err(invalid(format!(
+                    "{path}: `mic = {other}`: `fixed` or `follow`; nothing was changed"
+                )));
+            }
+        };
         let fallback = Look::default();
         let label = |key: &str, found: Option<&str>, default: String| match found
             .filter(|v| !v.is_empty())
@@ -271,6 +282,7 @@ impl File {
             release,
             notice,
             mic_hotkey,
+            mic_follows,
             look,
         })
     }
@@ -751,6 +763,32 @@ mod tests {
             mode("monitor = DP-2\nrelease =\n", None).unwrap().release,
             None
         );
+    }
+
+    #[test]
+    fn the_mic_stays_fixed_by_default() {
+        assert!(!mode("monitor = DP-2\n", None).unwrap().mic_follows);
+        assert!(!mode("monitor = DP-2\nmic =\n", None).unwrap().mic_follows);
+    }
+
+    #[test]
+    fn mic_fixed_or_follow_is_read_globally_and_per_section() {
+        let text = "mic = follow\n\
+                    [office]\nmonitor = DP-1\n\
+                    [call]\nmonitor = DP-2\nmic = fixed\n";
+        assert!(mode(text, Some("office")).unwrap().mic_follows);
+        assert!(!mode(text, Some("call")).unwrap().mic_follows);
+        let text = "[office]\nmonitor = DP-1\nmic = follow\n";
+        assert!(mode(text, Some("office")).unwrap().mic_follows);
+    }
+
+    #[test]
+    fn an_unknown_mic_value_is_refused_naming_the_key() {
+        let error = mode("monitor = DP-2\nmic = always\n", None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let text = error.to_string();
+        assert!(text.contains("`mic = always`"), "{text}");
+        assert!(text.contains("`fixed` or `follow`"), "{text}");
     }
 
     #[test]
