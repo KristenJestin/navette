@@ -26,7 +26,10 @@ check() { # <subject> <where> [<squash suffix>]
 if [ "${1:-}" = "--range" ]; then
   status=0
   while read -r sha; do
-    check "$(git log -1 --format=%s "$sha")" "${sha:0:8}" || status=1
+    subject=$(git log -1 --format=%s "$sha")
+    # GitHub appends " (#n)" to a single-commit squash: judge the subject the author wrote.
+    [[ $subject =~ ^(.*)\ \(#[0-9]+\)$ ]] && subject=${BASH_REMATCH[1]}
+    check "$subject" "${sha:0:8}" || status=1
   done < <(git rev-list "$2")
   exit $status
 fi
