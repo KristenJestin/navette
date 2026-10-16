@@ -433,6 +433,7 @@ pub async fn watch(
     };
     loop {
         // Never written to: the socket stays open both ways for as long as it reads.
+        let mut heard = false;
         if let Ok(stream) = UnixStream::connect(path).await {
             let mut lines = BufReader::new(stream).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -440,11 +441,17 @@ pub async fn watch(
                 if !line.starts_with('{') {
                     continue;
                 }
+                heard = true;
                 tell(&line)?;
                 if once {
                     return Ok(());
                 }
             }
+        }
+        // Let go after a state, for falling behind or by a stop: connect again at once, and
+        // say `off` only if nothing answers.
+        if heard && !once {
+            continue;
         }
         tell(OFF)?;
         if once {
@@ -1245,5 +1252,33 @@ mod tests {
             "let go after {:?}",
             begun.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn watch_dropped_by_the_socket_reconnects_at_once_without_saying_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = listen(&path).unwrap();
+        let (first, second) = (linked_desk().line(), Parts::desk().line());
+        let lines = [first.clone(), second.clone()];
+        tokio::spawn(async move {
+            // The first connection is let go after its line, as a reader that fell behind.
+            let mut kept = Vec::new();
+            for line in lines {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .unwrap();
+                kept.push(stream);
+                kept.remove(0);
+            }
+            std::future::pending::<()>().await;
+        });
+        let (_task, mut hears) = watching(&path, false);
+        assert_eq!(heard(&mut hears).await, first);
+        assert_eq!(heard(&mut hears).await, second);
+        tokio::time::sleep(RETRY * 3).await;
+        assert!(hears.try_recv().is_err());
     }
 }
