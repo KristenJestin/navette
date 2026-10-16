@@ -129,7 +129,7 @@ jobs:
           for _ in range(3):
               threading.Thread(target=churn, daemon=True).start()
           # Reads like Rust's read_to_string on a proc file: a small probe, then growing chunks.
-          def table():
+          def chunked():
               fd = os.open("/proc/net/tcp", os.O_RDONLY)
               out, size = b"", 32
               while True:
@@ -140,13 +140,24 @@ jobs:
                   size = min(size * 2, 8192)
               os.close(fd)
               return out.decode().splitlines()[1:]
-          dup = reads = 0
-          end = time.time() + 120
-          while time.time() < end:
-              rows = table()
-              reads += 1
-              inodes = [r.split()[9] for r in rows if r.split()[3] == "01" and r.split()[9] != "0"]
-              if len(inodes) != len(set(inodes)):
-                  dup += 1
-          print(f"reads: {reads}, reads with a repeated established socket: {dup}")
+          # The whole table in one read(): one pass of the kernel's iterator.
+          def whole():
+              fd = os.open("/proc/net/tcp", os.O_RDONLY)
+              out = os.read(fd, 1 << 24)
+              assert len(out) < (1 << 24) - 1
+              os.close(fd)
+              return out.decode().splitlines()[1:]
+          mine = {str(os.fstat(s.fileno()).st_ino) for s in held}
+          for name, table in (("chunked", chunked), ("whole", whole)):
+              dup = missing = reads = 0
+              end = time.time() + 60
+              while time.time() < end:
+                  rows = [r.split() for r in table()]
+                  reads += 1
+                  inodes = [r[9] for r in rows if r[3] == "01" and r[9] != "0"]
+                  if len(inodes) != len(set(inodes)):
+                      dup += 1
+                  if not mine <= set(inodes):
+                      missing += 1
+              print(f"{name}: reads {reads}, with a repeated socket {dup}, with a held socket missing {missing}")
           PY
