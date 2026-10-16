@@ -35,7 +35,8 @@ While a mode runs, `navette serve` and `navette agent` each run one clipboard br
 link, whatever the monitors given: copy on one machine, paste on the other, text and files,
 both ways. It rides the link after the hello, in gliff's framing; the transfer is gliff's
 engine, which is lazy (nothing moves until an application pastes), typed, chunked, and
-refuses a request against an offer that a newer copy has replaced.
+refuses a request against an offer that a newer copy has replaced. Files go further: they
+cross only when an application reads them, through a virtual folder (below).
 
 - **Nothing crosses outside a mode.** The link stays up between two modes, so that a start is
   quick, but each machine's display says on it whether a mode runs: home once the remote
@@ -72,8 +73,46 @@ refuses a request against an offer that a newer copy has replaced.
   (`text/plain` and its charsets, `UTF8_STRING`, `STRING`, `TEXT`), `text/html`, `image/*`
   and the file lists. The types an application keeps for its own instances (a token, a
   process id) stay on their machine, where they mean something.
-- **Pasted files** go in a private temporary folder, not in the Downloads: `navette/clipboard`
-  in `$XDG_RUNTIME_DIR` (per user, mode 0700, cleared at logout), else `navette-clipboard-<uid>`
+- **The virtual folder.** The machine that receives a copy of files shows them in a folder it
+  mounts itself with FUSE, `navette/files` in `$XDG_RUNTIME_DIR`, the way remote desktop
+  clients do it. A paste of files (and the text of a copy of files) gets their paths there at
+  once, `<offer number>/<name>`, folders as their tree: nothing crosses, so a file manager
+  that reads every new copy to set its Paste button moves no byte, and never waits. A file's
+  bytes are fetched from the other machine only when an application reads it: the first read
+  fetches it whole, in order, into a cache file, and each read waits for its part. Reading the
+  same file again fetches nothing. The folder is read-only and the user's alone; a read waits
+  on a thread of its own, never on the link's.
+  - The bytes read go to disk, not memory: `navette/clipboard` in `$XDG_CACHE_HOME` (else
+    `~/.cache`), a folder made private to the user (mode 0700; a link put in its place is
+    refused), since a runtime folder is a tmpfs of a few GB that a large file would fill.
+    Each cache file is removed from the folder as soon as it is made, so nothing there has a
+    name and nothing stays: its bytes go when their copy goes, or when `navette` ends, however
+    it ends; the folder is emptied again at each start. A file read takes its size there
+    while its copy is shown, and the room for it and for the files being fetched beside it is
+    checked before it is fetched.
+  - A newer copy does not stop a transfer: an older copy stays while an application holds one
+    of its files or folders open, and while its transfer is under way: from the first read of
+    one of its files until it is cancelled, or until every file read is whole and nothing of
+    it was opened for 30 s (a file manager copying a folder opens its files one after the
+    other, with nothing open between two). The machine that copied serves the files of its
+    last 8 copies of files, for that. Several transfers can run at once.
+  - A file closed by its last reader before all its bytes came stops its fetch, and what came
+    of it goes: a file manager that looks at the first bytes of each file of the folder costs
+    a few chunks, not the files. A fetch that fails (the other machine stopped it, or sent
+    less than it said) keeps nothing either. In both cases a later read fetches the file
+    again. A copy whose reads fail says `Paste failed` once, not at each read.
+  - It is mounted when a mode starts and unmounted when it stops, when the link ends and when
+    `navette` exits; a read in progress then fails. A mount left by a `navette` that died is
+    unmounted at the next start.
+  - It needs nothing at build time (no libfuse: the `fuser` crate mounts through
+    `fusermount3`), and at run time `/dev/fuse` and `fusermount3` (setuid, from `fuse3`), as
+    the user, with no root and no change to the system; a setuid helper is what
+    `NoNewPrivileges=` forbids, so the agent's unit does not set it. Where it cannot be
+    mounted (no FUSE, or no `$XDG_RUNTIME_DIR`), the journal says so once, and a paste of
+    files fetches them all first, as below.
+- **Pasted files**, without the virtual folder, go in a private temporary folder, not in the
+  Downloads: `navette/clipboard` in `$XDG_RUNTIME_DIR` (per user, mode 0700, cleared at
+  logout), else `navette-clipboard-<uid>`
   in the temporary directory, mode 0700 as well, and refused if it is a link or belongs to
   another user. A file manager reads every new copy at once, so files come in with no paste;
   here they pile up nowhere the user keeps things, and a paste copies them from there to where
@@ -88,14 +127,15 @@ refuses a request against an offer that a newer copy has replaced.
   replacing, a file is linked in then unlinked, a folder replaces an empty one made for it. The
   application that pasted gets their paths once they are all complete (the text types of the
   copy name the same paths). A second paste of the same copy points at the same files.
-- **The same copy offered again** points at the same files too. The machine that copied offers
+- **The same copy offered again** points at the same files too (in the virtual folder: the
+  same paths, and what was read of them stays). The machine that copied offers
   files unchanged since its last copy of files (the same files, sizes and modification times)
   under the same offer number; the machine that fetched that copy answers with the files it
   received, while they are all still in the folder, and keeps them. A file changed since is
   fetched again. A new link starts with an empty folder, so a copy offered again on it is
   fetched again.
-- **A file manager that stops waiting.** A file manager that reads every new selection at
-  once gives up when the answer is slow: one waits two seconds for each of the two file-list
+- **A file manager that stops waiting** (without the virtual folder). A file manager that
+  reads every new selection at once gives up when the answer is slow: one waits two seconds for each of the two file-list
   types, so about four seconds in all, which a large paste over the LAN outlasts (with a mode
   running, the picture leaves the clipboard a few megabytes a second). It then holds a copy
   with no file in it, and its paste does nothing. When the files are in and the application
@@ -107,10 +147,14 @@ refuses a request against an offer that a newer copy has replaced.
   a large file never holds a frame back for longer than the chunk already on the line. When
   the picture keeps the link busy, the clipboard still gets one message in every eight frames,
   so a paste never stalls into gliff's 30 s idle timeout.
-- **Progress and cancel.** While files cross, either way, home's corners show a bar with what
-  is left ([the corner](mode.md#the-corner)); a click on it stops every transfer: the half
+- **Progress and cancel.** While files cross, either way, home's corners show a bar per
+  transfer with what is left ([the corner](mode.md#the-corner)); a click on one stops that
+  transfer, the others going on: the half
   of a paste already written is removed, nothing is left behind, and the copy whose paste was
-  stopped serves no more files (copy again to paste it). The bar loses a paste served from
+  stopped serves no more files (copy again to paste it). Through the virtual folder, a
+  transfer is the reads of one copy's files: its bar counts the bytes read of all of them
+  over their total, and a cancel fails the reads of that copy, those waiting and those to
+  come. The bar loses a paste served from
   here when its last byte goes, when a file is not the size the copy said, or when the other
   machine asks for no next file within 30 s. The machine that pasted says in a desktop
   notification when a paste did not end well: `Paste failed` with why (no room, the other
@@ -121,7 +165,7 @@ refuses a request against an offer that a newer copy has replaced.
   shows them crossing.
 - **When the link drops**, every paste and transfer in flight ends at once, and what it had
   written is removed; the files already pasted stay.
-- **When a newer copy replaces the one being pasted**, the paste of the older one stops, and
+- **When a newer copy replaces the one being pasted** (without the virtual folder), the paste of the older one stops, and
   what it had written is removed: a large file of a copy nobody holds any more never competes
   with the new one for the link. The application that pasted it gets nothing.
 - **The journal** follows each copy by its offer number, one line per step and on both

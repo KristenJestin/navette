@@ -13,11 +13,14 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use gliff_proto::ClipboardFile;
 use gliff_proto::clipboard::{MAX_FILE_ENTRIES, MAX_FILE_PATH_BYTES, safe_relative_path};
 use gliff_transport::clipboard::files::LocalFiles;
+
+use super::vfs::{Fuse, Mounter};
 
 /// What a copy of files offers the peer, and what it leaves out.
 #[derive(Debug, Default)]
@@ -138,72 +141,87 @@ pub struct Inbox {
     pub dir: PathBuf,
     /// The bytes free for the user on the disk that holds a folder.
     pub free: fn(&Path) -> io::Result<u64>,
+    /// The virtual folder where the peer's files show, fetched as they are read; with none,
+    /// or when it cannot be mounted, a paste fetches them all into `dir` first.
+    pub mount: Option<Arc<dyn Mounter>>,
+    /// Where the bytes of the files read through the virtual folder are kept while their
+    /// copy is there: on disk, since a file can be larger than the memory a runtime folder
+    /// holds. Each file there is unlinked as soon as it is made, and goes with its copy.
+    pub cache: PathBuf,
 }
 
 impl Inbox {
     pub fn new(dir: PathBuf) -> Self {
         Self {
+            cache: dir.clone(),
             dir,
             free: free_space,
+            mount: None,
         }
     }
 
     /// The machine's own: `navette/clipboard` in `$XDG_RUNTIME_DIR` (per user, 0700, cleared at
-    /// logout), else a folder of the user's in the temporary directory.
+    /// logout), else a folder of the user's in the temporary directory. The virtual folder is
+    /// `navette/files` beside it, in `$XDG_RUNTIME_DIR` only: a mount point in the shared
+    /// temporary directory is not this user's alone. The bytes read through it are kept in
+    /// `navette/clipboard` of the user's cache folder, on disk.
     pub fn of_this_user() -> Self {
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|d| !d.is_empty())
             .map(PathBuf::from);
-        Self::new(folder_in(runtime.as_deref(), &std::env::temp_dir(), euid()))
+        let mount = runtime
+            .as_deref()
+            .filter(|runtime| runtime.is_absolute())
+            .map(|runtime| {
+                let fuse = Fuse::at(runtime.join("navette").join("files"));
+                Arc::new(fuse) as Arc<dyn Mounter>
+            });
+        let dir = folder_in(runtime.as_deref(), &std::env::temp_dir(), euid());
+        let env = |name| std::env::var_os(name).map(PathBuf::from);
+        let cache = cache_in(env("XDG_CACHE_HOME").as_deref(), env("HOME").as_deref());
+        Self {
+            mount,
+            cache: cache.unwrap_or_else(|| dir.clone()),
+            ..Self::new(dir)
+        }
     }
 
     /// Makes the folder, the user's alone, or says why it cannot be trusted: the temporary
     /// directory is shared, so another user may have made the name first, or put a link there.
-    fn prepare(&self) -> io::Result<()> {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.dir)?;
-        let meta = std::fs::symlink_metadata(&self.dir)?;
-        if !meta.is_dir() || meta.uid() != euid() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{} is not a folder of this user", self.dir.display()),
-            ));
-        }
-        if meta.mode() & 0o077 != 0 {
-            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-        Ok(())
+    pub fn prepare(&self) -> io::Result<()> {
+        private(&self.dir)
+    }
+
+    /// Makes the cache folder, the user's alone, or says why it cannot be trusted.
+    pub fn prepare_cache(&self) -> io::Result<()> {
+        private(&self.cache)
     }
 
     /// Removes everything in the folder; the folder itself stays. Links are removed, never
     /// followed.
     pub fn empty(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let removed = match entry.file_type() {
-                Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
-                _ => std::fs::remove_file(&path),
-            };
-            if let Err(e) = removed
-                && e.kind() != io::ErrorKind::NotFound
-            {
-                eprintln!(
-                    "navette: clipboard: {} was not removed: {e}",
-                    path.display()
-                );
-            }
-        }
+        empty(&self.dir);
+    }
+
+    /// Removes what a process that died left in the cache folder.
+    pub fn empty_cache(&self) {
+        empty(&self.cache);
     }
 
     /// Room for `bytes` more, or why not.
     pub fn check_room(&self, bytes: u64) -> io::Result<()> {
         self.prepare()?;
-        let free = (self.free)(&self.dir)?;
+        self.room(&self.dir, bytes)
+    }
+
+    /// Room in the cache folder for `bytes` more, or why not.
+    pub fn check_cache_room(&self, bytes: u64) -> io::Result<()> {
+        self.prepare_cache()?;
+        self.room(&self.cache, bytes)
+    }
+
+    fn room(&self, dir: &Path, bytes: u64) -> io::Result<()> {
+        let free = (self.free)(dir)?;
         if free < bytes {
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
@@ -214,6 +232,48 @@ impl Inbox {
     }
 }
 
+/// Makes the folder `dir`, the user's alone, or says why it cannot be trusted: another user
+/// may have made the name first, or put a link there.
+fn private(dir: &Path) -> io::Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.uid() != euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a folder of this user", dir.display()),
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Removes everything in `dir`; the folder itself stays. Links are removed, never followed.
+fn empty(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        if let Err(e) = removed
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "navette: clipboard: {} was not removed: {e}",
+                path.display()
+            );
+        }
+    }
+}
+
 /// The folder under `runtime` (`$XDG_RUNTIME_DIR`) when it is an absolute path, else one named
 /// for the user in `temp`.
 fn folder_in(runtime: Option<&Path>, temp: &Path, uid: u32) -> PathBuf {
@@ -221,6 +281,17 @@ fn folder_in(runtime: Option<&Path>, temp: &Path, uid: u32) -> PathBuf {
         Some(runtime) if runtime.is_absolute() => runtime.join("navette").join("clipboard"),
         _ => temp.join(format!("navette-clipboard-{uid}")),
     }
+}
+
+/// The cache folder under `cache` (`$XDG_CACHE_HOME`) when it is an absolute path, else under
+/// `.cache` of `home`; none without either.
+fn cache_in(cache: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+    let cache = match (cache, home) {
+        (Some(cache), _) if cache.is_absolute() => cache.to_owned(),
+        (_, Some(home)) if home.is_absolute() => home.join(".cache"),
+        _ => return None,
+    };
+    Some(cache.join("navette").join("clipboard"))
 }
 
 fn euid() -> u32 {
@@ -632,8 +703,8 @@ mod tests {
     fn too_little_room_is_said_before_anything_is_written() {
         let tmp = tempfile::tempdir().unwrap();
         let inbox = Inbox {
-            dir: tmp.path().join("Navette"),
             free: |_| Ok(1 << 20),
+            ..Inbox::new(tmp.path().join("Navette"))
         };
         let error = inbox.check_room(2 << 30).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
@@ -671,6 +742,62 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         inbox.check_room(1).unwrap();
         assert_eq!(dir.metadata().unwrap().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn the_read_cache_is_in_the_user_s_cache_folder_on_disk() {
+        let cache = cache_in(
+            Some(Path::new("/var/cache/kim")),
+            Some(Path::new("/home/kim")),
+        );
+        assert_eq!(
+            cache.unwrap(),
+            Path::new("/var/cache/kim/navette/clipboard")
+        );
+    }
+
+    #[test]
+    fn without_xdg_cache_home_the_read_cache_is_in_the_home_s_cache_folder() {
+        let cache = cache_in(None, Some(Path::new("/home/kim")));
+        assert_eq!(
+            cache.unwrap(),
+            Path::new("/home/kim/.cache/navette/clipboard")
+        );
+        // A relative one is no place to trust.
+        assert_eq!(
+            cache_in(Some(Path::new("cache")), Some(Path::new("/home/kim"))).unwrap(),
+            Path::new("/home/kim/.cache/navette/clipboard")
+        );
+        assert_eq!(cache_in(None, Some(Path::new("home"))), None);
+    }
+
+    #[test]
+    fn the_read_cache_folder_is_made_private_and_emptied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("navette").join("clipboard");
+        let inbox = Inbox {
+            cache: cache.clone(),
+            ..Inbox::new(tmp.path().join("inbox"))
+        };
+        inbox.check_cache_room(1).unwrap();
+        assert_eq!(cache.metadata().unwrap().mode() & 0o777, 0o700);
+        std::fs::write(cache.join(".navette-read-1-0"), b"left by a crash").unwrap();
+        inbox.empty_cache();
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_read_cache_folder_that_is_a_link_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let cache = tmp.path().join("clipboard");
+        std::os::unix::fs::symlink(&elsewhere, &cache).unwrap();
+        let inbox = Inbox {
+            cache,
+            ..Inbox::new(tmp.path().join("inbox"))
+        };
+        assert!(inbox.check_cache_room(1).is_err());
     }
 
     #[test]

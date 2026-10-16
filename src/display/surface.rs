@@ -1698,12 +1698,16 @@ mod tests {
         let cancels = board.cancels();
         let feed = Feed::new(board, None, Default::default());
         let mut corner = feed.corner(Side::Remote);
-        let files = crate::clipboard::progress::Bar { done: 1, total: 4 };
+        let files = crate::clipboard::progress::Bar {
+            id: 1,
+            done: 1,
+            total: 4,
+        };
         corner.update(
-            crate::corner::Update::Files(Some(files)),
+            crate::corner::Update::Files(vec![files]),
             std::time::Instant::now(),
         );
-        let bar = corner.bar().unwrap();
+        let (bar, _) = corner.bars()[0];
         let queue = input::Queue::default();
         let mut capture = Capture::new(queue.clone(), None);
         let mut hover = Hover::default();

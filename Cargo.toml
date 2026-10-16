@@ -13,6 +13,8 @@ path = "src/main.rs"
 bytes = "1"
 clap = { version = "4.6", features = ["derive", "env"] }
 drm-fourcc = "2"
+# The virtual folder of the received files: mounted through `fusermount3`, no libfuse.
+fuser = { version = "0.18", default-features = false }
 gliff-proto = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
 gliff-sw = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }
 gliff-transport = { git = "https://github.com/KristenJestin/navette-gliff", branch = "navette" }

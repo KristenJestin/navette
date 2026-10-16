@@ -140,10 +140,8 @@ impl Painter {
         buffer.attach_to(&self.surface).ok()?;
         self.viewport.set_destination(size.0 as i32, size.1 as i32);
         let region = Region::new(compositor).ok()?;
-        for area in [self.corner.button(), self.corner.bar()]
-            .into_iter()
-            .flatten()
-        {
+        let bars = self.corner.bars().into_iter().map(|(area, _)| area);
+        for area in self.corner.button().into_iter().chain(bars) {
             region.add(
                 area.x as i32,
                 area.y as i32,
@@ -679,13 +677,12 @@ mod tests {
         sizes.push(corner.size(now));
         corner.update(Update::Say("x".repeat(200)), now);
         sizes.push(corner.size(now));
-        corner.update(
-            Update::Files(Some(Bar {
-                done: 1,
-                total: u64::MAX,
-            })),
-            now,
-        );
+        let bar = Bar {
+            id: 1,
+            done: 1,
+            total: u64::MAX,
+        };
+        corner.update(Update::Files(vec![bar; 5]), now);
         sizes.push(corner.size(now));
         assert!(sizes.windows(2).any(|w| w[0] != w[1]), "the corner grows");
         assert_eq!(layer_size(&corner), first);
