@@ -1,17 +1,17 @@
-//! The agent's side of the display: on home's order, make the headless outputs and stream
-//! each; take them away when home says stop or the link drops. While a mode is active, a
+//! The agent's side of the display: on the desk's order, make the headless outputs and stream
+//! each; take them away when the desk says stop or the link drops. While a mode is active, a
 //! reload gets the monitor rules back and a Hyprland restart (or a vanished output) gets an
 //! output back.
 //!
 //! Each output lives on its own: its stream, its injector, its failures and its waits before
 //! it is started again. When one has failed [`ATTEMPTS`] times in a row, the whole mode ends:
-//! home cannot show a desk with a hole in it.
+//! the desk cannot show a desk with a hole in it.
 //!
 //! An output's start blocks (Hyprland requests, the encoder's and the capture's start), so it
 //! runs as a task while the loop goes on serving the outputs that run: one start at a time,
 //! leftmost first, as each output's place depends on the size of the ones left of it.
 //!
-//! Home's input is injected on an output while its stream runs: the injector starts and stops
+//! The desk's input is injected on an output while its stream runs: the injector starts and stops
 //! with the stream, so it always points at the output that is there, and it is gone (every key
 //! and button released) before the output is removed.
 
@@ -29,9 +29,11 @@ use tokio::sync::oneshot;
 use super::output;
 use super::stream::{self, Source};
 use crate::display::wire::{Display, Incoming, MAX_OUTPUTS, Msg, Outbox, OutputCopy, Peer};
+use crate::events::{Driven, Events, Phase};
 use crate::hypr::{self, Hypr};
 use crate::input::{self, Inject, Injectors};
 use crate::lid::{self, Logind};
+use crate::names::Names;
 use crate::notify::Notifier;
 
 /// The first wait before a lost stream is started again, doubled after each failure up to
@@ -42,7 +44,7 @@ const RETRY: Duration = if cfg!(test) {
     Duration::from_secs(1)
 };
 const LONGEST_WAIT: Duration = Duration::from_secs(30);
-/// Failures in a row before home is told the mode cannot go on: about a minute of waits, long
+/// Failures in a row before the desk is told the mode cannot go on: about a minute of waits, long
 /// enough for Hyprland to restart.
 const ATTEMPTS: u32 = 6;
 /// A stream that ran this long was not failing: the count starts again.
@@ -120,8 +122,10 @@ pub struct Ports {
     pub logind: Arc<dyn Logind>,
     pub lid_record: Option<std::path::PathBuf>,
     pub lid_poll: Duration,
-    /// Says, once each, that home started driving the outputs and stopped.
+    /// Says, once each, that the desk started driving the outputs and stopped.
     pub notifier: Arc<dyn Notifier>,
+    /// Where the agent stands, for `events.sock`: the outputs the desk drives.
+    pub events: Arc<Events>,
 }
 
 /// Puts the laptop's screen back if a record says the agent disabled it.
@@ -149,7 +153,7 @@ async fn restore_now(ports: &Ports) {
     }
 }
 
-/// What home said of its input, kept for the next injector: its keymap, each surface's size
+/// What the desk said of its input, kept for the next injector: its keymap, each surface's size
 /// and its locks.
 #[derive(Default)]
 struct Home {
@@ -158,7 +162,7 @@ struct Home {
     locked: Option<input::Event>,
 }
 
-/// An active mode: the copies asked for, in home's order, and each one's stream.
+/// An active mode: the copies asked for, in the desk's order, and each one's stream.
 struct Active {
     copies: Vec<OutputCopy>,
     /// The scale Hyprland chose for each output made, which places the ones right of it.
@@ -166,7 +170,7 @@ struct Active {
     caps: ClientCaps,
     outputs: Vec<Output>,
     told_no_input: bool,
-    /// Until every output has run once: home waits for its answer, and a failure ends it.
+    /// Until every output has run once: the desk waits for its answer, and a failure ends it.
     starting: bool,
     /// The output being started, and its start.
     up: Option<(usize, tokio::task::JoinHandle<io::Result<Running>>)>,
@@ -174,8 +178,11 @@ struct Active {
     lid: Option<lid::Watch>,
     /// The start's generation, said back in `Started` and `Failed`.
     generation: Option<u32>,
-    /// The outputs, once the user was told home drives them: told again when the mode stops.
+    /// The outputs, once the user was told the desk drives them: told again when the mode stops.
     told: Option<Vec<String>>,
+    /// The desk as the sentences put it (`the desk`, or its label), as told when the mode
+    /// started.
+    desk: String,
 }
 
 struct Output {
@@ -185,7 +192,7 @@ struct Output {
 }
 
 impl Active {
-    /// Gives output `index` its stream, its injector getting what home said of its surface
+    /// Gives output `index` its stream, its injector getting what the desk said of its surface
     /// and its locks, up to now, and its keymap if it changed since the injector was made.
     fn run(&mut self, index: usize, running: Running, home: &Home, outbox: &Outbox) {
         match &running.input {
@@ -280,7 +287,7 @@ struct Running {
     // Field order is drop order: the capture, then the injector, both before the output goes
     // (Hyprland 0.56 aborts when a cursor capture outlives its monitor).
     _stream: Box<dyn Send + Sync>,
-    /// Without input, the picture still runs: home is told why, once a mode.
+    /// Without input, the picture still runs: the desk is told why, once a mode.
     input: Result<Box<dyn Inject>, String>,
     /// The keymap the injector was made with: one said while it started comes after.
     keymap: Option<String>,
@@ -301,12 +308,16 @@ pub async fn serve_peer(
     let hypr = &ports.hypr;
     let mut active: Option<Active> = None;
     let mut home = Home::default();
+    // What the desk said it is called, if it did.
+    let mut desk = Names::default();
     let mut input_open = true;
+    let mut told = None;
     loop {
-        // The clipboard and the sound cross only while home's mode runs here.
+        // The clipboard and the sound cross only while the desk's mode runs here.
         let running = active.is_some();
         peer.mode
             .send_if_modified(|mode| std::mem::replace(mode, running) != running);
+        tell(ports, active.as_ref(), &mut told);
         let retry_at = active.as_ref().and_then(Active::retry_at);
         let had_mode = active.is_some();
         tokio::select! {
@@ -320,7 +331,8 @@ pub async fn serve_peer(
                     match start(copies, caps) {
                         Ok(mut mode) => {
                             mode.generation = generation;
-                            // Whatever home asks: one of the release before may say `Some(false)`.
+                            mode.desk = desk.the_desk();
+                            // Whatever the desk asks: one of the release before may say `Some(false)`.
                             mode.lid = watch_lid(ports, &peer.outbox);
                             mode.bring_up(0, ports, &home, &peer.outbox);
                             active = Some(mode);
@@ -332,6 +344,15 @@ pub async fn serve_peer(
                     }
                 }
                 Some(Incoming::Display(Display::Stop)) => stop(&mut active, ports).await,
+                Some(Incoming::Desk(label)) => {
+                    desk = Names::new(Some(label.as_str()), None);
+                    if let Some(mode) = &mut active {
+                        mode.desk = desk.the_desk();
+                    }
+                    // None for an empty label, which names nothing.
+                    let peer = Some(label).filter(|label| !label.is_empty());
+                    ports.events.update(|p| p.peer = peer);
+                }
                 Some(Incoming::Feedback { output, msg }) => {
                     if let Some(running) = active.as_ref().and_then(|a| a.running(output.into())) {
                         let _ = running.feedback.send(msg);
@@ -341,9 +362,9 @@ pub async fn serve_peer(
             },
             event = peer.input.from_peer.next(), if input_open => match event {
                 // A compositor's keymap is compiled whole; an `include` would have this
-                // machine's xkbcommon read files of its own for home.
+                // machine's xkbcommon read files of its own for the desk.
                 Some((_, input::Event::Keymap(text))) if text.contains("include") => {
-                    eprintln!("navette: home's keymap includes files: refused, the last one stays");
+                    eprintln!("navette: the desk's keymap includes files: refused, the last one stays");
                 }
                 Some((output, event)) => {
                     let index = usize::from(output);
@@ -354,7 +375,7 @@ pub async fn serve_peer(
                         _ => {}
                     }
                     let Some(mode) = &active else { continue };
-                    // Home's keymap is every injector's; the rest is for the output named.
+                    // The desk's keymap is every injector's; the rest is for the output named.
                     let every = matches!(event, input::Event::Keymap(_));
                     for (i, o) in mode.outputs.iter().enumerate() {
                         if let Stream::Running(Running { input: Ok(input), .. }) = &o.stream
@@ -435,7 +456,7 @@ pub async fn serve_peer(
                                     generation: mode.generation,
                                 };
                                 peer.outbox.send(Msg::Display(started), Vec::new());
-                                ports.notifier.show(&driven(&names, ""), "");
+                                ports.notifier.show(&driven(&mode.desk, &names, ""), "");
                                 mode.told = Some(names);
                             }
                         }
@@ -474,9 +495,34 @@ pub async fn serve_peer(
         }
     }
     stop(&mut active, ports).await;
+    tell(ports, None, &mut told);
+    // The next link may be another desk's.
+    ports.events.update(|p| p.peer = None);
 }
 
-/// Starts the lid's watch; what keeps it from working is said here and at home.
+/// Tells the events which outputs the desk drives, when they changed since they were last told:
+/// how many, and whether they are still being made.
+fn tell(ports: &Ports, active: Option<&Active>, told: &mut Option<Option<(usize, bool)>>) {
+    let now = active.map(|a| (a.copies.len(), a.starting));
+    if *told == Some(now) {
+        return;
+    }
+    *told = Some(now);
+    ports.events.update(|p| {
+        p.mode = active.map(|a| Driven {
+            phase: if a.starting {
+                Phase::Starting
+            } else {
+                Phase::Running
+            },
+            // The desk does not say the mode's name.
+            name: None,
+            monitors: (0..a.copies.len()).map(output::name).collect(),
+        })
+    });
+}
+
+/// Starts the lid's watch; what keeps it from working is said here and at the desk.
 fn watch_lid(ports: &Ports, outbox: &Outbox) -> Option<lid::Watch> {
     let outbox = outbox.clone();
     let told = move |why: String| {
@@ -530,6 +576,7 @@ fn start(copies: Vec<OutputCopy>, caps: ClientCaps) -> Result<Active, String> {
         lid: None,
         generation: None,
         told: None,
+        desk: Names::default().the_desk(),
     })
 }
 
@@ -548,7 +595,7 @@ fn start_failed(index: usize, e: io::Error) -> String {
 }
 
 /// Counts one more failure of output `index`: waits longer before its next attempt, or gives
-/// up on the mode and tells home.
+/// up on the mode and tells the desk.
 async fn failed(
     active: &mut Option<Active>,
     index: usize,
@@ -638,7 +685,7 @@ fn start_blocking(
         .start(source, caps, outbox, feedback_rx, ended_tx)?;
     let input = ports.injectors.start(&name, keymap).map_err(|e| {
         eprintln!(
-            "navette: home's input cannot be injected on {name}, the picture goes on \
+            "navette: the desk's input cannot be injected on {name}, the picture goes on \
                  without it: {e}"
         );
         e.to_string()
@@ -661,6 +708,7 @@ async fn stop(active: &mut Option<Active>, ports: &Ports) {
         return;
     };
     let told = mode.told.take();
+    let desk = mode.desk.clone();
     // A start cannot be cut short: removed now, its output would be made again after.
     let starting = match mode.up.take() {
         Some((_, start)) => start.await.ok(),
@@ -686,16 +734,17 @@ async fn stop(active: &mut Option<Active>, ports: &Ports) {
         }
     }
     if let Some(names) = told {
-        ports.notifier.show(&driven(&names, " stopped"), "");
+        ports.notifier.show(&driven(&desk, &names, " stopped"), "");
     }
 }
 
-/// What the agent says when home starts driving its outputs, `2 screens driven from home
-/// (NAVETTE-1, NAVETTE-2)`, and with ` stopped` when it stops.
-fn driven(names: &[String], then: &str) -> String {
+/// What the agent says when the desk starts driving its outputs, `2 screens driven from the
+/// desk (NAVETTE-1, NAVETTE-2)` (`desk` being what it is called), and with ` stopped` when it
+/// stops.
+fn driven(desk: &str, names: &[String], then: &str) -> String {
     let screens = if names.len() > 1 { "screens" } else { "screen" };
     format!(
-        "{} {screens} driven from home{then} ({})",
+        "{} {screens} driven from {desk}{then} ({})",
         names.len(),
         names.join(", ")
     )
@@ -708,6 +757,7 @@ mod tests {
     use gliff_proto::{ChromaMode, Codec, ServerMsg};
 
     use super::*;
+    use crate::events::Parts;
     use crate::hypr::fake::{FakeHypr, FakeMonitor};
     use crate::lid::fake::FakeLogind;
 
@@ -725,7 +775,7 @@ mod tests {
         refuse_on: Mutex<Option<String>>,
         /// Takes this long to start the stream of this output: an encoder slow to open.
         slow_on: Mutex<Option<(String, Duration)>>,
-        /// Each stream's feedback from home.
+        /// Each stream's feedback from the desk.
         feedback: Mutex<Vec<(String, UnboundedReceiver<ClientMsg>)>>,
         panic: Mutex<bool>,
         dropped: Arc<Mutex<Vec<Dropped>>>,
@@ -873,7 +923,7 @@ mod tests {
         })
     }
 
-    /// A start that home numbered.
+    /// A start that the desk numbered.
     fn start_numbered(generation: u32) -> Incoming {
         let Incoming::Display(Display::Start {
             output,
@@ -894,7 +944,7 @@ mod tests {
         })
     }
 
-    /// A start as home sends it, the lid asked for an agent of the release before.
+    /// A start as the desk sends it, the lid asked for an agent of the release before.
     fn start_with_the_lid() -> Incoming {
         let Incoming::Display(Display::Start {
             output,
@@ -986,6 +1036,8 @@ mod tests {
         notices: Arc<crate::notify::Fake>,
         /// What the clipboard and the sound read: whether a mode runs.
         mode: tokio::sync::watch::Receiver<bool>,
+        /// What a reader of `events.sock` reads.
+        said: Mutex<mpsc::Receiver<Arc<str>>>,
         _dir: tempfile::TempDir,
         task: tokio::task::JoinHandle<()>,
     }
@@ -1021,6 +1073,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let record = dir.path().join("navette").join("lid");
         let notices = Arc::new(crate::notify::Fake::default());
+        // The link is up while the peer is served.
+        let state = Events::new(Parts {
+            link: crate::events::Link::Linked,
+            ..Parts::remote()
+        });
+        let said = Mutex::new(state.subscribe());
         let ports = Ports {
             hypr: hypr.clone(),
             streams: streams.clone(),
@@ -1033,6 +1091,7 @@ mod tests {
             lid_record: Some(record.clone()),
             lid_poll: poll,
             notifier: notices.clone(),
+            events: state,
         };
         let task = tokio::spawn(async move {
             serve_peer(peer, &ports, &mut events_rx).await;
@@ -1050,6 +1109,7 @@ mod tests {
             record,
             notices,
             mode: in_mode,
+            said,
             _dir: dir,
             task,
         }
@@ -1080,7 +1140,7 @@ mod tests {
     #[tokio::test]
     async fn home_s_input_is_injected_on_the_remote_output_with_home_s_keymap() {
         let agent = agent();
-        // Home's surface says its keymap and size before the remote output exists.
+        // The desk's surface says its keymap and size before the remote output exists.
         agent.input.push(input::Event::Keymap("home keymap".into()));
         let area = input::Event::Area {
             width: 1280,
@@ -1152,13 +1212,13 @@ mod tests {
     async fn starting_and_stopping_a_mode_notifies_each_machine_once() {
         let agent = agent();
         agent.inbox.try_send(start_of(vec![copy()])).unwrap();
-        let driven = "2 screens driven from home (NAVETTE-1, NAVETTE-2)";
+        let driven = "2 screens driven from the desk (NAVETTE-1, NAVETTE-2)";
         until(|| agent.notices.summaries() == [driven]).await;
         agent
             .inbox
             .try_send(Incoming::Display(Display::Stop))
             .unwrap();
-        let stopped = "2 screens driven from home stopped (NAVETTE-1, NAVETTE-2)";
+        let stopped = "2 screens driven from the desk stopped (NAVETTE-1, NAVETTE-2)";
         until(|| agent.notices.summaries() == [driven, stopped]).await;
         // A stop with no mode, and a start that fails, say nothing.
         agent
@@ -1179,6 +1239,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_agent_names_the_desk_by_the_label_it_was_told() {
+        let agent = agent();
+        agent.inbox.try_send(Incoming::Desk("NEAR".into())).unwrap();
+        agent.inbox.try_send(start_of(vec![copy()])).unwrap();
+        let driven = "2 screens driven from NEAR (NAVETTE-1, NAVETTE-2)";
+        until(|| agent.notices.summaries() == [driven]).await;
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        let stopped = "2 screens driven from NEAR stopped (NAVETTE-1, NAVETTE-2)";
+        until(|| agent.notices.summaries() == [driven, stopped]).await;
+    }
+
+    /// The next line `events.sock` says, parsed.
+    async fn next_said(agent: &Agent) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let line = agent.said.lock().unwrap().try_recv();
+                match line {
+                    Ok(line) => return serde_json::from_str(&line).unwrap(),
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("a line in time")
+    }
+
+    #[tokio::test]
+    async fn the_desk_s_label_is_the_peer_of_the_remote_s_events_while_linked() {
+        let agent = agent();
+        assert_eq!(next_said(&agent).await["peer"], serde_json::Value::Null);
+        agent.inbox.try_send(Incoming::Desk("NEAR".into())).unwrap();
+        let told = next_said(&agent).await;
+        assert_eq!(told["peer"], "NEAR");
+        assert_eq!(told["state"], "linked");
+        // The label goes with the link: the next one may be another desk's.
+        drop(agent.inbox);
+        agent.task.await.unwrap();
+        let left: serde_json::Value =
+            serde_json::from_str(&agent.said.lock().unwrap().try_recv().unwrap()).unwrap();
+        assert_eq!(left["peer"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
     async fn stopping_the_mode_releases_everything_before_the_output_goes() {
         let agent = agent();
         agent.inbox.try_send(start()).unwrap();
@@ -1191,7 +1297,7 @@ mod tests {
         assert_eq!(agent.dropped(0), Some(true));
     }
 
-    /// Every output is running: only then does the injector get home's keys.
+    /// Every output is running: only then does the injector get the desk's keys.
     fn started(outbox: &Outbox) -> bool {
         outbox
             .queued()
@@ -1356,7 +1462,7 @@ mod tests {
         );
     }
 
-    /// Puts the pointer over the first output, as home's input or the laptop's trackpad does,
+    /// Puts the pointer over the first output, as the desk's input or the laptop's trackpad does,
     /// and waits for the agent to hide it.
     async fn pointer_on_the_first_output(agent: &Agent) {
         agent.hypr.move_cursor(2000, 100);
@@ -1613,6 +1719,7 @@ mod tests {
             lid_record: record.map(std::path::Path::to_path_buf),
             lid_poll: LID_POLL,
             notifier: Arc::new(crate::notify::Fake::default()),
+            events: Events::new(Parts::remote()),
         }
     }
 
@@ -1749,6 +1856,9 @@ mod tests {
     async fn home_s_acks_go_to_the_stream_of_their_output() {
         let agent = agent();
         two(&agent).await;
+        // A stream is counted when its start runs, before the agent holds it: an ack that
+        // comes in between is dropped for good. `Started` is said once every output runs.
+        until(|| started(&agent.outbox)).await;
         for output in [1, 7] {
             agent
                 .inbox
@@ -1858,7 +1968,7 @@ mod tests {
     async fn the_outputs_are_named_from_left_to_right() {
         let agent = agent();
         three(&agent).await;
-        // The first monitor from home's left is NAVETTE-1, the next NAVETTE-2, and so on:
+        // The first monitor from the desk's left is NAVETTE-1, the next NAVETTE-2, and so on:
         // the name follows the place, so the n-th from the left is the same name.
         assert_eq!(outputs(&agent), the_desk_of_three());
     }
@@ -1985,7 +2095,7 @@ mod tests {
         agent.hypr.monitor("eDP-1").unwrap().disabled
     }
 
-    /// A mode as home starts it, its output streaming.
+    /// A mode as the desk starts it, its output streaming.
     async fn running_with_the_lid(agent: &Agent) {
         agent.inbox.try_send(start_with_the_lid()).unwrap();
         until(|| agent.streams.count() == 1).await;
@@ -2006,7 +2116,8 @@ mod tests {
             agent.hypr.monitor("eDP-1").unwrap(),
             FakeMonitor::new("eDP-1", 1920, 1200, 0)
         );
-        assert!(!agent.record.exists());
+        // The record goes after the rule is applied, not with it.
+        until(|| !agent.record.exists()).await;
     }
 
     #[tokio::test]
@@ -2091,7 +2202,7 @@ mod tests {
         *agent.logind.refuse.lock().unwrap() = Some("Access denied".into());
         agent.logind.close(true);
         running_with_the_lid(&agent).await;
-        // The mode runs all the same, home is told, and the lid is read only before the lock.
+        // The mode runs all the same, the desk is told, and the lid is read only before the lock.
         until(|| !no_lid(&agent.outbox).is_empty()).await;
         assert!(no_lid(&agent.outbox)[0].contains("Access denied"));
         tokio::time::sleep(LID_POLL * 5).await;
@@ -2103,7 +2214,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_lid_closed_during_a_mode_started_without_closed_lid_disables_the_laptop_screen() {
-        // Home of the release before sends `Some(false)` by default, and older ones nothing.
+        // The desk of the release before sends `Some(false)` by default, and older ones nothing.
         for asked in [None, Some(false)] {
             let agent = agent();
             let Incoming::Display(Display::Start {
@@ -2367,5 +2478,78 @@ mod tests {
         until(|| agent.injected(3).is_some()).await;
         assert_eq!(agent.injected(2).unwrap().2, [area(1920)]);
         assert_eq!(agent.injected(3).unwrap().2, []);
+    }
+
+    /// The lines said since the last look, until one says `last`, as (state, monitors).
+    async fn said_until(agent: &Agent, last: &str) -> Vec<(String, serde_json::Value)> {
+        let mut said = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let line = agent.said.lock().unwrap().try_recv();
+                match line {
+                    Ok(line) => {
+                        let line: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let state = line["state"].as_str().unwrap().to_string();
+                        let done = state == last;
+                        said.push((state, line["monitors"].clone()));
+                        if done {
+                            return;
+                        }
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("never said {last}: said {said:?}"));
+        said
+    }
+
+    fn line(state: &str, monitors: &[&str]) -> (String, serde_json::Value) {
+        (state.to_string(), serde_json::json!(monitors))
+    }
+
+    #[tokio::test]
+    async fn the_agent_says_starting_while_it_makes_its_outputs_then_mode_with_their_names() {
+        let agent = agent();
+        assert_eq!(said_until(&agent, "linked").await, [line("linked", &[])]);
+        two(&agent).await;
+        assert_eq!(
+            said_until(&agent, "mode").await,
+            [
+                line("starting", &["NAVETTE-1", "NAVETTE-2"]),
+                line("mode", &["NAVETTE-1", "NAVETTE-2"])
+            ]
+        );
+        agent
+            .inbox
+            .try_send(Incoming::Display(Display::Stop))
+            .unwrap();
+        assert_eq!(said_until(&agent, "linked").await, [line("linked", &[])]);
+    }
+
+    #[tokio::test]
+    async fn a_start_the_agent_cannot_make_says_starting_then_linked() {
+        let agent = agent();
+        *agent.streams.refuse.lock().unwrap() = true;
+        agent.inbox.try_send(start()).unwrap();
+        assert_eq!(said_until(&agent, "linked").await, [line("linked", &[])]);
+        assert_eq!(
+            said_until(&agent, "linked").await,
+            [line("starting", &["NAVETTE-1"]), line("linked", &[])]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_ends_the_mode_said() {
+        let agent = agent();
+        agent.inbox.try_send(start()).unwrap();
+        said_until(&agent, "mode").await;
+        drop(agent.inbox);
+        agent.task.await.unwrap();
+        let left = agent.said.lock().unwrap().try_recv().unwrap();
+        let left: serde_json::Value = serde_json::from_str(&left).unwrap();
+        assert_eq!(left["state"], "linked");
+        assert_eq!(left["monitors"], serde_json::json!([]));
     }
 }

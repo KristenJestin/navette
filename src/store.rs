@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use crate::identity::{Fingerprint, Identity};
+use crate::network::Mac;
 
 const CERT_FILE: &str = "identity.crt";
 const KEY_FILE: &str = "identity.key";
@@ -19,7 +20,7 @@ const PAIRING_FILE: &str = "paired.conf";
 pub enum Role {
     /// The machine with the monitors: it listens, on its LAN address only.
     Home,
-    /// The managed laptop: it only dials out to home.
+    /// The managed laptop: it only dials out to the desk.
     Remote,
 }
 
@@ -28,8 +29,11 @@ pub enum Role {
 pub struct Pairing {
     pub role: Role,
     pub peer: Fingerprint,
-    /// Home: the LAN address it listens on. Remote: the home address it dials.
+    /// Desk: the LAN address it listens on. Remote: the desk address it dials.
     pub address: SocketAddr,
+    /// Remote: the hardware address of the desk's router, its default gateway at the desk; none for a
+    /// pairing made before it was recorded, or without one known yet.
+    pub gateway: Option<Mac>,
 }
 
 /// Navette's config directory.
@@ -87,7 +91,10 @@ impl Store {
         };
         let damaged = || io::Error::other(format!("{} is damaged: pair again", path.display()));
         let text = String::from_utf8(bytes).map_err(|_| damaged())?;
-        let (mut role, mut peer, mut address) = (None, None, None);
+        let (mut peer, mut address) = (None, None);
+        let mut role = Err("has no `role` key".to_string());
+        // Absent from a pairing made before it was recorded; present, it must read.
+        let mut gateway = Ok(None);
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -96,21 +103,27 @@ impl Store {
             match key.trim() {
                 "role" => {
                     role = match value {
-                        "home" => Some(Role::Home),
-                        "remote" => Some(Role::Remote),
-                        _ => None,
+                        // `home` is what 0.1 wrote, before the desk was called the desk.
+                        "desk" | "home" => Ok(Role::Home),
+                        "remote" => Ok(Role::Remote),
+                        _ => Err(format!("has `role = {value}`, which is not desk or remote")),
                     }
                 }
                 "peer" => peer = Fingerprint::from_hex(value),
                 "address" => address = value.parse().ok(),
+                "gateway" => gateway = Mac::parse(value).map(Some).ok_or(()),
                 _ => {}
             }
         }
-        match (role, peer, address) {
-            (Some(role), Some(peer), Some(address)) => Ok(Some(Pairing {
+        // A role that does not read is named: it is the key a hand edit gets wrong.
+        let role =
+            role.map_err(|why| io::Error::other(format!("{} {why}: pair again", path.display())))?;
+        match (peer, address, gateway) {
+            (Some(peer), Some(address), Ok(gateway)) => Ok(Some(Pairing {
                 role,
                 peer,
                 address,
+                gateway,
             })),
             _ => Err(damaged()),
         }
@@ -119,15 +132,18 @@ impl Store {
     /// Records a pairing, replacing any previous one.
     pub fn save_pairing(&self, pairing: &Pairing) -> io::Result<()> {
         let role = match pairing.role {
-            Role::Home => "home",
+            Role::Home => "desk",
             Role::Remote => "remote",
         };
-        let text = format!(
+        let mut text = format!(
             "# Written by `navette pair`. The peer is the SHA-256 of its certificate.\n\
              role = {role}\npeer = {}\naddress = {}\n",
             pairing.peer.to_hex(),
             pairing.address
         );
+        if let Some(gateway) = pairing.gateway {
+            text.push_str(&format!("gateway = {gateway}\n"));
+        }
         self.write_private(PAIRING_FILE, text.as_bytes())
     }
 
@@ -215,10 +231,101 @@ mod tests {
             role: Role::Remote,
             peer: Identity::generate().unwrap().fingerprint(),
             address: "192.0.2.10:7420".parse().unwrap(),
+            gateway: Mac::parse("02:00:00:00:00:01"),
         };
         store.save_pairing(&pairing).unwrap();
         assert_eq!(store.pairing().unwrap(), Some(pairing));
         assert_eq!(mode(&tmp.path().join(PAIRING_FILE)), 0o600);
+    }
+
+    fn pairing_text(role: &str) -> (Fingerprint, String) {
+        let peer = Identity::generate().unwrap().fingerprint();
+        let text = format!(
+            "role = {role}\npeer = {}\naddress = 192.0.2.10:7420\n",
+            peer.to_hex()
+        );
+        (peer, text)
+    }
+
+    #[test]
+    fn a_new_pairing_at_the_desk_writes_role_desk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path());
+        store
+            .save_pairing(&Pairing {
+                role: Role::Home,
+                peer: Identity::generate().unwrap().fingerprint(),
+                address: "192.0.2.10:7420".parse().unwrap(),
+                gateway: None,
+            })
+            .unwrap();
+        let text = fs::read_to_string(tmp.path().join(PAIRING_FILE)).unwrap();
+        assert!(text.contains("role = desk\n"), "{text}");
+        assert!(!text.contains("home"), "{text}");
+        assert_eq!(store.pairing().unwrap().unwrap().role, Role::Home);
+    }
+
+    #[test]
+    fn a_pairing_made_by_0_1_with_role_home_still_loads_as_the_desk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (peer, text) = pairing_text("home");
+        fs::write(tmp.path().join(PAIRING_FILE), text).unwrap();
+        let pairing = Store::new(tmp.path()).pairing().unwrap().unwrap();
+        assert_eq!(pairing.role, Role::Home);
+        assert_eq!(pairing.peer, peer);
+        // Read as it is: nothing is rewritten, so no pairing is redone.
+        let text = fs::read_to_string(tmp.path().join(PAIRING_FILE)).unwrap();
+        assert!(text.starts_with("role = home\n"), "{text}");
+    }
+
+    #[test]
+    fn a_pairing_with_role_desk_loads_as_the_desk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, text) = pairing_text("desk");
+        fs::write(tmp.path().join(PAIRING_FILE), text).unwrap();
+        let pairing = Store::new(tmp.path()).pairing().unwrap().unwrap();
+        assert_eq!(pairing.role, Role::Home);
+    }
+
+    #[test]
+    fn a_role_that_is_neither_desk_nor_remote_says_which_two_are_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, text) = pairing_text("boss");
+        fs::write(tmp.path().join(PAIRING_FILE), text).unwrap();
+        let error = Store::new(tmp.path()).pairing().unwrap_err().to_string();
+        assert!(error.contains("not desk or remote"), "{error}");
+    }
+
+    #[test]
+    fn a_pairing_made_before_the_gateway_was_recorded_reads_without_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = Identity::generate().unwrap().fingerprint();
+        fs::write(
+            tmp.path().join(PAIRING_FILE),
+            format!(
+                "role = remote\npeer = {}\naddress = 192.0.2.10:7420\n",
+                peer.to_hex()
+            ),
+        )
+        .unwrap();
+        let pairing = Store::new(tmp.path()).pairing().unwrap().unwrap();
+        assert_eq!(pairing.gateway, None);
+        assert_eq!(pairing.peer, peer);
+    }
+
+    #[test]
+    fn a_damaged_gateway_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = Identity::generate().unwrap().fingerprint();
+        fs::write(
+            tmp.path().join(PAIRING_FILE),
+            format!(
+                "role = remote\npeer = {}\naddress = 192.0.2.10:7420\ngateway = 02:00\n",
+                peer.to_hex()
+            ),
+        )
+        .unwrap();
+        assert!(Store::new(tmp.path()).pairing().is_err());
     }
 
     #[test]

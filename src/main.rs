@@ -1,8 +1,8 @@
-//! `navette`: the work-from-home mode. The machine with the monitors ("home") pairs once with
-//! the work laptop ("remote"), then `navette serve` at home and `navette agent` on the laptop
-//! keep an authenticated link between them. `navette mode start [name]` gives the home monitors
+//! `navette`: the work-from-home mode. The machine with the monitors ("desk") pairs once with
+//! the work laptop ("remote"), then `navette serve` at the desk and `navette agent` on the laptop
+//! keep an authenticated link between them. `navette mode start [name]` gives the desk monitors
 //! of a mode to the remote machine, `navette mode stop` gives them back, `navette status` says
-//! what runs; `navette serve --audio` brings the remote machine's sound home and sends the home
+//! what runs; `navette serve --audio` brings the remote machine's sound to the desk and sends the desk
 //! mic there while a mode runs; `navette mic` switches it.
 
 use std::io::BufRead;
@@ -20,14 +20,17 @@ use navette::clipboard::progress::Shown;
 use navette::corner::{self, Board};
 use navette::desk::Desk;
 use navette::display::{decode, remote};
+use navette::events;
 use navette::hypr::{self, Eval};
 use navette::input;
 use navette::lid;
 use navette::link::{self, Backoff, Event, Heartbeat, Wire};
 use navette::mic::{self, Mic, NoSound, Routing};
 use navette::mode::{self, Home, HomeGpu};
+use navette::network::{self, ProcNet};
 use navette::notify;
 use navette::pair::{self, Pin, Timeouts};
+use navette::runner::{self, Plan};
 use navette::single::{self, AgentLock};
 use navette::store::Store;
 use navette::transport::bind_lan;
@@ -51,10 +54,10 @@ struct Cli {
 enum Command {
     /// Pair this machine with the other one, once.
     ///
-    /// At home, `navette pair --listen <LAN-address:port>` shows a PIN. On the remote machine,
-    /// `navette pair <home-address:port>` asks for it.
+    /// At the desk, `navette pair --listen <LAN-address:port>` shows a PIN. On the remote machine,
+    /// `navette pair <desk-address:port>` asks for it.
     Pair {
-        /// Home: the LAN address and port to listen on (never 0.0.0.0 or ::).
+        /// Desk: the LAN address and port to listen on (never 0.0.0.0 or ::).
         #[arg(
             long,
             value_name = "ADDR:PORT",
@@ -62,23 +65,32 @@ enum Command {
             required_unless_present = "home"
         )]
         listen: Option<SocketAddr>,
-        /// Remote: the home machine's address and port.
-        #[arg(value_name = "HOME:PORT")]
+        /// Remote: the desk's address and port.
+        #[arg(value_name = "DESK:PORT")]
         home: Option<SocketAddr>,
     },
-    /// Home: wait for the paired remote machine and keep its link up.
+    /// Desk: wait for the paired remote machine and keep its link up.
     Serve {
         /// The LAN address and port to listen on [default: the one used to pair].
         #[arg(long, value_name = "ADDR:PORT")]
         listen: Option<SocketAddr>,
-        /// While a mode runs, play the remote machine's sound here, mixed with home sound, and
-        /// send it the home mic.
+        /// While a mode runs, play the remote machine's sound here, mixed with the desk's sound,
+        /// and send it the desk's mic.
         #[arg(long)]
         audio: bool,
     },
-    /// Remote: dial the paired home machine and keep the link up (a systemd user service).
+    /// Remote: dial the paired desk and keep the link up (a systemd user service).
     Agent,
-    /// Home: give the configured monitors to the remote machine, or take them back.
+    /// Run what this machine's pairing says: `serve` at the desk, `agent` on the remote machine.
+    ///
+    /// The same command, signals, logs and exit status as the one it runs, so that one systemd
+    /// unit (`navette.service`) serves both machines. Not paired, it exits with status 78.
+    Run {
+        /// Desk: as `navette serve --audio`. Ignored on the remote machine, which says so.
+        #[arg(long)]
+        audio: bool,
+    },
+    /// Desk: give the configured monitors to the remote machine, or take them back.
     ///
     /// The monitors are named in `mode.conf` in the config directory: `monitor = <output name>`,
     /// or `monitor = desc:<start of the monitor's description>`. A `[name]` section defines a
@@ -89,17 +101,34 @@ enum Command {
         #[command(subcommand)]
         action: ModeAction,
     },
-    /// Home: say which mode runs, and whether the remote machine is connected.
+    /// Desk: say which mode runs, and whether the remote machine is connected.
     ///
     /// `navette serve` must be running.
     Status,
-    /// Home: send the home mic to the remote machine or keep it home, while a mode runs.
+    /// Desk: send the desk's mic to the remote machine or keep it at the desk, while a mode runs.
     ///
-    /// A mode sends it to the remote machine when it starts, and brings it home when it stops.
+    /// A mode sends it to the remote machine when it starts, and brings it back to the desk when
+    /// it stops.
     /// `navette serve --audio` must be running.
     Mic {
         #[command(subcommand)]
         action: MicAction,
+    },
+    /// Both machines: say where Navette stands, then again at every change, until stopped: for
+    /// a bar or a shell (`docs/events.md`).
+    ///
+    /// Reads `navette serve` or `navette agent`, whichever runs here; with neither, `off`, until
+    /// one starts.
+    Watch {
+        /// The lines of JSON as they come, each a whole state.
+        #[arg(long, conflicts_with = "waybar")]
+        json: bool,
+        /// Lines of JSON for a Waybar custom module (`text`, `alt`, `class`, `tooltip`).
+        #[arg(long)]
+        waybar: bool,
+        /// The current state only, then exit.
+        #[arg(long)]
+        once: bool,
     },
 }
 
@@ -109,9 +138,12 @@ enum MicAction {
     Toggle,
     /// Send it to the remote machine.
     Remote,
-    /// Keep it home.
+    /// Keep it at the desk.
+    Desk,
+    /// The word of 0.1 for `desk`, still taken.
+    #[command(hide = true)]
     Home,
-    /// Say where it goes: `remote`, `home`, or `off` with no mode running.
+    /// Say where it goes: `remote`, `desk`, or `off` with no mode running.
     Status {
         /// One line of JSON (`text`, `alt`, `class`, `tooltip`), for a bar.
         #[arg(long)]
@@ -134,10 +166,14 @@ enum ModeAction {
         #[arg(value_name = "NAME")]
         name: Option<String>,
     },
-    /// The monitors come back home.
+    /// The monitors come back to the desk.
     Stop,
     /// Say the modes `mode.conf` defines and their monitors.
-    List,
+    List {
+        /// One array of JSON: `[{"name":..,"monitors":[..]}]`, the unnamed mode's name null.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -155,7 +191,7 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("navette: {e}");
-            ExitCode::FAILURE
+            ExitCode::from(runner::exit_code(&e))
         }
     }
 }
@@ -187,17 +223,24 @@ async fn run(cli: Cli) -> std::io::Result<()> {
         Command::Pair {
             home: Some(home), ..
         } => {
-            eprint!("PIN shown on the home machine: ");
+            eprint!("PIN shown on the desk: ");
             let mut line = String::new();
             std::io::stdin().lock().read_line(&mut line)?;
             let pin = Pin::parse(&line).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "a PIN is six digits")
             })?;
-            pair::remote(&store, home, &pin, Timeouts::default()).await?;
-            println!("Paired. Start the agent: systemctl --user enable --now navette-agent");
+            // The desk's router, as this machine sees it now, on the desk's network: the agent dials
+            // the desk only behind it.
+            let gateway = network::routers(&ProcNet, home.ip()).first().copied();
+            pair::remote(&store, home, gateway, &pin, Timeouts::default()).await?;
+            // A running agent read the previous pairing when it started: restart it.
+            println!(
+                "Paired. Start Navette, or restart it to use this pairing: \
+                 systemctl --user enable navette && systemctl --user restart navette"
+            );
             Ok(())
         }
-        Command::Pair { .. } => unreachable!("clap requires --listen or the home address"),
+        Command::Pair { .. } => unreachable!("clap requires --listen or the desk address"),
         Command::Serve { listen, audio } => {
             let acceptor = link::home_acceptor(&store, listen).await?;
             eprintln!(
@@ -205,19 +248,19 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 acceptor.local_addr()?
             );
             let (events, log) = mpsc::unbounded_channel();
-            tokio::spawn(print_events(log));
             let control = mode::listen(&mode::control_path()?)?;
             let mic_control = mic::control_path()?;
             let mic_control = mode::listen(&mic_control)?;
+            let stream = events::listen(&events::path()?)?;
             let gpu = tokio::task::spawn_blocking(decode::open_gpu)
                 .await
                 .map_err(std::io::Error::other)?;
-            // Without `--audio`, home never reaches PipeWire.
+            // Without `--audio`, the desk never reaches PipeWire.
             let graph = audio.then(PipeWire::default);
             let toggle = mic::toggle_command(&std::env::current_exe()?);
             let saved = audio::Saved::in_dir(audio::Saved::default_dir()?);
             if let Some(graph) = graph.clone() {
-                // Home's mic back first, if a previous run died with it away.
+                // The desk's mic back first, if a previous run died with it away.
                 let saved = saved.clone();
                 tokio::task::spawn_blocking(move || audio::mic::repair_home(&graph, &saved))
                     .await
@@ -243,6 +286,18 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 });
             }
             tokio::spawn(corner::follow(board.clone(), routing.watch()));
+            let state = mode::events(store.dir());
+            let followed = state.clone();
+            tokio::spawn(print_events(log, "the remote", move |event| {
+                followed.update(|p| events::link_heard(p, event));
+            }));
+            tokio::spawn(events::follow_mic(state.clone(), routing.watch()));
+            let (orders, orders_rx) = mpsc::unbounded_channel();
+            let commands = events::Commands::Desk {
+                orders: orders.clone(),
+                mic: routing.clone(),
+            };
+            let stream = tokio::spawn(events::serve(stream, state.clone(), Arc::new(commands)));
             let mic_control = tokio::spawn(mic::serve(mic_control, routing));
             let home = Home {
                 config_dir: store.dir().to_path_buf(),
@@ -254,9 +309,9 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 sound: sound.clone().map(|sound| sound as Arc<dyn mode::Sound>),
                 board: board.clone(),
                 notifier: Arc::new(notify::NotifySend::new(notify::Command)),
+                events: state,
             };
             let (peers, peers_rx) = mpsc::unbounded_channel();
-            let (orders, orders_rx) = mpsc::unbounded_channel();
             let (hypr_events, hypr_events_rx) = mpsc::unbounded_channel();
             hypr::watch_events(hypr_events);
             let modes = tokio::spawn(mode::serve(home, peers_rx, orders_rx, hypr_events_rx));
@@ -301,6 +356,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             tokio::task::spawn_blocking(clipboard::vfs::unmounted).await?;
             control.abort();
             let _ = control.await;
+            stream.abort();
+            let _ = stream.await;
             let _ = modes.await;
             mic_control.abort();
             let _ = mic_control.await;
@@ -310,8 +367,22 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             // Before anything is dialed: a second agent would drop the first one's link.
             let _one_agent = AgentLock::take(&single::agent_lock_path()?)?;
             let dialer = link::remote_dialer(&store)?;
+            let home_network = network::HomeNetwork::new(ProcNet, store.clone())?;
+            // Only after the lock: the socket of a running agent is never taken from it.
+            let state = events::Events::new(events::Parts::remote());
+            match events::path().and_then(|path| events::listen(&path)) {
+                Ok(stream) => {
+                    let refused = Arc::new(events::Commands::Remote);
+                    tokio::spawn(events::serve(stream, state.clone(), refused));
+                }
+                // The link matters more than a bar.
+                Err(e) => eprintln!("navette: no events.sock, a bar cannot follow the agent: {e}"),
+            }
             let (events, log) = mpsc::unbounded_channel();
-            tokio::spawn(print_events(log));
+            let followed = state.clone();
+            tokio::spawn(print_events(log, "the desk", move |event| {
+                followed.update(|p| events::link_heard(p, event));
+            }));
             let (peers, peers_rx) = mpsc::unbounded_channel();
             let (hypr_events, hypr_events_rx) = mpsc::unbounded_channel();
             hypr::watch_events(hypr_events);
@@ -323,13 +394,14 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 lid_record: lid::record_path(),
                 lid_poll: lid::POLL,
                 notifier: Arc::new(notify::NotifySend::new(notify::Command)),
+                events: state,
             };
             let mut display = tokio::spawn(remote::serve(peers_rx, ports, hypr_events_rx));
             let graph = PipeWire::default();
             let saved = audio::Saved::in_dir(audio::Saved::default_dir()?);
             // The latest link's audio thread; each one joins the one before it.
             let audio_thread = Arc::new(Mutex::new(None));
-            // Home shows the files crossing, and stops them: this machine only says how a paste
+            // The desk shows the files crossing, and stops them: this machine only says how a paste
             // ended.
             let shown = Shown::notifications(Arc::new(notify::NotifySend::new(notify::Command)));
             let kept = clipboard::Kept::default();
@@ -352,6 +424,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             };
             let agent = link::agent(
                 dialer,
+                home_network,
                 Heartbeat::default(),
                 Backoff::default(),
                 events,
@@ -386,17 +459,56 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             .await?;
             Ok(())
         }
+        Command::Run { audio } => {
+            let command = match runner::plan(&store, audio)? {
+                Plan::Serve { audio } => Command::Serve {
+                    listen: None,
+                    audio,
+                },
+                Plan::Agent { audio_ignored } => {
+                    if audio_ignored {
+                        eprintln!("navette: --audio is ignored on the remote machine");
+                    }
+                    Command::Agent
+                }
+            };
+            // The command itself, in this process, not a child: its signals and exit are ours.
+            Box::pin(run(Cli {
+                config_dir: Some(store.dir().to_path_buf()),
+                command,
+            }))
+            .await
+        }
         Command::Mode { action } => {
             let order = match action {
                 ModeAction::Start { name } => mode::start_order(name.as_deref())?,
                 ModeAction::Stop => "stop".to_string(),
-                ModeAction::List => {
-                    println!("{}", mode::list(store.dir())?);
+                ModeAction::List { json } => {
+                    match json {
+                        true => println!("{}", mode::list_json(store.dir())?),
+                        false => println!("{}", mode::list(store.dir())?),
+                    }
                     return Ok(());
                 }
             };
             println!("{}", mode::order(&mode::control_path()?, &order).await?);
             Ok(())
+        }
+        Command::Watch { json, waybar, once } => {
+            events::watch(&events::path()?, once, |line| {
+                use std::io::Write;
+                let shown = match (json, waybar) {
+                    (true, _) => Some(line.to_string()),
+                    (_, true) => events::waybar(line),
+                    _ => events::word(line),
+                };
+                let Some(shown) = shown else { return Ok(()) };
+                let mut out = std::io::stdout().lock();
+                writeln!(out, "{shown}")?;
+                // A bar reads it through a pipe: each line at once.
+                out.flush()
+            })
+            .await
         }
         Command::Status => {
             println!("{}", mode::order(&mode::control_path()?, "status").await?);
@@ -411,9 +523,16 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let order = match action {
                 MicAction::Toggle => mic::Order::Toggle,
                 MicAction::Remote => mic::Order::Remote,
-                MicAction::Home => mic::Order::Home,
+                MicAction::Desk => mic::Order::Home,
+                MicAction::Home => {
+                    eprintln!(
+                        "navette: `navette mic home` is now `navette mic desk`; the old word \
+                         still works for now"
+                    );
+                    mic::Order::Home
+                }
                 MicAction::Status { json } => {
-                    // No `navette serve`: the mic is home.
+                    // No `navette serve`: the mic is at the desk.
                     let status = mic::ask(&path, mic::Order::Status)
                         .await
                         .unwrap_or(mic::Status::Off);
@@ -446,16 +565,36 @@ async fn stopped() -> std::io::Result<()> {
     }
 }
 
-/// The link's events, on stderr (the journal, under systemd). They name no key or certificate.
-async fn print_events(mut events: mpsc::UnboundedReceiver<Event>) {
+/// The link's events, on stderr (the journal, under systemd), each handed to `then` too; a
+/// version refusal is said once. `other` names the other machine. They name no key or
+/// certificate.
+async fn print_events(
+    mut events: mpsc::UnboundedReceiver<Event>,
+    other: &str,
+    then: impl Fn(&Event),
+) {
+    let mut refusals = link::RefusalLog::default();
     while let Some(event) = events.recv().await {
+        then(&event);
+        if !refusals.says(&event) {
+            continue;
+        }
         match event {
-            Event::Connected => eprintln!("navette: link up"),
+            Event::Connected { peer } => eprintln!("navette: link up, {other} runs Navette {peer}"),
+            Event::Incompatible { peer } => {
+                eprintln!("navette: {}", link::refusal(other, &peer))
+            }
             Event::Disconnected(e) => eprintln!("navette: link down: {e}"),
             Event::Failed(e) => eprintln!("navette: {e}"),
             Event::Retrying(delay) => {
                 eprintln!("navette: dialing again in {} s", delay.as_secs_f32())
             }
+            Event::Away => eprintln!(
+                "navette: not on the desk's network: not dialing it, checking again every \
+                 {} s (after a new router there, pair again)",
+                network::RECHECK.as_secs()
+            ),
+            Event::Back => eprintln!("navette: on the desk's network: dialing it"),
         }
     }
 }

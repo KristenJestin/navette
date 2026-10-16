@@ -1,35 +1,35 @@
-# The home mic
+# The desk mic
 
-The home mic serves one machine at a time. When a mode starts it goes to the remote machine;
-when the mode stops it comes back home. While the mode runs, a hotkey, `navette mic` or a bar
+The desk mic serves one machine at a time. When a mode starts it goes to the remote machine;
+when the mode stops it comes back to the desk. While the mode runs, a hotkey, `navette mic` or a bar
 switches it either way, or, with `mic = follow`, it goes to the side that has the keyboard
 ([following the keyboard](#following-the-keyboard)). It needs `navette serve --audio`, the switch that plays the remote
-machine's sound at home ([the sound](audio.md)).
+machine's sound at the desk ([the sound](audio.md)).
 
-- **On the remote machine**, the agent opens a virtual source, *Home mic (Navette)*
-  (`navette-home-mic`), and makes it the default mic for the whole mode: a call there picks it
-  up like any mic. It plays what home sends, through the same small jitter buffer as the sound
-  (30 ms before playing, 120 ms at most), and silence while the mic is home: switching never
+- **On the remote machine**, the agent opens a virtual source, *Desk mic (Navette)*
+  (`navette-desk-mic`), and makes it the default mic for the whole mode: a call there picks it
+  up like any mic. It plays what the desk sends, through the same small jitter buffer as the sound
+  (30 ms before playing, 120 ms at most), and silence while the mic is at the desk: switching never
   changes the remote's devices, so a call keeps its mic. When the mode stops, the link drops or
   the agent stops, the previous default mic is put back, then the source is removed. It is saved
   meanwhile in `$XDG_STATE_HOME/navette/previous-default-source` (0600), and put back after a
   crash as soon as the agent is connected again, as the default output is, and a source gone with a PipeWire restart is opened again within a quarter of a second.
-- **At home**, Navette loads PipeWire's echo canceller (`libpipewire-module-echo-cancel`,
+- **At the desk**, Navette loads PipeWire's echo canceller (`libpipewire-module-echo-cancel`,
   WebRTC) into its own process for the mode, and unloads it after; a crash takes it away too. It
-  captures the mic home's apps have when the mode starts, by its name, and cancels what the
-  default output plays, read from its monitor (`monitor.mode`): home's default output is never
+  captures the mic the desk's apps have when the mode starts, by its name, and cancels what the
+  default output plays, read from its monitor (`monitor.mode`): the desk's default output is never
   changed, and the canceller's source is no default. What it hears is Opus-encoded (48 kHz
   stereo, 10 ms frames, in-band FEC) and sent while the mic goes to the remote machine. The
-  capture stays open for the whole mode, the mic home included: the canceller takes some six
-  seconds to adapt, and would start over at each switch. When home's PipeWire restarts, the
+  capture stays open for the whole mode, the mic at the desk included: the canceller takes some six
+  seconds to adapt, and would start over at each switch. When the desk's PipeWire restarts, the
   capture, its canceller and the silent source below are opened again within a quarter of a
   second; while they cannot be, the mic says `failed`, and `navette mic toggle` says why.
-- **Home apps do not hear the mic while it is remote.** Home's default mic is then a silent
+- **The desk apps do not hear the mic while it is remote.** The desk's default mic is then a silent
   source of Navette's, *Mic away (Navette)* (`navette-mic-away`): the apps that follow the
   default (most do, a call included) move to it and hear silence, and move back when the mic
-  comes home. Muting the mic itself would silence the echo canceller too, which captures it by
+  comes to the desk. Muting the mic itself would silence the echo canceller too, which captures it by
   name. The default it replaces is saved in `$XDG_STATE_HOME/navette/previous-default-source`
-  (0600) and put back when the mic comes home, when the mode stops, when the link drops, and
+  (0600) and put back when the mic comes to the desk, when the mode stops, when the link drops, and
   after a crash as soon as `navette serve` starts again. An app set to record from the mic
   itself, by its name rather than the default, still hears it.
 
@@ -38,12 +38,12 @@ machine's sound at home ([the sound](audio.md)).
 ```
 navette mic toggle       # to the other machine
 navette mic remote       # to the remote machine
-navette mic home         # home
-navette mic status       # remote, home, failed, or off when no mode runs
+navette mic desk         # to the desk
+navette mic status       # remote, desk, failed, or off when no mode runs
 ```
 
 Each prints where the mic goes once it is done. With no mode running there is nothing to
-switch: the command says so and the mic stays home. While the mic says `failed`, switching it
+switch: the command says so and the mic stays at the desk. While the mic says `failed`, switching it
 says why instead.
 
 The mode binds a hotkey, `SUPER + CTRL + M` unless `mode.conf` names other keys:
@@ -76,10 +76,10 @@ mic = follow
 ```
 
 - When the mode starts, the mic goes where the keyboard is: to the remote machine when the
-  pointer is over a monitor the mode gives, home otherwise. It comes home when the mode stops.
+  pointer is over a monitor the mode gives, the desk otherwise. It comes to the desk when the mode stops.
 - Each time the keyboard changes side, the pointer going onto a reserved monitor or back onto a
-  home one, or the release hotkey giving it back to home, the mic goes there, as the hotkey
-  sends it: the corners say `Mic → remote` or `Mic → home`, and a switch that cannot happen says
+  desk one, or the release hotkey giving it back to the desk, the mic goes there, as the hotkey
+  sends it: the corners say `Mic → remote` or `Mic → desk`, and a switch that cannot happen says
   `Mic not switched: <why>`.
 - It goes once the keyboard has stayed on its new side for half a second: a pointer only
   passing over a monitor on its way to another moves nothing. The mic never switches to the
@@ -91,10 +91,10 @@ mic = follow
 
 ## Saying where it went
 
-Every home monitor shows where the mic is, in its corner ([the corner](mode.md#the-corner)),
+Every desk monitor shows where the mic is, in its corner ([the corner](mode.md#the-corner)),
 with a button that switches it. At each switch, the corners say it for two seconds:
-`Mic → remote` or `Mic → home`. That covers the hotkey, the corner's button, the bar, `navette
-mic` and a mode starting or stopping. A mode that stops with the mic already home moves
+`Mic → remote` or `Mic → desk`. That covers the hotkey, the corner's button, the bar, `navette
+mic` and a mode starting or stopping. A mode that stops with the mic already at the desk moves
 nothing, and says nothing. A mic that cannot go where it should says `Mic failed: <why>`, and a
 switch that does not happen (the mic failed, PipeWire refusing) says `Mic not switched: <why>`,
 since a hotkey has no terminal to print it to. With no mode running there is no corner:
@@ -119,19 +119,26 @@ A bar runs `navette mic watch --json` for as long as it lives, shows the state, 
   "exec": "navette mic watch --json",
   "return-type": "json",
   "format": "{icon}",
-  "format-icons": { "remote": "mic → work", "home": "mic · home", "failed": "mic ✗", "off": "" },
+  "format-icons": { "remote": "mic → work", "desk": "mic · desk", "failed": "mic ✗", "off": "" },
   "on-click": "navette mic toggle"
 }
 ```
 
+Before 0.2 the word for the desk was `home`: a Waybar style keyed on `home` (the `class` of the
+JSON, or a `format-icons` entry) now keys on `desk`. `navette mic home` is still taken for now, and
+says `navette mic desk` once each time it runs; so is the word `home` on `mic.sock` and on
+[`events.sock`](events.md), which answer `desk`.
+
 A Quickshell bar does the same with a `Process` running `navette mic watch --json`, a
 `SplitParser` that reads each line with `JSON.parse`, and `Quickshell.execDetached(["navette",
 "mic", "toggle"])` on a click. `navette mic status --json` gives one line, for a bar that polls.
+For the whole state on either machine, the mic included, a bar reads `navette watch`
+([the events](events.md)).
 
 ## The messages
 
 Three top-level variants of the link's `LinkMsg` (`src/wire.rs`), a block of their own, all
-home → remote:
+desk → remote:
 
 | Variant | Fields |
 |---|---|
@@ -139,27 +146,27 @@ home → remote:
 | `52` `MicStop` | none: put the previous default mic back and remove the source |
 | `53` `MicFrame` | the session and a sequence number, and `data_len`: the Opus packet follows (4000 bytes at most, or the link ends) |
 
-Home numbers each mode, and the remote drops a frame of another session. They share the
+The desk numbers each mode, and the remote drops a frame of another session. They share the
 sound's queues (64 frames each way): a frame is dropped rather than delay the next, an order
 never is.
 
 ## Checking it on the two machines
 
-1. Install the build on both machines, restart the agent on the laptop, and at home run
+1. Install the build on both machines, restart the agent on the laptop, and at the desk run
    `navette serve --audio`, then `navette mode start`.
-2. On the laptop, `wpctl status` shows *Home mic (Navette)* as the default source (`*`); at
-   home, `navette mic status` says `remote`.
-3. Start a call on the laptop, with the home speakers playing it: speak, and the other side
+2. On the laptop, `wpctl status` shows *Desk mic (Navette)* as the default source (`*`); at
+   the desk, `navette mic status` says `remote`.
+3. Start a call on the laptop, with the desk speakers playing it: speak, and the other side
    hears you, without its own voice coming back (ask them).
 4. Press `SUPER + CTRL + M` with the pointer over the work monitor: `navette mic status` says
-   `home`, the call hears silence, and the corners say `Mic → home`. Press it again over a
-   home monitor: they hear you again, and the corners say `Mic → remote`. Do the same with the
+   `desk`, the call hears silence, and the corners say `Mic → desk`. Press it again over a
+   desk monitor: they hear you again, and the corners say `Mic → remote`. Do the same with the
    corner's button and with the bar item, mid-call.
-5. Meanwhile, at home, `wpctl status` shows *Mic away (Navette)* as the default source while
-   the mic is remote, and the home mic again while it is home; a home app recording from the
+5. Meanwhile, at the desk, `wpctl status` shows *Mic away (Navette)* as the default source while
+   the mic is remote, and the desk mic again while it is at the desk; a desk app recording from the
    default hears silence, then the mic.
 6. `navette mode stop`: on the laptop, `wpctl status` shows the previous default source again.
-7. With `mic = follow` in the mode, start it again and move the pointer from a home monitor
+7. With `mic = follow` in the mode, start it again and move the pointer from a desk monitor
    onto a reserved one and back, stopping on each: the corner's check follows the pointer,
    half a second after it stops. Sweep the pointer across a monitor quickly: the mic does not
    switch.

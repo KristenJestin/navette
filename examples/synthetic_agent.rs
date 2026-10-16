@@ -18,6 +18,7 @@ use navette::display::stream::Source;
 use navette::display::wire::{Msg, Outbox};
 use navette::hypr::{self, Hypr};
 use navette::link::{self, Backoff, Heartbeat};
+use navette::network::{HomeNetwork, ProcNet};
 use navette::store::Store;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::oneshot;
@@ -245,6 +246,8 @@ async fn main() -> io::Result<()> {
         lid_record: navette::lid::record_path(),
         lid_poll: navette::lid::POLL,
         notifier: Arc::new(navette::notify::NotifySend::new(navette::notify::Command)),
+        // No socket here: nothing reads it.
+        events: navette::events::Events::new(navette::events::Parts::remote()),
     };
     tokio::spawn(remote::serve(peers_rx, ports, hypr_events_rx));
     // The display only: no clipboard bridge here.
@@ -256,6 +259,7 @@ async fn main() -> io::Result<()> {
     };
     link::agent(
         dialer,
+        HomeNetwork::new(ProcNet, store)?,
         Heartbeat::default(),
         Backoff::default(),
         events,

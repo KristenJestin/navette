@@ -1,10 +1,10 @@
-//! Home's mic, heard on the remote machine: the mirror of the remote's sound.
+//! The desk's mic, heard on the remote machine: the mirror of the remote's sound.
 //!
 //! While a mode runs, the remote machine has a virtual source named for Navette, made its
-//! default mic; what home sends plays into it through a small jitter buffer, and it is silent
-//! while nothing comes (the mic is home). At home, the mic is captured with the echo of the
-//! home speakers cancelled, Opus-encoded and sent while the mic goes to the remote machine;
-//! meanwhile home's default mic is a silent source, so that home apps do not hear it.
+//! default mic; what the desk sends plays into it through a small jitter buffer, and it is silent
+//! while nothing comes (the mic is at the desk). At the desk, the mic is captured with the echo of the
+//! the desk speakers cancelled, Opus-encoded and sent while the mic goes to the remote machine;
+//! meanwhile the desk's default mic is a silent source, so that desk apps do not hear it.
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -20,9 +20,11 @@ use super::{
 };
 
 /// The remote's virtual source.
-pub const SOURCE: &str = "navette-home-mic";
-const SOURCE_DESCRIPTION: &str = "Home mic (Navette)";
-/// Home's echo-cancelled mic.
+pub const SOURCE: &str = "navette-desk-mic";
+const SOURCE_DESCRIPTION: &str = "Desk mic (Navette)";
+/// What 0.1 called the source: see [`super::LEGACY_SINK`].
+pub(super) const LEGACY_SOURCE: &str = "navette-home-mic";
+/// The desk's echo-cancelled mic.
 pub const MIC: &str = "navette-mic";
 const MIC_DESCRIPTION: &str = "Mic to the remote machine (Navette)";
 
@@ -56,7 +58,7 @@ impl<G: Graph> Voice<G> {
         })
     }
 
-    /// Takes a new session, which home started without stopping the last: the source stays the
+    /// Takes a new session, which the desk started without stopping the last: the source stays the
     /// default mic.
     pub fn restart(&mut self, session: u32) -> io::Result<()> {
         self.decoder = Decoder::new()?;
@@ -90,14 +92,14 @@ impl<G: Graph> Voice<G> {
     }
 }
 
-/// While the mic goes to the remote machine, home's default mic: a source of Navette's that
-/// stays silent, so that home apps no longer hear the mic.
+/// While the mic goes to the remote machine, the desk's default mic: a source of Navette's that
+/// stays silent, so that desk apps no longer hear the mic.
 pub const AWAY: &str = "navette-mic-away";
 const AWAY_DESCRIPTION: &str = "Mic away (Navette)";
 
-/// Home's mic while a mode runs. Its echo-cancelled capture stays open for the whole mode; while
-/// it goes to the remote machine, it is sent there, and home's apps hear [`AWAY`]. Dropping it
-/// gives home its mic back, then closes the echo canceller.
+/// The desk's mic while a mode runs. Its echo-cancelled capture stays open for the whole mode; while
+/// it goes to the remote machine, it is sent there, and the desk's apps hear [`AWAY`]. Dropping it
+/// gives the desk its mic back, then closes the echo canceller.
 pub struct HomeMic<G: Graph> {
     // Field order is drop order: the apps get their mic back first.
     away: Option<Away<G>>,
@@ -120,7 +122,7 @@ struct Sending {
     remote: Arc<AtomicBool>,
 }
 
-/// Home's default mic switched to the silent source, put back when dropped.
+/// The desk's default mic switched to the silent source, put back when dropped.
 struct Away<G: Graph> {
     // Field order is drop order, as for the remote's source.
     switch: Switch<G>,
@@ -128,8 +130,8 @@ struct Away<G: Graph> {
 }
 
 impl<G: Graph> HomeMic<G> {
-    /// Opens the mic home's apps have now and sends it to the remote machine, its frames to
-    /// `remote_machine` under `session`, or keeps it home unless `remote`.
+    /// Opens the mic the desk's apps have now and sends it to the remote machine, its frames to
+    /// `remote_machine` under `session`, or keeps it at the desk unless `remote`.
     pub fn start(
         graph: G,
         saved: Saved,
@@ -140,7 +142,7 @@ impl<G: Graph> HomeMic<G> {
         // Named, not followed: the default goes silent while the mic is away.
         let mic = graph
             .mic_in_use()?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home has no mic"))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "the desk has no mic"))?;
         let sending = Sending {
             remote_machine,
             session,
@@ -161,8 +163,8 @@ impl<G: Graph> HomeMic<G> {
         Ok(home_mic)
     }
 
-    /// Sends the mic to the remote machine, home's apps hearing silence meanwhile, or keeps it
-    /// home.
+    /// Sends the mic to the remote machine, the desk's apps hearing silence meanwhile, or keeps it
+    /// at the desk.
     pub fn send_to(&mut self, remote: bool) -> io::Result<()> {
         if !remote {
             self.sending.remote.store(false, Ordering::Relaxed);
@@ -221,7 +223,7 @@ fn open_capture<G: Graph>(graph: &G, mic: &str, sending: &Sending) -> io::Result
         MIC_DESCRIPTION,
         mic,
         Box::new(move |pcm| {
-            // The mic home is nothing sent: the remote's source plays silence.
+            // The mic at the desk is nothing sent: the remote's source plays silence.
             if remote.load(Ordering::Relaxed) {
                 send(pcm);
             }
@@ -244,7 +246,7 @@ impl<G: Graph> Drop for HomeMic<G> {
     }
 }
 
-/// Gives home back the mic a `navette serve` that died left on [`AWAY`], unless the user chose
+/// Gives the desk back the mic a `navette serve` that died left on [`AWAY`], unless the user chose
 /// another since.
 pub fn repair_home<G: Graph>(graph: &G, saved: &Saved) {
     if let Err(e) = repair_one(graph, saved, Device::Source, AWAY) {
@@ -278,7 +280,7 @@ mod tests {
         .is_ok()
     }
 
-    /// The home mic hears `frames` of a tone, a graph quantum at a time.
+    /// The desk mic hears `frames` of a tone, a graph quantum at a time.
     fn speak(graph: &FakeGraph, frames: usize) {
         let mic = graph.state().mics[0].1.clone();
         for block in tone(frames).chunks(1024 * super::super::codec::CHANNELS) {
@@ -314,6 +316,38 @@ mod tests {
                 format!("remove {SOURCE}"),
             ]
         );
+    }
+
+    #[test]
+    fn the_source_is_named_for_the_desk() {
+        assert_eq!(SOURCE, "navette-desk-mic");
+        assert_eq!(SOURCE_DESCRIPTION, "Desk mic (Navette)");
+    }
+
+    #[test]
+    fn a_default_mic_left_on_the_source_of_0_1_is_put_back_as_ours() {
+        let graph = FakeGraph::default();
+        graph.state().default_source = Some(DefaultNode::named("navette-home-mic"));
+        let (_tmp, saved) = saved();
+        saved
+            .save(Device::Source, Some(&DefaultNode::named("laptop-mic")))
+            .unwrap();
+        drop(Voice::start(graph.clone(), saved.clone(), 1).unwrap());
+        assert_eq!(
+            graph.state().default_source,
+            Some(DefaultNode::named("laptop-mic"))
+        );
+        // And a repair of its own, with nothing started.
+        graph.state().default_source = Some(DefaultNode::named("navette-home-mic"));
+        saved
+            .save(Device::Source, Some(&DefaultNode::named("laptop-mic")))
+            .unwrap();
+        super::super::repair(&graph, &saved);
+        assert_eq!(
+            graph.state().default_source,
+            Some(DefaultNode::named("laptop-mic"))
+        );
+        assert_eq!(saved.load(Device::Source).unwrap(), None);
     }
 
     #[test]
@@ -358,13 +392,15 @@ mod tests {
         // The next agent: no session asked for yet.
         let (wire, _link) = super::super::wire();
         remote(graph.clone(), saved.clone(), wire, None).unwrap();
+        // The repair puts each default back, then clears what it saved: waiting for the
+        // defaults alone leaves the clearing to race the asserts.
         until(&graph, |s| {
             s.default == Some(DefaultNode::named("laptop-speakers"))
                 && s.default_source == Some(DefaultNode::named("laptop-mic"))
+                && saved.load(Device::Sink).unwrap().is_none()
+                && saved.load(Device::Source).unwrap().is_none()
         })
         .await;
-        assert_eq!(saved.load(Device::Sink).unwrap(), None);
-        assert_eq!(saved.load(Device::Source).unwrap(), None);
     }
 
     #[test]
@@ -408,7 +444,7 @@ mod tests {
         );
     }
 
-    /// Home, its mic `desk-mic`, and a mic started on it, sending to the returned queue.
+    /// The desk, its mic `desk-mic`, and a mic started on it, sending to the returned queue.
     fn home_mic() -> (
         FakeGraph,
         tempfile::TempDir,
@@ -627,7 +663,7 @@ mod tests {
         link.to_audio
             .send(Message::MicStart { session: 1 })
             .unwrap();
-        // A home that restarted, say: no stop came first.
+        // A desk that restarted, say: no stop came first.
         link.to_audio
             .send(Message::MicStart { session: 2 })
             .unwrap();

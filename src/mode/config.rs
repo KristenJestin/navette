@@ -1,9 +1,10 @@
-//! `mode.conf`: the modes the maintainer defines at home, each naming the home monitors the
+//! `mode.conf`: the modes the maintainer defines at the desk, each naming the desk monitors the
 //! remote machine takes. Keys before any `[section]` are the default of every mode, and a
 //! `monitor` among them is the one unnamed mode, so a file written before modes had names keeps
 //! working. A `[name]` section is a named mode: its `monitor`, and any of `release`, `mic`,
 //! `mic_hotkey`, `remote_label`, `local_label`, `remote_bar`, `local_bar`, `local_above` it wants
-//! other than the default.
+//! other than the default. `here_notice` is about the link, so only the keys before any section
+//! set it.
 //! `#` starts a comment.
 
 use std::io;
@@ -11,8 +12,10 @@ use std::path::{Path, PathBuf};
 
 use crate::corner::{self, Look};
 use crate::display::wire::MAX_OUTPUTS;
+use crate::events::Defined;
 use crate::hypr::Monitor;
 use crate::input::{self, Hotkey};
+use crate::names::Names;
 
 pub const CONFIG_FILE: &str = "mode.conf";
 /// The keys that switch the mic, unless the config names others: free in Omarchy's own
@@ -39,9 +42,14 @@ pub struct Mode {
     pub mic_hotkey: String,
     /// `mic = follow`: the mic goes to the side that has the keyboard.
     pub mic_follows: bool,
-    /// The layer namespaces of home's own tools drawn above the remote's picture.
+    /// `here_notice = off` turns off the notification that the remote machine is here. It is
+    /// about the link, not about a mode: only the keys before any section set it.
+    pub here_notice: bool,
+    /// The layer namespaces of the desk's own tools drawn above the remote's picture.
     pub local_above: Vec<String>,
     pub look: Look,
+    /// What the sentences call the machines: the labels as set, not the corner's tags.
+    pub names: Names,
 }
 
 /// The settings of one section; the first one, before any `[name]`, has no name.
@@ -243,6 +251,15 @@ impl File {
                 )));
             }
         };
+        let here_notice = match self.sections[0].get("here_notice").unwrap_or_default() {
+            "" | "on" => true,
+            "off" => false,
+            other => {
+                return Err(invalid(format!(
+                    "{path}: `here_notice = {other}`: `on` or `off`; nothing was changed"
+                )));
+            }
+        };
         let local_above = match value("local_above").unwrap_or(LOCAL_ABOVE) {
             "none" => Vec::new(),
             list => list
@@ -290,6 +307,7 @@ impl File {
             remote_bar,
             home_bar,
         };
+        let names = Names::new(local_label, value("remote_label"));
         Ok(Mode {
             name: section.name.clone(),
             monitors,
@@ -297,8 +315,10 @@ impl File {
             notice,
             mic_hotkey,
             mic_follows,
+            here_notice,
             local_above,
             look,
+            names,
         })
     }
 }
@@ -365,10 +385,49 @@ pub fn list(config_dir: &Path) -> io::Result<String> {
     Ok(lines.join("\n"))
 }
 
-/// The home monitors the specs name, in the order given: by output name, or by the start of the
+/// The modes the file defines, as the events and `navette mode list --json` say them: a mode
+/// the file gets wrong is left out, as it cannot start.
+pub fn defined(config_dir: &Path) -> io::Result<Vec<Defined>> {
+    let file = File::read(config_dir)?;
+    Ok(file
+        .sections
+        .iter()
+        .enumerate()
+        // A file with no default mode has the named ones only.
+        .filter(|(_, section)| section.name.is_some() || section.get("monitor").is_some())
+        .filter_map(|(index, _)| file.mode(index).ok())
+        .map(|mode| Defined {
+            name: mode.name,
+            monitors: mode.monitors,
+        })
+        .collect())
+}
+
+/// The remote machine's label, `remote_label` before any section, as the events say it.
+pub fn remote_label(config_dir: &Path) -> String {
+    File::read(config_dir)
+        .ok()
+        .and_then(|file| file.sections[0].get("remote_label").map(str::to_string))
+        .unwrap_or_else(|| Look::default().remote_label)
+}
+
+/// The desk's label as the link carries it, `local_label` (or `home_label`) before any
+/// section: the one the remote machine can say. None when it is not set, or the corner could not
+/// draw it, in which case no mode would start either.
+pub fn desk_label(config_dir: &Path) -> Option<String> {
+    let file = File::read(config_dir).ok()?;
+    let before = &file.sections[0];
+    before
+        .get("local_label")
+        .or_else(|| before.get("home_label"))
+        .filter(|label| !label.is_empty() && corner::check_label(label).is_ok())
+        .map(str::to_string)
+}
+
+/// The desk monitors the specs name, in the order given: by output name, or by the start of the
 /// description (Hyprland's `desc:`), so a change of connector order breaks nothing. A monitor
 /// that is not there, a description that fits two, or one monitor named twice, changes nothing.
-pub fn resolve(specs: &[String], monitors: &[Monitor]) -> io::Result<Vec<Monitor>> {
+pub fn resolve(specs: &[String], monitors: &[Monitor], names: &Names) -> io::Result<Vec<Monitor>> {
     let there = || {
         monitors
             .iter()
@@ -393,7 +452,8 @@ pub fn resolve(specs: &[String], monitors: &[Monitor]) -> io::Result<Vec<Monitor
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "no monitor {spec} at home (there are: {}); nothing was changed",
+                        "no monitor {spec} on {} (there are: {}); nothing was changed",
+                        names.the_desk(),
                         there()
                     ),
                 ));
@@ -807,6 +867,46 @@ mod tests {
     }
 
     #[test]
+    fn here_notice_is_on_by_default() {
+        assert!(mode("monitor = DP-2\n", None).unwrap().here_notice);
+        assert!(
+            mode("monitor = DP-2\nhere_notice =\n", None)
+                .unwrap()
+                .here_notice
+        );
+        assert!(
+            mode("monitor = DP-2\nhere_notice = on\n", None)
+                .unwrap()
+                .here_notice
+        );
+    }
+
+    #[test]
+    fn here_notice_off_is_read() {
+        assert!(
+            !mode("monitor = DP-2\nhere_notice = off\n", None)
+                .unwrap()
+                .here_notice
+        );
+    }
+
+    #[test]
+    fn here_notice_is_read_globally_only() {
+        let text = "[office]\nmonitor = DP-2\nhere_notice = off\n";
+        assert!(mode(text, Some("office")).unwrap().here_notice);
+        let text = "here_notice = off\n[office]\nmonitor = DP-2\nhere_notice = on\n";
+        assert!(!mode(text, Some("office")).unwrap().here_notice);
+    }
+
+    #[test]
+    fn an_unknown_here_notice_value_is_refused_naming_the_key() {
+        let error = mode("monitor = DP-2\nhere_notice = sometimes\n", None).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("`here_notice = sometimes`"), "{text}");
+        assert!(text.contains("`on` or `off`"), "{text}");
+    }
+
+    #[test]
     fn local_above_defaults_to_the_selection_overlays_of_slurp_and_hyprpicker() {
         let mode = mode("monitor = DP-2\n", None).unwrap();
         assert_eq!(mode.local_above, ["selection", "hyprpicker"]);
@@ -862,7 +962,8 @@ mod tests {
         ];
         let found = |specs: &[&str]| {
             let specs: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
-            resolve(&specs, &monitors).map(|m| m.into_iter().map(|m| m.name).collect::<Vec<_>>())
+            resolve(&specs, &monitors, &Names::default())
+                .map(|m| m.into_iter().map(|m| m.name).collect::<Vec<_>>())
         };
         assert_eq!(found(&["DP-2"]).unwrap(), ["DP-2"]);
         assert_eq!(found(&["desc:Dell Inc. DELL U2723QE"]).unwrap(), ["DP-1"]);
@@ -876,27 +977,100 @@ mod tests {
             monitor("DP-2", "Dell Inc. DELL U2723QE 7XYZ456"),
         ];
         let specs = |s: &str| vec![s.to_string()];
-        let none = resolve(&specs("desc:Iiyama"), &monitors).unwrap_err();
+        let none = resolve(&specs("desc:Iiyama"), &monitors, &Names::default()).unwrap_err();
         assert_eq!(none.kind(), io::ErrorKind::NotFound);
         let none = none.to_string();
         assert!(
             none.contains("desc:Iiyama") && none.contains("DP-1, DP-2"),
             "{none}"
         );
-        let two = resolve(&specs("desc:Dell Inc."), &monitors).unwrap_err();
+        let two = resolve(&specs("desc:Dell Inc."), &monitors, &Names::default()).unwrap_err();
         let two = two.to_string();
         assert!(two.contains("DP-1") && two.contains("DP-2"), "{two}");
         assert!(two.contains("more of the description"), "{two}");
         // Told apart by the serial.
-        let one = resolve(&specs("desc:Dell Inc. DELL U2723QE 7XYZ456"), &monitors).unwrap();
+        let one = resolve(
+            &specs("desc:Dell Inc. DELL U2723QE 7XYZ456"),
+            &monitors,
+            &Names::default(),
+        )
+        .unwrap();
         assert_eq!(one[0].name, "DP-2");
+    }
+
+    #[test]
+    fn a_monitor_that_is_not_there_is_missing_on_the_desk_by_its_label() {
+        let monitors = [monitor("DP-1", "Dell Inc. DELL U2723QE 7XYZ123")];
+        let specs = ["DP-3".to_string()];
+        let default = resolve(&specs, &monitors, &Names::default()).unwrap_err();
+        assert!(
+            default
+                .to_string()
+                .contains("no monitor DP-3 on the desk ("),
+            "{default}"
+        );
+        let labelled = resolve(&specs, &monitors, &Names::new(Some("NEAR"), None)).unwrap_err();
+        assert!(
+            labelled.to_string().contains("no monitor DP-3 on NEAR ("),
+            "{labelled}"
+        );
+    }
+
+    #[test]
+    fn a_mode_names_the_machines_by_its_labels_else_desk_and_remote() {
+        let none = mode("monitor = DP-2\n", None).unwrap();
+        assert_eq!(none.names, Names::default());
+        let text = "remote_label = FAR\nlocal_label = NEAR\n\
+                    [office]\nmonitor = DP-1\n\
+                    [travel]\nmonitor = DP-2\nremote_label = AWAY\n\
+                    [bare]\nmonitor = DP-3\nlocal_label =\n";
+        let office = mode(text, Some("office")).unwrap();
+        assert_eq!(office.names, Names::new(Some("NEAR"), Some("FAR")));
+        let travel = mode(text, Some("travel")).unwrap();
+        assert_eq!(travel.names, Names::new(Some("NEAR"), Some("AWAY")));
+        // An empty label is none: the corner says LOCAL, the sentences say the desk.
+        let bare = mode(text, Some("bare")).unwrap();
+        assert_eq!(bare.names.desk, "desk");
+    }
+
+    #[test]
+    fn the_old_home_label_still_names_the_desk_in_the_sentences() {
+        let mode_ = mode("monitor = DP-2\nhome_label = NEAR\n", None).unwrap();
+        assert_eq!(mode_.names.desk, "NEAR");
+    }
+
+    #[test]
+    fn a_label_that_is_the_default_tag_still_counts_as_set() {
+        // `LOCAL` is what the corner says with no label; set by hand, it is the user's word.
+        let mode_ = mode(
+            "monitor = DP-2\nlocal_label = LOCAL\nremote_label = REMOTE\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(mode_.names, Names::new(Some("LOCAL"), Some("REMOTE")));
+    }
+
+    #[test]
+    fn the_desk_label_the_link_carries_is_the_one_before_any_section() {
+        let dir = written("local_label = NEAR\n[office]\nmonitor = DP-1\nlocal_label = HERE\n");
+        assert_eq!(desk_label(dir.path()), Some("NEAR".to_string()));
+        let dir = written("home_label = OLD\n[office]\nmonitor = DP-1\n");
+        assert_eq!(desk_label(dir.path()), Some("OLD".to_string()));
+        let dir = written("[office]\nmonitor = DP-1\nlocal_label = HERE\n");
+        assert_eq!(desk_label(dir.path()), None);
+        assert_eq!(desk_label(tempfile::tempdir().unwrap().path()), None);
+        // A label the corner could not draw is not sent either: the mode would not start.
+        let dir = written("local_label = Café\n");
+        assert_eq!(desk_label(dir.path()), None);
     }
 
     #[test]
     fn a_monitor_named_twice_by_name_and_description_is_refused() {
         let monitors = [monitor("DP-1", "Dell Inc. DELL U2723QE 7XYZ123")];
         let specs = ["DP-1".to_string(), "desc:Dell".to_string()];
-        let error = resolve(&specs, &monitors).unwrap_err().to_string();
+        let error = resolve(&specs, &monitors, &Names::default())
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("DP-1 twice"), "{error}");
     }
 
@@ -904,7 +1078,47 @@ mod tests {
     fn a_disabled_monitor_is_not_there() {
         let mut off = monitor("DP-1", "Dell Inc. DELL U2723QE 7XYZ123");
         off.disabled = true;
-        let error = resolve(&["DP-1".to_string()], &[off]).unwrap_err();
+        let error = resolve(&["DP-1".to_string()], &[off], &Names::default()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn the_modes_for_json_name_the_unnamed_one_null_and_leave_the_broken_ones_out() {
+        let dir = written(
+            "monitor = DP-1\n[office]\nmonitor = DP-1, desc:Invented Display\n\
+             [broken]\nrelease = none\n[travel]\nmonitor = DP-2\n",
+        );
+        let named = |name: Option<&str>, monitors: &[&str]| Defined {
+            name: name.map(str::to_string),
+            monitors: monitors.iter().map(|m| m.to_string()).collect(),
+        };
+        assert_eq!(
+            defined(dir.path()).unwrap(),
+            [
+                named(None, &["DP-1"]),
+                named(Some("office"), &["DP-1", "desc:Invented Display"]),
+                named(Some("travel"), &["DP-2"]),
+            ]
+        );
+        // With no default monitor, there is no unnamed mode.
+        let dir = written("release = none\n[office]\nmonitor = DP-1\n");
+        assert_eq!(
+            defined(dir.path()).unwrap(),
+            [named(Some("office"), &["DP-1"])]
+        );
+        let none = tempfile::tempdir().unwrap();
+        assert_eq!(
+            defined(none.path()).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn the_remote_label_is_the_one_before_any_section_or_the_corner_s() {
+        let dir = written("remote_label = FAR\n[office]\nmonitor = DP-1\nremote_label = AWAY\n");
+        assert_eq!(remote_label(dir.path()), "FAR");
+        let dir = written("[office]\nmonitor = DP-1\nremote_label = AWAY\n");
+        assert_eq!(remote_label(dir.path()), "REMOTE");
+        assert_eq!(remote_label(tempfile::tempdir().unwrap().path()), "REMOTE");
     }
 }

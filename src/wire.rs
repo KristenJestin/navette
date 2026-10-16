@@ -2,15 +2,16 @@
 //! the raw bytes it declares) carrying Navette's own messages. A heartbeat shows the sender
 //! alive; the clipboard messages are the five of gliff's transfer engine, so its rules (chunk
 //! size, ack window, serials) apply unchanged; the display's are its orders, gliff's stream
-//! messages (a video frame's bytes follow it) and their feedback; the input's, home's keyboard
+//! messages (a video frame's bytes follow it) and their feedback; the input's, the desk's keyboard
 //! and pointer. A message this build does not know is skipped,
 //! so a newer peer can add some without breaking an older one.
 //!
-//! To extend the link without a new [`VERSION`](crate::link::VERSION), add a top-level variant
-//! to [`LinkMsg`] with a number never used before, or an optional field (`Option`, a new `#[n]`)
-//! at the end of an existing one: an older peer skips the first and ignores the second. Any
-//! other change is malformed to an older peer and ends the link, a new variant of a nested enum
-//! (`ClipboardItem`, say) included: change the version instead.
+//! To extend the link within a minor version, add a top-level variant to [`LinkMsg`] with a
+//! number never used before, or an optional field (`Option`, a new `#[n]`) at the end of an
+//! existing one: an older peer skips the first and ignores the second. Any other change is
+//! malformed to an older peer and ends the link, a new variant of a nested enum
+//! (`ClipboardItem`, say) included: make it a `feat`, a new minor version, which the hello of
+//! the previous one refuses (`docs/versions.md`).
 
 use bytes::Bytes;
 use gliff_proto::{ClientMsg, ClipboardFile, ClipboardItem, ClipboardMsg, ServerMsg};
@@ -71,27 +72,35 @@ pub enum LinkMsg {
     // names its output, none for output 0 (so a one-output mode reads as before).
     #[n(20)]
     Display(#[n(0)] Display),
-    /// Remote to home; a video frame's two streams (`data_len`, then `aux_len` bytes) follow.
+    /// Remote to desk; a video frame's two streams (`data_len`, then `aux_len` bytes) follow.
     #[n(21)]
     Video(#[n(0)] ServerMsg, #[n(1)] Option<u8>),
-    /// Home to remote.
+    /// Desk to remote.
     #[n(22)]
     Feedback(#[n(0)] ClientMsg, #[n(1)] Option<u8>),
-    // Input (`crate::input`), home to remote, a block of numbers of its own; an event names
+    // Input (`crate::input`), desk to remote, a block of numbers of its own; an event names
     // the output it is for as a stream's message does.
     #[n(30)]
     Input(#[n(0)] input::Event, #[n(1)] Option<u8>),
-    /// Remote to home, once a mode: the picture runs without input.
+    /// Remote to desk, once a mode: the picture runs without input.
     #[n(31)]
     NoInput {
         #[n(0)]
         reason: String,
     },
-    /// Remote to home: the mode runs, but the remote leaves its lid alone (`closed_lid`).
+    /// Remote to desk: the mode runs, but the remote leaves its lid alone (`closed_lid`).
     #[n(32)]
     NoLid {
         #[n(0)]
         reason: String,
+    },
+    /// Desk to remote, once the link is up: how the desk's user calls the desk (`local_label`),
+    /// for the remote's own messages. An older peer skips it, and a desk with no label sends
+    /// none.
+    #[n(33)]
+    Desk {
+        #[n(0)]
+        label: String,
     },
     // The remote machine's sound (`crate::audio`), a block of numbers of its own.
     #[n(48)]
@@ -111,7 +120,7 @@ pub enum LinkMsg {
         #[n(2)]
         data_len: u32,
     },
-    // Home's mic (`crate::audio::mic`), home to remote, a block of numbers of its own.
+    // The desk's mic (`crate::audio::mic`), desk to remote, a block of numbers of its own.
     #[n(51)]
     MicStart {
         #[n(0)]
@@ -129,7 +138,7 @@ pub enum LinkMsg {
         #[n(2)]
         data_len: u32,
     },
-    /// The level the remote's sink and home's playback share, both ways, only when one side's
+    /// The level the remote's sink and the desk's playback share, both ways, only when one side's
     /// mixer moves it: the linear gain of each channel, which the other side applies.
     #[n(54)]
     AudioVolume {
@@ -157,6 +166,7 @@ impl From<(u8, Msg)> for LinkMsg {
             Msg::Feedback(msg) => Self::Feedback(msg, output_id(output)),
             Msg::NoInput(reason) => Self::NoInput { reason },
             Msg::NoLid(reason) => Self::NoLid { reason },
+            Msg::Desk(label) => Self::Desk { label },
         }
     }
 }
@@ -240,6 +250,7 @@ impl LinkMsg {
             | Self::Input(..)
             | Self::NoInput { .. }
             | Self::NoLid { .. }
+            | Self::Desk { .. }
             | Self::AudioStart { .. }
             | Self::AudioStop
             | Self::AudioFrame { .. }
@@ -345,6 +356,38 @@ mod tests {
             let back: LinkMsg = minicbor::decode(&bytes).unwrap();
             assert_eq!(back.into_clipboard(), Some(msg));
         }
+    }
+
+    #[test]
+    fn the_desk_s_label_survives_the_trip_through_the_link() {
+        let bytes = minicbor::to_vec(LinkMsg::from((0, Msg::Desk("NEAR".into())))).unwrap();
+        let back: LinkMsg = minicbor::decode(&bytes).unwrap();
+        assert_eq!(
+            back,
+            LinkMsg::Desk {
+                label: "NEAR".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_peer_skips_the_desk_s_label_and_reads_on() {
+        // What a 0.2.0 reads: the messages it has, none of them number 33.
+        #[derive(Debug, PartialEq, Decode)]
+        enum Older {
+            #[n(0)]
+            Heartbeat,
+        }
+        let (a, b) = tokio::io::duplex(4096);
+        let (mut write, mut read) = (Framed::new(a), Framed::new(b));
+        write
+            .write_msg(&LinkMsg::Desk {
+                label: "NEAR".into(),
+            })
+            .await
+            .unwrap();
+        write.write_msg(&LinkMsg::Heartbeat).await.unwrap();
+        assert_eq!(read.read_msg::<Older>().await.unwrap(), Older::Heartbeat);
     }
 
     #[tokio::test]

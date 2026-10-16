@@ -1,4 +1,4 @@
-//! One `navette agent` per remote machine. Home keeps the newest connection of its paired
+//! One `navette agent` per remote machine. The desk keeps the newest connection of its paired
 //! remote and drops the older one, so two agents would drop each other's link, dial again, and
 //! do it forever. The agent takes this lock before it dials and holds it for its whole life:
 //! the kernel releases it when the process ends, a crash included, so no stale file is ever
@@ -45,7 +45,7 @@ impl AgentLock {
             Err(TryLockError::WouldBlock) => Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "another navette agent is already running \
-                 (systemctl --user status navette-agent)",
+                 (systemctl --user status navette)",
             )),
             Err(TryLockError::Error(e)) => Err(e),
         }

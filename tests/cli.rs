@@ -137,6 +137,19 @@ fn two_machines_pair_with_a_pin_and_the_remote_connects_on_its_own() {
 }
 
 #[test]
+fn pairing_again_says_to_restart_a_running_agent() {
+    // A running agent read the previous pairing (the desk's router, say) when it started.
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (_serve, _agent, printed) = paired_link(&home, &remote);
+    assert!(
+        printed.contains("systemctl --user enable navette && systemctl --user restart navette"),
+        "{printed}"
+    );
+    assert!(!printed.contains("navette-agent"), "{printed}");
+}
+
+#[test]
 fn no_key_or_certificate_is_ever_printed_or_logged() {
     let tmp = tempfile::tempdir().unwrap();
     let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
@@ -184,7 +197,9 @@ fn nothing_listens_on_the_remote_machine() {
             )
         })
         .collect();
-    let mut established = 0;
+    // A table read in several `read()`s can repeat a row while sockets come and go on the
+    // machine, so a socket is counted once by its inode.
+    let mut established = std::collections::HashSet::new();
     for table in ["tcp", "tcp6", "udp", "udp6"] {
         let text = fs::read_to_string(format!("/proc/{pid}/net/{table}")).unwrap_or_default();
         for line in text.lines().skip(1) {
@@ -196,11 +211,15 @@ fn nothing_listens_on_the_remote_machine() {
             assert!(table.starts_with("tcp"), "the agent holds a UDP socket");
             assert_ne!(state, "0A", "the agent listens on a TCP socket");
             if state == "01" {
-                established += 1;
+                established.insert(inode.to_owned());
             }
         }
     }
-    assert_eq!(established, 1, "the agent holds exactly its link to home");
+    assert_eq!(
+        established.len(),
+        1,
+        "the agent holds exactly its link to home"
+    );
 }
 
 #[test]
@@ -288,7 +307,7 @@ fn a_second_agent_refuses_to_start_while_one_runs() {
         "{output}"
     );
     assert!(
-        output.contains("systemctl --user status navette-agent"),
+        output.contains("(systemctl --user status navette)"),
         "{output}"
     );
 }
@@ -326,4 +345,240 @@ fn an_agent_starts_after_the_previous_one_crashed() {
 
     let next = Navette::start(&remote, &["agent"]);
     next.wait_for("link up");
+}
+
+#[test]
+fn mode_list_json_without_serve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Navette::start(tmp.path(), &["mode", "list", "--json"]).finish();
+    assert_eq!(output, "[]\n", "no mode.conf: no mode");
+    fs::write(
+        tmp.path().join("mode.conf"),
+        "[default]\nmonitor = DP-2\n[office]\nmonitor = DP-1, DP-2\n",
+    )
+    .unwrap();
+    let (status, output) =
+        Navette::start(tmp.path(), &["mode", "list", "--json"]).finish_with_status();
+    assert!(status.success(), "{output}");
+    assert_eq!(
+        output,
+        "[{\"name\":\"default\",\"monitors\":[\"DP-2\"]},\
+         {\"name\":\"office\",\"monitors\":[\"DP-1\",\"DP-2\"]}]\n"
+    );
+}
+
+#[test]
+fn watch_once_without_serve_or_agent_says_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (status, output) =
+        Navette::start(tmp.path(), &["watch", "--json", "--once"]).finish_with_status();
+    assert!(status.success(), "{output}");
+    assert_eq!(output, "{\"v\":1,\"state\":\"off\"}\n");
+    let output = Navette::start(tmp.path(), &["watch", "--waybar", "--once"]).finish();
+    assert!(output.contains(r#""class":"off""#), "{output}");
+    let output = Navette::start(tmp.path(), &["watch", "--once"]).finish();
+    assert_eq!(output, "off\n");
+}
+
+/// `navette watch --json --once` on `config`'s machine, until its state is `state`.
+fn watched_until(config: &Path, state: &str) -> String {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let output = Navette::start(config, &["watch", "--json", "--once"]).finish();
+        if output.contains(&format!(r#""state":"{state}""#)) {
+            return output;
+        }
+        assert!(Instant::now() < deadline, "never {state}: {output}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn each_machine_says_where_it_stands_on_its_events_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (_serve, _agent, _) = paired_link(&home, &remote);
+    let desk = watched_until(&home, "linked");
+    assert!(desk.contains(r#""role":"desk""#), "{desk}");
+    assert!(desk.contains(r#""peer":"REMOTE""#), "{desk}");
+    let far = watched_until(&remote, "linked");
+    assert!(far.contains(r#""role":"remote""#), "{far}");
+    // The remote drives nothing: a command there is refused.
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(remote.join("run/navette/events.sock")).unwrap();
+    stream.write_all(b"stop\n").unwrap();
+    let mut lines = BufReader::new(stream).lines();
+    assert!(lines.next().unwrap().unwrap().starts_with('{'));
+    assert_eq!(
+        lines.next().unwrap().unwrap(),
+        "error the remote does not drive the mode"
+    );
+}
+
+#[test]
+fn the_remote_says_dialing_once_the_desk_goes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (serve, _agent, _) = paired_link(&home, &remote);
+    watched_until(&remote, "linked");
+    drop(serve);
+    watched_until(&remote, "dialing");
+}
+
+#[test]
+fn run_without_a_pairing_exits_with_the_refusal_status_and_says_to_pair() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (status, output) = Navette::start(tmp.path(), &["run", "--audio"]).finish_with_status();
+    assert_eq!(
+        status.code(),
+        Some(i32::from(navette::runner::REFUSED)),
+        "{output}"
+    );
+    assert!(
+        output.contains("navette: not paired; run navette pair first"),
+        "{output}"
+    );
+}
+
+#[test]
+fn run_with_a_broken_role_names_the_key_and_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("paired.conf"), "role = boss\n").unwrap();
+    let (status, output) = Navette::start(tmp.path(), &["run"]).finish_with_status();
+    assert_eq!(
+        status.code(),
+        Some(i32::from(navette::runner::REFUSED)),
+        "{output}"
+    );
+    assert!(output.contains("role"), "{output}");
+    assert!(output.contains("paired.conf"), "{output}");
+}
+
+/// Pairs the two config dirs, then starts `navette run` on both machines (no `--audio` at home:
+/// it would reach the real PipeWire) and waits until both report the link up.
+fn run_link(home: &Path, remote: &Path, remote_args: &[&str]) -> (Navette, Navette) {
+    let home_pair = Navette::start(home, &["pair", "--listen", "127.0.0.1:0"]);
+    let pin = home_pair.wait_for("PIN:");
+    let pin = pin.rsplit(' ').next().unwrap().to_owned();
+    let hint = home_pair.wait_for("navette pair ");
+    let address = hint.split('`').nth(1).unwrap().rsplit(' ').next().unwrap();
+    let mut remote_pair = Navette::start(remote, &["pair", address]);
+    remote_pair.type_line(&pin);
+    remote_pair.finish();
+    home_pair.finish();
+
+    let serve = Navette::start(home, &["run"]);
+    serve.wait_for("waiting for the paired remote machine");
+    let agent = Navette::start(remote, &[&["run"], remote_args].concat());
+    serve.wait_for("link up");
+    agent.wait_for("link up");
+    (serve, agent)
+}
+
+#[test]
+fn run_starts_serve_at_home_and_the_agent_on_the_remote_machine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (_serve, _agent) = run_link(&home, &remote, &[]);
+}
+
+#[test]
+fn run_on_the_remote_machine_says_once_that_audio_is_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (_serve, agent) = run_link(&home, &remote, &["--audio"]);
+    let output = agent.output();
+    assert_eq!(output.matches("--audio is ignored").count(), 1, "{output}");
+}
+
+#[test]
+fn run_ends_on_sigterm_like_the_command_it_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (serve, agent) = run_link(&home, &remote, &[]);
+    for machine in [agent, serve] {
+        let pid = machine.child.id().to_string();
+        let sent = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+        assert!(sent.success());
+        let (status, output) = machine.finish_with_status();
+        assert_eq!(status.code(), Some(0), "{output}");
+    }
+}
+
+#[test]
+fn pairing_writes_role_desk_and_a_pairing_that_says_home_still_runs_serve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (serve, _agent) = run_link(&home, &remote, &[]);
+    let file = home.join("paired.conf");
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.contains("role = desk\n"), "{text}");
+    let far = fs::read_to_string(remote.join("paired.conf")).unwrap();
+    assert!(far.contains("role = remote\n"), "{far}");
+    // A pairing made by 0.1.0: nothing is paired again.
+    drop(serve);
+    fs::write(&file, text.replace("role = desk", "role = home")).unwrap();
+    let again = Navette::start(&home, &["run"]);
+    again.wait_for("waiting for the paired remote machine");
+}
+
+#[test]
+fn mic_home_still_works_and_says_the_new_name_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Navette::start(tmp.path(), &["mic", "home"]).finish();
+    assert_eq!(output.matches("navette mic desk").count(), 1, "{output}");
+    assert!(
+        output.contains("`navette serve` is not running"),
+        "the order itself was still sent: {output}"
+    );
+}
+
+#[test]
+fn mic_desk_says_nothing_of_the_old_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Navette::start(tmp.path(), &["mic", "desk"]).finish();
+    assert!(!output.contains("mic home"), "{output}");
+    assert!(
+        output.contains("`navette serve` is not running"),
+        "{output}"
+    );
+}
+
+/// `navette watch --json --once` on `config`'s machine, until its line holds `needle`.
+fn watched_with(config: &Path, needle: &str) -> String {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let output = Navette::start(config, &["watch", "--json", "--once"]).finish();
+        if output.contains(needle) {
+            return output;
+        }
+        assert!(Instant::now() < deadline, "never {needle}: {output}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn the_remote_says_the_label_of_the_desk_as_its_peer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("mode.conf"),
+        "local_label = NEAR\nremote_label = FAR\nmonitor = DP-2\n",
+    )
+    .unwrap();
+    let (_serve, _agent, _) = paired_link(&home, &remote);
+    let desk = watched_until(&home, "linked");
+    assert!(desk.contains(r#""peer":"FAR""#), "{desk}");
+    let far = watched_with(&remote, r#""peer":"NEAR""#);
+    assert!(far.contains(r#""role":"remote""#), "{far}");
+}
+
+#[test]
+fn with_no_label_the_remote_has_no_peer_to_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (_serve, _agent, _) = paired_link(&home, &remote);
+    let far = watched_until(&remote, "linked");
+    assert!(far.contains(r#""peer":null"#), "{far}");
 }

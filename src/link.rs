@@ -1,10 +1,10 @@
-//! The link once paired: the remote's agent dials home and keeps a connection, home serves it.
-//! Over it, a hello (the link's version), then gliff's framing carrying a heartbeat each way
+//! The link once paired: the remote's agent dials the desk and keeps a connection, the desk serves it.
+//! Over it, a hello (Navette's version: the same minor links, another is refused), then gliff's framing carrying a heartbeat each way
 //! and the connection's services (the clipboard bridge, the display), over the same
 //! authenticated stream. The link stays up between two modes, so that a start is quick, but
 //! carries nothing of the user's then: no copy, no sound, no mic, no input.
 //!
-//! The agent reconnects with an exponential backoff whenever the link drops; home keeps the
+//! The agent reconnects with an exponential backoff whenever the link drops; the desk keeps the
 //! newest connection of its one paired remote and drops the older one, which a laptop that
 //! changed network may have left half-open. Once the newer one has said hello, it ends the
 //! older connection, and so its service, before it starts the newer one's: a service such as
@@ -30,14 +30,30 @@ use crate::audio::{self, codec::MAX_PACKET};
 use crate::display::wire::{Cursor, Incoming, MAX_CURSOR, MAX_OUTPUTS, Outbox, Peer, Pointer};
 use crate::frame::{read_frame, write_frame};
 use crate::input;
+use crate::network::{HomeNetwork, RECHECK, Tables};
 use crate::store::{Role, Store};
 use crate::transport::{Accept, Dial, TlsAcceptor, TlsDialer};
 use crate::wire::{Clip, LinkMsg, checked, output_id};
 
-/// The version of the link's messages; peers of another version refuse each other.
-pub const VERSION: u8 = 2;
+/// This Navette's version, as `navette --version` says it: two machines link only within a
+/// minor version (`docs/versions.md`).
+pub const NAVETTE_VERSION: &str = match option_env!("NAVETTE_VERSION") {
+    Some(version) => version,
+    None => "0.0.0-dev",
+};
 
 const HELLO: u8 = 1;
+/// After `HELLO`, 0.1 put its link version (1 or 2) and nothing more; from 0.2, this byte, then
+/// Navette's version. An old peer is still told apart, and refused by name.
+const NAMED: u8 = 0;
+/// What a peer that says the old hello runs.
+const OLD: &str = "0.1";
+/// The longest version a peer may say: far above `1.12.3-beta.45+abcdef`.
+const LONGEST_VERSION: usize = 64;
+
+/// How long the agent waits after the desk refused its version, or it refused the desk's: only
+/// an update of one machine changes the answer, so there is no point dialing every few seconds.
+pub const REFUSED_REDIAL: Duration = Duration::from_secs(60);
 
 /// Clipboard messages read from the peer and not yet taken by the bridge. The reader never
 /// waits on a service: past this many, a message for it is dropped, so a stuck service cannot
@@ -120,7 +136,7 @@ impl Backoff {
 }
 
 impl Default for Backoff {
-    /// Capped at a few seconds: a refused dial to a LAN address costs nothing, and home may be
+    /// Capped at a few seconds: a refused dial to a LAN address costs nothing, and the desk may be
     /// back at any moment, so the agent must not be found asleep for half a minute.
     fn default() -> Self {
         Self::new(Duration::from_secs(1), Duration::from_secs(3))
@@ -130,32 +146,160 @@ impl Default for Backoff {
 /// What the link went through, for the log. Never carries a key or a certificate.
 #[derive(Debug)]
 pub enum Event {
-    Connected,
+    /// Linked to a peer of the same minor version: the version it said.
+    Connected {
+        peer: String,
+    },
+    /// The peer runs another minor version: the version it said.
+    Incompatible {
+        peer: String,
+    },
     Disconnected(io::Error),
-    /// A connection home refused, or one the agent could not open.
+    /// A connection the desk refused, or one the agent could not open.
     Failed(io::Error),
     Retrying(Duration),
+    /// The agent is not on the desk's network: it does not dial.
+    Away,
+    /// The agent is back on the desk's network: it dials again.
+    Back,
 }
 
-/// Both sides say hello first; a peer of another version is refused.
+/// Both sides say hello first, with their Navette version; a peer of another minor version is
+/// refused. Returns the peer's version. It runs inside the authenticated link, and the version
+/// is trusted for this comparison only.
 pub async fn hello<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     heartbeat: Heartbeat,
-) -> io::Result<()> {
-    write_frame(stream, &[HELLO, VERSION]).await?;
+) -> io::Result<String> {
+    hello_as(stream, heartbeat, NAVETTE_VERSION).await
+}
+
+/// [`hello`], saying `ours` as this machine's version.
+async fn hello_as<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    heartbeat: Heartbeat,
+    ours: &str,
+) -> io::Result<String> {
+    let mut said = vec![HELLO, NAMED];
+    said.extend_from_slice(ours.as_bytes());
+    write_frame(stream, &said).await?;
     let frame = tokio::time::timeout(heartbeat.timeout, read_frame(stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no hello from the peer"))??;
-    match frame.as_slice() {
-        [HELLO, VERSION] => Ok(()),
-        [HELLO, other] => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("the peer speaks link version {other}, this machine {VERSION}: update both"),
-        )),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "no hello from the peer",
-        )),
+    let no_hello = || io::Error::new(io::ErrorKind::InvalidData, "no hello from the peer");
+    let refuse = |peer: String| {
+        let ours = ours.to_string();
+        io::Error::new(io::ErrorKind::InvalidData, Incompatible { peer, ours })
+    };
+    let peer = match frame.as_slice() {
+        [HELLO, NAMED, version @ ..] => readable(version).ok_or_else(no_hello)?,
+        // Whatever this machine runs, even a beta of 0.1's minor: 0.1 cannot read its hello.
+        [HELLO, _] => return Err(refuse(OLD.to_string())),
+        _ => return Err(no_hello()),
+    };
+    if same_minor(&peer, ours) {
+        Ok(peer)
+    } else {
+        Err(refuse(peer))
+    }
+}
+
+/// A version as a peer says it: short, plain, and starting with its major and minor numbers,
+/// so that it is safe in a log line and can be compared.
+fn readable(version: &[u8]) -> Option<String> {
+    let version = std::str::from_utf8(version).ok()?;
+    let plain = version
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b));
+    (version.len() <= LONGEST_VERSION && plain && minor(version).is_some())
+        .then(|| version.to_string())
+}
+
+/// A version's major and minor numbers: `0.2` of `0.2.1-beta.3`, `0.0` of a local build.
+fn minor(version: &str) -> Option<(u64, u64)> {
+    let mut numbers = version.splitn(3, '.');
+    let major = numbers.next()?.parse().ok()?;
+    let minor = numbers.next()?;
+    let digits = minor
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(minor, |end| &minor[..end]);
+    Some((major, digits.parse().ok()?))
+}
+
+/// The rule: the same major and minor. A local build is `0.0`, which no release is, so it
+/// links only with another local build.
+fn same_minor(a: &str, b: &str) -> bool {
+    minor(a).is_some_and(|a| Some(a) == minor(b))
+}
+
+/// The error of a hello refused for the peer's version.
+#[derive(Debug)]
+struct Incompatible {
+    peer: String,
+    ours: String,
+}
+
+impl std::fmt::Display for Incompatible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", refusal_of("the peer", &self.peer, &self.ours))
+    }
+}
+
+impl std::error::Error for Incompatible {}
+
+/// The version a hello was refused for, if it was refused for its version.
+pub fn incompatible(error: &io::Error) -> Option<&str> {
+    let refused = error.get_ref()?.downcast_ref::<Incompatible>()?;
+    Some(&refused.peer)
+}
+
+/// What a refusal says: what `other` runs, what this machine runs, and which to update.
+pub fn refusal(other: &str, peer: &str) -> String {
+    refusal_of(other, peer, NAVETTE_VERSION)
+}
+
+pub(crate) fn refusal_of(other: &str, peer: &str, ours: &str) -> String {
+    let update = match (minor(peer), minor(ours)) {
+        (Some((0, 0)), _) | (_, Some((0, 0))) => {
+            "a local build links only with another local build".to_string()
+        }
+        (theirs, ours) if theirs < ours => format!("update {other}"),
+        _ => "update this machine".to_string(),
+    };
+    format!("{other} runs Navette {peer}, this machine {ours}: {update}")
+}
+
+/// Says a version refusal once, not at each of the agent's redials, nor the wait before each:
+/// again only after a link, or for another version.
+#[derive(Default)]
+pub struct RefusalLog {
+    refused: Option<String>,
+}
+
+impl RefusalLog {
+    /// Whether `event` is to be said.
+    pub fn says(&mut self, event: &Event) -> bool {
+        match event {
+            Event::Incompatible { peer } => {
+                self.refused.replace(peer.clone()).as_ref() != Some(peer)
+            }
+            Event::Retrying(_) => self.refused.is_none(),
+            Event::Connected { .. } | Event::Failed(_) | Event::Disconnected(_) => {
+                self.refused = None;
+                true
+            }
+            Event::Away | Event::Back => true,
+        }
+    }
+}
+
+/// The event of a failed hello.
+fn refused(error: io::Error) -> Event {
+    match incompatible(&error) {
+        Some(peer) => Event::Incompatible {
+            peer: peer.to_string(),
+        },
+        None => Event::Failed(error),
     }
 }
 
@@ -256,7 +400,7 @@ async fn send<W: AsyncWrite + Unpin>(
                     .map_err(io_error)?
             }
             msg = sound.recv(), if sound_open => match msg {
-                // What the remote plays, or the home mic hears, never crosses outside a mode,
+                // What the remote plays, or the desk mic hears, never crosses outside a mode,
                 // whatever the other side asked.
                 Some(msg) if msg.is_frame() && !in_mode(&mode) => {}
                 Some(msg) => {
@@ -457,6 +601,13 @@ async fn receive<R: AsyncRead + Unpin>(
                 let _ = display.try_send(Incoming::NoLid(reason));
                 continue;
             }
+            // Said in notifications: only what a corner could draw is taken.
+            LinkMsg::Desk { label } => {
+                if crate::corner::check_label(&label).is_ok() {
+                    let _ = display.try_send(Incoming::Desk(label));
+                }
+                continue;
+            }
             msg => msg,
         };
         let Some(clip) = clip.into_clipboard().map(checked) else {
@@ -536,30 +687,59 @@ async fn audio_received<R: AsyncRead + Unpin>(
     })
 }
 
-/// `navette agent`: dials home, keeps the link up, and dials again whenever it drops. `attach`
-/// starts the connection's service each time the link is up. Never returns.
-pub async fn agent<D, F, Fut>(
+/// `navette agent`: dials the desk, keeps the link up, and dials again whenever it drops. `attach`
+/// starts the connection's service each time the link is up. Away from the desk's network, it does
+/// not dial, and looks again every `RECHECK`. Never returns.
+pub async fn agent<D, T, F, Fut>(
     dialer: D,
+    mut network: HomeNetwork<T>,
     heartbeat: Heartbeat,
     mut backoff: Backoff,
     events: UnboundedSender<Event>,
     attach: F,
 ) where
     D: Dial,
+    T: Tables,
     F: Fn(Wire) -> Fut,
     Fut: Future<Output = ()>,
 {
+    // Said once per change, not at each check.
+    let mut away = false;
     loop {
+        if !network.at_home() {
+            if !away {
+                away = true;
+                let _ = events.send(Event::Away);
+            }
+            tokio::time::sleep(RECHECK).await;
+            continue;
+        }
+        if away {
+            away = false;
+            let _ = events.send(Event::Back);
+        }
         match dialer.dial().await {
-            Ok(mut stream) => match hello(&mut stream, heartbeat).await {
-                Ok(()) => {
+            Ok(mut stream) => match hello(&mut stream, heartbeat).await.map_err(refused) {
+                Ok(peer) => {
                     backoff.reset();
-                    let _ = events.send(Event::Connected);
+                    if let Err(e) = network.linked() {
+                        let _ = events.send(Event::Failed(e));
+                    }
+                    let _ = events.send(Event::Connected { peer });
                     let ended = run(stream, heartbeat, &attach).await;
                     let _ = events.send(Event::Disconnected(ended));
                 }
-                Err(e) => {
-                    let _ = events.send(Event::Failed(e));
+                Err(refusal @ Event::Incompatible { .. }) => {
+                    // Hung up before the wait, not held open for it.
+                    drop(stream);
+                    let _ = events.send(refusal);
+                    // The gate is looked at again at the top of the loop, before the dial.
+                    let _ = events.send(Event::Retrying(REFUSED_REDIAL));
+                    tokio::time::sleep(REFUSED_REDIAL).await;
+                    continue;
+                }
+                Err(event) => {
+                    let _ = events.send(event);
                 }
             },
             Err(e) => {
@@ -612,16 +792,16 @@ pub async fn serve<A, F, Fut>(
         tokio::select! {
             Some(mut stream) = connections.recv() => {
                 greetings.spawn_local(async move {
-                    hello(&mut stream, heartbeat).await.map(|()| stream)
+                    hello(&mut stream, heartbeat).await.map(|peer| (stream, peer))
                 });
             }
             Some(greeted) = greetings.join_next() => match greeted {
-                Ok(Ok(stream)) => {
+                Ok(Ok((stream, peer))) => {
                     // Only a connection that said hello replaces the link. The older link, with
                     // its service, is gone before the newer one's starts.
                     session.abort_all();
                     while session.join_next().await.is_some() {}
-                    let _ = events.send(Event::Connected);
+                    let _ = events.send(Event::Connected { peer });
                     let (events, attach) = (events.clone(), attach.clone());
                     session.spawn_local(async move {
                         let ended = run(stream, heartbeat, attach).await;
@@ -629,7 +809,7 @@ pub async fn serve<A, F, Fut>(
                     });
                 }
                 Ok(Err(e)) => {
-                    let _ = events.send(Event::Failed(e));
+                    let _ = events.send(refused(e));
                 }
                 Err(_) => {}
             },
@@ -643,7 +823,7 @@ pub fn remote_dialer(store: &Store) -> io::Result<TlsDialer> {
     TlsDialer::new(&store.identity()?, pairing.peer, pairing.address)
 }
 
-/// Home's acceptor, on `listen` or else the address it was paired on.
+/// The desk's acceptor, on `listen` or else the address it was paired on.
 pub async fn home_acceptor(store: &Store, listen: Option<SocketAddr>) -> io::Result<TlsAcceptor> {
     let pairing = paired_as(store, Role::Home)?;
     let address = listen.unwrap_or(pairing.address);
@@ -674,7 +854,7 @@ fn paired_as(store: &Store, role: Role) -> io::Result<crate::store::Pairing> {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use gliff_proto::{ClientMsg, ClipboardFile};
     use tokio::sync::mpsc;
@@ -682,6 +862,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::display::wire::{Display, Msg as DisplayMsg};
     use crate::identity::Identity;
+    use crate::network::tests::{FakeTables, HOME_ROUTER, OTHER_ROUTER, mac, paired_remote};
     use crate::pair::{self, Pin, Timeouts};
     use crate::transport::bind_lan;
 
@@ -693,6 +874,11 @@ pub(crate) mod tests {
     }
 
     async fn nothing(_: Wire) {}
+
+    /// The gate of a pairing that does not know the desk's router: it dials wherever it is.
+    pub(crate) fn anywhere(store: &Store) -> HomeNetwork<FakeTables> {
+        HomeNetwork::new(FakeTables::default(), store.clone()).unwrap()
+    }
 
     fn quick_backoff() -> Backoff {
         Backoff::new(Duration::from_millis(10), Duration::from_millis(100))
@@ -707,7 +893,7 @@ pub(crate) mod tests {
 
     async fn until_connected(events: &mut mpsc::UnboundedReceiver<Event>) {
         loop {
-            if let Event::Connected = next(events).await {
+            if let Event::Connected { .. } = next(events).await {
                 return;
             }
         }
@@ -732,7 +918,7 @@ pub(crate) mod tests {
         let pin = Pin::random();
         let (home, remote) = tokio::join!(
             pair::home(&desk.home, listener, &pin, Timeouts::default()),
-            pair::remote(&desk.remote, address, &pin, Timeouts::default()),
+            pair::remote(&desk.remote, address, None, &pin, Timeouts::default()),
         );
         home.unwrap();
         remote.unwrap();
@@ -768,15 +954,133 @@ pub(crate) mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
+    /// Both ends of an in-memory link say hello as `a` and `b`: what each heard.
+    async fn hellos(a: &str, b: &str) -> (io::Result<String>, io::Result<String>) {
+        let (mut ends_a, mut ends_b) = tokio::io::duplex(1024);
+        tokio::join!(
+            hello_as(&mut ends_a, fast(), a),
+            hello_as(&mut ends_b, fast(), b)
+        )
+    }
+
+    /// The version a hello was refused for, if it was.
+    fn refused_for(heard: io::Result<String>) -> Option<String> {
+        incompatible(&heard.expect_err("refused")).map(str::to_string)
+    }
+
     #[tokio::test]
-    async fn a_peer_of_another_version_is_refused() {
+    async fn the_same_minor_links_and_each_side_sees_the_other_s_version() {
+        let (a, b) = hellos("0.2.0", "0.2.3").await;
+        assert_eq!(a.unwrap(), "0.2.3");
+        assert_eq!(b.unwrap(), "0.2.0");
+    }
+
+    #[tokio::test]
+    async fn another_minor_is_refused_on_both_sides_naming_the_peer_s_version() {
+        let (a, b) = hellos("0.2.1", "0.3.0").await;
+        assert_eq!(refused_for(a).as_deref(), Some("0.3.0"));
+        assert_eq!(refused_for(b).as_deref(), Some("0.2.1"));
+    }
+
+    #[tokio::test]
+    async fn a_prerelease_counts_as_its_minor() {
+        let (a, b) = hellos("0.2.1-beta.3", "0.2.0").await;
+        assert_eq!(a.unwrap(), "0.2.0");
+        assert_eq!(b.unwrap(), "0.2.1-beta.3");
+        let (a, _) = hellos("0.2.1-beta.3", "0.3.0").await;
+        assert_eq!(refused_for(a).as_deref(), Some("0.3.0"));
+    }
+
+    #[tokio::test]
+    async fn a_local_build_links_only_with_another_local_build() {
+        let (a, b) = hellos("0.0.0-dev", "0.2.0").await;
+        assert_eq!(refused_for(a).as_deref(), Some("0.2.0"));
+        assert_eq!(refused_for(b).as_deref(), Some("0.0.0-dev"));
+        let (a, b) = hellos("0.0.0-dev", "0.0.0-dev").await;
+        assert_eq!(a.unwrap(), "0.0.0-dev");
+        assert_eq!(b.unwrap(), "0.0.0-dev");
+    }
+
+    #[tokio::test]
+    async fn an_old_hello_is_refused_as_0_1_naming_it() {
         let (mut a, mut b) = tokio::io::duplex(1024);
-        let other = async {
-            write_frame(&mut b, &[HELLO, VERSION + 1]).await.unwrap();
+        let old = async {
+            // What every 0.1.x says, and nothing more.
+            write_frame(&mut b, &[HELLO, 2]).await.unwrap();
             b
         };
-        let (result, _b) = tokio::join!(hello(&mut a, fast()), other);
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let (heard, mut b) = tokio::join!(hello_as(&mut a, fast(), "0.2.0"), old);
+        assert_eq!(refused_for(heard).as_deref(), Some("0.1"));
+        // What 0.1 reads first is still a hello frame: a frame starting with `HELLO`.
+        let frame = read_frame(&mut b).await.unwrap();
+        assert_eq!(frame.first(), Some(&HELLO));
+        assert_eq!(
+            refusal_of("the remote", "0.1", "0.2.0"),
+            "the remote runs Navette 0.1, this machine 0.2.0: update the remote"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_hello_is_refused_even_by_a_0_1_beta() {
+        let (mut a, mut b) = tokio::io::duplex(1024);
+        let old = async {
+            write_frame(&mut b, &[HELLO, 2]).await.unwrap();
+            b
+        };
+        // The beta after 0.1.0 is 0.1.1-beta.N, of 0.1's minor: 0.1 cannot read its hello.
+        let (heard, _b) = tokio::join!(hello_as(&mut a, fast(), "0.1.1-beta.3"), old);
+        assert_eq!(refused_for(heard).as_deref(), Some("0.1"));
+    }
+
+    #[test]
+    fn the_refusal_names_the_machine_to_update() {
+        assert_eq!(
+            refusal_of("the remote", "0.2.3", "0.3.0"),
+            "the remote runs Navette 0.2.3, this machine 0.3.0: update the remote"
+        );
+        assert_eq!(
+            refusal_of("the desk", "0.4.0", "0.3.1"),
+            "the desk runs Navette 0.4.0, this machine 0.3.1: update this machine"
+        );
+        assert_eq!(
+            refusal_of("the desk", "0.0.0-dev", "0.3.1"),
+            "the desk runs Navette 0.0.0-dev, this machine 0.3.1: a local build links only \
+             with another local build"
+        );
+    }
+
+    #[test]
+    fn a_version_refusal_is_logged_once_until_a_link_or_another_version() {
+        let refused = |peer: &str| Event::Incompatible { peer: peer.into() };
+        let mut log = RefusalLog::default();
+        assert!(log.says(&refused("0.1")));
+        // The agent's wait and its next refusal, a minute later, say nothing new.
+        assert!(!log.says(&Event::Retrying(REFUSED_REDIAL)));
+        assert!(!log.says(&refused("0.1")));
+        assert!(log.says(&refused("0.3.0")));
+        assert!(log.says(&Event::Connected {
+            peer: "0.2.0".into()
+        }));
+        assert!(log.says(&Event::Retrying(Duration::from_secs(1))));
+        assert!(log.says(&refused("0.3.0")));
+    }
+
+    #[tokio::test]
+    async fn a_hello_with_an_unreadable_version_is_no_hello() {
+        let saids: [&[u8]; 4] = [b"\x1b[2Jboom", b"", b"latest", &[b'0'; 65]];
+        for said in saids {
+            let (mut a, mut b) = tokio::io::duplex(1024);
+            let other = async {
+                let mut frame = vec![HELLO, NAMED];
+                frame.extend_from_slice(said);
+                write_frame(&mut b, &frame).await.unwrap();
+                b
+            };
+            let (heard, _b) = tokio::join!(hello_as(&mut a, fast(), "0.2.0"), other);
+            let error = heard.expect_err("no hello");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(incompatible(&error), None, "{said:?}");
+        }
     }
 
     #[tokio::test]
@@ -896,7 +1200,7 @@ pub(crate) mod tests {
         let (sound, display) = ends.await.unwrap();
         let packet = Bytes::from_static(&[1, 2, 3]);
         let frames = |seq| {
-            // The remote's sound, and home's mic.
+            // The remote's sound, and the desk's mic.
             for frame in [
                 audio::Message::Frame {
                     session: 1,
@@ -1084,7 +1388,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Home's side of a link that is accepted from a queue of in-memory connections.
+    /// The desk's side of a link that is accepted from a queue of in-memory connections.
     pub(crate) struct Queue(pub(crate) mpsc::UnboundedReceiver<tokio::io::DuplexStream>);
 
     impl Accept for Queue {
@@ -1114,7 +1418,7 @@ pub(crate) mod tests {
 
                 let (home_end, mut bad) = tokio::io::duplex(1024);
                 connections.send(home_end).unwrap();
-                write_frame(&mut bad, &[HELLO, VERSION + 1]).await.unwrap();
+                write_frame(&mut bad, &[HELLO + 1, 2]).await.unwrap();
                 match next(&mut home_events).await {
                     Event::Failed(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
                     other => panic!("the bad hello must fail alone: {other:?}"),
@@ -1125,7 +1429,7 @@ pub(crate) mod tests {
                     () = &mut quiet => {}
                     event = home_events.recv() => panic!("the good link moved: {event:?}"),
                 }
-                assert!(!good.is_finished(), "home dropped the good link");
+                assert!(!good.is_finished(), "the desk dropped the good link");
             })
             .await;
     }
@@ -1178,7 +1482,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A dialer that refuses until `home_is_back`, then answers like home does.
+    /// A dialer that refuses until `home_is_back`, then answers like the desk does.
     struct Outage {
         home_is_back: Arc<AtomicBool>,
     }
@@ -1202,6 +1506,7 @@ pub(crate) mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_agent_redials_within_the_cap_after_a_long_outage() {
+        let tmp = tempfile::tempdir().unwrap();
         let home_is_back = Arc::new(AtomicBool::new(false));
         let (events_tx, mut events) = mpsc::unbounded_channel();
         let backoff = Backoff::default();
@@ -1209,30 +1514,302 @@ pub(crate) mod tests {
             Outage {
                 home_is_back: home_is_back.clone(),
             },
+            anywhere(&Store::new(tmp.path())),
             Heartbeat::default(),
             backoff,
             events_tx,
             nothing,
         ));
-        // Ten minutes without home: far more failures than it takes to reach the cap.
+        // Ten minutes without the desk: far more failures than it takes to reach the cap.
         tokio::time::sleep(Duration::from_secs(600)).await;
         while events.try_recv().is_ok() {}
-        // Home comes back right after a refused dial, the worst moment: the agent has just
+        // The desk comes back right after a refused dial, the worst moment: the agent has just
         // started its longest wait.
         while !matches!(events.recv().await, Some(Event::Retrying(_))) {}
         home_is_back.store(true, Ordering::SeqCst);
         let back = tokio::time::Instant::now();
         let waited = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
-                if let Event::Connected = events.recv().await.expect("the agent is alive") {
+                if let Event::Connected { .. } = events.recv().await.expect("the agent is alive") {
                     return back.elapsed();
                 }
             }
         })
         .await
-        .expect("the agent dials home again");
+        .expect("the agent dials the desk again");
         agent.abort();
         assert!(waited <= A_FEW_SECONDS, "dialled again after {waited:?}");
+    }
+
+    /// A dialer that answers like the desk does, and counts its dials; the desk a 0.1 if `old`.
+    #[derive(Clone, Default)]
+    struct Counted {
+        dials: Arc<AtomicUsize>,
+        old: bool,
+    }
+
+    impl Dial for Counted {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn dial(&self) -> io::Result<Self::Stream> {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            let (agent_side, mut home_side) = tokio::io::duplex(1024);
+            let old = self.old;
+            tokio::spawn(async move {
+                if old {
+                    let _ = write_frame(&mut home_side, &[HELLO, 2]).await;
+                    // 0.1 refuses the newer hello and hangs up.
+                    let _ = read_frame(&mut home_side).await;
+                    return;
+                }
+                let _ = hello(&mut home_side, Heartbeat::default()).await;
+                std::future::pending::<()>().await;
+            });
+            Ok(agent_side)
+        }
+    }
+
+    /// An agent paired with the desk's router as `gateway`, on `tables`.
+    fn gated_agent(
+        store: &Store,
+        tables: FakeTables,
+    ) -> (
+        Counted,
+        tokio::task::JoinHandle<()>,
+        mpsc::UnboundedReceiver<Event>,
+    ) {
+        gated_agent_dialing(store, tables, Counted::default())
+    }
+
+    /// The same, dialing with `dialer`.
+    fn gated_agent_dialing<D: Dial + Clone + Send + Sync + 'static>(
+        store: &Store,
+        tables: FakeTables,
+        dialer: D,
+    ) -> (
+        D,
+        tokio::task::JoinHandle<()>,
+        mpsc::UnboundedReceiver<Event>,
+    ) {
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let agent = tokio::spawn(agent(
+            dialer.clone(),
+            HomeNetwork::new(tables, store.clone()).unwrap(),
+            Heartbeat::default(),
+            Backoff::default(),
+            events_tx,
+            nothing,
+        ));
+        (dialer, agent, events)
+    }
+
+    fn drained(events: &mut mpsc::UnboundedReceiver<Event>) -> Vec<Event> {
+        std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
+
+    /// Away from the desk for ten minutes: no dial, and one line said, not one per check.
+    async fn never_dialed_and_said_once(tables: FakeTables) {
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let (dialer, agent, mut events) = gated_agent(&store, tables);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        agent.abort();
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 0);
+        let said = drained(&mut events);
+        assert!(matches!(said.as_slice(), [Event::Away]), "said {said:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_agent_dials_behind_home_s_router() {
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let (_, agent, mut events) = gated_agent(&store, FakeTables::behind(HOME_ROUTER));
+        let first = tokio::time::timeout(A_FEW_SECONDS, events.recv()).await;
+        agent.abort();
+        assert!(
+            matches!(first, Ok(Some(Event::Connected { .. }))),
+            "{first:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn behind_another_router_the_agent_never_dials_and_says_so_once() {
+        never_dialed_and_said_once(FakeTables::behind(OTHER_ROUTER)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_no_router_the_agent_never_dials_and_says_so_once() {
+        never_dialed_and_said_once(FakeTables::default()).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn with_no_arp_entry_for_the_router_the_agent_never_dials_and_says_so_once() {
+        let tables = FakeTables::behind(HOME_ROUTER);
+        tables.set(
+            &tables.route().unwrap(),
+            "IP address       HW type     Flags       HW address            Mask     Device\n",
+        );
+        never_dialed_and_said_once(tables).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn back_on_home_s_network_the_agent_dials_again() {
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let tables = FakeTables::behind(OTHER_ROUTER);
+        let (_, agent, mut events) = gated_agent(&store, tables.clone());
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        tables.move_behind(HOME_ROUTER);
+        let back = tokio::time::Instant::now();
+        let said = tokio::time::timeout(RECHECK + A_FEW_SECONDS, async {
+            let mut said = Vec::new();
+            loop {
+                let event = events.recv().await.expect("the agent is alive");
+                let connected = matches!(event, Event::Connected { .. });
+                said.push(event);
+                if connected {
+                    return said;
+                }
+            }
+        })
+        .await
+        .expect("the agent dials the desk again");
+        agent.abort();
+        assert!(
+            back.elapsed() <= RECHECK,
+            "linked after {:?}",
+            back.elapsed()
+        );
+        assert!(
+            matches!(
+                said.as_slice(),
+                [Event::Away, Event::Back, Event::Connected { .. }]
+            ),
+            "said {said:?}"
+        );
+    }
+
+    fn old_desk() -> Counted {
+        Counted {
+            old: true,
+            ..Counted::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_agent_refused_for_its_version_redials_once_a_minute() {
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let (dialer, agent, mut events) =
+            gated_agent_dialing(&store, FakeTables::behind(HOME_ROUTER), old_desk());
+        let refused = next(&mut events).await;
+        assert!(
+            matches!(&refused, Event::Incompatible { peer } if peer == "0.1"),
+            "{refused:?}"
+        );
+        assert!(
+            matches!(next(&mut events).await, Event::Retrying(d) if d == REFUSED_REDIAL),
+            "the wait after a refusal is a minute"
+        );
+        assert_eq!(REFUSED_REDIAL, Duration::from_secs(60));
+        tokio::time::sleep(REFUSED_REDIAL - A_FEW_SECONDS).await;
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 1, "redialed too soon");
+        tokio::time::sleep(2 * A_FEW_SECONDS).await;
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 2);
+        agent.abort();
+    }
+
+    /// A desk of another minor that refuses the agent and keeps its end open: whether the agent
+    /// hung up before its wait.
+    #[derive(Clone, Default)]
+    struct Refusing {
+        hung_up: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    impl Dial for Refusing {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn dial(&self) -> io::Result<Self::Stream> {
+            let (agent_side, mut home_side) = tokio::io::duplex(1024);
+            let hung_up = self.hung_up.clone();
+            tokio::spawn(async move {
+                let _ = hello_as(&mut home_side, Heartbeat::default(), "9.0.0").await;
+                let read = tokio::time::timeout(A_FEW_SECONDS, read_frame(&mut home_side)).await;
+                hung_up.lock().unwrap().push(matches!(read, Ok(Err(_))));
+                std::future::pending::<()>().await;
+            });
+            Ok(agent_side)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_agent_refused_for_its_version_hangs_up_before_it_waits() {
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let (desk, agent, mut events) =
+            gated_agent_dialing(&store, FakeTables::behind(HOME_ROUTER), Refusing::default());
+        while !matches!(next(&mut events).await, Event::Retrying(_)) {}
+        tokio::time::sleep(2 * A_FEW_SECONDS).await;
+        agent.abort();
+        assert_eq!(*desk.hung_up.lock().unwrap(), [true]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_agent_refused_for_its_version_checks_the_desk_s_network_before_redialing() {
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let tables = FakeTables::behind(HOME_ROUTER);
+        let (dialer, agent, mut events) = gated_agent_dialing(&store, tables.clone(), old_desk());
+        while !matches!(next(&mut events).await, Event::Retrying(_)) {}
+        tables.move_behind(OTHER_ROUTER);
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        agent.abort();
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
+        let said = drained(&mut events);
+        assert!(matches!(said.as_slice(), [Event::Away]), "said {said:?}");
+    }
+
+    #[tokio::test]
+    async fn the_desk_refuses_an_old_remote_and_says_its_version() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (connections, queue) = mpsc::unbounded_channel();
+                let (events, mut home_events) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(serve(Queue(queue), fast(), events, nothing));
+                let (home_end, mut old) = tokio::io::duplex(1024);
+                connections.send(home_end).unwrap();
+                write_frame(&mut old, &[HELLO, 2]).await.unwrap();
+                match next(&mut home_events).await {
+                    Event::Incompatible { peer } => assert_eq!(peer, "0.1"),
+                    other => panic!("refused for its version: {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn linked_each_side_says_the_other_s_version() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (connections, queue) = mpsc::unbounded_channel();
+                let (events, mut home_events) = mpsc::unbounded_channel();
+                tokio::task::spawn_local(serve(Queue(queue), fast(), events, nothing));
+                let (home_end, mut remote) = tokio::io::duplex(1024);
+                connections.send(home_end).unwrap();
+                let heard = hello(&mut remote, fast()).await.unwrap();
+                assert_eq!(heard, NAVETTE_VERSION);
+                match next(&mut home_events).await {
+                    Event::Connected { peer } => assert_eq!(peer, NAVETTE_VERSION),
+                    other => panic!("linked: {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_old_pairing_learns_home_s_router_at_its_first_link() {
+        let (_tmp, store) = paired_remote(None);
+        let (_, agent, mut events) = gated_agent(&store, FakeTables::behind(HOME_ROUTER));
+        until_connected(&mut events).await;
+        agent.abort();
+        assert_eq!(
+            store.pairing().unwrap().unwrap().gateway,
+            Some(mac(HOME_ROUTER))
+        );
     }
 
     #[tokio::test]
@@ -1246,6 +1823,7 @@ pub(crate) mod tests {
                 let home = tokio::task::spawn_local(serve(acceptor, fast(), home_tx, nothing));
                 let remote = tokio::task::spawn_local(agent(
                     remote_dialer(&desk.remote).unwrap(),
+                    anywhere(&desk.remote),
                     fast(),
                     quick_backoff(),
                     remote_tx,
@@ -1267,6 +1845,7 @@ pub(crate) mod tests {
                 let (remote_tx, mut remote_events) = mpsc::unbounded_channel();
                 let remote = tokio::task::spawn_local(agent(
                     remote_dialer(&desk.remote).unwrap(),
+                    anywhere(&desk.remote),
                     fast(),
                     quick_backoff(),
                     remote_tx,
@@ -1324,6 +1903,7 @@ pub(crate) mod tests {
                 let home = tokio::task::spawn_local(serve(acceptor, fast(), home_tx, nothing));
                 let remote = tokio::task::spawn_local(agent(
                     remote_dialer(&desk.remote).unwrap(),
+                    anywhere(&desk.remote),
                     fast(),
                     quick_backoff(),
                     remote_tx,
@@ -1332,7 +1912,7 @@ pub(crate) mod tests {
                 until_connected(&mut home_events).await;
                 until_connected(&mut remote_events).await;
 
-                // A stranger with its own certificate, and a silent connection: home refuses both.
+                // A stranger with its own certificate, and a silent connection: the desk refuses both.
                 let stranger = TlsDialer::new(
                     &Identity::generate().unwrap(),
                     desk.home.identity().unwrap().fingerprint(),
@@ -1521,7 +2101,7 @@ pub(crate) mod tests {
         .clone();
         assert_eq!(pointers[0], Pointer::default());
         assert_eq!(&pointers[1].shape.as_ref().unwrap().argb[..], &[3; 4]);
-        // Home's acks, and home's input, go back to output 1.
+        // The desk's acks, and the desk's input, go back to output 1.
         ends.home
             .outbox
             .on(1)
@@ -1555,7 +2135,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_remote_cursor_is_never_lost_behind_a_full_display_queue() {
         let mut ends = display_link(1 << 20).await;
-        // Home's display reads nothing: its queue fills.
+        // The desk's display reads nothing: its queue fills.
         for id in 0..DISPLAY_INBOUND as u64 + 20 {
             let (msg, payloads) = video_frame(id, 16);
             ends.remote.outbox.send(msg, payloads);
@@ -1611,6 +2191,18 @@ pub(crate) mod tests {
         match incoming(&mut ends.home).await {
             Incoming::NoLid(reason) => assert_eq!(reason, "Access denied"),
             other => panic!("expected the notice, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_desk_s_label_crosses_the_link_to_the_remote() {
+        let mut ends = display_link(64 * 1024).await;
+        ends.home
+            .outbox
+            .send(DisplayMsg::Desk("NEAR".into()), Vec::new());
+        match incoming(&mut ends.remote).await {
+            Incoming::Desk(label) => assert_eq!(label, "NEAR"),
+            other => panic!("expected the label, got {other:?}"),
         }
     }
 
@@ -1739,7 +2331,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn frames_the_display_cannot_take_are_acked_and_a_keyframe_asked_for() {
         let mut ends = display_link(1 << 20).await;
-        // Home's display reads nothing: its queue fills.
+        // The desk's display reads nothing: its queue fills.
         for id in 0..DISPLAY_INBOUND as u64 + 20 {
             let (msg, payloads) = video_frame(id, 16);
             ends.remote.outbox.send(msg, payloads);
@@ -1884,5 +2476,41 @@ pub(crate) mod tests {
             gaps.iter().all(|&gap| gap >= FRAMES_PER_CLIP),
             "frames between clipboard messages: {gaps:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn on_the_remote_the_events_say_away_then_dialing_then_linked() {
+        use crate::events::{Events, Parts, link_after};
+        let (_tmp, store) = paired_remote(Some(HOME_ROUTER));
+        let tables = FakeTables::behind(OTHER_ROUTER);
+        let (_, agent, mut events) = gated_agent(&store, tables.clone());
+        let state = Events::new(Parts::remote());
+        let mut said = state.subscribe();
+        let followed = state.clone();
+        let follow = tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                followed.update(|p| p.link = link_after(p.link, &event));
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        tables.move_behind(HOME_ROUTER);
+        let states = tokio::time::timeout(RECHECK + A_FEW_SECONDS, async {
+            let mut states = Vec::new();
+            loop {
+                let line = said.recv().await.unwrap();
+                let line: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let state = line["state"].as_str().unwrap().to_string();
+                let linked = state == "linked";
+                states.push(state);
+                if linked {
+                    return states;
+                }
+            }
+        })
+        .await
+        .expect("linked in time");
+        agent.abort();
+        follow.abort();
+        assert_eq!(states, ["dialing", "away", "dialing", "linked"]);
     }
 }

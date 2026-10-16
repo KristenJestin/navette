@@ -1,7 +1,7 @@
 # The Navette agent on the remote machine: a systemd user service, no root. It only dials out
-# to the paired home machine and never listens.
+# to the paired desk and never listens.
 #
-# Install (once `navette pair <home:port>` has succeeded):
+# Install (once `navette pair <desk:port>` has succeeded):
 #   cargo install --locked --path . --root ~/.local
 #   install -Dm644 dist/navette-agent.service ~/.config/systemd/user/navette-agent.service
 #   systemctl --user daemon-reload
@@ -9,9 +9,9 @@
 # Logs: journalctl --user -u navette-agent
 
 [Unit]
-Description=Navette agent: keeps the link to the paired home machine
+Description=Navette agent: keeps the link to the paired desk
 # Stopped before PipeWire, so it can put the previous default output back. Ordered only, not
-# wanted: `Wants=` would start PipeWire with the agent, which needs it only once home asks for
+# wanted: `Wants=` would start PipeWire with the agent, which needs it only once the desk asks for
 # the sound, and connects then.
 After=pipewire.service wireplumber.service
 

@@ -23,7 +23,7 @@
 //! > substantial portions of the Software. The Software is provided "as is", without warranty
 //! > of any kind.
 //!
-//! The home machine is gliff's client side of the engine (odd request ids) and the remote
+//! The desk is gliff's client side of the engine (odd request ids) and the remote
 //! machine its server side (even ones), so two transfers in opposite directions never share an
 //! id. Everything here runs on the link's thread, in a `LocalSet` of the bridge's own, so the
 //! end of the bridge ends every transfer and paste it started; the compositor calls that block
@@ -1656,7 +1656,7 @@ mod tests {
         }
     }
 
-    /// Home and the remote machine, each with its bridge, over an in-memory link. Spawns on
+    /// The desk and the remote machine, each with its bridge, over an in-memory link. Spawns on
     /// the current `LocalSet`.
     /// Each machine's receiving folder is `home` or `remote` in `folders`.
     /// A mode runs on it from the start.
@@ -1900,7 +1900,7 @@ mod tests {
                 remote.offered(1).await;
                 home.mode(false);
                 remote.mode(false);
-                // What the remote held of home's copy goes with the mode.
+                // What the remote held of the desk's copy goes with the mode.
                 assert_eq!(remote.offered(2).await, Vec::<String>::new());
                 home.copy(&[(HTML, b"<p>salaries</p>")]);
                 settled().await;
@@ -1977,7 +1977,7 @@ mod tests {
                     panic!("an offer first");
                 };
                 remote.mode(false);
-                // A home that asks anyway: its offer is not put on the clipboard, and its
+                // A desk that asks anyway: its offer is not put on the clipboard, and its
                 // request is refused, in that order.
                 home.write_msg(&LinkMsg::ClipboardOffer {
                     serial: 9,
@@ -2043,7 +2043,7 @@ mod tests {
         file_crosses(false).await;
     }
 
-    /// Home copies `name` of `copied` (made with `content`); the remote pastes it. The paths it
+    /// The desk copies `name` of `copied` (made with `content`); the remote pastes it. The paths it
     /// read.
     async fn copy_and_paste(
         home: &Machine,
@@ -2201,7 +2201,7 @@ mod tests {
         })
     }
 
-    /// Home and the remote machine, each keeping what it keeps from one link to the next, and
+    /// The desk and the remote machine, each keeping what it keeps from one link to the next, and
     /// the way to plug a new link between them. Each machine's receiving folder is `home` or
     /// `remote` in `folders`.
     fn reconnecting_desk(folders: &std::path::Path) -> (Machine, Machine, impl Fn() -> Cable) {
@@ -2212,7 +2212,7 @@ mod tests {
         (home, remote, move || plug(&home_ends, &remote_ends))
     }
 
-    /// The remote copies `list` again on a new link, and home pastes it; what it read.
+    /// The remote copies `list` again on a new link, and the desk pastes it; what it read.
     async fn after_a_reconnect(
         home: &Machine,
         remote: &Machine,
@@ -2869,7 +2869,7 @@ mod tests {
             .await;
     }
 
-    /// Home copies `files` (made under `tmp/copied`), the remote pastes them; what it read.
+    /// The desk copies `files` (made under `tmp/copied`), the remote pastes them; what it read.
     async fn paste_on_the_remote(home: &Machine, remote: &Machine, list: &str) -> String {
         home.copy(&[(URI_LIST, list.as_bytes())]);
         remote.offered(1).await;
@@ -2892,8 +2892,8 @@ mod tests {
         assert!(bars.iter().any(|bars| !bars.is_empty()), "{bars:?}");
     }
 
-    /// Home copies the files `names` of `tmp/copied` the way a file manager does: the file
-    /// lists and the text types, all naming home's paths.
+    /// The desk copies the files `names` of `tmp/copied` the way a file manager does: the file
+    /// lists and the text types, all naming the desk's paths.
     fn copy_files_with_text(home: &Machine, copied: &std::path::Path, names: &[&str]) {
         let paths: Vec<_> = names.iter().map(|n| copied.join(n)).collect();
         let list = uri_list_of(&paths);
@@ -2995,7 +2995,7 @@ mod tests {
             .run_until(async {
                 let (home, remote) = desk(tmp.path());
                 paste_on_the_remote(&home, &remote, &list).await;
-                // Home serves it, the remote writes it: both count it.
+                // The desk serves it, the remote writes it: both count it.
                 the_bar_went(&home.seen, 1 << 20).await;
                 the_bar_went(&remote.seen, 1 << 20).await;
             })
@@ -3017,7 +3017,7 @@ mod tests {
                 paste_on_the_remote(&home, &remote, &list).await;
                 the_bar_went(&home.seen, (1 << 20) + 7).await;
                 the_bar_went(&remote.seen, (1 << 20) + 7).await;
-                // Home serves it, the remote writes it: each knows the list of the copy.
+                // The desk serves it, the remote writes it: each knows the list of the copy.
                 let trip = Some(progress::Headline {
                     name: "trip".into(),
                     more: 1,
@@ -3047,7 +3047,7 @@ mod tests {
                 paste_on_the_remote(&home, &remote, &list).await;
                 the_bar_went(&home.seen, 3 << 10).await;
                 the_bar_went(&remote.seen, 3 << 10).await;
-                // One for the copy served by home, one for the paste on the remote; not one
+                // One for the copy served by the desk, one for the paste on the remote; not one
                 // per file served.
                 assert_eq!(files::HEADLINES.with(|n| n.get()), 2);
             })
@@ -3490,7 +3490,7 @@ mod tests {
             .await;
     }
 
-    /// Two ends joined by a line of about 500 Mbit/s each way, like a home network.
+    /// Two ends joined by a line of about 500 Mbit/s each way, like a local network.
     fn lan() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
         let (home, home_line) = tokio::io::duplex(64 * 1024);
         let (remote_line, remote) = tokio::io::duplex(64 * 1024);
@@ -3527,7 +3527,7 @@ mod tests {
     struct Measured {
         /// From the paste to its last byte in the receiving folder.
         elapsed: Duration,
-        /// Each frame's delay from the remote's queue to home's display, while it ran.
+        /// Each frame's delay from the remote's queue to the desk's display, while it ran.
         delays: Vec<Duration>,
         pasted: std::path::PathBuf,
     }
@@ -3541,7 +3541,7 @@ mod tests {
         }
     }
 
-    /// The remote copies `copied` and home pastes it, while the remote streams a 60 kB frame
+    /// The remote copies `copied` and the desk pastes it, while the remote streams a 60 kB frame
     /// every 16 ms, as its encoder would: one waiting at most.
     async fn frames_during_a_paste(
         home: &Machine,
@@ -3679,6 +3679,7 @@ mod tests {
                     machine_on(Side::Server, Inbox::new(tmp.path().join("r")), |service| {
                         tokio::task::spawn_local(link::agent(
                             dialer,
+                            link::tests::anywhere(&desk.remote),
                             Heartbeat::default(),
                             link::Backoff::default(),
                             events,
@@ -3837,7 +3838,7 @@ mod tests {
         (machine, Framed::new(peer), mount)
     }
 
-    /// Home and the remote machine, each reading the other's files through a virtual folder.
+    /// The desk and the remote machine, each reading the other's files through a virtual folder.
     fn desk_reading(
         folders: &std::path::Path,
     ) -> (Machine, Machine, Arc<FakeMount>, Arc<FakeMount>) {
@@ -4099,7 +4100,7 @@ mod tests {
             .await;
     }
 
-    /// Home reads two files of two copies of the remote's, each one chunk in: the two reads,
+    /// The desk reads two files of two copies of the remote's, each one chunk in: the two reads,
     /// their transfers, and the peer's end.
     async fn two_reads_under_way(
         home: &Machine,
@@ -4119,7 +4120,7 @@ mod tests {
         [(read_a, a_id), (read_b, b_id)]
     }
 
-    /// The bars of the two transfers of copies 6 and 7, once home shows both.
+    /// The bars of the two transfers of copies 6 and 7, once the desk shows both.
     async fn two_bars(seen: &Seen) -> Vec<Bar> {
         let ids = [Crossing::Read(6).id(), Crossing::Read(7).id()];
         within("two bars", async {
@@ -4269,7 +4270,7 @@ mod tests {
                 let pasted = remote.paste(URI_LIST).await;
                 let paths = parse_uri_list(&String::from_utf8(pasted).unwrap());
                 let folder = remote_mount.folder().await;
-                // The file manager opened it, then something else is copied at home.
+                // The file manager opened it, then something else is copied at the desk.
                 let rel = paths[0].strip_prefix(folder.path()).unwrap();
                 let dir = folder.lookup(1, rel.iter().next().unwrap()).unwrap();
                 let ino = folder
@@ -4577,7 +4578,7 @@ mod tests {
                 let (remote, mut home, mount) = alone_reading(Side::Server, tmp.path());
                 let path = offer_a_file(&remote, &mut home, 6, "a.bin", 2 * CHUNK as u64, 1).await;
                 let folder = mount.folder().await;
-                // Home's user cancelled its serving: each request is refused from now on.
+                // The desk's user cancelled its serving: each request is refused from now on.
                 for _ in 0..3 {
                     let read = tokio::task::spawn_local(read_file(folder.clone(), path.clone()));
                     let (id, _) = next_request(&mut home).await;
@@ -4767,6 +4768,7 @@ mod tests {
                 let remote = machine_on(Side::Server, inbox, |service| {
                     tokio::task::spawn_local(link::agent(
                         dialer,
+                        link::tests::anywhere(&desk.remote),
                         Heartbeat::default(),
                         link::Backoff::default(),
                         events,
