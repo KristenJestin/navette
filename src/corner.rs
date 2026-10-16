@@ -406,9 +406,10 @@ const GLOW: (f64, f64) = (150.0, 80.0);
 const DOT: f64 = 2.0;
 /// The longest message shown, in characters; a longer one ends with `…`.
 const LONGEST: usize = 64;
-/// A bar of files crossing is as tall as its text, with a dot of air: several of them stack
-/// under the tag without going far below the room the tag row and a message already take.
-const BAR_ROW: f64 = 16.0;
+/// A bar of files crossing is as tall as the font's eight rows, the descenders of `g`, `p` and
+/// `y` included, with a pixel of air: several of them stack under the tag without going far
+/// below the room the tag row and a message already take.
+const BAR_ROW: f64 = 17.0;
 /// The air between two bars, and between the tag row and the first bar.
 const BAR_GAP: f64 = 2.0;
 /// The longest text of a bar of files crossing, in characters: its name is cut to fit.
@@ -705,7 +706,7 @@ impl Corner {
             let text = bar_text(&files);
             pen.text(
                 bar.x + 6.0,
-                bar.y + (BAR_ROW - 7.0 * DOT) / 2.0,
+                bar.y + (BAR_ROW - 8.0 * DOT) / 2.0,
                 &text,
                 LABEL,
             );
@@ -1392,6 +1393,35 @@ mod tests {
         let mut unnamed = named("x", 0, 2);
         unnamed.headline = None;
         assert_eq!(bar_text(&unnamed), "2.0 GiB x");
+    }
+
+    #[test]
+    fn the_text_of_a_bar_stays_inside_the_bar() {
+        // The same bar named with letters that hang below the line, and with letters that do
+        // not: whatever differs between the two is the descenders, and none may fall outside.
+        let now = Instant::now();
+        for scale in [1.0, 2.0, 3.0] {
+            let drawn = |name: &str| {
+                let mut pro = bare_clone(now);
+                pro.update(Update::Files(vec![named(name, 0, 1)]), now);
+                (pro.bars()[0].0, pro.draw(now, scale))
+            };
+            let (bar, hanging) = drawn("gypqgypq");
+            let (_, level) = drawn("AAAAAAAA");
+            assert_eq!((hanging.width, hanging.height), (level.width, level.height));
+            let inside = |x: u32, y: u32| {
+                let (x, y) = (x as f64 / scale, y as f64 / scale);
+                x >= bar.x && x < bar.x + bar.width && y >= bar.y && y < bar.y + bar.height
+            };
+            for y in 0..hanging.height {
+                for x in 0..hanging.width {
+                    assert!(
+                        inside(x, y) || hanging.at(x, y) == level.at(x, y),
+                        "scale {scale}: the text drew at ({x}, {y}), outside the bar {bar:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
