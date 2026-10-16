@@ -48,6 +48,7 @@ jobs:
 
   # TEMPORARY (#140): the three flaky tests, looped under CPU load. Removed before the merge.
   stress:
+    if: false
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -101,3 +102,51 @@ jobs:
           done
           echo "failed iterations: $fail of 20"
           [ "$fail" = 0 ]
+
+  tcpdup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Does reading /proc/net/tcp under churn repeat a socket?
+        run: |
+          ulimit -n 65536
+          python3 - <<'PY'
+          import os, socket, threading, time
+          srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(4096)
+          port = srv.getsockname()[1]
+          kept = []
+          def accept():
+              while True:
+                  c = srv.accept()[0]
+                  if len(kept) < 3000:
+                      kept.append(c)
+                  else:
+                      c.close()
+          threading.Thread(target=accept, daemon=True).start()
+          held = [socket.create_connection(("127.0.0.1", port)) for _ in range(3000)]
+          def churn():
+              while True:
+                  socket.create_connection(("127.0.0.1", port)).close()
+          for _ in range(3):
+              threading.Thread(target=churn, daemon=True).start()
+          # Reads like Rust's read_to_string on a proc file: a small probe, then growing chunks.
+          def table():
+              fd = os.open("/proc/net/tcp", os.O_RDONLY)
+              out, size = b"", 32
+              while True:
+                  chunk = os.read(fd, size)
+                  if not chunk:
+                      break
+                  out += chunk
+                  size = min(size * 2, 8192)
+              os.close(fd)
+              return out.decode().splitlines()[1:]
+          dup = reads = 0
+          end = time.time() + 120
+          while time.time() < end:
+              rows = table()
+              reads += 1
+              inodes = [r.split()[9] for r in rows if r.split()[3] == "01" and r.split()[9] != "0"]
+              if len(inodes) != len(set(inodes)):
+                  dup += 1
+          print(f"reads: {reads}, reads with a repeated established socket: {dup}")
+          PY
