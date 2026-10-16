@@ -1382,6 +1382,47 @@ mod tests {
     }
 
     #[test]
+    fn the_remote_s_nodes_are_named_for_the_desk() {
+        assert_eq!(SINK, "navette-desk-speakers");
+        assert_eq!(SINK_DESCRIPTION, "Desk speakers (Navette)");
+        assert_eq!(mic::SOURCE, "navette-desk-mic");
+    }
+
+    #[test]
+    fn a_default_left_on_the_sink_of_0_1_by_an_agent_that_died_is_put_back_as_ours() {
+        let graph = FakeGraph::default();
+        graph.state().default = Some(DefaultNode::named("navette-home-speakers"));
+        let (_tmp, saved) = saved();
+        saved
+            .save(Device::Sink, Some(&DefaultNode::named("speakers")))
+            .unwrap();
+        repair(&graph, &saved);
+        assert_eq!(graph.state().default, Some(DefaultNode::named("speakers")));
+        assert_eq!(saved.load(Device::Sink).unwrap(), None);
+    }
+
+    #[test]
+    fn a_start_after_an_agent_of_0_1_died_saves_the_users_choice_not_its_sink() {
+        let graph = FakeGraph::default();
+        graph.state().default = Some(DefaultNode::named("navette-home-speakers"));
+        let (_tmp, saved) = saved();
+        saved
+            .save(Device::Sink, Some(&DefaultNode::named("speakers")))
+            .unwrap();
+        drop(start(&graph, &saved));
+        assert_eq!(graph.state().default, Some(DefaultNode::named("speakers")));
+    }
+
+    #[test]
+    fn an_old_sink_left_as_the_default_with_nothing_saved_is_cleared() {
+        let graph = FakeGraph::default();
+        graph.state().default = Some(DefaultNode::named("navette-home-speakers"));
+        let (_tmp, saved) = saved();
+        drop(start(&graph, &saved));
+        assert_eq!(graph.state().default, None);
+    }
+
+    #[test]
     fn a_default_that_could_not_be_put_back_stays_saved() {
         let graph = FakeGraph::with_default("speakers");
         let (_tmp, saved) = saved();

@@ -317,6 +317,38 @@ mod tests {
     }
 
     #[test]
+    fn the_source_is_named_for_the_desk() {
+        assert_eq!(SOURCE, "navette-desk-mic");
+        assert_eq!(SOURCE_DESCRIPTION, "Desk mic (Navette)");
+    }
+
+    #[test]
+    fn a_default_mic_left_on_the_source_of_0_1_is_put_back_as_ours() {
+        let graph = FakeGraph::default();
+        graph.state().default_source = Some(DefaultNode::named("navette-home-mic"));
+        let (_tmp, saved) = saved();
+        saved
+            .save(Device::Source, Some(&DefaultNode::named("laptop-mic")))
+            .unwrap();
+        drop(Voice::start(graph.clone(), saved.clone(), 1).unwrap());
+        assert_eq!(
+            graph.state().default_source,
+            Some(DefaultNode::named("laptop-mic"))
+        );
+        // And a repair of its own, with nothing started.
+        graph.state().default_source = Some(DefaultNode::named("navette-home-mic"));
+        saved
+            .save(Device::Source, Some(&DefaultNode::named("laptop-mic")))
+            .unwrap();
+        super::super::repair(&graph, &saved);
+        assert_eq!(
+            graph.state().default_source,
+            Some(DefaultNode::named("laptop-mic"))
+        );
+        assert_eq!(saved.load(Device::Source).unwrap(), None);
+    }
+
+    #[test]
     fn the_mic_and_the_sound_keep_their_own_saved_defaults() {
         let graph = FakeGraph::with_default("laptop-speakers");
         graph.state().default_source = Some(DefaultNode::named("laptop-mic"));

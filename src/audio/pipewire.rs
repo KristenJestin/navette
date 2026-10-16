@@ -2205,7 +2205,7 @@ mod tests {
 
     #[test]
     fn the_sink_s_monitor_carries_the_sound_before_its_volume() {
-        let props = sink_properties("navette-home-speakers", "Home speakers");
+        let props = sink_properties("navette-desk-speakers", "Desk speakers");
         assert_eq!(props.get("monitor.channel-volumes"), Some("false"));
         assert_eq!(props.get(*pw::keys::MEDIA_CLASS), Some("Audio/Sink"));
     }
