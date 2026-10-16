@@ -43,3 +43,55 @@ fn a_66_character_title_on_pull_request_95_passes() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Runs `--range` over a throwaway repository holding one commit with `subject`.
+fn check_range(subject: &str) -> Output {
+    let dir = tempfile::tempdir().unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+    };
+    git(&["init", "--quiet"]);
+    git(&["commit", "--quiet", "--allow-empty", "-m", subject]);
+    Command::new("bash")
+        .arg(SCRIPT)
+        .args(["--range", "HEAD"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_72_character_squash_subject_with_its_pull_request_suffix_passes_in_a_range() {
+    let output = check_range(&format!("{} (#87)", title(72)));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_73_character_subject_before_the_pull_request_suffix_fails_in_a_range() {
+    let output = check_range(&format!("{} (#87)", title(73)));
+    assert!(!output.status.success());
+}
+
+#[test]
+fn a_73_character_subject_without_a_suffix_fails_in_a_range() {
+    let output = check_range(&title(73));
+    assert!(!output.status.success());
+}
+
+#[test]
+fn a_70_character_title_on_pull_request_123_still_fails() {
+    let output = check_title(&title(70), "123");
+    assert!(!output.status.success());
+}
