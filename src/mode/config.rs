@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::corner::{self, Look};
 use crate::display::wire::MAX_OUTPUTS;
+use crate::events::Defined;
 use crate::hypr::Monitor;
 use crate::input::{self, Hotkey};
 
@@ -377,6 +378,32 @@ pub fn list(config_dir: &Path) -> io::Result<String> {
         file.mode(0)?;
     }
     Ok(lines.join("\n"))
+}
+
+/// The modes the file defines, as the events and `navette mode list --json` say them: a mode
+/// the file gets wrong is left out, as it cannot start.
+pub fn defined(config_dir: &Path) -> io::Result<Vec<Defined>> {
+    let file = File::read(config_dir)?;
+    Ok(file
+        .sections
+        .iter()
+        .enumerate()
+        // A file with no default mode has the named ones only.
+        .filter(|(_, section)| section.name.is_some() || section.get("monitor").is_some())
+        .filter_map(|(index, _)| file.mode(index).ok())
+        .map(|mode| Defined {
+            name: mode.name,
+            monitors: mode.monitors,
+        })
+        .collect())
+}
+
+/// The remote machine's label, `remote_label` before any section, as the events say it.
+pub fn remote_label(config_dir: &Path) -> String {
+    File::read(config_dir)
+        .ok()
+        .and_then(|file| file.sections[0].get("remote_label").map(str::to_string))
+        .unwrap_or_else(|| Look::default().remote_label)
 }
 
 /// The home monitors the specs name, in the order given: by output name, or by the start of the
@@ -960,5 +987,45 @@ mod tests {
         off.disabled = true;
         let error = resolve(&["DP-1".to_string()], &[off]).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn the_modes_for_json_name_the_unnamed_one_null_and_leave_the_broken_ones_out() {
+        let dir = written(
+            "monitor = DP-1\n[office]\nmonitor = DP-1, desc:Invented Display\n\
+             [broken]\nrelease = none\n[travel]\nmonitor = DP-2\n",
+        );
+        let named = |name: Option<&str>, monitors: &[&str]| Defined {
+            name: name.map(str::to_string),
+            monitors: monitors.iter().map(|m| m.to_string()).collect(),
+        };
+        assert_eq!(
+            defined(dir.path()).unwrap(),
+            [
+                named(None, &["DP-1"]),
+                named(Some("office"), &["DP-1", "desc:Invented Display"]),
+                named(Some("travel"), &["DP-2"]),
+            ]
+        );
+        // With no default monitor, there is no unnamed mode.
+        let dir = written("release = none\n[office]\nmonitor = DP-1\n");
+        assert_eq!(
+            defined(dir.path()).unwrap(),
+            [named(Some("office"), &["DP-1"])]
+        );
+        let none = tempfile::tempdir().unwrap();
+        assert_eq!(
+            defined(none.path()).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn the_remote_label_is_the_one_before_any_section_or_the_corner_s() {
+        let dir = written("remote_label = FAR\n[office]\nmonitor = DP-1\nremote_label = AWAY\n");
+        assert_eq!(remote_label(dir.path()), "FAR");
+        let dir = written("[office]\nmonitor = DP-1\nremote_label = AWAY\n");
+        assert_eq!(remote_label(dir.path()), "REMOTE");
+        assert_eq!(remote_label(tempfile::tempdir().unwrap().path()), "REMOTE");
     }
 }

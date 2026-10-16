@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::net::unix::OwnedReadHalf;
 use tokio::sync::mpsc::{self, UnboundedSender};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::mic::{self, Routing};
 use crate::mode;
@@ -249,6 +249,17 @@ impl Events {
     fn readers(&self) -> usize {
         let inner = self.inner.lock().unwrap();
         inner.readers.iter().filter(|r| !r.is_closed()).count()
+    }
+}
+
+/// Keeps the desk's `mic` as the mic says it, `mic watch`'s own source, until it is gone.
+pub async fn follow_mic(events: Arc<Events>, mut mic: watch::Receiver<mic::Status>) {
+    loop {
+        let status = *mic.borrow_and_update();
+        events.update(|p| p.mic = Some(status));
+        if mic.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -801,5 +812,25 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
+
+    #[tokio::test]
+    async fn a_mic_switch_gives_one_line() {
+        let events = Events::new(linked_desk());
+        let (_dir, path) = served(events.clone(), desk_commands().0);
+        let mut reader = Reader::connect(&path).await;
+        assert_eq!(reader.next().await, linked_desk().line());
+        let (mic, status) = watch::channel(mic::Status::Remote);
+        tokio::spawn(follow_mic(events.clone(), status));
+        // Where it stands when followed is said at once: already so here.
+        reader.quiet().await;
+        mic.send(mic::Status::Home).unwrap();
+        let line: serde_json::Value = serde_json::from_str(&reader.next().await).unwrap();
+        assert_eq!(line["mic"], "home");
+        assert_eq!(line["state"], "linked");
+        mic.send(mic::Status::Failed).unwrap();
+        let line: serde_json::Value = serde_json::from_str(&reader.next().await).unwrap();
+        assert_eq!(line["mic"], "failed");
+        reader.quiet().await;
     }
 }

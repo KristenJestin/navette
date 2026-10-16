@@ -20,6 +20,7 @@ use navette::clipboard::progress::Shown;
 use navette::corner::{self, Board};
 use navette::desk::Desk;
 use navette::display::{decode, remote};
+use navette::events;
 use navette::hypr::{self, Eval};
 use navette::input;
 use navette::lid;
@@ -217,6 +218,7 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             let control = mode::listen(&mode::control_path()?)?;
             let mic_control = mic::control_path()?;
             let mic_control = mode::listen(&mic_control)?;
+            let stream = events::listen(&events::path()?)?;
             let gpu = tokio::task::spawn_blocking(decode::open_gpu)
                 .await
                 .map_err(std::io::Error::other)?;
@@ -251,6 +253,14 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 });
             }
             tokio::spawn(corner::follow(board.clone(), routing.watch()));
+            let state = mode::events(store.dir());
+            tokio::spawn(events::follow_mic(state.clone(), routing.watch()));
+            let (orders, orders_rx) = mpsc::unbounded_channel();
+            let commands = events::Commands::Desk {
+                orders: orders.clone(),
+                mic: routing.clone(),
+            };
+            let stream = tokio::spawn(events::serve(stream, state.clone(), Arc::new(commands)));
             let mic_control = tokio::spawn(mic::serve(mic_control, routing));
             let home = Home {
                 config_dir: store.dir().to_path_buf(),
@@ -262,9 +272,9 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 sound: sound.clone().map(|sound| sound as Arc<dyn mode::Sound>),
                 board: board.clone(),
                 notifier: Arc::new(notify::NotifySend::new(notify::Command)),
+                events: state,
             };
             let (peers, peers_rx) = mpsc::unbounded_channel();
-            let (orders, orders_rx) = mpsc::unbounded_channel();
             let (hypr_events, hypr_events_rx) = mpsc::unbounded_channel();
             hypr::watch_events(hypr_events);
             let modes = tokio::spawn(mode::serve(home, peers_rx, orders_rx, hypr_events_rx));
@@ -309,6 +319,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             tokio::task::spawn_blocking(clipboard::vfs::unmounted).await?;
             control.abort();
             let _ = control.await;
+            stream.abort();
+            let _ = stream.await;
             let _ = modes.await;
             mic_control.abort();
             let _ = mic_control.await;

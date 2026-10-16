@@ -38,6 +38,7 @@ use crate::display::output;
 use crate::display::surface::NAMESPACE as SURFACE_NAMESPACE;
 use crate::display::wire::{Display, Incoming, MAX_OUTPUTS, Msg, OutputCopy, Peer, Pointer};
 use crate::display::{Ended, Keyboard, Released};
+use crate::events::{Driven, Events, Link, Parts, Phase};
 use crate::hypr::{self, Eval, Hypr, lua_string};
 use crate::input::{self, Hotkey};
 use crate::notify::Notifier;
@@ -222,6 +223,8 @@ pub struct Home {
     pub board: Arc<Board>,
     /// Says, once each, that a mode started and stopped.
     pub notifier: Arc<dyn Notifier>,
+    /// Where the desk stands, for `events.sock`.
+    pub events: Arc<Events>,
 }
 
 /// Home's GPU, kept from one mode to the next until a decoder lost it. A lost device fails
@@ -298,6 +301,8 @@ struct Active {
     notice: Option<String>,
     /// Says the mode stopped, once it said it started: last, once the rest is gone.
     told: Option<Told>,
+    /// Told that the mode is stopping, while it gives the monitors back.
+    events: Arc<Events>,
 }
 
 /// The notification that a mode stopped, shown when the mode goes, however it ends.
@@ -360,16 +365,62 @@ fn switch_error(switched: Option<&str>, title: &str, e: io::Error) -> io::Error 
     )
 }
 
-/// What `navette status` says: the mode, and whether the remote machine is there for the next.
-fn status(active: Option<&Active>, peer: Option<&Peer>) -> String {
-    let mode = match active {
+/// What `navette status` says, from the state the events say: the mode, and whether the remote
+/// machine is there for the next.
+fn status(parts: &Parts) -> String {
+    let mode = match &parts.mode {
         None => "no mode is running".to_string(),
-        Some(a) if a.starting.is_some() => format!("{} is starting on {}", a.title(), a.label()),
-        Some(a) => format!("{} runs on {}", a.title(), a.label()),
+        Some(driven) => {
+            let title = match &driven.name {
+                Some(name) => format!("mode `{name}`"),
+                None => "the mode".to_string(),
+            };
+            let verb = match driven.phase {
+                Phase::Starting => "is starting on",
+                Phase::Running => "runs on",
+                Phase::Stopping => "is stopping on",
+            };
+            format!("{title} {verb} {}", driven.monitors.join(", "))
+        }
     };
-    let linked = peer.is_some_and(|p| !p.outbox.is_closed());
-    let link = if linked { "connected" } else { "not connected" };
+    let link = match parts.link {
+        Link::Linked => "connected",
+        _ => "not connected",
+    };
     format!("{mode}; the remote machine is {link}")
+}
+
+/// The link and the mode as the events last said them: whether linked, and the mode's
+/// generation and whether it is starting.
+type Stand = (bool, Option<(u32, bool)>);
+
+/// Tells the events where the desk stands, when the link or the mode changed since they were
+/// last told: the loop goes round for every picture, and `mode.conf` is read only then.
+fn tell(home: &Home, peer: Option<&Peer>, active: Option<&Active>, told: &mut Option<Stand>) {
+    let linked = peer.is_some_and(|p| !p.outbox.is_closed());
+    let now = (linked, active.map(|a| (a.generation, a.starting.is_some())));
+    if *told == Some(now) {
+        return;
+    }
+    *told = Some(now);
+    let (peer, modes) = (
+        config::remote_label(&home.config_dir),
+        config::defined(&home.config_dir).unwrap_or_default(),
+    );
+    home.events.update(|p| {
+        p.link = if linked { Link::Linked } else { Link::Waiting };
+        p.mode = active.map(|a| Driven {
+            phase: if a.starting.is_some() {
+                Phase::Starting
+            } else {
+                Phase::Running
+            },
+            name: a.name.clone(),
+            monitors: a.monitors.clone(),
+        });
+        p.peer = Some(peer);
+        p.modes = modes;
+    });
 }
 
 /// How long the desk waits after a link comes up before it says the remote machine is here. A user
@@ -436,7 +487,9 @@ pub async fn serve(
     let mut here_at: Option<tokio::time::Instant> = None;
     // The offer's button, pressed.
     let (pressed_tx, mut pressed) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let mut told = None;
     loop {
+        tell(&home, peer.as_ref(), active.as_ref(), &mut told);
         // The link carries the user's clipboard and sound once the remote started the mode,
         // and no longer once home stops it.
         if let Some(peer) = &peer {
@@ -582,7 +635,8 @@ pub async fn serve(
                     let _ = reply.send(answer);
                 }
                 Some(Order::Status(reply)) => {
-                    let _ = reply.send(Ok(status(active.as_ref(), peer.as_ref())));
+                    tell(&home, peer.as_ref(), active.as_ref(), &mut told);
+                    let _ = reply.send(Ok(status(&home.events.parts())));
                 }
                 None => break,
             },
@@ -978,6 +1032,7 @@ async fn launch(
         starting: None,
         notice: mode.notice,
         told: None,
+        events: home.events.clone(),
     });
     // What was already under the monitors comes out from under the covers.
     send_home(home, sending).await;
@@ -1180,7 +1235,16 @@ async fn link_lost(active: &mut Option<Active>, why: &str) {
 }
 
 /// Drops a mode off the executor (the threads are joined, the desk undone), and waits for it.
+/// However it ends, the events say it is stopping meanwhile.
 async fn release(active: Active) {
+    let (name, monitors) = (active.name.clone(), active.monitors.clone());
+    active.events.update(|p| {
+        p.mode = Some(Driven {
+            phase: Phase::Stopping,
+            name,
+            monitors,
+        })
+    });
     let _ = tokio::task::spawn_blocking(move || drop(active)).await;
 }
 
@@ -1190,6 +1254,15 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| io::Error::other(e.to_string()))?
+}
+
+/// The desk's state as `serve` starts, with what `mode.conf` says.
+pub fn events(config_dir: &Path) -> Arc<Events> {
+    Events::new(Parts {
+        peer: Some(config::remote_label(config_dir)),
+        modes: config::defined(config_dir).unwrap_or_default(),
+        ..Parts::desk()
+    })
 }
 
 /// `$XDG_RUNTIME_DIR/navette/control.sock`.
@@ -1585,6 +1658,8 @@ mod tests {
         peers: UnboundedSender<Peer>,
         orders: UnboundedSender<Order>,
         events: UnboundedSender<hypr::Event>,
+        /// What a reader of `events.sock` reads.
+        said: Mutex<mpsc::Receiver<Arc<str>>>,
     }
 
     fn desk(monitor: &str) -> Desk {
@@ -1629,6 +1704,8 @@ mod tests {
         let (peers, peers_rx) = mpsc::unbounded_channel();
         let (orders, orders_rx) = mpsc::unbounded_channel();
         let (events, events_rx) = mpsc::unbounded_channel();
+        let state = self::events(config.path());
+        let said = Mutex::new(state.subscribe());
         let home = Home {
             config_dir: config.path().to_path_buf(),
             hypr: hypr.clone(),
@@ -1639,6 +1716,7 @@ mod tests {
             sound: Some(sound.clone()),
             board: board.clone(),
             notifier: notices.clone(),
+            events: state,
         };
         tokio::spawn(serve(home, peers_rx, orders_rx, events_rx));
         Desk {
@@ -1662,6 +1740,7 @@ mod tests {
             peers,
             orders,
             events,
+            said,
         }
     }
 
@@ -2803,6 +2882,7 @@ mod tests {
             sound: None,
             board: Arc::default(),
             notifier: Arc::new(crate::notify::Fake::default()),
+            events: self::events(desk._config.path()),
         };
         open_desk(
             &crashed,
@@ -2913,6 +2993,7 @@ mod tests {
             sound: None,
             board: Arc::default(),
             notifier: Arc::new(crate::notify::Fake::default()),
+            events: self::events(desk._config.path()),
         };
         open_desk(
             &crashed,
@@ -3076,6 +3157,7 @@ mod tests {
             sound: None,
             board: Arc::default(),
             notifier: Arc::new(crate::notify::Fake::default()),
+            events: self::events(desk._config.path()),
         };
         open_desk(
             &crashed,
@@ -4396,5 +4478,113 @@ mod tests {
         assert_eq!(start_timeout(3), START_TIMEOUT * 3);
         // `navette mode` waits longer than serve does for the remote.
         assert!(ORDER_TIMEOUT > start_timeout(MAX_OUTPUTS.into()));
+    }
+
+    /// The lines said since the last look, until one says `last`.
+    async fn said_until(desk: &Desk, last: &str) -> Vec<serde_json::Value> {
+        let mut said = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let line = desk.said.lock().unwrap().try_recv();
+                match line {
+                    Ok(line) => {
+                        let line: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let done = line["state"] == last;
+                        said.push(line);
+                        if done {
+                            return;
+                        }
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("never said {last}: said {said:?}"));
+        said
+    }
+
+    fn states(said: &[serde_json::Value]) -> Vec<&str> {
+        said.iter().map(|l| l["state"].as_str().unwrap()).collect()
+    }
+
+    /// Nothing more said within a moment.
+    async fn says_nothing_more(desk: &Desk) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let line = desk.said.lock().unwrap().try_recv();
+        assert!(line.is_err(), "said {line:?}");
+    }
+
+    #[tokio::test]
+    async fn a_link_a_mode_start_and_stop_and_a_drop_each_give_one_line() {
+        let desk = desk("DP-2");
+        assert_eq!(states(&said_until(&desk, "waiting").await), ["waiting"]);
+        let remote = started(&desk).await;
+        assert_eq!(
+            states(&said_until(&desk, "mode").await),
+            ["linked", "starting", "mode"]
+        );
+        answer(ask(&desk, false).await).await.unwrap();
+        assert_eq!(
+            states(&said_until(&desk, "linked").await),
+            ["stopping", "linked"]
+        );
+        drop(remote);
+        assert_eq!(states(&said_until(&desk, "waiting").await), ["waiting"]);
+        says_nothing_more(&desk).await;
+    }
+
+    #[tokio::test]
+    async fn a_drop_during_a_mode_says_stopping_then_waiting() {
+        let desk = desk("DP-2");
+        let remote = started(&desk).await;
+        said_until(&desk, "mode").await;
+        drop(remote);
+        let said = said_until(&desk, "waiting").await;
+        assert_eq!(states(&said), ["stopping", "waiting"]);
+        // What it gives back is said while it does.
+        assert_eq!(said[0]["monitors"], serde_json::json!(["DP-2"]));
+    }
+
+    #[tokio::test]
+    async fn the_desk_line_names_its_peer_its_mode_and_the_modes_of_mode_conf() {
+        let desk = desk_with(
+            "remote_label = FAR\n[office]\nmonitor = DP-2\n[all]\nmonitor = DP-1, DP-2\n",
+        );
+        let first = said_until(&desk, "waiting").await;
+        let modes = serde_json::json!([
+            {"name": "office", "monitors": ["DP-2"]},
+            {"name": "all", "monitors": ["DP-1", "DP-2"]},
+        ]);
+        assert_eq!(first[0]["peer"], "FAR");
+        assert_eq!(first[0]["modes"], modes);
+        let remote = connect(&desk);
+        let pending = ask_mode(&desk, "office").await;
+        made(&remote, 1).await;
+        answer(pending).await.unwrap();
+        let said = said_until(&desk, "mode").await;
+        let running = said.last().unwrap();
+        assert_eq!(running["role"], "desk");
+        assert_eq!(running["mode"], "office");
+        assert_eq!(running["monitors"], serde_json::json!(["DP-2"]));
+        assert_eq!(running["modes"], modes);
+    }
+
+    #[tokio::test]
+    async fn the_picture_the_pointer_and_a_refused_start_say_nothing() {
+        let desk = desk("DP-2");
+        said_until(&desk, "waiting").await;
+        // No link: refused, and nothing changed.
+        assert!(answer(ask(&desk, true).await).await.is_err());
+        says_nothing_more(&desk).await;
+        let remote = started(&desk).await;
+        said_until(&desk, "mode").await;
+        remote.pointer.send(vec![Pointer::default()]).unwrap();
+        remote
+            .to_home
+            .try_send(Incoming::NoInput("invented".into()))
+            .unwrap();
+        status_of(&desk).await;
+        says_nothing_more(&desk).await;
     }
 }
