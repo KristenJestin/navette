@@ -182,10 +182,14 @@ impl Machine {
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&fakes).unwrap();
         fs::create_dir_all(&packed).unwrap();
+        // `is-enabled` answers like systemd: the state on stdout, non-zero unless enabled.
         fake(
             &fakes,
             "systemctl",
-            "echo \"$*\" >> \"$FAKE_SYSTEMCTL_LOG\"\n",
+            "echo \"$*\" >> \"$FAKE_SYSTEMCTL_LOG\"\n\
+             case \"$*\" in *is-enabled*)\n\
+             if [ -n \"${FAKE_AGENT_ENABLED:-}\" ]; then echo enabled; exit 0; fi\n\
+             echo disabled; exit 1;; esac\n",
         );
         let archive = unpack("1.2.3", &packed);
         Self {
