@@ -14,7 +14,8 @@
 //! - **Messages** (`Mic → remote`, `Keyboard → home`, …) show under the button for two seconds,
 //!   in place of desktop notifications.
 //! - **Files crossing** the clipboard, either way, show as one bar per transfer under the tag,
-//!   with what is left; a click on a bar stops its transfer, the others going on.
+//!   as wide as the tag row (more only when the text needs it) and stacked tightly, filled
+//!   by the part done and saying what is left; a click on a bar stops its transfer, the others going on.
 //!
 //! [`Board`] carries the mic's place and the messages to every corner open; [`Corner`] is one
 //! corner, drawn in software into ARGB pixels. Its text uses a 5×8 bitmap font of its own, so
@@ -404,8 +405,11 @@ const GLOW: (f64, f64) = (150.0, 80.0);
 const DOT: f64 = 2.0;
 /// The longest message shown, in characters; a longer one ends with `…`.
 const LONGEST: usize = 64;
-/// The narrowest a bar of files crossing is.
-const BAR_WIDTH: f64 = 160.0;
+/// A bar of files crossing is as tall as its text, with a dot of air: several of them stack
+/// under the tag without going far below the room the tag row and a message already take.
+const BAR_ROW: f64 = 16.0;
+/// The air between two bars, and between the tag row and the first bar.
+const BAR_GAP: f64 = 2.0;
 
 /// One corner: what it shows, and how it is drawn.
 pub struct Corner {
@@ -549,30 +553,46 @@ impl Corner {
         })
     }
 
-    /// The bars of the transfers shown, one under the other below the tag: where a click
-    /// stops one.
+    /// The bars of the transfers shown, one under the other below the tag, all as wide as the
+    /// tag row or as their longest text: where a click stops one.
     pub fn bars(&self) -> Vec<(Rect, Bar)> {
-        let mut y = PAD;
-        self.files
-            .iter()
-            .take(BARS_SHOWN)
+        let shown = self.files.iter().take(BARS_SHOWN);
+        let widest = shown
+            .clone()
+            .map(|bar| text_width(&bar_text(bar)) + 2.0 * 6.0)
+            .fold(self.row_width(), f64::max);
+        let mut y = PAD + ROW;
+        shown
             .map(|bar| {
-                y += ROW + 6.0;
+                y += BAR_GAP;
                 let rect = Rect {
                     x: PAD,
                     y,
-                    width: (text_width(&bar_text(bar)) + 2.0 * 6.0).max(BAR_WIDTH),
-                    height: ROW,
+                    width: widest,
+                    height: BAR_ROW,
                 };
+                y += BAR_ROW;
                 (rect, *bar)
             })
             .collect()
     }
 
+    /// How wide the tag and the button make the first row.
+    fn row_width(&self) -> f64 {
+        let right = self.button().map_or_else(
+            || self.tag().map_or(PAD, |(tag, _)| tag.x + tag.width),
+            |button| button.x + button.width,
+        );
+        right - PAD
+    }
+
     /// The top of the line under the button: under the bars when there are some.
     fn line_y(&self) -> f64 {
-        let rows = 1 + self.files.len().min(BARS_SHOWN);
-        PAD + rows as f64 * (ROW + 6.0)
+        let bottom = self
+            .bars()
+            .last()
+            .map_or(PAD + ROW, |(bar, _)| bar.y + bar.height);
+        bottom + 6.0
     }
 
     /// The line under the button: the message, else the hint while hovered.
@@ -665,18 +685,23 @@ impl Corner {
             pen.check(cx, cy, check, accent);
         }
         for (bar, files) in self.bars() {
-            pen.rounded(bar, 5.0, PILL);
+            pen.rounded(bar, 4.0, PILL);
             let part = (files.done as f64 / files.total.max(1) as f64).min(1.0);
             if part > 0.0 {
                 let done = Rect {
                     width: (bar.width * part).max(10.0),
                     ..bar
                 };
-                pen.rounded(done, 5.0, FILL);
+                pen.rounded(done, 4.0, FILL);
             }
-            pen.rounded_outline(bar, 5.0, BORDER);
+            pen.rounded_outline(bar, 4.0, BORDER);
             let text = bar_text(&files);
-            pen.text(bar.x + 6.0, bar.y + (ROW - 7.0 * DOT) / 2.0, &text, LABEL);
+            pen.text(
+                bar.x + 6.0,
+                bar.y + (BAR_ROW - 7.0 * DOT) / 2.0,
+                &text,
+                LABEL,
+            );
         }
         if let Some(line) = self.line(now) {
             let row = Rect {
@@ -693,9 +718,11 @@ impl Corner {
 }
 
 /// What a bar of files crossing says.
+///
+/// Only what is left and the cancel mark: the fill says how far it is, and the text stays short
+/// enough for the bar to be no wider than the tag row.
 fn bar_text(bar: &Bar) -> String {
-    let percent = (bar.done as u128 * 100 / bar.total.max(1) as u128).min(100);
-    format!("Files {percent}%, {} left  x", human_bytes(bar.left()))
+    format!("{} x", human_bytes(bar.left()))
 }
 
 /// Draws in logical pixels on a canvas of physical ones.
@@ -1209,7 +1236,7 @@ mod tests {
             total: 3 << 30,
         };
         pro.update(Update::Files(vec![files]), now);
-        assert_eq!(bar_text(&files), "Files 33%, 2.0 GiB left  x");
+        assert_eq!(bar_text(&files), "2.0 GiB x");
         let (bar, _) = pro.bars()[0];
         let (width, height) = pro.size(now);
         assert!(f64::from(width) >= bar.x + bar.width && f64::from(height) >= bar.y + bar.height);
@@ -1230,6 +1257,73 @@ mod tests {
     }
 
     #[test]
+    fn several_transfers_do_not_grow_the_corner_past_the_bound() {
+        let now = Instant::now();
+        let bare = corner(Side::Remote, Status::Remote, now);
+        let (bare_width, bare_height) = bare.size(now);
+        // Two pastes of a 2 GiB file, then a third: the bound is the corner without bars for
+        // the width, and for the height too up to two transfers, one more row after.
+        let transfer = |id, done_gib: u64| Bar {
+            id,
+            done: done_gib << 30,
+            total: 2 << 30,
+        };
+        let all = [transfer(1, 1), transfer(2, 0), transfer(3, 2)];
+        for count in 1..=BARS_SHOWN {
+            let mut pro = bare_clone(now);
+            pro.update(Update::Files(all[..count].to_vec()), now);
+            let (width, height) = pro.size(now);
+            assert_eq!(width, bare_width, "{count} transfers: as wide as without");
+            let bound = if count <= 2 {
+                bare_height
+            } else {
+                bare_height + (BAR_ROW + BAR_GAP).ceil() as u32
+            };
+            assert!(height <= bound, "{count} transfers: {height} > {bound}");
+
+            // Each one is still there to click: inside the corner, clear of the others and of
+            // the tag row, and named by its own click.
+            let bars = pro.bars();
+            assert_eq!(bars.len(), count);
+            let row_bottom = PAD + ROW;
+            let mut above = row_bottom;
+            for (rect, bar) in &bars {
+                assert!(rect.y >= above, "{count} transfers: bars overlap");
+                above = rect.y + rect.height;
+                assert!(rect.x + rect.width <= f64::from(width), "inside the corner");
+                assert!(above <= f64::from(height), "inside the corner");
+                pro.point_at(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+                assert_eq!(pro.press(), Press::Cancel(bar.id));
+                pro.point_at(rect.x + 1.0, rect.y + rect.height - 1.0);
+                assert_eq!(pro.press(), Press::Cancel(bar.id), "its corners too");
+            }
+            // The room the surface is given holds them.
+            let (room_width, room_height) = pro.room();
+            assert!(room_width >= width && room_height >= height);
+        }
+    }
+
+    #[test]
+    fn the_bars_never_cover_the_mic_button() {
+        let now = Instant::now();
+        let mut pro = bare_clone(now);
+        let bar = |id| Bar {
+            id,
+            done: 1,
+            total: 3,
+        };
+        pro.update(Update::Files((1..=3).map(bar).collect()), now);
+        let button = pro.button().unwrap();
+        for (rect, _) in pro.bars() {
+            assert!(rect.y >= button.y + button.height, "under the button");
+        }
+    }
+
+    fn bare_clone(now: Instant) -> Corner {
+        corner(Side::Remote, Status::Remote, now)
+    }
+
+    #[test]
     fn a_click_on_a_bar_stops_its_transfer_and_anywhere_else_switches_the_mic() {
         let now = Instant::now();
         let board = Arc::new(Board::default());
@@ -1247,7 +1341,10 @@ mod tests {
         };
         pro.update(Update::Files(vec![bar(5), bar(9)]), now);
         let (second, button) = (pro.bars()[1].0, pro.button().unwrap());
-        assert!(second.y >= pro.bars()[0].0.y + ROW, "one under the other");
+        assert!(
+            second.y >= pro.bars()[0].0.y + BAR_ROW,
+            "one under the other"
+        );
 
         pro.point_at(second.x + second.width / 2.0, second.y + 4.0);
         assert_eq!(pro.press(), Press::Cancel(9));
