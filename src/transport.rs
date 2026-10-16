@@ -1,11 +1,11 @@
-//! The transport between the two machines, behind two traits: the remote [`Dial`]s, home
+//! The transport between the two machines, behind two traits: the remote [`Dial`]s, the desk
 //! [`Accept`]s, and either way the result is an authenticated byte stream (`AsyncRead +
 //! AsyncWrite`) that the link, and later gliff's framing, runs on. A QUIC transport can replace
 //! TCP by implementing the same two traits.
 //!
 //! The TCP one runs mutual TLS 1.3. There is no CA and no host name: each side accepts exactly
 //! one certificate, the one whose SHA-256 it recorded at pairing, and the handshake fails for
-//! anything else, so home never hands an unpaired peer's stream to the rest of Navette.
+//! anything else, so the desk never hands an unpaired peer's stream to the rest of Navette.
 
 use std::future::Future;
 use std::io;
@@ -30,20 +30,20 @@ use crate::identity::{Fingerprint, Identity};
 /// How long a peer has to finish connecting before it is dropped.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How many connections home handshakes with at once.
+/// How many connections the desk handshakes with at once.
 const MAX_HANDSHAKES: usize = 8;
 
 /// An authenticated byte stream to the paired machine.
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Stream for T {}
 
-/// The remote's side: it opens the connection to home.
+/// The remote's side: it opens the connection to the desk.
 pub trait Dial: Send + Sync {
     type Stream: Stream;
     fn dial(&self) -> impl Future<Output = io::Result<Self::Stream>> + Send;
 }
 
-/// Home's side: it waits for the paired remote.
+/// The desk's side: it waits for the paired remote.
 pub trait Accept: Send {
     type Stream: Stream;
     /// The next authenticated stream. An `Err` is one refused or failed connection; the next
@@ -51,7 +51,7 @@ pub trait Accept: Send {
     fn accept(&mut self) -> impl Future<Output = io::Result<Self::Stream>> + Send;
 }
 
-/// Refuses an address that is not one machine's own: a wildcard (home listens on its LAN
+/// Refuses an address that is not one machine's own: a wildcard (the desk listens on its LAN
 /// address only), multicast or broadcast. An IPv4-mapped IPv6 address is judged as the IPv4 one
 /// it stands for, since `[::ffff:0.0.0.0]` binds every interface too.
 pub fn refuse_wildcard(address: SocketAddr) -> io::Result<()> {
@@ -82,8 +82,8 @@ pub async fn bind_lan(address: SocketAddr) -> io::Result<TcpListener> {
     TcpListener::bind(address).await
 }
 
-/// Dials home over TCP and TLS 1.3, presenting this machine's identity and accepting only the
-/// paired home certificate.
+/// Dials the desk over TCP and TLS 1.3, presenting this machine's identity and accepting only the
+/// certificate of the desk it paired with.
 pub struct TlsDialer {
     address: SocketAddr,
     connector: tokio_rustls::TlsConnector,
@@ -121,11 +121,13 @@ impl Dial for TlsDialer {
         };
         tokio::time::timeout(self.timeout, connect)
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "home did not answer in time"))?
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "the desk did not answer in time")
+            })?
     }
 }
 
-/// Listens on home's LAN address and completes TLS 1.3 only with the paired remote.
+/// Listens on the desk's LAN address and completes TLS 1.3 only with the paired remote.
 pub struct TlsAcceptor {
     listener: TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
@@ -413,7 +415,7 @@ mod tests {
         let m = machines();
         let mut acceptor = home_acceptor(&m).await;
         let address = acceptor.local_addr().unwrap();
-        // A client with no certificate at all, which trusts the home certificate.
+        // A client with no certificate at all, which trusts the desk certificate.
         let provider = provider();
         let config = ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -513,7 +515,7 @@ mod tests {
             .unwrap();
         let home = tokio::time::timeout(Duration::from_secs(5), home)
             .await
-            .expect("home must hand on the verified stream")
+            .expect("the desk must hand on the verified stream")
             .unwrap()
             .unwrap();
         drop((home, remote));

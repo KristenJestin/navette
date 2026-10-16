@@ -1,4 +1,4 @@
-//! What a mode changes on the home desk, recorded so it can always be undone.
+//! What a mode changes on the desk, recorded so it can always be undone.
 //!
 //! Each change is a pair of runtime Lua chunks: one that applies it, one that undoes it. The undo
 //! chunks are written to a private file under `$XDG_RUNTIME_DIR` before the change is applied,
@@ -139,7 +139,7 @@ impl From<HyprError> for DeskError {
     }
 }
 
-/// The changes applied to the home desk, in order.
+/// The changes applied to the desk, in order.
 pub struct Desk<H: Hyprland> {
     hypr: H,
     record: PathBuf,

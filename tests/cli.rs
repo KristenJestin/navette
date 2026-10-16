@@ -498,3 +498,81 @@ fn run_ends_on_sigterm_like_the_command_it_runs() {
         assert_eq!(status.code(), Some(0), "{output}");
     }
 }
+
+#[test]
+fn pairing_writes_role_desk_and_a_pairing_that_says_home_still_runs_serve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (serve, _agent) = run_link(&home, &remote, &[]);
+    let file = home.join("paired.conf");
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.contains("role = desk\n"), "{text}");
+    let far = fs::read_to_string(remote.join("paired.conf")).unwrap();
+    assert!(far.contains("role = remote\n"), "{far}");
+    // A pairing made by 0.1.0: nothing is paired again.
+    drop(serve);
+    fs::write(&file, text.replace("role = desk", "role = home")).unwrap();
+    let again = Navette::start(&home, &["run"]);
+    again.wait_for("waiting for the paired remote machine");
+}
+
+#[test]
+fn mic_home_still_works_and_says_the_new_name_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Navette::start(tmp.path(), &["mic", "home"]).finish();
+    assert_eq!(output.matches("navette mic desk").count(), 1, "{output}");
+    assert!(
+        output.contains("`navette serve` is not running"),
+        "the order itself was still sent: {output}"
+    );
+}
+
+#[test]
+fn mic_desk_says_nothing_of_the_old_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Navette::start(tmp.path(), &["mic", "desk"]).finish();
+    assert!(!output.contains("mic home"), "{output}");
+    assert!(
+        output.contains("`navette serve` is not running"),
+        "{output}"
+    );
+}
+
+/// `navette watch --json --once` on `config`'s machine, until its line holds `needle`.
+fn watched_with(config: &Path, needle: &str) -> String {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let output = Navette::start(config, &["watch", "--json", "--once"]).finish();
+        if output.contains(needle) {
+            return output;
+        }
+        assert!(Instant::now() < deadline, "never {needle}: {output}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn the_remote_says_the_label_of_the_desk_as_its_peer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("mode.conf"),
+        "local_label = NEAR\nremote_label = FAR\nmonitor = DP-2\n",
+    )
+    .unwrap();
+    let (_serve, _agent, _) = paired_link(&home, &remote);
+    let desk = watched_until(&home, "linked");
+    assert!(desk.contains(r#""peer":"FAR""#), "{desk}");
+    let far = watched_with(&remote, r#""peer":"NEAR""#);
+    assert!(far.contains(r#""role":"remote""#), "{far}");
+}
+
+#[test]
+fn with_no_label_the_remote_has_no_peer_to_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, remote) = (tmp.path().join("home"), tmp.path().join("remote"));
+    let (_serve, _agent, _) = paired_link(&home, &remote);
+    let far = watched_until(&remote, "linked");
+    assert!(far.contains(r#""peer":null"#), "{far}");
+}

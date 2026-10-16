@@ -59,45 +59,47 @@ impl Default for Pointer {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {
     Display(Display),
-    /// Remote to home: gliff's stream messages (config, frames, cursor, pings).
+    /// Remote to desk: gliff's stream messages (config, frames, cursor, pings).
     Video(ServerMsg),
-    /// Home to remote: gliff's answers to them (frame acks, keyframe requests, pongs).
+    /// Desk to remote: gliff's answers to them (frame acks, keyframe requests, pongs).
     Feedback(ClientMsg),
-    /// Remote to home: the picture goes on, but home's input cannot be injected (the reason).
+    /// Remote to desk: the picture goes on, but the desk's input cannot be injected (the reason).
     NoInput(String),
-    /// Remote to home: the mode goes on, but the lid is left alone (the reason).
+    /// Remote to desk: the mode goes on, but the lid is left alone (the reason).
     NoLid(String),
+    /// Desk to remote, once the link is up: how the desk's user calls it (`local_label`).
+    Desk(String),
 }
 
 /// The display's orders and their answers.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub enum Display {
-    /// Home to remote: make a headless output that copies this home monitor, and stream it.
+    /// Desk to remote: make a headless output that copies this desk monitor, and stream it.
     #[n(0)]
     Start {
         /// Output 0, the leftmost.
         #[n(0)]
         output: OutputCopy,
-        /// What home decodes.
+        /// What the desk decodes.
         #[n(1)]
         caps: ClientCaps,
-        /// The other monitors, outputs 1, 2…, in home's left-to-right order.
+        /// The other monitors, outputs 1, 2…, in the desk's left-to-right order.
         #[n(2)]
         others: Option<Vec<OutputCopy>>,
         /// Always `Some(true)`: an agent of the release before keeps its lid (`crate::lid`)
         /// only when asked. An agent now keeps it during every mode, and ignores this.
         #[n(3)]
         closed_lid: Option<bool>,
-        /// Which mode this is, said back in `Started` and `Failed` so that home can tell the
+        /// Which mode this is, said back in `Started` and `Failed` so that the desk can tell the
         /// answer of a mode it already stopped (a switch) from the new one's. An agent that
         /// does not know it ignores it and never says it back.
         #[n(4)]
         generation: Option<u32>,
     },
-    /// Home to remote: stop streaming and remove the output.
+    /// Desk to remote: stop streaming and remove the output.
     #[n(1)]
     Stop,
-    /// Remote to home: the output exists, its stream follows.
+    /// Remote to desk: the output exists, its stream follows.
     #[n(2)]
     Started {
         #[n(0)]
@@ -112,7 +114,7 @@ pub enum Display {
         #[n(3)]
         generation: Option<u32>,
     },
-    /// Remote to home: the output could not be made, or the mode ended on the remote; nothing
+    /// Remote to desk: the output could not be made, or the mode ended on the remote; nothing
     /// was left behind.
     #[n(3)]
     Failed {
@@ -124,7 +126,7 @@ pub enum Display {
     },
 }
 
-/// The home monitor a remote output copies: its mode, scale and orientation.
+/// The desk monitor a remote output copies: its mode, scale and orientation.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct OutputCopy {
     /// The mode, unrotated, as Hyprland reports it.
@@ -159,13 +161,14 @@ pub enum Incoming {
     },
     NoInput(String),
     NoLid(String),
+    Desk(String),
 }
 
 /// One live connection, as the display and its input see it. `inbox` ends when the link drops.
 pub struct Peer {
     pub outbox: Outbox,
     pub inbox: mpsc::Receiver<Incoming>,
-    /// Remote to home, each output's at its id (none yet: the default); it ends with the inbox.
+    /// Remote to desk, each output's at its id (none yet: the default); it ends with the inbox.
     pub pointer: watch::Receiver<Vec<Pointer>>,
     pub input: crate::input::Wire,
     /// Whether a mode runs on this link, which this machine's display says: nothing else
@@ -213,7 +216,7 @@ impl Queue {
                     keep
                 });
             }
-            // Unlike gliff's, a newer image leaves the visibility queued: home reads them apart.
+            // Unlike gliff's, a newer image leaves the visibility queued: the desk reads them apart.
             Msg::Video(
                 ServerMsg::CursorShape { .. }
                 | ServerMsg::CursorPos { .. }
@@ -330,7 +333,7 @@ impl Outbox {
         }
     }
 
-    /// Home could not take a frame (the display fell behind): it is acked all the same, the
+    /// The desk could not take a frame (the display fell behind): it is acked all the same, the
     /// remote pacing on acks, and a keyframe is asked for, the next frames depending on it.
     pub(crate) fn refuse_frame(&self, msg: &ServerMsg) {
         if let ServerMsg::VideoFrame { frame_id, .. } = msg {

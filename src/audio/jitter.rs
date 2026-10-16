@@ -1,4 +1,4 @@
-//! Home's small buffer between the frames arriving from the link and the playback stream that
+//! The desk's small buffer between the frames arriving from the link and the playback stream that
 //! PipeWire pulls at its own pace: it starts playing once a few frames are in, and plays
 //! silence when the link falls behind. It keeps as little as the link lets it: each time it
 //! runs dry it keeps more, and two minutes with room to spare let it keep less. The two machines'
@@ -108,7 +108,7 @@ impl Jitter {
 
     /// The least the target may be: a pull's worth beyond `floor`. The remote sends a cycle
     /// of its own at a time, a pull's worth when both graphs run the same quantum; as the
-    /// clocks drift, one of them now and then reaches home just after the pull it used to be
+    /// clocks drift, one of them now and then reaches the desk just after the pull it used to be
     /// in time for, and that pull finds a cycle less. Only a drift of the phase shows it, every
     /// few minutes: no window would see it coming.
     fn least(&self) -> usize {
@@ -322,7 +322,7 @@ mod tests {
     /// Both graphs run 1024-frame cycles, PipeWire's default quantum.
     const QUANTUM: usize = 1024;
 
-    /// Home Wi-Fi as the laptop sees it: a few ms most of the time, and every few seconds a
+    /// The desk's Wi-Fi as the laptop sees it: a few ms most of the time, and every few seconds a
     /// stall of 20 to 50 ms (a retransmission, the radio waking up), in seconds.
     fn wifi(chance: &mut Chance) -> f64 {
         let mut ms = 1.0 - 2.0 * (1.0 - chance.next()).ln();
@@ -336,7 +336,7 @@ mod tests {
         0.003
     }
 
-    /// How long each frame takes to reach home, in seconds.
+    /// How long each frame takes to reach the desk, in seconds.
     type Delay<'a> = &'a mut dyn FnMut(&mut Chance) -> f64;
 
     /// What a stretch of a simulated session gave.
@@ -348,9 +348,9 @@ mod tests {
         mean_ms: f64,
     }
 
-    /// A session, as `jitter` would play it at home: the remote's sink encodes its cycles into
-    /// 10 ms frames, on a clock `drift_ppm` faster than home's; each frame reaches home after
-    /// `delay`, in order, as on TCP; home's playback takes a cycle's worth at the rate the
+    /// A session, as `jitter` would play it at the desk: the remote's sink encodes its cycles into
+    /// 10 ms frames, on a clock `drift_ppm` faster than the desk's; each frame reaches the desk after
+    /// `delay`, in order, as on TCP; the desk's playback takes a cycle's worth at the rate the
     /// buffer asks for. One stretch per pair of `(seconds, delay)`, one after the other.
     fn session(
         jitter: &mut Jitter,
@@ -373,10 +373,10 @@ mod tests {
             let (mut level, mut pulls) = (0.0, 0u64);
             let end = now + *seconds;
             while now < end {
-                // Home's cycles start a third of a cycle after the remote's.
+                // The desk's cycles start a third of a cycle after the remote's.
                 now = (home_cycles as f64 + 0.33) * cycle;
                 home_cycles += 1;
-                // The remote starts a cycle after home's playback, which asks for sound before
+                // The remote starts a cycle after the desk's playback, which asks for sound before
                 // any comes.
                 while (sent + 1) as f64 * remote_cycle <= now {
                     let at = (sent + 1) as f64 * remote_cycle;
@@ -411,7 +411,7 @@ mod tests {
         heard
     }
 
-    /// Home's buffer, as the playback has it.
+    /// The desk's buffer, as the playback has it.
     fn home() -> Jitter {
         Jitter::new(crate::audio::JITTER_FLOOR, crate::audio::JITTER_CEILING)
     }

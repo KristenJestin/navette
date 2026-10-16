@@ -1,4 +1,4 @@
-//! `navette run`: which command this machine's pairing says to run (`serve` at home, `agent` on
+//! `navette run`: which command this machine's pairing says to run (`serve` at the desk, `agent` on
 //! the remote machine), so that one systemd unit serves both machines.
 
 use std::fmt;
@@ -13,10 +13,10 @@ pub const REFUSED: u8 = 78;
 /// What the pairing says to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Plan {
-    /// Home: `navette serve`.
+    /// Desk: `navette serve`.
     Serve { audio: bool },
     /// Remote: `navette agent`. `audio_ignored` is set when `--audio` was given, which only
-    /// home uses.
+    /// the desk uses.
     Agent { audio_ignored: bool },
 }
 
@@ -130,7 +130,7 @@ mod tests {
         let (tmp, store) = paired_as(Role::Home);
         let file = tmp.path().join("paired.conf");
         let text = fs::read_to_string(&file).unwrap();
-        fs::write(&file, text.replace("role = home", "role = boss")).unwrap();
+        fs::write(&file, text.replace("role = desk", "role = boss")).unwrap();
         let refused = plan(&store, false).unwrap_err().to_string();
         assert!(refused.contains("role"), "{refused}");
         assert!(refused.contains("boss"), "{refused}");
@@ -142,7 +142,7 @@ mod tests {
         let (tmp, store) = paired_as(Role::Home);
         let file = tmp.path().join("paired.conf");
         let text = fs::read_to_string(&file).unwrap();
-        fs::write(&file, text.replace("role = home\n", "")).unwrap();
+        fs::write(&file, text.replace("role = desk\n", "")).unwrap();
         let refused = plan(&store, false).unwrap_err().to_string();
         assert!(refused.contains("role"), "{refused}");
         assert!(refused.contains(file.to_str().unwrap()), "{refused}");

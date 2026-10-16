@@ -3,9 +3,9 @@
 //! mic button alone, so the pointer anywhere else goes where it would without it.
 //!
 //! On a reserved monitor it is a subsurface of the remote's picture ([`super::surface`]); on each
-//! of home's own monitors, a small layer surface of its own, [`HomeCorner`]: on the overlay
+//! of the desk's own monitors, a small layer surface of its own, [`HomeCorner`]: on the overlay
 //! layer, anchored top left, with no keyboard, `local_bar` pixels from the top over the exclusive
-//! zones there (home's bars), or placed by the compositor below them with `local_bar = auto`.
+//! zones there (the desk's bars), or placed by the compositor below them with `local_bar = auto`.
 
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -221,7 +221,7 @@ pub(super) fn scale_of(info: &OutputInfo) -> f64 {
     }
 }
 
-/// Where home's corner sits on its monitor: its layer surface's anchor, exclusive zone and top
+/// Where the desk's corner sits on its monitor: its layer surface's anchor, exclusive zone and top
 /// margin.
 #[derive(Debug, PartialEq)]
 struct Place {
@@ -230,7 +230,7 @@ struct Place {
     top: i32,
 }
 
-/// Where home's corner sits with `local_bar` (see [`crate::corner::Look`]).
+/// Where the desk's corner sits with `local_bar` (see [`crate::corner::Look`]).
 fn place(home_bar: Option<i32>) -> Place {
     let anchor = Anchor::TOP | Anchor::LEFT;
     match home_bar {
@@ -249,14 +249,14 @@ fn place(home_bar: Option<i32>) -> Place {
     }
 }
 
-/// The size home's layer surface is given, in logical pixels, whatever the corner shows:
+/// The size the desk's layer surface is given, in logical pixels, whatever the corner shows:
 /// Hyprland animates a layer surface's new size, and stretches the buffer already drawn at that
 /// size to the animated one, so a corner that grew with it looked squashed.
 fn layer_size(corner: &Corner) -> (u32, u32) {
     corner.room()
 }
 
-/// The corner on one of home's own monitors, on its own thread. Dropping it removes it.
+/// The corner on one of the desk's own monitors, on its own thread. Dropping it removes it.
 pub struct HomeCorner {
     stop: Option<channel::Sender<()>>,
     /// The compositor's socket: shut down at the drop, a thread still waiting on it ends.
@@ -372,7 +372,7 @@ fn run(
         }
     }
     let output =
-        found.ok_or_else(|| io::Error::other(format!("no monitor {output_name} at home")))?;
+        found.ok_or_else(|| io::Error::other(format!("no monitor {output_name} on the desk")))?;
     state.scale = state
         .outputs
         .info(&output)

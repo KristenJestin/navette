@@ -1,9 +1,9 @@
-//! The remote's headless outputs that copy home monitors (the sequence measured in #3): each
+//! The remote's headless outputs that copy the desk monitors (the sequence measured in #3): each
 //! monitor rule is declared first, then its output is created, so it is born in its place;
 //! then Hyprland's own monitor list is checked against what was asked. Headless outputs are
 //! runtime-only: a reload drops the rules (sent again), a restart drops the outputs (made again).
 //!
-//! The copies sit right of the remote's own monitors, side by side in home's left-to-right
+//! The copies sit right of the remote's own monitors, side by side in the desk's left-to-right
 //! order: each one's place follows from the copies before it, never from which was made first.
 
 use std::io;
@@ -347,7 +347,7 @@ mod tests {
         }
     }
 
-    /// Home's desk of the issue, its first monitor kept home: a portrait one between two
+    /// The setup of the issue, its first monitor kept at the desk: a portrait one between two
     /// landscape ones given to the remote.
     fn three() -> Vec<OutputCopy> {
         let mut portrait = landscape(2560, 1440, 1000);
