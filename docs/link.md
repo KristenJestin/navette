@@ -25,8 +25,9 @@ and `navette agent` on the remote machine, as a systemd user service
 
 Both commands keep their files in `$XDG_CONFIG_HOME/navette` (`--config-dir` or
 `NAVETTE_CONFIG_DIR` to move it): `identity.key` and `identity.crt` (this machine's Navette
-identity) and `paired.conf` (the peer's certificate fingerprint, its role and the address),
-all 0600 in a 0700 directory. Pairing again replaces `paired.conf`; to change a machine's
+identity) and `paired.conf` (the peer's certificate fingerprint, its role and the address,
+and on the remote machine the hardware address of the desk's router, below), all 0600 in a
+0700 directory. Pairing again replaces `paired.conf`; to change a machine's
 identity, remove its `identity.*` files and pair both machines again.
 
 ## The clipboard
@@ -188,6 +189,30 @@ sudo ufw allow in proto tcp from 192.0.2.20 to 192.0.2.10 port 7420 comment nave
 
 Nothing changes on the remote machine: it only dials out, and with its corporate VPN up its
 LAN traffic to home still goes directly over the local network.
+
+## Only from the desk's network
+
+The agent dials only when the laptop is on the desk's network. Away from it (an office LAN, a
+hotel's Wi-Fi), the desk's private address may be anybody's, and a managed laptop has no
+business knocking at it every few seconds. A subnet says nothing, since the same private
+subnet exists on many networks: the desk's network is known by its router, the laptop's
+default gateway there.
+
+At pairing, the remote machine records that router's hardware address in `paired.conf`
+(`gateway = 02:00:00:00:00:01`). Before each dial, the agent reads its routing and ARP tables
+(`/proc/net/route`, `/proc/net/arp`), which sends nothing, and dials only when one of its
+default gateways has that address: a corporate VPN's default route goes through a tunnel, not
+a router, and does not hide the one below it. Otherwise it does not dial, says once in its
+journal `not on the desk's network`, and looks again every 10 s; back on the desk's network,
+it links within that.
+
+- **A pairing made before this check** has no `gateway`: the agent dials as before, and learns
+  the router at its next link, then keeps it. That is safe: the link only comes up with the
+  paired desk, authenticated, so the laptop was on the desk's network when it learned.
+- **No router known yet** (pairing, or that first link, came before any traffic through the
+  router, so the ARP table did not have it): the same, the next link learns it.
+- **A new router at the desk** has another hardware address: the agent never dials again,
+  and its journal says so, until `navette pair` is run again on both machines.
 
 ## Pairing protocol
 

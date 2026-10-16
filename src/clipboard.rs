@@ -3679,6 +3679,7 @@ mod tests {
                     machine_on(Side::Server, Inbox::new(tmp.path().join("r")), |service| {
                         tokio::task::spawn_local(link::agent(
                             dialer,
+                            link::tests::anywhere(&desk.remote),
                             Heartbeat::default(),
                             link::Backoff::default(),
                             events,
@@ -4767,6 +4768,7 @@ mod tests {
                 let remote = machine_on(Side::Server, inbox, |service| {
                     tokio::task::spawn_local(link::agent(
                         dialer,
+                        link::tests::anywhere(&desk.remote),
                         Heartbeat::default(),
                         link::Backoff::default(),
                         events,

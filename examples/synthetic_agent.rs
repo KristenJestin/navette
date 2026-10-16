@@ -18,6 +18,7 @@ use navette::display::stream::Source;
 use navette::display::wire::{Msg, Outbox};
 use navette::hypr::{self, Hypr};
 use navette::link::{self, Backoff, Heartbeat};
+use navette::network::{HomeNetwork, ProcNet};
 use navette::store::Store;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::oneshot;
@@ -256,6 +257,7 @@ async fn main() -> io::Result<()> {
     };
     link::agent(
         dialer,
+        HomeNetwork::new(ProcNet, store)?,
         Heartbeat::default(),
         Backoff::default(),
         events,

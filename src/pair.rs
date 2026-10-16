@@ -35,6 +35,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::frame::{read_frame, write_frame};
 use crate::identity::Fingerprint;
+use crate::network;
 use crate::store::{Pairing, Role, Store};
 
 const ID_HOME: &[u8] = b"navette-pair-v1 home";
@@ -109,14 +110,16 @@ pub async fn home(
         role: Role::Home,
         peer: remote,
         address,
+        gateway: None,
     })
 }
 
 /// The remote's side: dials home at `address`. Records home in `store` only if the exchange
-/// succeeds.
+/// succeeds, with `gateway`, the hardware address of home's router (see `network`).
 pub async fn remote(
     store: &Store,
     address: SocketAddr,
+    gateway: Option<network::Mac>,
     pin: &Pin,
     timeouts: Timeouts,
 ) -> io::Result<()> {
@@ -131,6 +134,7 @@ pub async fn remote(
         role: Role::Remote,
         peer: home,
         address,
+        gateway,
     })
 }
 
@@ -299,7 +303,7 @@ mod tests {
         let pin = Pin::random();
         let (home, remote) = tokio::join!(
             home(&d.home, listener, &pin, fast()),
-            remote(&d.remote, address, &pin, fast()),
+            remote(&d.remote, address, None, &pin, fast()),
         );
         home.unwrap();
         remote.unwrap();
@@ -315,6 +319,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_remote_records_home_s_router_at_pairing() {
+        let d = desk();
+        let listener = loopback().await;
+        let address = listener.local_addr().unwrap();
+        let pin = Pin::random();
+        let router = network::Mac::parse("02:00:00:00:00:01");
+        let (home, remote) = tokio::join!(
+            home(&d.home, listener, &pin, fast()),
+            remote(&d.remote, address, router, &pin, fast()),
+        );
+        home.unwrap();
+        remote.unwrap();
+        assert_eq!(d.remote.pairing().unwrap().unwrap().gateway, router);
+        // Home's own pairing has no use for it.
+        assert_eq!(d.home.pairing().unwrap().unwrap().gateway, None);
+    }
+
+    #[tokio::test]
     async fn a_wrong_pin_fails_and_leaves_nothing_trusted() {
         let d = desk();
         let listener = loopback().await;
@@ -323,7 +345,7 @@ mod tests {
         let typed = Pin::parse("123457").unwrap();
         let (home, remote) = tokio::join!(
             home(&d.home, listener, &shown, fast()),
-            remote(&d.remote, address, &typed, fast()),
+            remote(&d.remote, address, None, &typed, fast()),
         );
         assert_eq!(home.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(remote.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
@@ -345,11 +367,13 @@ mod tests {
         .unwrap();
         let (home, first) = tokio::join!(
             home(&d.home, listener, &pin, fast()),
-            remote(&d.remote, address, &guess, fast()),
+            remote(&d.remote, address, None, &guess, fast()),
         );
         assert!(home.is_err() && first.is_err());
         // The session is over: the right PIN now finds nobody listening.
-        let second = remote(&d.remote, address, &pin, fast()).await.unwrap_err();
+        let second = remote(&d.remote, address, None, &pin, fast())
+            .await
+            .unwrap_err();
         assert_eq!(second.kind(), io::ErrorKind::ConnectionRefused);
         assert_eq!(d.remote.pairing().unwrap(), None);
     }
