@@ -488,6 +488,8 @@ pub(super) fn repair_one<G: Graph>(
     {
         graph.set_default_node(device, previous.as_ref())?;
     }
+    #[cfg(test)]
+    std::thread::sleep(std::time::Duration::from_millis(100)); // TEMPORARY (#140)
     saved.clear(device)
 }
 
