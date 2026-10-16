@@ -460,15 +460,21 @@ pub async fn serve(listener: UnixListener, mic: Arc<dyn Routing>) {
             let Some(order) = Order::parse(word) else {
                 return;
             };
-            let answer = tokio::task::spawn_blocking(move || mic.order(order))
-                .await
-                .unwrap_or_else(|e| Err(io::Error::other(e.to_string())));
-            let text = match answer {
-                Ok(status) => format!("ok {}\n", status.word()),
-                Err(e) => format!("error {e}\n"),
-            };
-            let _ = write.write_all(text.as_bytes()).await;
+            let text = answer(mic, order).await;
+            let _ = write.write_all(format!("{text}\n").as_bytes()).await;
         });
+    }
+}
+
+/// Carries out `order`, off the async runtime: `ok <status>` or `error <why>`, without the
+/// newline.
+pub async fn answer(mic: Arc<dyn Routing>, order: Order) -> String {
+    let answer = tokio::task::spawn_blocking(move || mic.order(order))
+        .await
+        .unwrap_or_else(|e| Err(io::Error::other(e.to_string())));
+    match answer {
+        Ok(status) => format!("ok {}", status.word()),
+        Err(e) => format!("error {e}"),
     }
 }
 

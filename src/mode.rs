@@ -1234,28 +1234,45 @@ pub async fn accept_orders(listener: UnixListener, orders: UnboundedSender<Order
                 _ => return,
             }
             let (reply, answer) = oneshot::channel();
-            let order = match line.trim() {
-                "start" => Order::Start(None, reply),
-                "stop" => Order::Stop(reply),
-                "status" => Order::Status(reply),
-                other => match other.strip_prefix("start ").map(str::trim) {
-                    Some(name) if config::is_name(name) => {
-                        Order::Start(Some(name.to_string()), reply)
-                    }
-                    _ => return,
-                },
-            };
-            if orders.send(order).is_err() {
+            let Some(order) = order_of(&line, reply) else {
                 return;
-            }
-            let text = match answer.await {
-                Ok(Ok(text)) => format!("ok {text}\n"),
-                Ok(Err(e)) => format!("error {e}\n"),
-                Err(_) => "error navette is stopping\n".to_string(),
             };
-            let _ = write.write_all(text.as_bytes()).await;
+            let Some(text) = answered(&orders, order, answer).await else {
+                return;
+            };
+            let _ = write.write_all(format!("{text}\n").as_bytes()).await;
         });
     }
+}
+
+/// The order a control line says, answered on `reply`; none for a line that says none.
+pub fn order_of(line: &str, reply: oneshot::Sender<io::Result<String>>) -> Option<Order> {
+    match line.trim() {
+        "start" => Some(Order::Start(None, reply)),
+        "stop" => Some(Order::Stop(reply)),
+        "status" => Some(Order::Status(reply)),
+        other => match other.strip_prefix("start ").map(str::trim) {
+            Some(name) if config::is_name(name) => {
+                Some(Order::Start(Some(name.to_string()), reply))
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Hands `order` to `serve` and waits for its answer, `ok …` or `error …` without the newline;
+/// none when `serve` is gone before taking it.
+pub async fn answered(
+    orders: &UnboundedSender<Order>,
+    order: Order,
+    answer: oneshot::Receiver<io::Result<String>>,
+) -> Option<String> {
+    orders.send(order).ok()?;
+    Some(match answer.await {
+        Ok(Ok(text)) => format!("ok {text}"),
+        Ok(Err(e)) => format!("error {e}"),
+        Err(_) => "error navette is stopping".to_string(),
+    })
 }
 
 /// The order that starts the mode called `name`, or the config's own with no name.
