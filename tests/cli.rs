@@ -515,3 +515,25 @@ fn pairing_writes_role_desk_and_a_pairing_that_says_home_still_runs_serve() {
     let again = Navette::start(&home, &["run"]);
     again.wait_for("waiting for the paired remote machine");
 }
+
+#[test]
+fn mic_home_still_works_and_says_the_new_name_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Navette::start(tmp.path(), &["mic", "home"]).finish();
+    assert_eq!(output.matches("navette mic desk").count(), 1, "{output}");
+    assert!(
+        output.contains("`navette serve` is not running"),
+        "the order itself was still sent: {output}"
+    );
+}
+
+#[test]
+fn mic_desk_says_nothing_of_the_old_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Navette::start(tmp.path(), &["mic", "desk"]).finish();
+    assert!(!output.contains("mic home"), "{output}");
+    assert!(
+        output.contains("`navette serve` is not running"),
+        "{output}"
+    );
+}
