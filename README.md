@@ -82,9 +82,10 @@ work-from-home mode (pairing, modes, monitor mapping, mic routing, rollback) is 
 
 ## Install
 
-A release or the beta of `dev`, without building, on both machines with the icon its
-notifications show, and the agent's unit on the laptop: [`docs/install.md`](docs/install.md).
-Install the same version on both.
+A release or the beta of `dev`, without building: unpack the archive on each machine and run its
+`install.sh`, which installs the binary, the icon its notifications show and the one systemd unit
+for both machines, then `systemctl --user enable --now navette` once paired:
+[`docs/install.md`](docs/install.md). Install the same version on both.
 
 ## Build
 
