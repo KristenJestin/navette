@@ -33,6 +33,7 @@ use tokio::sync::oneshot;
 use crate::corner::{Board, Feed};
 use crate::desk::{Change, Desk, DeskError};
 use crate::display::decode::{self, Decoding, Picture, Video};
+use crate::display::output;
 use crate::display::wire::{Display, Incoming, MAX_OUTPUTS, Msg, OutputCopy, Peer, Pointer};
 use crate::display::{Ended, Keyboard, Released};
 use crate::hypr::{self, Eval, Hypr, lua_string};
@@ -62,12 +63,22 @@ const ORDER_READ: Duration = if cfg!(test) {
     Duration::from_secs(5)
 };
 const ORDER_LONGEST: u64 = 64;
+/// With `mic = follow`, how long the keyboard stays on a side before the mic goes there: a
+/// pointer only passing over a monitor moves nothing, as each switch shows in the corners and
+/// makes a gap in a call.
+const MIC_FOLLOWS: Duration = if cfg!(test) {
+    Duration::from_millis(150)
+} else {
+    Duration::from_millis(500)
+};
 
 /// The home mic, which goes to the remote machine while a mode runs (the port behind which
 /// tests put a fake). Its calls wait for PipeWire and the link: they are made off the executor.
 pub trait Mic: Send + Sync {
-    /// The mic goes to the remote machine.
-    fn start(&self) -> io::Result<()>;
+    /// The mic goes to the remote machine, or stays home unless `remote`.
+    fn start(&self, remote: bool) -> io::Result<()>;
+    /// It goes to that side, as the hotkey sends it, unless it is there already.
+    fn follow(&self, remote: bool) -> io::Result<()>;
     /// It comes back home.
     fn stop(&self);
     /// The shell command the hotkey runs to switch it.
@@ -258,8 +269,14 @@ struct Active {
     desk: Arc<Mutex<Desk<Eval>>>,
     /// Why a surface or a decoder cannot go on.
     ended: UnboundedReceiver<String>,
-    /// Each time the release hotkey gave the keyboard back, and a surface took it again.
+    /// Each time the release hotkey gave the keyboard back, and a surface took it again; each
+    /// time the pointer came over a reserved monitor or left it.
     released: UnboundedReceiver<Keyboard>,
+    /// `mic = follow`, with a mic to switch.
+    mic_follows: bool,
+    /// With `mic = follow`, the side the keyboard went to last, whether the remote's, and when
+    /// the mic follows it there.
+    keyboard: Option<(bool, tokio::time::Instant)>,
     /// The `navette mode start` waiting for the remote's answer.
     starting: Option<(oneshot::Sender<io::Result<String>>, tokio::time::Instant)>,
     /// What the config says that is no longer read, said with `mode start`'s answer.
@@ -362,6 +379,7 @@ pub async fn serve(
         let deadline = active
             .as_ref()
             .and_then(|a| a.starting.as_ref().map(|(_, at)| *at));
+        let mic_follows_at = active.as_ref().and_then(|a| a.keyboard.map(|(_, at)| at));
         tokio::select! {
             // A link that came up is known before the orders that follow it.
             biased;
@@ -541,6 +559,8 @@ pub async fn serve(
                         }
                     }
                 }
+                // The pointer's own moves: the corner says nothing of them.
+                Said::Keyboard(Keyboard::Came | Keyboard::Left) => {}
                 Said::Ended(why) => {
                     if let Some(peer) = &peer {
                         peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
@@ -548,6 +568,15 @@ pub async fn serve(
                     stop(&mut active, &why).await;
                 }
             },
+            _ = sleep_until(mic_follows_at) => {
+                let remote = active.as_mut().and_then(|a| a.keyboard.take()).map(|(r, _)| r);
+                if let (Some(remote), Some(mic)) = (remote, home.mic.clone()) {
+                    // Awaited here: a switch is never queued behind another.
+                    if let Err(e) = blocking(move || mic.follow(remote)).await {
+                        eprintln!("navette: mic: it did not follow the keyboard: {e}");
+                    }
+                }
+            }
             _ = sleep_until(deadline) => {
                 if let Some(peer) = &peer {
                     peer.outbox.send(Msg::Display(Display::Stop), Vec::new());
@@ -568,9 +597,22 @@ pub async fn serve(
     stop(&mut active, "navette is stopping").await;
 }
 
+/// Whether the pointer, and the keyboard with it, is over one of the `given` monitors. When
+/// Hyprland cannot say, the mic goes to the remote machine, as with `mic = fixed`.
+fn pointer_over(hypr: &dyn Hypr, given: &[hypr::Monitor]) -> bool {
+    match hypr::cursor(hypr) {
+        Ok((x, y)) => given.iter().any(|m| output::covers(m, x, y)),
+        Err(e) => {
+            eprintln!("navette: mic: where the pointer is is unknown, the mic goes remote: {e}");
+            true
+        }
+    }
+}
+
 /// What the running mode's surface and decoder say.
 enum Said {
-    /// The keyboard went home by the release hotkey, or came back to the remote.
+    /// The keyboard went home by the release hotkey, or came back to the remote, or went with
+    /// the pointer.
     Keyboard(Keyboard),
     /// Why they gave up.
     Ended(String),
@@ -583,7 +625,13 @@ async fn said(active: &mut Option<Active>) -> Option<Said> {
     };
     tokio::select! {
         Some(why) = a.ended.recv() => Some(Said::Ended(why)),
-        Some(keyboard) = a.released.recv() => Some(Said::Keyboard(keyboard)),
+        Some(keyboard) = a.released.recv() => {
+            if a.mic_follows {
+                let at = tokio::time::Instant::now() + MIC_FOLLOWS;
+                a.keyboard = Some((keyboard.remote(), at));
+            }
+            Some(Said::Keyboard(keyboard))
+        }
         else => None,
     }
 }
@@ -717,6 +765,9 @@ async fn launch(
     });
     let first = copies.next().expect("one monitor at least");
     let others: Vec<_> = copies.collect();
+    let mic_follows = mode.mic_follows && home.mic.is_some();
+    // With `mic = follow`, the mic starts where the keyboard is.
+    let pointed = mic_follows.then(|| (home.hypr.clone(), given.clone()));
     let names: Vec<String> = given.into_iter().map(|m| m.name).collect();
     let home_monitor = monitors
         .iter()
@@ -787,7 +838,8 @@ async fn launch(
             SoundPlayed(sound)
         });
         let mic = mic.map(|mic| {
-            if let Err(e) = mic.start() {
+            let remote = pointed.is_none_or(|(hypr, given)| pointer_over(&*hypr, &given));
+            if let Err(e) = mic.start(remote) {
                 eprintln!(
                     "navette: mic: it stays home, it could not go to the remote machine: {e}"
                 );
@@ -825,6 +877,8 @@ async fn launch(
         desk: Arc::new(Mutex::new(desk)),
         ended,
         released,
+        mic_follows,
+        keyboard: None,
         starting: None,
         notice: mode.notice,
         told: None,
@@ -1284,13 +1338,35 @@ mod tests {
     struct FakeMic {
         log: Mutex<Vec<&'static str>>,
         refuse: bool,
+        /// Whether it goes to the remote machine.
+        remote: Mutex<bool>,
+    }
+
+    impl FakeMic {
+        /// The hotkey, the corner's button or `navette mic`, which the mode does not see.
+        fn by_hand(&self, remote: bool) {
+            *self.remote.lock().unwrap() = remote;
+            self.log.lock().unwrap().push("by hand");
+        }
     }
 
     impl Mic for FakeMic {
-        fn start(&self) -> io::Result<()> {
-            self.log.lock().unwrap().push("start");
+        fn start(&self, remote: bool) -> io::Result<()> {
+            let said = if remote { "start" } else { "start home" };
+            self.log.lock().unwrap().push(said);
             if self.refuse {
                 return Err(io::Error::other("no echo canceller"));
+            }
+            *self.remote.lock().unwrap() = remote;
+            Ok(())
+        }
+
+        fn follow(&self, remote: bool) -> io::Result<()> {
+            let mut now = self.remote.lock().unwrap();
+            if *now != remote {
+                *now = remote;
+                let said = if remote { "to remote" } else { "to home" };
+                self.log.lock().unwrap().push(said);
             }
             Ok(())
         }
@@ -1838,6 +1914,94 @@ mod tests {
         answer(ask(&desk, false).await).await.unwrap();
         // Stopped all the same, so that it no longer says it failed.
         assert_eq!(mic_log(&desk), ["start", "stop"]);
+    }
+
+    /// The keyboard going with the pointer, or by the release hotkey, as DP-2's surface says.
+    fn keyboard(desk: &Desk, keyboard: Keyboard) {
+        desk.releases.lock().unwrap()[0].send(keyboard).unwrap();
+    }
+
+    fn follows() -> Desk {
+        desk_with("monitor = DP-2\nmic = follow\n")
+    }
+
+    #[tokio::test]
+    async fn with_mic_fixed_a_crossing_never_switches_the_mic() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        keyboard(&desk, Keyboard::Left);
+        tokio::time::sleep(MIC_FOLLOWS * 3).await;
+        keyboard(&desk, Keyboard::Came);
+        tokio::time::sleep(MIC_FOLLOWS * 3).await;
+        assert_eq!(mic_log(&desk), ["start"]);
+    }
+
+    #[tokio::test]
+    async fn with_mic_follow_the_mode_starts_with_the_mic_where_the_keyboard_is() {
+        // The pointer over DP-1, at home.
+        let desk = follows();
+        let _remote = started(&desk).await;
+        assert_eq!(mic_log(&desk), ["start home"]);
+        // Over DP-2, which the mode gives.
+        let desk = follows();
+        desk.hypr.move_cursor(2000, 10);
+        let _remote = started(&desk).await;
+        assert_eq!(mic_log(&desk), ["start"]);
+    }
+
+    #[tokio::test]
+    async fn with_mic_follow_the_keyboard_crossing_moves_the_mic_after_the_delay() {
+        let desk = follows();
+        let _remote = started(&desk).await;
+        let crossed = std::time::Instant::now();
+        keyboard(&desk, Keyboard::Came);
+        until(|| mic_log(&desk) == ["start home", "to remote"]).await;
+        assert!(crossed.elapsed() >= MIC_FOLLOWS, "{:?}", crossed.elapsed());
+        let crossed = std::time::Instant::now();
+        keyboard(&desk, Keyboard::Left);
+        until(|| mic_log(&desk) == ["start home", "to remote", "to home"]).await;
+        assert!(crossed.elapsed() >= MIC_FOLLOWS, "{:?}", crossed.elapsed());
+    }
+
+    #[tokio::test]
+    async fn with_mic_follow_the_release_hotkey_brings_the_mic_home() {
+        let desk = follows();
+        desk.hypr.move_cursor(2000, 10);
+        let _remote = started(&desk).await;
+        keyboard(&desk, Keyboard::Home);
+        until(|| mic_log(&desk) == ["start", "to home"]).await;
+        // The pointer back over the picture takes the keyboard again.
+        keyboard(&desk, Keyboard::Left);
+        keyboard(&desk, Keyboard::Remote);
+        until(|| mic_log(&desk) == ["start", "to home", "to remote"]).await;
+    }
+
+    #[tokio::test]
+    async fn with_mic_follow_a_pass_over_a_monitor_shorter_than_the_delay_does_not_switch() {
+        let desk = follows();
+        let _remote = started(&desk).await;
+        keyboard(&desk, Keyboard::Came);
+        keyboard(&desk, Keyboard::Left);
+        tokio::time::sleep(MIC_FOLLOWS * 3).await;
+        assert_eq!(mic_log(&desk), ["start home"]);
+    }
+
+    #[tokio::test]
+    async fn with_mic_follow_a_switch_by_hand_holds_until_the_next_crossing() {
+        let desk = follows();
+        let _remote = started(&desk).await;
+        keyboard(&desk, Keyboard::Came);
+        until(|| mic_log(&desk) == ["start home", "to remote"]).await;
+        // The hotkey brings the mic home, the keyboard staying with the remote.
+        desk.mic.by_hand(false);
+        tokio::time::sleep(MIC_FOLLOWS * 3).await;
+        assert_eq!(mic_log(&desk), ["start home", "to remote", "by hand"]);
+        // The keyboard comes home, where the mic already is, then goes back: the mic follows.
+        keyboard(&desk, Keyboard::Left);
+        tokio::time::sleep(MIC_FOLLOWS * 3).await;
+        assert_eq!(mic_log(&desk), ["start home", "to remote", "by hand"]);
+        keyboard(&desk, Keyboard::Came);
+        until(|| mic_log(&desk) == ["start home", "to remote", "by hand", "to remote"]).await;
     }
 
     #[tokio::test]

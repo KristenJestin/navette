@@ -486,7 +486,7 @@ pub struct Capture {
     /// The locks last sent since the keyboard came; `None` sends them at the next modifiers.
     locks_sent: Option<Vec<String>>,
     /// Hears each time the keyboard goes home by the hotkey, and the first time a surface takes
-    /// it back after.
+    /// it back after; and each time the pointer comes or leaves, the keyboard with it.
     on_release: Option<crate::display::Released>,
     /// The surface's origin in home's layout, and its size.
     at: Option<(i32, i32)>,
@@ -565,6 +565,8 @@ impl Capture {
         self.released = false;
         if self.queue.shared.at_home.swap(false, Ordering::Relaxed) {
             self.said(Keyboard::Remote);
+        } else {
+            self.said(Keyboard::Came);
         }
         self.last = Some((x, y));
         self.queue.push(Event::Motion { x, y, delta: None });
@@ -575,6 +577,7 @@ impl Capture {
     pub fn leave(&mut self) -> Focus {
         self.release();
         self.released = false;
+        self.said(Keyboard::Left);
         Focus::Give
     }
 
@@ -1131,8 +1134,38 @@ mod tests {
         capture
     }
 
+    /// What the corner says of the keyboard: the moves the release hotkey makes.
     fn heard(news: &mut News) -> Vec<Keyboard> {
+        sides(news)
+            .into_iter()
+            .filter(|k| matches!(k, Keyboard::Home | Keyboard::Remote))
+            .collect()
+    }
+
+    fn sides(news: &mut News) -> Vec<Keyboard> {
         std::iter::from_fn(|| news.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn the_pointer_coming_and_leaving_says_where_the_keyboard_goes() {
+        let queue = Queue::default();
+        let (news, mut heard_by) = tokio::sync::mpsc::unbounded_channel();
+        let mut first = hearing(&queue, 0, &news);
+        let mut second = hearing(&queue, 1, &news);
+        first.enter(10.0, 10.0);
+        first.leave();
+        second.enter(10.0, 10.0);
+        assert_eq!(
+            sides(&mut heard_by),
+            [Keyboard::Came, Keyboard::Left, Keyboard::Came]
+        );
+        release_hotkey(&mut second);
+        second.leave();
+        second.enter(10.0, 10.0);
+        assert_eq!(
+            sides(&mut heard_by),
+            [Keyboard::Home, Keyboard::Left, Keyboard::Remote]
+        );
     }
 
     fn release_hotkey(capture: &mut Capture) {
