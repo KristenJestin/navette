@@ -329,7 +329,7 @@ is no longer read, and `navette mode start` says so on one line; the line can go
   it). If the agent's loop fails, the agent ends and systemd starts it again.
 - **When the lid cannot be watched**, the mode runs all the same, the lid does what it
   always does, and `navette serve` says why at home, as the agent does in its journal
-  (`journalctl --user -u navette-agent`). Nothing else is tried. That is when logind or the
+  (`journalctl --user -u navette`). Nothing else is tried. That is when logind or the
   laptop's policy refuses the lock, when `LidClosed` cannot be read (then no lock is taken;
   if it stops being readable for five seconds, the screen comes back and the lock is let
   go), and without `XDG_RUNTIME_DIR`. An agent too old to keep its lid during a mode is

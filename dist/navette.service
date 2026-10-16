@@ -1,0 +1,41 @@
+# Navette as a systemd user service, the same unit on both machines: `navette run` reads the role
+# `navette pair` recorded and runs `navette serve` (home) or `navette agent` (the remote machine),
+# the same process and exit status as that command. No root.
+#
+# Install: `install.sh` of the release archive (or INSTALL.md, by hand). Once `navette pair` has
+# succeeded:
+#   systemctl --user enable --now navette
+# Logs: journalctl --user -u navette
+
+[Unit]
+Description=Navette: keeps the link between the home machine and the remote machine
+# Both roles reach Hyprland and Wayland (home draws on the monitors, the remote machine makes
+# headless outputs and injects input), so the unit lives in the graphical session. Under Hyprland
+# started by uwsm (Omarchy), `graphical-session.target` is reached only once the compositor has
+# reported ready, which is after `uwsm finalize` has put WAYLAND_DISPLAY and
+# HYPRLAND_INSTANCE_SIGNATURE in the user manager's environment: `After=` is what makes them
+# visible to the service. The target refuses a manual start (`systemctl --user start
+# graphical-session.target` fails), but this service can be started by hand: `WantedBy=` is what
+# starts it at login, and `PartOf=` stops it with the session instead of leaving it dialing a
+# compositor that is gone.
+PartOf=graphical-session.target
+# PipeWire: ordered only, not wanted. `Wants=` would start it with Navette, which needs it only
+# when sound is asked for (home `--audio`; the remote machine once home asks for it). Ordered, the
+# remote machine stops before it and can put the previous default output back.
+After=graphical-session.target pipewire.service wireplumber.service
+
+[Service]
+ExecStart=%h/.local/bin/navette run --audio
+# The link redials on its own; this only covers a crash.
+Restart=on-failure
+RestartSec=10
+# `navette run` exits with 78 when this machine is not paired, or its pairing does not read: no
+# restart can fix that, so none is tried (it would only fill the journal). Pair, then start it.
+RestartPreventExitStatus=78
+# No `NoNewPrivileges=`: the clipboard's virtual folder is mounted by `fusermount3`, which is
+# setuid; with it, the mount fails and a paste of files fetches them all first. The line was a
+# thin layer for a user service anyway: Navette can already reach the user's own service
+# manager over D-Bus, and so start a process without it.
+
+[Install]
+WantedBy=graphical-session.target

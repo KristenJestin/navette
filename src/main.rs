@@ -30,6 +30,7 @@ use navette::mode::{self, Home, HomeGpu};
 use navette::network::{self, ProcNet};
 use navette::notify;
 use navette::pair::{self, Pin, Timeouts};
+use navette::runner::{self, Plan};
 use navette::single::{self, AgentLock};
 use navette::store::Store;
 use navette::transport::bind_lan;
@@ -80,6 +81,15 @@ enum Command {
     },
     /// Remote: dial the paired home machine and keep the link up (a systemd user service).
     Agent,
+    /// Run what this machine's pairing says: `serve` at home, `agent` on the remote machine.
+    ///
+    /// The same command, signals, logs and exit status as the one it runs, so that one systemd
+    /// unit (`navette.service`) serves both machines. Not paired, it exits with status 78.
+    Run {
+        /// Home: as `navette serve --audio`. Ignored on the remote machine, which says so.
+        #[arg(long)]
+        audio: bool,
+    },
     /// Home: give the configured monitors to the remote machine, or take them back.
     ///
     /// The monitors are named in `mode.conf` in the config directory: `monitor = <output name>`,
@@ -177,7 +187,7 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("navette: {e}");
-            ExitCode::FAILURE
+            ExitCode::from(runner::exit_code(&e))
         }
     }
 }
@@ -221,8 +231,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             pair::remote(&store, home, gateway, &pin, Timeouts::default()).await?;
             // A running agent read the previous pairing when it started: restart it.
             println!(
-                "Paired. Start the agent, or restart it to use this pairing: \
-                 systemctl --user enable navette-agent && systemctl --user restart navette-agent"
+                "Paired. Start Navette, or restart it to use this pairing: \
+                 systemctl --user enable navette && systemctl --user restart navette"
             );
             Ok(())
         }
@@ -444,6 +454,26 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             })
             .await?;
             Ok(())
+        }
+        Command::Run { audio } => {
+            let command = match runner::plan(&store, audio)? {
+                Plan::Serve { audio } => Command::Serve {
+                    listen: None,
+                    audio,
+                },
+                Plan::Agent { audio_ignored } => {
+                    if audio_ignored {
+                        eprintln!("navette: --audio is ignored on the remote machine");
+                    }
+                    Command::Agent
+                }
+            };
+            // The command itself, in this process, not a child: its signals and exit are ours.
+            Box::pin(run(Cli {
+                config_dir: Some(store.dir().to_path_buf()),
+                command,
+            }))
+            .await
         }
         Command::Mode { action } => {
             let order = match action {

@@ -45,7 +45,7 @@ impl AgentLock {
             Err(TryLockError::WouldBlock) => Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "another navette agent is already running \
-                 (systemctl --user status navette-agent)",
+                 (systemctl --user status navette)",
             )),
             Err(TryLockError::Error(e)) => Err(e),
         }

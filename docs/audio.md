@@ -169,7 +169,7 @@ them as concealed or lost.
 ## Checking it on the two machines
 
 1. Install the build on both machines, then on the laptop
-   `systemctl --user restart navette-agent`.
+   `systemctl --user restart navette`.
 2. At home: `navette serve --audio`. Before any mode, music on the laptop plays on the
    laptop's own speakers, and `wpctl status` there shows its own default sink.
 3. `navette mode start`. On the laptop, `wpctl status` shows *Home speakers (Navette)* as the
@@ -178,7 +178,7 @@ them as concealed or lost.
 5. `navette mode stop` with music playing on the laptop: silence at home, and the music goes
    back to the laptop's own speakers, which `wpctl status` shows as the default again. Start
    the mode again, then stop `navette serve` (Ctrl-C): the previous default comes back too.
-   Start both again, then `systemctl --user stop navette-agent` on the laptop: the same.
+   Start both again, then `systemctl --user stop navette` on the laptop: the same.
 6. With a mode running and a video playing on the laptop, restart its sound
    server: `systemctl --user restart pipewire wireplumber`. Within a few seconds, the video is
    heard at home again and `wpctl status` shows *Home speakers (Navette)* as the default; stop
@@ -195,7 +195,7 @@ them as concealed or lost.
    Wi-Fi, play music on
    the laptop for ten minutes or more. Listen for crackles, and note the last
    `navette: audio:` line home printed: each counter says which kind of event a crackle was.
-   Also run `journalctl --user -u navette-agent | grep 'frames dropped'` on the laptop.
+   Also run `journalctl --user -u navette | grep 'frames dropped'` on the laptop.
    Report the last line, the laptop's lines, and how many crackles were heard.
 
 9. The volume. Note home's volume (say 70 %) and start a mode: the laptop's mixer
@@ -207,7 +207,7 @@ them as concealed or lost.
    back. Then the other way: at home, use home's own volume keys (pointer over a home monitor)
    or its mixer: the laptop's mixer and bar follow; mute at home, and the laptop shows muted.
    Stop the mode: home keeps the level last set, the laptop's own output is at its own volume
-   from before. If a level does not follow, `journalctl --user -u navette-agent | grep
+   from before. If a level does not follow, `journalctl --user -u navette | grep
    'navette: audio: \(the sink\|home set\)'` on the laptop and the `navette: audio:` lines of
    `navette serve` say on which side it stopped.
 
