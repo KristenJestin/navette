@@ -234,7 +234,6 @@ async fn run(cli: Cli) -> std::io::Result<()> {
                 acceptor.local_addr()?
             );
             let (events, log) = mpsc::unbounded_channel();
-            tokio::spawn(print_events(log, |_| {}));
             let control = mode::listen(&mode::control_path()?)?;
             let mic_control = mic::control_path()?;
             let mic_control = mode::listen(&mic_control)?;
@@ -274,6 +273,10 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             }
             tokio::spawn(corner::follow(board.clone(), routing.watch()));
             let state = mode::events(store.dir());
+            let followed = state.clone();
+            tokio::spawn(print_events(log, "the remote", move |event| {
+                followed.update(|p| events::heard(p, event));
+            }));
             tokio::spawn(events::follow_mic(state.clone(), routing.watch()));
             let (orders, orders_rx) = mpsc::unbounded_channel();
             let commands = events::Commands::Desk {
@@ -363,8 +366,8 @@ async fn run(cli: Cli) -> std::io::Result<()> {
             }
             let (events, log) = mpsc::unbounded_channel();
             let followed = state.clone();
-            tokio::spawn(print_events(log, move |event| {
-                followed.update(|p| p.link = events::link_after(p.link, event));
+            tokio::spawn(print_events(log, "the desk", move |event| {
+                followed.update(|p| events::heard(p, event));
             }));
             let (peers, peers_rx) = mpsc::unbounded_channel();
             let (hypr_events, hypr_events_rx) = mpsc::unbounded_channel();
@@ -521,13 +524,25 @@ async fn stopped() -> std::io::Result<()> {
     }
 }
 
-/// The link's events, on stderr (the journal, under systemd), each handed to `then` too. They
-/// name no key or certificate.
-async fn print_events(mut events: mpsc::UnboundedReceiver<Event>, then: impl Fn(&Event)) {
+/// The link's events, on stderr (the journal, under systemd), each handed to `then` too; a
+/// version refusal is said once. `other` names the other machine. They name no key or
+/// certificate.
+async fn print_events(
+    mut events: mpsc::UnboundedReceiver<Event>,
+    other: &str,
+    then: impl Fn(&Event),
+) {
+    let mut refusals = link::RefusalLog::default();
     while let Some(event) = events.recv().await {
         then(&event);
+        if !refusals.says(&event) {
+            continue;
+        }
         match event {
-            Event::Connected => eprintln!("navette: link up"),
+            Event::Connected { peer } => eprintln!("navette: link up, {other} runs Navette {peer}"),
+            Event::Incompatible { peer } => {
+                eprintln!("navette: {}", link::refusal(other, &peer))
+            }
             Event::Disconnected(e) => eprintln!("navette: link down: {e}"),
             Event::Failed(e) => eprintln!("navette: {e}"),
             Event::Retrying(delay) => {

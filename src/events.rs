@@ -102,6 +102,11 @@ pub struct Parts {
     /// The other machine's label: `remote_label` on the desk; none on the remote, which is not
     /// told the desk's.
     pub peer: Option<String>,
+    /// The other machine's Navette version, as its hello said it: while linked, and while
+    /// refused for it.
+    pub peer_version: Option<String>,
+    /// The other machine's last hello was refused for its version.
+    pub refused: bool,
     /// The desk's modes; none on the remote.
     pub modes: Vec<Defined>,
     /// Where the desk's mic goes; the remote does not know it.
@@ -116,6 +121,8 @@ impl Parts {
             link: Link::Waiting,
             mode: None,
             peer: None,
+            peer_version: None,
+            refused: false,
             modes: Vec::new(),
             mic: Some(mic::Status::Off),
         }
@@ -128,6 +135,8 @@ impl Parts {
             link: Link::Dialing,
             mode: None,
             peer: None,
+            peer_version: None,
+            refused: false,
             modes: Vec::new(),
             mic: None,
         }
@@ -141,14 +150,14 @@ impl Parts {
             .filter(|d| d.phase == Phase::Stopping || self.link == Link::Linked)
     }
 
-    /// The `state` value. A new one (the link refusing the other machine's version, to come)
-    /// goes here: readers ignore the values they do not know.
+    /// The `state` value. A new one goes here: readers ignore the values they do not know.
     pub fn state(&self) -> &'static str {
         match self.shown().map(|d| d.phase) {
             Some(Phase::Starting) => "starting",
             Some(Phase::Running) => "mode",
             Some(Phase::Stopping) => "stopping",
             None => match self.link {
+                Link::Waiting | Link::Dialing if self.refused => "incompatible",
                 Link::Waiting => "waiting",
                 Link::Away => "away",
                 Link::Dialing => "dialing",
@@ -168,6 +177,7 @@ impl Parts {
             ("role", json!(self.role.word()).to_string()),
             ("state", json!(self.state()).to_string()),
             ("peer", json!(self.peer).to_string()),
+            ("peer_version", json!(self.peer_version).to_string()),
             (
                 "mode",
                 json!(shown.and_then(|d| d.name.as_deref())).to_string(),
@@ -273,8 +283,34 @@ pub fn link_after(link: Link, event: &crate::link::Event) -> Link {
     match event {
         Event::Away => Link::Away,
         Event::Back | Event::Disconnected(_) => Link::Dialing,
-        Event::Connected => Link::Linked,
+        Event::Connected { .. } => Link::Linked,
+        // A refusal shows as `incompatible`, while the agent still dials now and then.
+        Event::Incompatible { .. } => Link::Dialing,
         Event::Failed(_) | Event::Retrying(_) => link,
+    }
+}
+
+/// The parts after one of the link's events, on either machine: the remote's link, and on both
+/// the other machine's version.
+pub fn heard(parts: &mut Parts, event: &crate::link::Event) {
+    use crate::link::Event;
+    if parts.role == Role::Remote {
+        parts.link = link_after(parts.link, event);
+    }
+    match event {
+        Event::Connected { peer } => {
+            parts.peer_version = Some(peer.clone());
+            parts.refused = false;
+        }
+        // A hello refused beside the desk's link (an old agent left running, say) changes
+        // nothing of that link.
+        Event::Incompatible { .. } if parts.link == Link::Linked => {}
+        Event::Incompatible { peer } => {
+            parts.peer_version = Some(peer.clone());
+            parts.refused = true;
+        }
+        Event::Disconnected(_) => parts.peer_version = None,
+        Event::Failed(_) | Event::Retrying(_) | Event::Away | Event::Back => {}
     }
 }
 
@@ -514,6 +550,16 @@ pub fn waybar(line: &str) -> Option<String> {
         }
         "mode" => (state, format!("The desk drives {monitors}")),
         "stopping" => (state, format!("Giving {monitors} back")),
+        "incompatible" => {
+            let version = text_of("peer_version").unwrap_or("another version");
+            (
+                state,
+                format!(
+                    "{} runs Navette {version}, another minor version: update the older machine",
+                    capital(&other)
+                ),
+            )
+        }
         // A state of a later version: shown as it is.
         _ => (state, state.to_string()),
     };

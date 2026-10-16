@@ -366,7 +366,7 @@ fn switch_error(switched: Option<&str>, title: &str, e: io::Error) -> io::Error 
 }
 
 /// What `navette status` says, from the state the events say: the mode, and whether the remote
-/// machine is there for the next.
+/// machine is there for the next, or refused for its version.
 fn status(parts: &Parts) -> String {
     let mode = match &parts.mode {
         None => "no mode is running".to_string(),
@@ -383,9 +383,12 @@ fn status(parts: &Parts) -> String {
             format!("{title} {verb} {}", driven.monitors.join(", "))
         }
     };
-    let link = match parts.link {
-        Link::Linked => "connected",
-        _ => "not connected",
+    let link = match (parts.link, &parts.peer_version) {
+        (Link::Linked, _) => "connected".to_string(),
+        (_, Some(peer)) if parts.refused => {
+            format!("refused: {}", crate::link::refusal("the remote", peer))
+        }
+        _ => "not connected".to_string(),
     };
     format!("{mode}; the remote machine is {link}")
 }

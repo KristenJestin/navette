@@ -1,5 +1,5 @@
 //! The link once paired: the remote's agent dials home and keeps a connection, home serves it.
-//! Over it, a hello (the link's version), then gliff's framing carrying a heartbeat each way
+//! Over it, a hello (Navette's version: the same minor links, another is refused), then gliff's framing carrying a heartbeat each way
 //! and the connection's services (the clipboard bridge, the display), over the same
 //! authenticated stream. The link stays up between two modes, so that a start is quick, but
 //! carries nothing of the user's then: no copy, no sound, no mic, no input.
@@ -35,10 +35,25 @@ use crate::store::{Role, Store};
 use crate::transport::{Accept, Dial, TlsAcceptor, TlsDialer};
 use crate::wire::{Clip, LinkMsg, checked, output_id};
 
-/// The version of the link's messages; peers of another version refuse each other.
-pub const VERSION: u8 = 2;
+/// This Navette's version, as `navette --version` says it: two machines link only within a
+/// minor version (`docs/versions.md`).
+pub const NAVETTE_VERSION: &str = match option_env!("NAVETTE_VERSION") {
+    Some(version) => version,
+    None => "0.0.0-dev",
+};
 
 const HELLO: u8 = 1;
+/// After `HELLO`, 0.1 put its link version (1 or 2) and nothing more; from 0.2, this byte, then
+/// Navette's version. An old peer is still told apart, and refused by name.
+const NAMED: u8 = 0;
+/// What a peer that says the old hello runs.
+const OLD: &str = "0.1";
+/// The longest version a peer may say: far above `1.12.3-beta.45+abcdef`.
+const LONGEST_VERSION: usize = 64;
+
+/// How long the agent waits after the desk refused its version, or it refused the desk's: only
+/// an update of one machine changes the answer, so there is no point dialing every few seconds.
+pub const REFUSED_REDIAL: Duration = Duration::from_secs(60);
 
 /// Clipboard messages read from the peer and not yet taken by the bridge. The reader never
 /// waits on a service: past this many, a message for it is dropped, so a stuck service cannot
@@ -131,7 +146,14 @@ impl Default for Backoff {
 /// What the link went through, for the log. Never carries a key or a certificate.
 #[derive(Debug)]
 pub enum Event {
-    Connected,
+    /// Linked to a peer of the same minor version: the version it said.
+    Connected {
+        peer: String,
+    },
+    /// The peer runs another minor version: the version it said.
+    Incompatible {
+        peer: String,
+    },
     Disconnected(io::Error),
     /// A connection home refused, or one the agent could not open.
     Failed(io::Error),
@@ -142,25 +164,143 @@ pub enum Event {
     Back,
 }
 
-/// Both sides say hello first; a peer of another version is refused.
+/// Both sides say hello first, with their Navette version; a peer of another minor version is
+/// refused. Returns the peer's version. It runs inside the authenticated link, and the version
+/// is trusted for this comparison only.
 pub async fn hello<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     heartbeat: Heartbeat,
-) -> io::Result<()> {
-    write_frame(stream, &[HELLO, VERSION]).await?;
+) -> io::Result<String> {
+    hello_as(stream, heartbeat, NAVETTE_VERSION).await
+}
+
+/// [`hello`], saying `ours` as this machine's version.
+async fn hello_as<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    heartbeat: Heartbeat,
+    ours: &str,
+) -> io::Result<String> {
+    let mut said = vec![HELLO, NAMED];
+    said.extend_from_slice(ours.as_bytes());
+    write_frame(stream, &said).await?;
     let frame = tokio::time::timeout(heartbeat.timeout, read_frame(stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no hello from the peer"))??;
-    match frame.as_slice() {
-        [HELLO, VERSION] => Ok(()),
-        [HELLO, other] => Err(io::Error::new(
+    let no_hello = || io::Error::new(io::ErrorKind::InvalidData, "no hello from the peer");
+    let peer = match frame.as_slice() {
+        [HELLO, NAMED, version @ ..] => readable(version).ok_or_else(no_hello)?,
+        [HELLO, _] => OLD.to_string(),
+        _ => return Err(no_hello()),
+    };
+    if same_minor(&peer, ours) {
+        Ok(peer)
+    } else {
+        Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("the peer speaks link version {other}, this machine {VERSION}: update both"),
-        )),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "no hello from the peer",
-        )),
+            Incompatible {
+                peer,
+                ours: ours.to_string(),
+            },
+        ))
+    }
+}
+
+/// A version as a peer says it: short, plain, and starting with its major and minor numbers,
+/// so that it is safe in a log line and can be compared.
+fn readable(version: &[u8]) -> Option<String> {
+    let version = std::str::from_utf8(version).ok()?;
+    let plain = version
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b));
+    (version.len() <= LONGEST_VERSION && plain && minor(version).is_some())
+        .then(|| version.to_string())
+}
+
+/// A version's major and minor numbers: `0.2` of `0.2.1-beta.3`, `0.0` of a local build.
+fn minor(version: &str) -> Option<(u64, u64)> {
+    let mut numbers = version.splitn(3, '.');
+    let major = numbers.next()?.parse().ok()?;
+    let minor = numbers.next()?;
+    let digits = minor
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(minor, |end| &minor[..end]);
+    Some((major, digits.parse().ok()?))
+}
+
+/// The rule: the same major and minor. A local build is `0.0`, which no release is, so it
+/// links only with another local build.
+fn same_minor(a: &str, b: &str) -> bool {
+    minor(a).is_some_and(|a| Some(a) == minor(b))
+}
+
+/// The error of a hello refused for the peer's version.
+#[derive(Debug)]
+struct Incompatible {
+    peer: String,
+    ours: String,
+}
+
+impl std::fmt::Display for Incompatible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", refusal_of("the peer", &self.peer, &self.ours))
+    }
+}
+
+impl std::error::Error for Incompatible {}
+
+/// The version a hello was refused for, if it was refused for its version.
+pub fn incompatible(error: &io::Error) -> Option<&str> {
+    let refused = error.get_ref()?.downcast_ref::<Incompatible>()?;
+    Some(&refused.peer)
+}
+
+/// What a refusal says: what `other` runs, what this machine runs, and which to update.
+pub fn refusal(other: &str, peer: &str) -> String {
+    refusal_of(other, peer, NAVETTE_VERSION)
+}
+
+fn refusal_of(other: &str, peer: &str, ours: &str) -> String {
+    let update = match (minor(peer), minor(ours)) {
+        (Some((0, 0)), _) | (_, Some((0, 0))) => {
+            "a local build links only with another local build".to_string()
+        }
+        (theirs, ours) if theirs < ours => format!("update {other}"),
+        _ => "update this machine".to_string(),
+    };
+    format!("{other} runs Navette {peer}, this machine {ours}: {update}")
+}
+
+/// Says a version refusal once, not at each of the agent's redials, nor the wait before each:
+/// again only after a link, or for another version.
+#[derive(Default)]
+pub struct RefusalLog {
+    refused: Option<String>,
+}
+
+impl RefusalLog {
+    /// Whether `event` is to be said.
+    pub fn says(&mut self, event: &Event) -> bool {
+        match event {
+            Event::Incompatible { peer } => {
+                self.refused.replace(peer.clone()).as_ref() != Some(peer)
+            }
+            Event::Retrying(_) => self.refused.is_none(),
+            Event::Connected { .. } | Event::Failed(_) | Event::Disconnected(_) => {
+                self.refused = None;
+                true
+            }
+            Event::Away | Event::Back => true,
+        }
+    }
+}
+
+/// The event of a failed hello.
+fn refused(error: io::Error) -> Event {
+    match incompatible(&error) {
+        Some(peer) => Event::Incompatible {
+            peer: peer.to_string(),
+        },
+        None => Event::Failed(error),
     }
 }
 
@@ -574,17 +714,25 @@ pub async fn agent<D, T, F, Fut>(
         }
         match dialer.dial().await {
             Ok(mut stream) => match hello(&mut stream, heartbeat).await {
-                Ok(()) => {
+                Ok(peer) => {
                     backoff.reset();
                     if let Err(e) = network.linked() {
                         let _ = events.send(Event::Failed(e));
                     }
-                    let _ = events.send(Event::Connected);
+                    let _ = events.send(Event::Connected { peer });
                     let ended = run(stream, heartbeat, &attach).await;
                     let _ = events.send(Event::Disconnected(ended));
                 }
                 Err(e) => {
-                    let _ = events.send(Event::Failed(e));
+                    let event = refused(e);
+                    let version = matches!(event, Event::Incompatible { .. });
+                    let _ = events.send(event);
+                    if version {
+                        // The gate is looked at again at the top of the loop, before the dial.
+                        let _ = events.send(Event::Retrying(REFUSED_REDIAL));
+                        tokio::time::sleep(REFUSED_REDIAL).await;
+                        continue;
+                    }
                 }
             },
             Err(e) => {
@@ -637,16 +785,16 @@ pub async fn serve<A, F, Fut>(
         tokio::select! {
             Some(mut stream) = connections.recv() => {
                 greetings.spawn_local(async move {
-                    hello(&mut stream, heartbeat).await.map(|()| stream)
+                    hello(&mut stream, heartbeat).await.map(|peer| (stream, peer))
                 });
             }
             Some(greeted) = greetings.join_next() => match greeted {
-                Ok(Ok(stream)) => {
+                Ok(Ok((stream, peer))) => {
                     // Only a connection that said hello replaces the link. The older link, with
                     // its service, is gone before the newer one's starts.
                     session.abort_all();
                     while session.join_next().await.is_some() {}
-                    let _ = events.send(Event::Connected);
+                    let _ = events.send(Event::Connected { peer });
                     let (events, attach) = (events.clone(), attach.clone());
                     session.spawn_local(async move {
                         let ended = run(stream, heartbeat, attach).await;
@@ -654,7 +802,7 @@ pub async fn serve<A, F, Fut>(
                     });
                 }
                 Ok(Err(e)) => {
-                    let _ = events.send(Event::Failed(e));
+                    let _ = events.send(refused(e));
                 }
                 Err(_) => {}
             },
