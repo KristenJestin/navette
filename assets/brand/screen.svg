@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
 <!-- The desk with a mode running, as in social-preview.svg, without its words: the first monitor
      at the desk, the two others showing the work laptop, closed on the desk. The ground is
-     transparent, so the page shows through. The left part is left quiet: on a wide page a title
-     sits over it. -->
-<g transform="translate(250 40) scale(1.06)">
+     transparent, so the page shows through. The left half is left quiet: on a wide page a title
+     sits over it and the picture fades in from the left, so the whole desk keeps to the right. -->
+<g transform="translate(677 207) scale(0.72)">
 <defs>
 <radialGradient id="glow-local" cx="0" cy="0" r="1"><stop offset="0" stop-color="#d9493a" stop-opacity=".8"/><stop offset="1" stop-color="#d9493a" stop-opacity="0"/></radialGradient>
 <radialGradient id="glow-remote" cx="0" cy="0" r="1"><stop offset="0" stop-color="#e0893f" stop-opacity=".8"/><stop offset="1" stop-color="#e0893f" stop-opacity="0"/></radialGradient>
