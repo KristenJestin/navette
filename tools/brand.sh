@@ -27,3 +27,4 @@ for size in 266 532; do
   rsvg-convert -w "$size" -h "$size" "$brand/icon-pixel.svg" -o "$brand/png/icon-pixel-$size.png"
 done
 rsvg-convert "$brand/social-preview.svg" -o "$brand/png/social-preview.png"
+rsvg-convert "$brand/screen.svg" -o "$brand/png/screen.png"
