@@ -1,8 +1,8 @@
 // Copied from gliff (https://github.com/omacom/gliff), crates/gliff-server/src/rate.rs at
 // 58273cb (the fork's navette branch). Copyright (c) 2026 Kevin McConnell, MIT license: see
 // LICENSES/gliff-MIT.txt. Changed for Navette: `RateController::ceiling_bitrate` is added, for
-// still-picture refinement, and a simulation of two streams sharing one link (one per remote
-// output); gliff's logic is unchanged.
+// still-picture refinement, a simulation of two streams sharing one link (one per remote
+// output), and a probe up the ladder when its rate evidence has gone stale (a still screen).
 
 //! Link estimation and rate control for a frame-paced stream.
 //!
@@ -242,6 +242,20 @@ impl LinkEstimator {
         Some((min - self.base_rtt_ms(now)?).max(0.0))
     }
 
+    /// No delivery-rate sample within the rate window: `rate_max_bps` still holds what an older
+    /// window measured, as on a still screen, whose app-limited trickle cannot replace it.
+    pub fn rate_is_stale(&self, now: Instant) -> bool {
+        self.rate_samples
+            .back()
+            .is_none_or(|s| now.duration_since(s.at) > self.rate_window(now))
+    }
+
+    /// The newest round trip minus the base: the queueing the last ack saw.
+    pub fn last_queueing_ms(&self, now: Instant) -> Option<f64> {
+        let (_, last) = self.rtt_window.back()?;
+        Some((last - self.base_rtt_ms(now)?).max(0.0))
+    }
+
     /// Max-filtered delivered rate: capacity for growth and the byte cap.
     pub fn rate_max_bps(&self, _now: Instant) -> Option<f64> {
         self.rate_samples
@@ -369,13 +383,19 @@ pub const LEVELS: [Level; 7] = [
 /// step down after a short hold, step up only after `hold_up`, which
 /// doubles when an up-step flaps back down. During slow start, upward
 /// moves use the first measured capacity while downward moves wait for
-/// confirmed congestion.
+/// confirmed congestion. When the rate evidence has gone stale (a still
+/// screen proves no capacity), the ladder probes one rung up instead; see
+/// `probe`.
 pub struct Ladder {
     index: usize,
     hold_up: Duration,
     below_since: Option<Instant>,
     last_change: Option<Instant>,
     last_step_up: Option<Instant>,
+    /// The rung a probe stepped up from, while its trial runs.
+    probe_from: Option<usize>,
+    /// How long a rung is held before a probe; doubles on each failed one.
+    probe_hold: Duration,
 }
 
 const HOLD_DOWN: Duration = Duration::from_secs(2);
@@ -391,6 +411,8 @@ impl Ladder {
             below_since: None,
             last_change: None,
             last_step_up: None,
+            probe_from: None,
+            probe_hold: HOLD_UP,
         }
     }
 
@@ -471,6 +493,26 @@ impl Ladder {
             return None;
         }
 
+        // A probe on trial fails when what the better rung sent came back
+        // queued, and passes after a full hold without that.
+        if let Some(from) = self.probe_from {
+            if link
+                .last_queueing_ms(now)
+                .is_some_and(|q| q > link.queue_threshold_ms(now))
+            {
+                self.probe_hold = (2 * self.probe_hold).min(MAX_HOLD_UP);
+                self.move_to(now, from);
+                return Some(from);
+            }
+            if self
+                .last_change
+                .is_some_and(|t| now.duration_since(t) >= HOLD_UP)
+            {
+                self.probe_from = None;
+                self.probe_hold = HOLD_UP;
+            }
+        }
+
         if sel < self.index {
             self.below_since = None;
             // Step up needs headroom (1.25x the floor) and a full hold.
@@ -494,19 +536,59 @@ impl Ladder {
                 {
                     self.hold_up = (2 * self.hold_up).min(MAX_HOLD_UP);
                 }
+                if self.probe_from.is_some() {
+                    self.probe_hold = (2 * self.probe_hold).min(MAX_HOLD_UP);
+                }
                 self.move_to(now, sel);
                 return Some(sel);
             }
         } else {
             self.below_since = None;
         }
-        None
+        self.probe(now, link, recent_congestion)
     }
 
+    /// Steps one rung up on stale evidence: a still screen's trickle never
+    /// proves the capacity a better rung needs, so without this a stream
+    /// degraded by congestion keeps the worse rung as long as it stays still.
+    /// The frames the better rung sends (a keyframe when the resolution or
+    /// the chroma changes) are the probe, judged in `consider`. Taken only
+    /// when the round trip is back near its base; a still screen costs
+    /// little at any rung.
+    fn probe(
+        &mut self,
+        now: Instant,
+        link: &LinkEstimator,
+        recent_congestion: bool,
+    ) -> Option<usize> {
+        let quiet = link
+            .last_queueing_ms(now)
+            .is_some_and(|q| q <= link.queue_threshold_ms(now));
+        let held = self
+            .last_change
+            .is_none_or(|t| now.duration_since(t) >= self.probe_hold);
+        if self.index == 0
+            || self.probe_from.is_some()
+            || recent_congestion
+            || !quiet
+            || !held
+            || !link.rate_is_stale(now)
+        {
+            return None;
+        }
+        let from = self.index;
+        self.last_step_up = Some(now);
+        self.move_to(now, from - 1);
+        self.probe_from = Some(from);
+        Some(from - 1)
+    }
+
+    /// Any move ends a probe's trial: a move on rate evidence supersedes it.
     fn move_to(&mut self, now: Instant, index: usize) {
         self.index = index;
         self.last_change = Some(now);
         self.below_since = None;
+        self.probe_from = None;
     }
 }
 
@@ -1461,17 +1543,26 @@ mod tests {
 
     #[test]
     fn a_moving_screen_keeps_todays_behaviour() {
-        // In motion on a link that stays congested, the rate evidence stays fresh: the
-        // stream never tries full resolution.
+        // In motion the rate evidence stays fresh, through the congestion and after it: the
+        // ladder moves on it alone and never probes.
         let mut sim = degraded_by_congestion();
-        let moving_from = sim.now;
-        sim.run(120.0, 30, LAN_RTT_MS, CONGESTED_BPS);
-        let climbs: Vec<_> = sim
-            .level_changes
-            .iter()
-            .filter(|(t, l)| *t > moving_from && LEVELS[*l].scale == 1.0)
-            .collect();
-        assert!(climbs.is_empty(), "{climbs:?}");
-        assert_eq!(sim.ladder.level().scale, 0.5);
+        let from = sim.now;
+        let mut next_send = sim.now;
+        let mut link_free = sim.now;
+        while sim.now < from + Duration::from_secs(180) {
+            sim.now += MS;
+            let cap = if sim.now < from + Duration::from_secs(120) {
+                CONGESTED_BPS
+            } else {
+                LAN_BPS
+            };
+            sim.step(30, LAN_RTT_MS, cap, &mut next_send, &mut link_free);
+            assert!(
+                sim.ladder.probe_from.is_none(),
+                "a probe at {:?}",
+                sim.now - from
+            );
+        }
+        assert_eq!(sim.ladder.probe_hold, HOLD_UP);
     }
 }
