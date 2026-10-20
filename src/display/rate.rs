@@ -858,6 +858,25 @@ mod tests {
             link_free: &mut Instant,
         ) -> u64 {
             let interval = Duration::from_secs_f64(1.0 / fps.max(1) as f64);
+            let acked = self.take_acks(fps == 0);
+            if fps == 0 || self.now < *next_send {
+                return acked;
+            }
+            // One simulated frame carries every stream's share.
+            let bytes = (self.ctl.target() / (fps * 8)).max(500) as usize;
+            let room = self.link.inflight_bytes() + self.link.est_frame_bytes()
+                <= self.link.cap_bytes(self.now, self.ctl.is_slow_start());
+            if !room {
+                self.ctl.note_blocked_at_cap();
+                return acked;
+            }
+            self.send(bytes, false, rtt_ms, cap_bps, link_free);
+            *next_send = self.now + interval;
+            acked
+        }
+
+        /// Takes the acks due and lets the ladder consider each one.
+        fn take_acks(&mut self, idle: bool) -> u64 {
             let mut acked = 0;
             while self
                 .pending_acks
@@ -879,33 +898,101 @@ mod tests {
                 ) {
                     self.level_changes.push((self.now, level));
                 }
-                if fps == 0 && self.link.inflight_bytes() == 0 {
+                if idle && self.link.inflight_bytes() == 0 {
                     self.ctl.note_idle(self.now);
                 }
                 acked += 1;
             }
-            if fps == 0 || self.now < *next_send {
-                return acked;
-            }
-            // One simulated frame carries every stream's share.
-            let bytes = (self.ctl.target() / (fps * 8)).max(500) as usize;
-            let room = self.link.inflight_bytes() + self.link.est_frame_bytes()
-                <= self.link.cap_bytes(self.now, self.ctl.is_slow_start());
-            if !room {
-                self.ctl.note_blocked_at_cap();
-                return acked;
-            }
+            acked
+        }
+
+        fn send(
+            &mut self,
+            bytes: usize,
+            app_limited: bool,
+            rtt_ms: f64,
+            cap_bps: f64,
+            link_free: &mut Instant,
+        ) {
             // Serialization on the capacity plus the propagation delay.
             let tx = Duration::from_secs_f64(bytes as f64 * 8.0 / cap_bps);
             *link_free = (*link_free).max(self.now) + tx;
             let ack_at = *link_free + Duration::from_secs_f64(rtt_ms / 1000.0);
             self.ctl.note_frame_sent(self.now);
-            self.link.on_sent(self.now, self.frame_id, bytes, false);
+            self.link
+                .on_sent(self.now, self.frame_id, bytes, app_limited);
             self.pending_acks.push_back((ack_at, self.frame_id));
             self.frame_id += 1;
-            *next_send = self.now + interval;
-            acked
         }
+
+        /// A still screen for `secs`: a small app-limited frame every second (a clock, a
+        /// blinking caret), and a keyframe at the rung's size whenever the ladder changes the
+        /// resolution or the chroma, as the stream rebuilds its encoder then.
+        fn run_still(&mut self, secs: f64, rtt_ms: f64, cap_bps: f64) {
+            let end = self.now + Duration::from_secs_f64(secs);
+            // The link is busy with what the previous phase left queued.
+            let mut link_free = self.pending_acks.back().map_or(self.now, |(t, _)| {
+                (*t - Duration::from_secs_f64(rtt_ms / 1000.0)).max(self.now)
+            });
+            let mut next_send = self.now;
+            let shape = |l: &Level| (l.scale, l.aux);
+            let mut sent_shape = shape(self.ladder.level());
+            let mut key_due = false;
+            while self.now < end {
+                self.now += MS;
+                self.take_acks(false);
+                let level = self.ladder.level();
+                if shape(level) != sent_shape {
+                    sent_shape = shape(level);
+                    key_due = true;
+                }
+                let room = self.link.inflight_bytes() == 0
+                    || self.link.inflight_bytes() + self.link.est_frame_bytes()
+                        <= self.link.cap_bytes(self.now, self.ctl.is_slow_start());
+                if !room {
+                    continue;
+                }
+                if key_due {
+                    let streams = if level.aux && self.streams == 2 {
+                        2.0
+                    } else {
+                        1.0
+                    };
+                    let px = self.pixels as f64 * (level.scale * level.scale) as f64;
+                    let bytes = (px * streams * KEY_BITS_PER_PIXEL / 8.0) as usize;
+                    self.send(bytes, true, rtt_ms, cap_bps, &mut link_free);
+                    key_due = false;
+                    next_send = self.now + STILL_EVERY;
+                } else if self.now >= next_send {
+                    self.send(STILL_BYTES, true, rtt_ms, cap_bps, &mut link_free);
+                    next_send = self.now + STILL_EVERY;
+                }
+            }
+        }
+    }
+
+    /// A still screen's trickle, and what a keyframe of text costs per pixel.
+    const STILL_EVERY: Duration = Duration::from_secs(1);
+    const STILL_BYTES: usize = 2_000;
+    const KEY_BITS_PER_PIXEL: f64 = 1.0;
+    /// A healthy gigabit LAN, and the same LAN congested well below what one stream wants.
+    const LAN_BPS: f64 = 1e9;
+    const CONGESTED_BPS: f64 = 0.25e6;
+    const LAN_RTT_MS: f64 = 2.0;
+
+    /// A two-stream 1080p monitor in motion, first on a healthy LAN, then through a long
+    /// congestion that takes it down to half resolution.
+    fn degraded_by_congestion() -> Sim {
+        let mut sim = Sim::new(1920 * 1080, 2, 60);
+        sim.run(4.0, 30, LAN_RTT_MS, LAN_BPS);
+        sim.run(40.0, 30, LAN_RTT_MS, CONGESTED_BPS);
+        assert_eq!(
+            sim.ladder.level().scale,
+            0.5,
+            "congestion left the stream at level {}",
+            sim.ladder.index()
+        );
+        sim
     }
 
     #[test]
@@ -1314,5 +1401,77 @@ mod tests {
                 "{rates:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_still_screen_degraded_during_congestion_returns_to_full_resolution() {
+        let mut sim = degraded_by_congestion();
+        let still_from = sim.now;
+        sim.run_still(60.0, LAN_RTT_MS, LAN_BPS);
+        let moves: Vec<_> = sim
+            .level_changes
+            .iter()
+            .filter(|(t, _)| *t > still_from)
+            .map(|(t, l)| (t.duration_since(still_from).as_secs_f64(), *l))
+            .collect();
+        assert_eq!(
+            sim.ladder.index(),
+            0,
+            "still at level {} after a minute of a healthy link: {moves:?}",
+            sim.ladder.index()
+        );
+    }
+
+    #[test]
+    fn a_link_that_stays_too_slow_keeps_the_stream_on_its_rung() {
+        let mut sim = degraded_by_congestion();
+        let still_from = sim.now;
+        let secs = 300.0;
+        sim.run_still(secs, LAN_RTT_MS, CONGESTED_BPS);
+        // Time spent at full resolution, and when each stay began.
+        let mut full_res = Duration::ZERO;
+        let mut climbs = Vec::new();
+        let mut at = (still_from, sim.ladder.level().scale == 1.0);
+        let changes = sim.level_changes.iter().filter(|(t, _)| *t > still_from);
+        for &(t, level) in changes.chain([&(sim.now, sim.ladder.index())]) {
+            let full = LEVELS[level].scale == 1.0;
+            if at.1 {
+                full_res += t - at.0;
+            }
+            if full && !at.1 {
+                climbs.push(t.duration_since(still_from).as_secs_f64());
+            }
+            at = (t, full);
+        }
+        assert!(
+            full_res.as_secs_f64() < 0.2 * secs,
+            "{full_res:?} of {secs} s at full resolution on a slow link: {climbs:?}"
+        );
+        assert!(
+            climbs.len() <= 6,
+            "climbed {} times: {climbs:?}",
+            climbs.len()
+        );
+        let gaps: Vec<f64> = climbs.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            gaps.windows(2).all(|g| g[1] > g[0]),
+            "the tries do not back off: {climbs:?}"
+        );
+    }
+
+    #[test]
+    fn a_moving_screen_keeps_todays_behaviour() {
+        // In motion on a link that stays congested, the rate evidence stays fresh: the
+        // stream never tries full resolution.
+        let mut sim = degraded_by_congestion();
+        let moving_from = sim.now;
+        sim.run(120.0, 30, LAN_RTT_MS, CONGESTED_BPS);
+        let climbs: Vec<_> = sim
+            .level_changes
+            .iter()
+            .filter(|(t, l)| *t > moving_from && LEVELS[*l].scale == 1.0)
+            .collect();
+        assert!(climbs.is_empty(), "{climbs:?}");
+        assert_eq!(sim.ladder.level().scale, 0.5);
     }
 }
