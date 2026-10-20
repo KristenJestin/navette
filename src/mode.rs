@@ -3179,6 +3179,23 @@ mod tests {
         assert!(rules[2].contains(&below("hyprpicker")), "{rules:?}");
     }
 
+    /// Hyprland 0.56.2 applies a layer's rules only when it maps: a tie would leave the stacking
+    /// to the map order, and hyprpicker's frozen copy over slurp's veil (#166).
+    #[tokio::test]
+    async fn the_first_listed_local_above_layer_is_drawn_on_top() {
+        let desk = desk("DP-2");
+        let _remote = started(&desk).await;
+        let rules = desk.hypr.layer_rules();
+        assert!(
+            rules[1].contains(r#"match = { namespace = "^selection$" }, order = -2000"#),
+            "{rules:?}"
+        );
+        assert!(
+            rules[2].contains(r#"match = { namespace = "^hyprpicker$" }, order = -1999"#),
+            "{rules:?}"
+        );
+    }
+
     #[tokio::test]
     async fn with_local_above_none_only_navette_s_rule_is_sent() {
         let desk = desk_with("monitor = DP-2\nlocal_above = none\n");
