@@ -52,7 +52,8 @@ use config::{Mode, resolve};
 /// The `order` of the layer rule on Navette's picture: lower than any of the desk's overlays, which
 /// have 0 unless the user's own rules say otherwise, so it is drawn after them (#116).
 const PICTURE_ORDER: i32 = -1000;
-/// The `order` of the `local_above` layers: drawn after the picture.
+/// The `order` of the first `local_above` layer, drawn after the picture; each next one gets one
+/// more, so it is drawn before (#166).
 const LOCAL_ABOVE_ORDER: i32 = -2000;
 
 /// How long the remote has to make its output.
@@ -1143,7 +1144,9 @@ async fn open_desk(
         // highest first, only when one maps, unmaps or commits its layer-shell state, and draws
         // the last on top. Navette's picture then stays above an overlay of the desk's that maps
         // later (an OSD, a shell restarted), and the tools the user starts on purpose stay above
-        // it. A mode without the rules still shows the picture.
+        // it. A layer's rules apply only when it maps, so a tie between two of these tools would
+        // leave their stacking to the map order: the first listed is drawn on top (#166). A mode
+        // without the rules still shows the picture.
         let above = [(
             SURFACE_NAMESPACE.to_string(),
             "above".to_string(),
@@ -1151,7 +1154,7 @@ async fn open_desk(
         )];
         let below = local_above.iter().enumerate().map(|(index, namespace)| {
             let base = format!("local-above-{}", index + 1);
-            (namespace.clone(), base, LOCAL_ABOVE_ORDER)
+            (namespace.clone(), base, LOCAL_ABOVE_ORDER + index as i32)
         });
         for (namespace, base, order) in above.into_iter().chain(below) {
             let fields = format!(
@@ -3149,8 +3152,8 @@ mod tests {
     /// The rule that draws Navette's picture last among the overlay layers.
     const ABOVE: &str = r#"match = { namespace = "^navette$" }, order = -1000"#;
 
-    fn below(namespace: &str) -> String {
-        format!(r#"match = {{ namespace = "^{namespace}$" }}, order = -2000"#)
+    fn below(namespace: &str, order: i32) -> String {
+        format!(r#"match = {{ namespace = "^{namespace}$" }}, order = {order}"#)
     }
 
     #[tokio::test]
@@ -3160,10 +3163,10 @@ mod tests {
         let rules = desk.hypr.layer_rules();
         assert_eq!(rules.len(), 3, "{rules:?}");
         assert!(rules[0].contains(ABOVE), "{rules:?}");
-        assert!(rules[1].contains(&below("selection")), "{rules:?}");
+        assert!(rules[1].contains(&below("selection", -2000)), "{rules:?}");
         // A namespace is matched whole, its dots as dots.
         assert!(
-            rules[2].contains(&below("invented\\\\.picker")),
+            rules[2].contains(&below("invented\\\\.picker", -1999)),
             "{rules:?}"
         );
         assert!(rules.iter().all(|r| r.contains("name = \"navette-")));
@@ -3175,8 +3178,8 @@ mod tests {
         let _remote = started(&desk).await;
         let rules = desk.hypr.layer_rules();
         assert_eq!(rules.len(), 3, "{rules:?}");
-        assert!(rules[1].contains(&below("selection")), "{rules:?}");
-        assert!(rules[2].contains(&below("hyprpicker")), "{rules:?}");
+        assert!(rules[1].contains(&below("selection", -2000)), "{rules:?}");
+        assert!(rules[2].contains(&below("hyprpicker", -1999)), "{rules:?}");
     }
 
     /// Hyprland 0.56.2 applies a layer's rules only when it maps: a tie would leave the stacking

@@ -252,12 +252,16 @@ local_above = selection, hyprpicker   # the default; local_above = none for none
 
 The default is the selection overlays of slurp (namespace `selection`) and hyprpicker
 (`hyprpicker`). `none`, or the key left empty, lists none. `hyprctl layers` shows a tool's
-namespace while it is open.
+namespace while it is open. The order of the list is the stacking: the first listed is drawn on
+top. A region screenshot shows hyprpicker's frozen copy of the screen and slurp's veil over it,
+so `selection` comes before `hyprpicker`.
 
 Both are runtime layer rules, set before the surfaces open: the picture's surface (namespace
-`navette`) gets `order = -1000` and each listed namespace `order = -2000`. Hyprland sorts a
-monitor's overlay layers by `order`, highest first, whenever one of them maps, and draws the last
-on top. After a config reload, which drops runtime rules, the rules are set again and each
+`navette`) gets `order = -1000`, the first listed namespace `order = -2000`, the next one
+`-1999`, and so on. Hyprland sorts a monitor's overlay layers by `order`, highest first, whenever
+one of them maps, and draws the last on top. It applies a layer's rules only when the layer maps,
+so two listed namespaces with the same `order` would be stacked by the moment each one maps: a
+tie let hyprpicker cover slurp's veil. After a config reload, which drops runtime rules, the rules are set again and each
 surface makes Hyprland sort its monitor again, at once and without a blank frame. The rules are
 disabled when the mode stops, and at the next start after a crash.
 
