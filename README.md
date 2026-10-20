@@ -3,7 +3,7 @@
 <img src="assets/brand/png/social-preview.png" alt="Navette: the desk with a mode running, its first monitor at the desk and the two others showing the work laptop, closed on the desk" width="100%">
 
 [![Latest version](https://img.shields.io/github/v/release/KristenJestin/navette?include_prereleases)](https://github.com/KristenJestin/navette/releases)
-[![Licence: Apache-2.0](https://img.shields.io/github/license/KristenJestin/navette)](LICENSE)
+[![Licence: AGPL-3.0](https://img.shields.io/github/license/KristenJestin/navette)](LICENSE)
 [![CI of dev](https://github.com/KristenJestin/navette/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/KristenJestin/navette/actions/workflows/ci.yml?query=branch%3Adev)
 
 </div>
@@ -105,7 +105,7 @@ cargo test
 
 <img src="assets/brand/png/icon-pixel-266.png" alt="The icon of Navette, the crossed chevrons drawn in pixels" width="72" align="right">
 
-Apache-2.0. Code reused from gliff (MIT) keeps its MIT notice ([`LICENSES`](LICENSES)).
+Free software under the [AGPL-3.0](LICENSE). Code reused from gliff (MIT) keeps its MIT notice ([`LICENSES`](LICENSES)).
 The logo, the icon and the banner are in [`assets/brand`](assets/brand/README.md); the banner is
 drawn with Figtree and JetBrains Mono, under the SIL Open Font License 1.1
 ([`assets/brand/fonts`](assets/brand/fonts/README.md)).
