@@ -467,11 +467,9 @@ impl Thread {
                         failures = 0;
                         decoder = self.decoder(config, false);
                         if let Some(d) = &decoder {
-                            eprintln!(
-                                "navette: decoding {width}x{height} {chroma:?} on the {}, {}",
-                                d.tier(),
-                                d.handover()
-                            );
+                            let line =
+                                decoding_line(self.outbox.output(), config, d.tier(), d.handover());
+                            eprintln!("navette: {line}");
                         }
                     }
                 }
@@ -653,6 +651,20 @@ impl Stats {
         self.latency_ms.clear();
         line
     }
+}
+
+/// What the desk says of a new stream configuration, naming the stream: with two monitors, which
+/// one changed.
+fn decoding_line(
+    output: u8,
+    (width, height, chroma): (u32, u32, ChromaMode),
+    tier: &str,
+    handover: &str,
+) -> String {
+    format!(
+        "{}: decoding {width}x{height} {chroma:?} on the {tier}, {handover}",
+        super::output::name(usize::from(output))
+    )
 }
 
 fn percentile(values: &mut [f32], p: f32) -> f32 {
@@ -1131,6 +1143,20 @@ mod tests {
         let line = stats.line(Some("CPU")).unwrap();
         assert!(line.contains("on the CPU"), "{line}");
         assert!(line.contains("2 decoders lost"), "{line}");
+    }
+
+    #[test]
+    fn the_line_for_a_new_stream_configuration_names_its_stream() {
+        let line = decoding_line(
+            1,
+            (1920, 1080, ChromaMode::Dual420),
+            "GPU",
+            "shown as a tiled dmabuf",
+        );
+        assert!(
+            line.starts_with("NAVETTE-2: decoding 1920x1080 Dual420 on the GPU"),
+            "{line}"
+        );
     }
 
     const BLOCK_LINEAR: u64 = 0x0300_0000_0060_6015;
