@@ -435,7 +435,7 @@ impl Session {
                 if moved.is_some() && self.apply_stream_params()? {
                     self.send_config();
                 }
-                if let Some(verdict) = self.ladder.take_verdict() {
+                for verdict in self.ladder.take_verdicts() {
                     // Rare (seconds to minutes apart), and the only account of why a stream is
                     // degraded: always in the journal, like the desk's per-stream reports.
                     eprintln!(

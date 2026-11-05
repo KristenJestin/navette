@@ -445,7 +445,8 @@ pub struct Ladder {
     probe_from: Option<usize>,
     /// How long a rung is held before a probe; doubles on each failed one.
     probe_hold: Duration,
-    verdict: Option<Verdict>,
+    /// Not yet taken: a probe can pass and the rate move up in the same call.
+    verdicts: Vec<Verdict>,
 }
 
 const HOLD_DOWN: Duration = Duration::from_secs(2);
@@ -463,7 +464,7 @@ impl Ladder {
             last_step_up: None,
             probe_from: None,
             probe_hold: HOLD_UP,
-            verdict: None,
+            verdicts: Vec::new(),
         }
     }
 
@@ -539,7 +540,7 @@ impl Ladder {
         if slow_start {
             if sel < self.index || (down > self.index && real && recent_congestion) {
                 self.move_to(now, sel);
-                self.verdict = Some(Verdict::Rate { rate_bps: rate });
+                self.verdicts.push(Verdict::Rate { rate_bps: rate });
                 return Some(sel);
             }
             return None;
@@ -552,7 +553,7 @@ impl Ladder {
             if let Some(queueing_ms) = link.last_queueing_ms(now).filter(|q| *q > threshold_ms) {
                 self.probe_hold = (2 * self.probe_hold).min(MAX_HOLD_UP);
                 self.move_to(now, from);
-                self.verdict = Some(Verdict::ProbeFailed {
+                self.verdicts.push(Verdict::ProbeFailed {
                     queueing_ms,
                     threshold_ms,
                     frame_bytes: link.last_acked_bytes(),
@@ -565,7 +566,7 @@ impl Ladder {
             {
                 self.probe_from = None;
                 self.probe_hold = HOLD_UP;
-                self.verdict = Some(Verdict::ProbePassed);
+                self.verdicts.push(Verdict::ProbePassed);
             }
         }
 
@@ -579,7 +580,7 @@ impl Ladder {
             if up < self.index && held {
                 self.last_step_up = Some(now);
                 self.move_to(now, up);
-                self.verdict = Some(Verdict::Rate { rate_bps: rate });
+                self.verdicts.push(Verdict::Rate { rate_bps: rate });
                 return Some(up);
             }
         } else if down > self.index && real {
@@ -597,7 +598,7 @@ impl Ladder {
                     self.probe_hold = (2 * self.probe_hold).min(MAX_HOLD_UP);
                 }
                 self.move_to(now, sel);
-                self.verdict = Some(Verdict::Rate { rate_bps: rate });
+                self.verdicts.push(Verdict::Rate { rate_bps: rate });
                 return Some(sel);
             }
         } else {
@@ -638,13 +639,13 @@ impl Ladder {
         self.last_step_up = Some(now);
         self.move_to(now, from - 1);
         self.probe_from = Some(from);
-        self.verdict = Some(Verdict::Probe);
+        self.verdicts.push(Verdict::Probe);
         Some(from - 1)
     }
 
-    /// Why the last move or probe outcome happened, once.
-    pub fn take_verdict(&mut self) -> Option<Verdict> {
-        self.verdict.take()
+    /// Why the moves and probe outcomes since the last call happened, once.
+    pub fn take_verdicts(&mut self) -> Vec<Verdict> {
+        std::mem::take(&mut self.verdicts)
     }
 
     /// Any move ends a probe's trial: a move on rate evidence supersedes it.
@@ -1046,7 +1047,7 @@ mod tests {
                 ) {
                     self.level_changes.push((self.now, level));
                 }
-                if let Some(verdict) = self.ladder.take_verdict() {
+                for verdict in self.ladder.take_verdicts() {
                     self.verdicts.push((self.now, verdict));
                 }
                 if idle && self.link.inflight_bytes() == 0 {
