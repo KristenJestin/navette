@@ -891,6 +891,7 @@ mod tests {
         streams: u32,
         max_fps: u32,
         level_changes: Vec<(Instant, usize)>,
+        verdicts: Vec<(Instant, Verdict)>,
         now: Instant,
         frame_id: u64,
         pending_acks: VecDeque<(Instant, u64)>,
@@ -906,6 +907,7 @@ mod tests {
                 streams,
                 max_fps,
                 level_changes: Vec::new(),
+                verdicts: Vec::new(),
                 now: Instant::now(),
                 frame_id: 0,
                 pending_acks: VecDeque::new(),
@@ -979,6 +981,9 @@ mod tests {
                     self.max_fps,
                 ) {
                     self.level_changes.push((self.now, level));
+                }
+                if let Some(verdict) = self.ladder.take_verdict() {
+                    self.verdicts.push((self.now, verdict));
                 }
                 if idle && self.link.inflight_bytes() == 0 {
                     self.ctl.note_idle(self.now);
@@ -1564,5 +1569,61 @@ mod tests {
             );
         }
         assert_eq!(sim.ladder.probe_hold, HOLD_UP);
+    }
+
+    #[test]
+    fn a_probe_that_fails_on_a_slow_link_reports_its_queueing_and_frame() {
+        let mut sim = degraded_by_congestion();
+        sim.verdicts.clear();
+        sim.run_still(120.0, LAN_RTT_MS, CONGESTED_BPS);
+        let failed: Vec<_> = sim
+            .verdicts
+            .iter()
+            .filter_map(|(_, v)| match v {
+                Verdict::ProbeFailed {
+                    queueing_ms,
+                    threshold_ms,
+                    frame_bytes,
+                } => Some((*queueing_ms, *threshold_ms, *frame_bytes)),
+                _ => None,
+            })
+            .collect();
+        assert!(!failed.is_empty(), "no failed probe: {:?}", sim.verdicts);
+        for (queueing_ms, threshold_ms, frame_bytes) in failed {
+            assert!(
+                queueing_ms > threshold_ms,
+                "{queueing_ms} <= {threshold_ms}"
+            );
+            assert!(frame_bytes > 0);
+        }
+    }
+
+    #[test]
+    fn a_probe_that_holds_on_a_healthy_link_reports_that_it_passed() {
+        let mut sim = degraded_by_congestion();
+        sim.verdicts.clear();
+        sim.run_still(60.0, LAN_RTT_MS, LAN_BPS);
+        assert!(
+            sim.verdicts
+                .iter()
+                .any(|(_, v)| matches!(v, Verdict::ProbePassed)),
+            "{:?}",
+            sim.verdicts
+        );
+    }
+
+    #[test]
+    fn a_move_on_the_measured_rate_reports_that_rate() {
+        let sim = degraded_by_congestion();
+        let rates: Vec<f64> = sim
+            .verdicts
+            .iter()
+            .filter_map(|(_, v)| match v {
+                Verdict::Rate { rate_bps } => Some(*rate_bps),
+                _ => None,
+            })
+            .collect();
+        assert!(!rates.is_empty(), "{:?}", sim.verdicts);
+        assert!(rates.iter().all(|r| r.is_finite() && *r > 0.0), "{rates:?}");
     }
 }

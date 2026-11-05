@@ -1133,6 +1133,20 @@ mod tests {
         assert!(line.contains("2 decoders lost"), "{line}");
     }
 
+    #[test]
+    fn the_line_for_a_new_stream_configuration_names_its_stream() {
+        let line = decoding_line(
+            1,
+            (1920, 1080, ChromaMode::Dual420),
+            "GPU",
+            "shown as a tiled dmabuf",
+        );
+        assert!(
+            line.starts_with("NAVETTE-2: decoding 1920x1080 Dual420 on the GPU"),
+            "{line}"
+        );
+    }
+
     const BLOCK_LINEAR: u64 = 0x0300_0000_0060_6015;
 
     #[test]
