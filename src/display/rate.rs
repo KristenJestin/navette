@@ -62,6 +62,9 @@ pub struct LinkEstimator {
     largest_frame: usize,
     /// Smoothed sent-frame size, to estimate the next frame's cost.
     avg_frame_bytes: f64,
+    /// Size of the frame the last ack was paired with: a probe's verdict says whether it was
+    /// judged on a large keyframe or on a small frame.
+    last_acked_bytes: usize,
 }
 
 /// The base-RTT window: long enough to ride out loss-recovery stalls,
@@ -85,6 +88,7 @@ impl LinkEstimator {
             inflight_bytes: 0,
             largest_frame: 0,
             avg_frame_bytes: 0.0,
+            last_acked_bytes: 0,
         }
     }
 
@@ -130,6 +134,7 @@ impl LinkEstimator {
         }
         self.delivered_time = Some(now);
         let frame = frame.expect("drained at least one frame");
+        self.last_acked_bytes = frame.bytes;
 
         let rtt_ms = now.duration_since(frame.sent_at).as_secs_f64() * 1000.0;
         self.record_rtt(now, rtt_ms);
@@ -248,6 +253,10 @@ impl LinkEstimator {
         self.rate_samples
             .back()
             .is_none_or(|s| now.duration_since(s.at) > self.rate_window(now))
+    }
+
+    pub fn last_acked_bytes(&self) -> usize {
+        self.last_acked_bytes
     }
 
     /// The newest round trip minus the base: the queueing the last ack saw.
@@ -379,6 +388,46 @@ pub const LEVELS: [Level; 7] = [
     },
 ];
 
+/// Why the ladder moved, or how a probe's trial ended, with the evidence, for the log: without
+/// it a stream left degraded says nothing about why its tries at the better rung fail.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Verdict {
+    /// The measured rate pays for a better rung, or no longer for this one.
+    Rate { rate_bps: f64 },
+    /// Stale rate evidence on a quiet link: one rung up, on trial.
+    Probe,
+    /// What the probed rung sent came back queued past the threshold.
+    ProbeFailed {
+        queueing_ms: f64,
+        threshold_ms: f64,
+        frame_bytes: usize,
+    },
+    /// The probed rung held a full hold without queueing.
+    ProbePassed,
+}
+
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Verdict::Rate { rate_bps } => {
+                write!(f, "on the measured rate, {:.1} Mbit/s", rate_bps / 1e6)
+            }
+            Verdict::Probe => write!(f, "probing: no fresh rate evidence, round trip quiet"),
+            Verdict::ProbeFailed {
+                queueing_ms,
+                threshold_ms,
+                frame_bytes,
+            } => write!(
+                f,
+                "probe failed: a {:.1} KB frame came back {queueing_ms:.1} ms queued \
+                 (threshold {threshold_ms:.1} ms)",
+                *frame_bytes as f64 / 1000.0
+            ),
+            Verdict::ProbePassed => write!(f, "probe passed"),
+        }
+    }
+}
+
 /// Picks the quality level the measured rate can pay for, with hysteresis:
 /// step down after a short hold, step up only after `hold_up`, which
 /// doubles when an up-step flaps back down. During slow start, upward
@@ -396,6 +445,7 @@ pub struct Ladder {
     probe_from: Option<usize>,
     /// How long a rung is held before a probe; doubles on each failed one.
     probe_hold: Duration,
+    verdict: Option<Verdict>,
 }
 
 const HOLD_DOWN: Duration = Duration::from_secs(2);
@@ -413,6 +463,7 @@ impl Ladder {
             last_step_up: None,
             probe_from: None,
             probe_hold: HOLD_UP,
+            verdict: None,
         }
     }
 
@@ -488,6 +539,7 @@ impl Ladder {
         if slow_start {
             if sel < self.index || (down > self.index && real && recent_congestion) {
                 self.move_to(now, sel);
+                self.verdict = Some(Verdict::Rate { rate_bps: rate });
                 return Some(sel);
             }
             return None;
@@ -496,12 +548,15 @@ impl Ladder {
         // A probe on trial fails when what the better rung sent came back
         // queued, and passes after a full hold without that.
         if let Some(from) = self.probe_from {
-            if link
-                .last_queueing_ms(now)
-                .is_some_and(|q| q > link.queue_threshold_ms(now))
-            {
+            let threshold_ms = link.queue_threshold_ms(now);
+            if let Some(queueing_ms) = link.last_queueing_ms(now).filter(|q| *q > threshold_ms) {
                 self.probe_hold = (2 * self.probe_hold).min(MAX_HOLD_UP);
                 self.move_to(now, from);
+                self.verdict = Some(Verdict::ProbeFailed {
+                    queueing_ms,
+                    threshold_ms,
+                    frame_bytes: link.last_acked_bytes(),
+                });
                 return Some(from);
             }
             if self
@@ -510,6 +565,7 @@ impl Ladder {
             {
                 self.probe_from = None;
                 self.probe_hold = HOLD_UP;
+                self.verdict = Some(Verdict::ProbePassed);
             }
         }
 
@@ -523,6 +579,7 @@ impl Ladder {
             if up < self.index && held {
                 self.last_step_up = Some(now);
                 self.move_to(now, up);
+                self.verdict = Some(Verdict::Rate { rate_bps: rate });
                 return Some(up);
             }
         } else if down > self.index && real {
@@ -540,6 +597,7 @@ impl Ladder {
                     self.probe_hold = (2 * self.probe_hold).min(MAX_HOLD_UP);
                 }
                 self.move_to(now, sel);
+                self.verdict = Some(Verdict::Rate { rate_bps: rate });
                 return Some(sel);
             }
         } else {
@@ -580,7 +638,13 @@ impl Ladder {
         self.last_step_up = Some(now);
         self.move_to(now, from - 1);
         self.probe_from = Some(from);
+        self.verdict = Some(Verdict::Probe);
         Some(from - 1)
+    }
+
+    /// Why the last move or probe outcome happened, once.
+    pub fn take_verdict(&mut self) -> Option<Verdict> {
+        self.verdict.take()
     }
 
     /// Any move ends a probe's trial: a move on rate evidence supersedes it.

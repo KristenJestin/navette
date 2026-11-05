@@ -467,11 +467,9 @@ impl Thread {
                         failures = 0;
                         decoder = self.decoder(config, false);
                         if let Some(d) = &decoder {
-                            eprintln!(
-                                "navette: decoding {width}x{height} {chroma:?} on the {}, {}",
-                                d.tier(),
-                                d.handover()
-                            );
+                            let line =
+                                decoding_line(self.outbox.output(), config, d.tier(), d.handover());
+                            eprintln!("navette: {line}");
                         }
                     }
                 }
@@ -653,6 +651,20 @@ impl Stats {
         self.latency_ms.clear();
         line
     }
+}
+
+/// What the desk says of a new stream configuration, naming the stream: with two monitors, which
+/// one changed.
+fn decoding_line(
+    output: u8,
+    (width, height, chroma): (u32, u32, ChromaMode),
+    tier: &str,
+    handover: &str,
+) -> String {
+    format!(
+        "{}: decoding {width}x{height} {chroma:?} on the {tier}, {handover}",
+        super::output::name(usize::from(output))
+    )
 }
 
 fn percentile(values: &mut [f32], p: f32) -> f32 {

@@ -422,7 +422,7 @@ impl Session {
                 let dual = self.base_chroma == ChromaMode::Dual420;
                 let can_drop_aux = self.can_drop_aux();
                 let pixels = self.base_stream.0 as u64 * self.base_stream.1 as u64;
-                if let Some(level) = self.ladder.consider(
+                let moved = self.ladder.consider(
                     now,
                     &self.link,
                     self.ctl.is_slow_start(),
@@ -431,11 +431,24 @@ impl Session {
                     dual,
                     can_drop_aux,
                     MAX_FPS,
-                ) {
-                    tracing::info!(level, fps_cap = self.fps_cap(), "ladder step");
-                    if self.apply_stream_params()? {
-                        self.send_config();
-                    }
+                );
+                if moved.is_some() && self.apply_stream_params()? {
+                    self.send_config();
+                }
+                if let Some(verdict) = self.ladder.take_verdict() {
+                    // Rare (seconds to minutes apart), and the only account of why a stream is
+                    // degraded: always in the journal, like the desk's per-stream reports.
+                    eprintln!(
+                        "navette: {}: level {} ({}x{} {:?}, fps cap {}), {verdict}; base round \
+                         trip {:.1} ms",
+                        self.source.output,
+                        self.ladder.index(),
+                        self.stream.0,
+                        self.stream.1,
+                        self.chroma,
+                        self.fps_cap(),
+                        self.link.base_rtt_ms(now).unwrap_or(0.0),
+                    );
                 }
             }
             ClientMsg::RequestKeyframe => {
